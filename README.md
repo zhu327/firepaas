@@ -49,6 +49,20 @@ make build
 # 5. 从 P0 验证开始,详见 docs/mvp-plan.md
 ```
 
+### 单机实验室(当前开发基准,ADR-0012)
+
+只有一台机器时,使用折叠版实验室(不写 /etc、不启巨页,与 k8s 共存):
+
+```bash
+source scripts/lab/env.sh
+bash scripts/lab/build-hypeman.sh     # 构建嵌有 Firecracker 的 hypeman
+bash scripts/lab/start.sh             # 单节点 Nomad + compute 池
+# raw_exec + KVM 需要 root:
+sudo env PATH="$PATH" NOMAD_ADDR=http://127.0.0.1:4646 nomad job run iac/nomad/hypeman-p0.hcl
+```
+
+详见 [scripts/lab/README.md](scripts/lab/README.md) 与 [docs/plans/2026-08-25-single-node-m0.md](docs/plans/2026-08-25-single-node-m0.md)。
+
 ## Go 工程策略
 
 当前使用占位 module path `github.com/example/firepaas/*`。M1 工程基线默认收敛为**一个根 `go.mod` + 多个 `cmd/*`**；如确有独立版本/依赖隔离需求才保留多 module，并以 ADR 记录。正式建仓时替换组织路径。

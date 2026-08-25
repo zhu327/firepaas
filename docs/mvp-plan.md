@@ -95,7 +95,7 @@ M0 → M1 → M2 → M3 → M4 → M5
 
 1. 准备 3 Nomad/Consul server（兼任 `control` 池 client）+ 2 compute 节点；统一使用**真实 Nomad node pool**（`compute`/`control`）：`scripts/bootstrap-lab.sh` 按 role 写入各节点 client 的 `node_pool` 配置，集群就绪后用 `iac/nomad/pools/*.hcl` 创建池。禁止 `-meta` constraint 方案，禁止两种混用。
 2. 新建独立 `iac/nomad/hypeman-p0.hcl`：真实 hypeman artifact/config、host data dir、KVM/网络前置条件、真实健康检查；不复用未来 `agentd` job。
-3. 对 job 执行 `nomad job fmt/validate/plan`，并完成每 compute 节点一个 alloc 的 smoke test。
+3. 对 job 执行 `nomad fmt`/`nomad job validate`/`nomad job plan`，并完成每 compute 节点一个 alloc 的 smoke test。
 4. 两节点分别跑 `pull → run → exec → logs → stop/delete`；验证重启和 `kill -9` 后的进程/TAP/数据恢复行为。
 5. 采集缓存/未缓存启动、standby restore、warm fork、密度、镜像拉取、内存/CPU 使用。
 6. 完成可运行的 agent 依赖 spike：以独立 adapter 实际执行 Create/List/Delete，不只做静态代码判断；列出 manager 构造、本地 JSON、后台 goroutine、bridge/ingress/registry 可关闭性等耦合点，估算 upstream 修改量并决定“直接依赖 / 维护 fork / 抽 runtime core”三选一。

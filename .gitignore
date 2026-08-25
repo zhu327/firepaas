@@ -28,3 +28,9 @@ iac/terraform/**/*.tfvars
 .idea/
 .vscode/
 .DS_Store
+
+# Built command binaries
+/agent/agentd
+/agent/m0-spike
+/control-plane/api
+/edge/edge-proxy

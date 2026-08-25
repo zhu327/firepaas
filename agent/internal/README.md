@@ -23,3 +23,33 @@ agent/
 - edge/catalog 不得感知 slot IP；proxy 通过内部 workload endpoint 接口解析 bridge/slot 地址。
 - proxy credential 仅由 Create 请求单向接收并保存验证材料/摘要，不进入 Machine/ListMachines/日志/operation result。
 - gRPC 端口 5108、proxy 端口 5107(与 e2b 的 5008/5007 区分,避免混部冲突)。
+
+## M0.4 spike 状态(2026-08-25,编译通过;运行待 root 冒烟)
+
+`cmd/m0-spike` 不经 HTTP API,直接 import hypeman lib 实际执行 Create/List/Delete:
+
+```bash
+sudo env CONFIG_PATH=scripts/lab/hypeman-p0.yaml \
+  go run ./cmd/m0-spike -image docker.io/library/nginx:alpine
+```
+
+已验证的耦合点(全部需要在运行验证后回填结论):
+
+1. `lib/instances.Manager` 与 `lib/images.Manager` 都是**已导出的稳定接口**,
+   Create/List/Get/Delete/Stop/Start/Standby/Restore/Snapshot/Fork 齐全,agent 只需包
+   接口而不必碰 manager 内部实现——这是“直接依赖”路径的有利证据。
+2. 但装配胶水在 `lib/providers`,它 import `cmd/api/config`、builders、builds、
+   ingress、registry、imagepush 等单机 API 关注点。agent 若直接用 providers,
+   会拉进整套单机控制面依赖图,违背“agent 只 import lib/*”的红线。
+3. `config.Config` 目前位于 `cmd/api/config` 而非 `lib/config`;agent 化必须把它
+   提取到 lib(上游化),或复制一个最小 agent config 结构。
+4. 构造 `instances.Manager` 需要 paths/image/system/network/device/volume 六个
+   manager + limits + hypervisor + snapshot defaults + meter/tracer;`NewManagerWithConfigE`
+   已经提供了非 panic 的错误路径,适合 agent 使用。
+5. 命名不一致:`Instance` 的 Go 字段是 `Id`,JSON 是 `id`;agent 层要自行做风格映射。
+6. hypeman-cli 仓库的 go.mod 含 replace 指令,`go install ...@v0.18.0` 会失败,
+   需要 clone 后 `go build`(build-hypeman.sh 已处理)。
+
+三选一建议(初步):**直接依赖 + 小范围上游化**。把 `config` 提取到 `lib/config` 并
+新增一个 agent 专用装配函数(不引入 ingress/builds),是改动最小且不 fork 的路径;
+运行冒烟与冷启动/密度数据通过后正式定论。

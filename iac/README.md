@@ -22,11 +22,11 @@ P0 job 与未来 agentd job **不得共用**：它们的端口、健康检查、
 - `compute`：Firecracker 数据面节点（agentd / hypeman-p0 system job）；
 - `control`：api/edge 等基础设施 service job，由 3 台 Nomad server 兼任 client。
 
-`scripts/bootstrap-lab.sh` 按 role 写入各节点 client 的 `node_pool` 配置；集群就绪后创建池：
+`scripts/bootstrap-lab.sh` 按 role 写入各节点 client 的 `node_pool` 配置；集群就绪后创建池（Nomad 2.x）：
 
 ```bash
-nomad node pool create iac/nomad/pools/control.hcl
-nomad node pool create iac/nomad/pools/compute.hcl
+nomad node pool apply iac/nomad/pools/control.hcl
+nomad node pool apply iac/nomad/pools/compute.hcl
 ```
 
 ## 服务发现
@@ -54,9 +54,9 @@ PG/Redis/MinIO/registry 不作为 Nomad job 管理（避免在 Nomad 里再编�
 ## M0 前置验证
 
 ```bash
-nomad node pool create iac/nomad/pools/control.hcl
-nomad node pool create iac/nomad/pools/compute.hcl
-nomad job fmt iac/nomad/hypeman-p0.hcl
+nomad node pool apply iac/nomad/pools/control.hcl
+nomad node pool apply iac/nomad/pools/compute.hcl
+nomad fmt -check iac/nomad/hypeman-p0.hcl
 nomad job validate iac/nomad/hypeman-p0.hcl
 nomad job plan iac/nomad/hypeman-p0.hcl
 nomad job run iac/nomad/hypeman-p0.hcl

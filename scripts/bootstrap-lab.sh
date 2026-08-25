@@ -10,9 +10,9 @@
 #   sudo bash scripts/bootstrap-lab.sh server                 # 3 台 server/control 节点
 #   sudo bash scripts/bootstrap-lab.sh compute <server-ip>    # 2 台 compute 节点
 #
-# 集群就绪后(任一 server):
-#   nomad node pool create iac/nomad/pools/control.hcl
-#   nomad node pool create iac/nomad/pools/compute.hcl
+# 集群就绪后(任一 server,Nomad 2.x 用 apply):
+#   nomad node pool apply iac/nomad/pools/control.hcl
+#   nomad node pool apply iac/nomad/pools/compute.hcl
 set -euo pipefail
 
 ROLE="${1:-}"
@@ -133,8 +133,8 @@ echo "下一步:"
 echo "  1. [server] 编辑 /etc/consul.d/consul.hcl,填入 retry_join(全部 3 台 server IP)"
 echo "  2. 启动: systemctl enable --now consul nomad"
 echo "  3. 集群就绪后(任一 server)创建节点池:"
-echo "       nomad node pool create iac/nomad/pools/control.hcl"
-echo "       nomad node pool create iac/nomad/pools/compute.hcl"
+echo "       nomad node pool apply iac/nomad/pools/control.hcl"
+echo "       nomad node pool apply iac/nomad/pools/compute.hcl"
 echo "  4. 验证: nomad server members && nomad node status"
 echo "  5. Consul DNS(可选,*.service.consul 解析): 将 .consul 域转发到 127.0.0.1:8600"
 echo "     (dnsmasq: server=/consul/127.0.0.1#8600;注意与 systemd-resolved 的端口冲突,"

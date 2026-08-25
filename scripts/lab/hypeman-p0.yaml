@@ -1,0 +1,28 @@
+# hypeman P0 配置（单机实验室）。
+# 重要约束（mvp-plan §4.7）：不设置任何 ingress（无 caddy/api hostname），
+# 内嵌 Caddy/DNS 不启动，避免与 Nomad/Consul 及未来 edge 端口冲突。
+
+jwt_secret: "dev-p0-single-node-change-me"
+
+# 由 root（Nomad raw_exec）运行；用户态手工调试可临时改成
+# /home/zty/.local/firepaas-lab/run/hypeman
+data_dir: /var/lib/firepaas-p0/hypeman
+
+port: 4973
+
+hypervisor:
+  default: firecracker
+  # 嵌入 firecracker v1.14.2（hypeman Makefile 固定版本）；本机不设外部覆盖。
+  # firecracker_binary_path: /usr/local/bin/firecracker
+  memory:
+    enabled: false
+
+network:
+  bridge_name: firepaas0
+  subnet_cidr: 10.100.0.0/16
+  dns_server: 223.5.5.5
+
+logging:
+  level: info
+
+env: lab

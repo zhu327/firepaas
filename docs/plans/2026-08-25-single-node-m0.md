@@ -60,8 +60,8 @@ M0 数据面 go/no-go 输入。
 
 # 配置与 job（用户态即可执行）
 ~/.local/firepaas-lab/bin/nomad agent -config=scripts/lab/nomad-single.hcl &   # 后台
-~/.local/firepaas-lab/bin/nomad node pool create iac/nomad/pools/compute.hcl
-~/.local/firepaas-lab/bin/nomad job fmt iac/nomad/hypeman-p0.hcl
+~/.local/firepaas-lab/bin/nomad node pool apply iac/nomad/pools/compute.hcl
+~/.local/firepaas-lab/bin/nomad fmt -check iac/nomad/hypeman-p0.hcl
 ~/.local/firepaas-lab/bin/nomad job validate iac/nomad/hypeman-p0.hcl
 ~/.local/firepaas-lab/bin/nomad job plan iac/nomad/hypeman-p0.hcl
 
