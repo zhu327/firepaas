@@ -1,0 +1,12 @@
+go 1.25.4
+
+// 开发布局要求:firepaas 与 hypeman 必须同级 checkout(../hypeman)。
+// CI 与新环境需先满足该布局再执行任何 go 命令(见 docs/mvp-plan.md M1 工程基线)。
+// agent 只 import hypeman 的 lib/*,不改其上游行为(见 agent/internal/README.md)。
+use (
+	./agent
+	./control-plane
+	./edge
+	./shared
+	../hypeman
+)

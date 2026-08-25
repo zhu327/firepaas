@@ -1,0 +1,336 @@
+// firepaas agent gRPC 契约 v1（草案，M1.2 冻结稳定子集）。
+//
+// 设计参考:
+//   - e2b-dev/infra/packages/orchestrator/orchestrator.proto(SandboxService/InfoService)
+//   - hypeman lib/hypervisor 的 VMConfig 能力集
+//
+// 约定:
+//   1. 控制面只通过本契约与节点交互,不直接访问 agent 本地文件/网络。
+//   2. machine_id + execution_id + generation + operation_id 是所有变更操作的 fencing/幂等键。
+//   3. 状态机:PENDING -> INITIALIZING -> RUNNING -> STOPPING -> STOPPED
+//                      |-> PAUSING -> PAUSED -> RESUMING -> RUNNING
+//                      `-> DELETING -> DELETED
+//   4. logs/exec 为流式 RPC,由控制面代理(CLI/用户不直连 agent);
+//      实时日志不经对象存储,Machine.log_url 仅指向归档日志。
+syntax = "proto3";
+
+package firepaas.agent.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/example/firepaas/shared/gen/agent/v1;agentv1";
+
+// ---------------------------------------------------------------------------
+// 节点信息(调度器的输入)
+// ---------------------------------------------------------------------------
+
+service InfoService {
+  // 控制面每 20s 调用一次:节点身份、容量、实时用量、标签、健康状态。
+  rpc ServiceInfo(google.protobuf.Empty) returns (ServiceInfoResponse);
+}
+
+message NodeCapacity {
+  uint64 vcpu_total = 1;
+  uint64 mem_total_mib = 2;
+  uint64 disk_total_mib = 3;
+  uint64 gpu_total = 4;
+}
+
+message NodeUsage {
+  double cpu_percent = 1;      // 0-100
+  uint64 mem_used_mib = 2;
+  uint64 mem_allocated_mib = 3; // 已承诺给 machine 的内存
+  uint64 disk_used_mib = 4;
+}
+
+message ServiceInfoResponse {
+  string node_id = 1;
+  string service_instance_id = 2; // agent 每次重启变化
+  string service_version = 3;
+  string service_commit = 4;
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    HEALTHY = 1;
+    DRAINING = 2;
+    UNHEALTHY = 3;
+    STANDBY = 4;
+  }
+  Status status = 5;
+  google.protobuf.Timestamp status_changed_at = 6;
+  NodeCapacity capacity = 7;
+  NodeUsage usage = 8;
+  map<string, string> labels = 9; // node_pool、arch、kernel_version、firecracker_version、gpu...
+  string network_cidr = 10;       // 节点内 slot 子网
+}
+
+// ---------------------------------------------------------------------------
+// Machine 生命周期(用户 VM)
+// ---------------------------------------------------------------------------
+
+service MachineService {
+  rpc CreateMachine(CreateMachineRequest) returns (CreateMachineResponse);
+  rpc UpdateMachine(UpdateMachineRequest) returns (Machine);
+  rpc ListMachines(ListMachinesRequest) returns (ListMachinesResponse);
+  rpc DeleteMachine(DeleteMachineRequest) returns (google.protobuf.Empty);
+  rpc StartMachine(StartMachineRequest) returns (Machine);
+  rpc StopMachine(StopMachineRequest) returns (Machine);
+  rpc PauseMachine(PauseMachineRequest) returns (Machine);     // standby 快照
+  rpc ResumeMachine(ResumeMachineRequest) returns (Machine);   // 从 standby 恢复
+  rpc CheckpointMachine(CheckpointMachineRequest) returns (Machine); // pause+resume in place
+
+  // 运行时交互通道：M1 确认数据通道边界，但 Exec 在 MVP 中保持实验状态。
+  // 调用方是控制面(代理 CLI/用户);同样受 mTLS 身份与 execution fencing 约束。
+  rpc StreamLogs(StreamLogsRequest) returns (stream LogChunk);
+  // exec 为双向流:第一帧必须是 open。operation_id 只保证“创建会话”幂等；
+  // MVP 中连接断开即终止会话，不承诺 stdin/stdout 无损续传或重新 attach。
+  rpc Exec(stream ExecInput) returns (stream ExecOutput);
+}
+
+enum MachineState {
+  MACHINE_STATE_UNSPECIFIED = 0;
+  PENDING = 1;
+  INITIALIZING = 2;
+  RUNNING = 3;
+  STOPPING = 4;
+  STOPPED = 5;
+  PAUSING = 6;
+  PAUSED = 7;
+  RESUMING = 8;
+  DELETING = 9;
+  DELETED = 10;
+}
+
+message MachineSpec {
+  string project_id = 1;
+  string app_id = 2;
+  string deployment_id = 3;
+  string execution_id = 4;    // 此次运行代，防串代
+  uint32 replica_ordinal = 16; // deployment 内的稳定副本槽位；不是 deployment 级幂等
+  string image_ref = 5;       // OCI 引用,如 registry.local/nginx:1.27
+  uint64 vcpu = 6;
+  uint64 mem_mib = 7;
+  uint64 disk_mib = 8;        // 0 = 使用镜像默认
+  map<string, string> env = 9; // 仅非敏感配置;敏感值用 secret_refs(ADR-0010)
+  repeated VolumeMount volumes = 10;
+  NetworkSpec network = 11;
+  RestartPolicy restart_policy = 12;
+  HealthCheckSpec health_check = 13;
+  uint64 max_runtime_seconds = 14; // TTL,0 = 不限
+  reserved 15; // 原 traffic_access_token；凭证不得进入会被 Machine 回显的 MachineSpec
+  repeated SecretRef secret_refs = 17; // secret 引用,值经 secret_env 一次性下发
+  PlacementConstraints placement = 18;  // 放置约束(ADR-0009),agent 不消费决策,仅记录
+}
+
+// SecretRef 引用控制面 secrets 表中的一个版本化 secret(ADR-0010)。
+message SecretRef {
+  string env_key = 1;      // 注入为环境变量名
+  string secret_id = 2;    // project 内 secret ID(或 name,由控制面解析)
+  uint64 version = 3;      // 固定版本;更新 secret = 新 deployment version
+}
+
+// PlacementConstraints 放置约束(ADR-0009):硬过滤在前,Best-of-K 打分在后。
+message PlacementConstraints {
+  string node_pool = 1;             // 目标节点池 label;空 = 默认 compute
+  map<string, string> labels = 2;   // key=value 硬过滤(arch、gpu、内核/FC 版本等)
+  enum AntiAffinity {
+    ANTI_AFFINITY_UNSPECIFIED = 0;
+    NONE = 1;                       // 不做排除
+    DEPLOYMENT = 2;                 // 尽力避免同 deployment 副本落同节点;候选不足可降级并记录调度事件
+  }
+  AntiAffinity anti_affinity = 3;
+}
+
+message NetworkSpec {
+  bool allow_internet = 1;        // 出站互联网
+  repeated string allowed_cidrs = 2;
+  repeated string denied_cidrs = 3;
+  uint64 ingress_port = 4;        // app 暴露端口(默认 8080)
+}
+
+message VolumeMount {
+  string volume_id = 1;
+  string mount_path = 2;
+}
+
+message RestartPolicy {
+  enum Mode {
+    MODE_UNSPECIFIED = 0;
+    NEVER = 1;
+    ALWAYS = 2;
+    ON_FAILURE = 3;
+  }
+  Mode mode = 1;
+  uint32 max_attempts = 2;
+  uint32 backoff_seconds = 3;
+}
+
+message HealthCheckSpec {
+  enum Type {
+    TYPE_UNSPECIFIED = 0;
+    HTTP = 1;
+    TCP = 2;
+    EXEC = 3;
+  }
+  Type type = 1;
+  string target = 2;      // http://127.0.0.1:8080/health 或 tcp://127.0.0.1:8080 或命令
+  uint32 interval_seconds = 3;
+  uint32 timeout_seconds = 4;
+  uint32 unhealthy_threshold = 5;
+}
+
+message CreateMachineRequest {
+  string machine_id = 1;       // 稳定逻辑副本 ID
+  MachineSpec spec = 2;
+  uint64 generation = 3;       // agent 只接受不早于已知 generation 的请求
+  string operation_id = 4;     // 重试必须复用；agent 返回已记录结果
+  // 解析 secret_refs 后的一次性下发值(ADR-0010)。仅存在于请求内存与 VM 启动配置;
+  // 禁止出现在响应(Machine/MachineSpec)、ListMachines、Redis、审计、日志与持久化
+  // 操作结果中;agent 重启重建 observed state 时不携带秘密(需值时由控制面重新下发)。
+  map<string, string> secret_env = 5;
+  // execution-bound 的代理凭证，仅用于本次创建请求。不得出现在 Machine/MachineSpec、
+  // ListMachines、Redis、日志或持久化 operation result；agent 仅持久化验证材料/摘要。
+  string proxy_credential = 6;
+}
+
+message CreateMachineResponse {
+  Machine machine = 1;
+}
+
+message UpdateMachineRequest {
+  string machine_id = 1;
+  string execution_id = 2;
+  optional uint64 max_runtime_seconds = 3;
+  optional NetworkSpec network = 4;
+  uint64 generation = 5;
+  string operation_id = 6;
+}
+
+message ListMachinesRequest {
+  string project_id = 1; // 空 = 全部
+}
+
+message ListMachinesResponse {
+  repeated Machine machines = 1;
+}
+
+// 应用层就绪状态(ADR-0008):由 agent 在 host 侧执行探针得出,是 controller
+// 更新 route_backends.readiness 的唯一来源;observed state,不写回 PG machines。
+enum MachineReadiness {
+  READINESS_UNSPECIFIED = 0;
+  UNKNOWN = 1;       // agent 未判定(新创建或 agent 失联后的保守值)
+  NOT_READY = 2;     // 探针连续失败,未达不健康阈值摘除逻辑由 controller 决定
+  READY = 3;         // 探针通过,可纳入 route backend set
+  UNCONFIGURED = 4;  // 未声明 health_check;等价 RUNNING 即 READY(M1 vertical slice 语义)
+}
+
+message Machine {
+  string machine_id = 1;
+  string execution_id = 2;
+  MachineState state = 3;
+  MachineSpec spec = 4;
+  string slot_index = 5;       // 网络 slot
+  string slot_ip = 6;          // 仅 control-plane observed state 使用；禁止写入 edge/Redis route catalog
+  string log_url = 7;         // 归档日志位置(对象存储,可为空);实时日志走 StreamLogs
+  google.protobuf.Timestamp created_at = 8;
+  google.protobuf.Timestamp updated_at = 9;
+  MachineReadiness readiness = 10;                // ADR-0008
+  google.protobuf.Timestamp last_readiness_change = 11;
+}
+
+message DeleteMachineRequest {
+  string machine_id = 1;
+  string execution_id = 2;
+  string reason = 3;
+  uint64 generation = 4;
+  string operation_id = 5;
+}
+
+// MachineOperationRequest 是所有状态改变 RPC 的统一 fencing 信封。
+message MachineOperationRequest {
+  string machine_id = 1;
+  string execution_id = 2;
+  uint64 generation = 3;
+  string operation_id = 4;
+  MachineState expected_state = 5;
+}
+
+message StartMachineRequest { MachineOperationRequest operation = 1; }
+message StopMachineRequest  { MachineOperationRequest operation = 1; }
+message PauseMachineRequest { MachineOperationRequest operation = 1; }
+message ResumeMachineRequest { MachineOperationRequest operation = 1; }
+message CheckpointMachineRequest { MachineOperationRequest operation = 1; }
+
+// ---------------------------------------------------------------------------
+// 运行时交互(logs / exec)
+// ---------------------------------------------------------------------------
+
+message StreamLogsRequest {
+  string machine_id = 1;
+  string execution_id = 2; // 防串代:旧 execution 的日志请求被拒绝
+  bool follow = 3;         // 持续跟随
+  bool tail = 4;           // true = 从当前尾部开始(忽略历史)
+  string cursor = 5;       // 续传游标;空 = 从头(tail=true 时忽略)
+}
+
+message LogChunk {
+  bytes data = 1;
+  string cursor = 2;       // 下一段起点;follow 模式下可为空
+}
+
+message ExecOpen {
+  string machine_id = 1;
+  string execution_id = 2;
+  string operation_id = 3; // 创建会话的幂等键；MVP 不提供断线续接
+  repeated string command = 4; // argv,如 ["/bin/sh", "-c", "env"]
+  map<string, string> env = 5;
+  string working_dir = 6;
+  bool tty = 7;
+}
+
+message ExecInput {
+  oneof frame {
+    ExecOpen open = 1; // 必须是第一帧
+    bytes stdin = 2;
+    uint32 signal = 3; // POSIX 信号编号
+  }
+}
+
+message ExecOutput {
+  oneof frame {
+    bytes stdout = 1;
+    bytes stderr = 2;
+    int32 exit_code = 3;
+    string error = 4; // 会话级错误(stale execution、machine 不存在等)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 镜像(节点本地缓存管理)
+// ---------------------------------------------------------------------------
+
+service ImageService {
+  rpc PullImage(PullImageRequest) returns (PullImageResponse);
+  rpc ListImages(ListImagesRequest) returns (ListImagesResponse);
+  rpc DeleteImage(DeleteImageRequest) returns (google.protobuf.Empty);
+}
+
+message PullImageRequest {
+  string image_ref = 1;
+  // 凭证由 agent-side credential provider 或短期身份令牌解析；禁止传递长期用户名/密码。
+  string credential_reference = 2;
+}
+
+message PullImageResponse {
+  string image_ref = 1;
+  string digest = 2;
+  uint64 size_mib = 3;
+}
+
+message ListImagesRequest {}
+
+message ListImagesResponse {
+  repeated PullImageResponse images = 1;
+}
+
+message DeleteImageRequest { string image_ref = 1; }

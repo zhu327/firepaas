@@ -1,0 +1,30 @@
+# Binaries
+/bin/
+**/bin/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Local data (agents, caddy, vm data)
+/data/
+/var/lib/firepaas/
+
+# Go
+vendor/
+*.test
+*.out
+
+# Codegen
+shared/gen/
+
+# Terraform
+iac/terraform/**/.terraform/
+iac/terraform/**/*.tfstate*
+iac/terraform/**/*.tfvars
+
+# Editors
+.idea/
+.vscode/
+.DS_Store

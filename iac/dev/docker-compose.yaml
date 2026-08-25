@@ -1,0 +1,47 @@
+# 本地开发依赖(P1.1):postgres / redis / minio
+# 用法:make dev-up(或 docker compose -f iac/dev/docker-compose.yaml up -d)
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: firepaas
+      POSTGRES_PASSWORD: firepaas
+      POSTGRES_DB: firepaas
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+
+  minio:
+    image: minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: firepaas
+      MINIO_ROOT_PASSWORD: firepaas-dev
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+
+  # 共享 OCI registry(M3 镜像 digest/缓存/预热依赖;实验室/生产形态见 iac/README.md)
+  registry:
+    image: registry:2
+    ports:
+      - "5000:5000"
+    volumes:
+      - registry-data:/var/lib/registry
+
+volumes:
+  pg-data:
+  redis-data:
+  minio-data:
+  registry-data:
