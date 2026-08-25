@@ -1,12 +1,11 @@
 # M0 专用：原版 hypeman 的单节点数据面验证。
-# 单机实验室默认值指向 scripts/lab/build-hypeman.sh 的产物与配置（ADR-0012）。
-# 多机实验室用 -var 覆盖：nomad job plan -var=hypeman_artifact=https://... \
-#   -var=hypeman_config=/etc/firepaas-p0/hypeman.yaml iac/nomad/hypeman-p0.hcl
+# 单机版默认直接执行构建产物（Nomad 2.0 不支持 file:// artifact，故不用 artifact）。
+# 多机版需另写 hypeman-p0-remote.hcl：artifact 用 http(s):// 源 + 校验 checksum。
 # 该 job 不代表 M1+ agentd 的端口、身份或安全模型。
 
-variable "hypeman_artifact" {
+variable "hypeman_command" {
   type    = string
-  default = "file:///home/zty/.local/firepaas-lab/bin/hypeman"
+  default = "/home/zty/.local/firepaas-lab/bin/hypeman"
 }
 
 variable "hypeman_config" {
@@ -61,20 +60,15 @@ job "firepaas-hypeman-p0" {
         CONFIG_PATH      = var.hypeman_config
         HYPEMAN_DATA_DIR = var.hypeman_data_dir
         HYPEMAN_PORT     = "4973"
+        # 受限网络下 Docker Hub 镜像站（hypeman lab 补丁）；无此限制的环境可置空。
+        HYPEMAN_DOCKER_HUB_MIRROR = "docker.m.daocloud.io"
         # 重要:hypeman 配置文件中不得设置任何 ingress(api.hostname 留空),
         # 内嵌 Caddy/DNS 不启动,避免与 Nomad/Consul 及未来 edge 端口冲突。
         # P0 只验证数据面(pull/run/exec/logs/snapshot)。
       }
 
       config {
-        command = "/bin/bash"
-        args    = ["-c", "chmod +x local/hypeman && exec local/hypeman"]
-      }
-
-      artifact {
-        source      = var.hypeman_artifact
-        destination = "local/hypeman"
-        mode        = "file"
+        command = var.hypeman_command
       }
     }
   }

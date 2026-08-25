@@ -90,10 +90,14 @@ INSTANCE_ID="$(echo "$INSTANCE_JSON" | json_get id)"
 log "instance created id=$INSTANCE_ID name=$INSTANCE_NAME"
 
 # ---- wait running ----
-log "wait for instance running (max 3m)"
-WAIT_OUT="$(curl -sS --max-time 180 "$HYPEMAN_URL/instances/$INSTANCE_ID/wait?state=running" -H "Authorization: Bearer $TOKEN")" \
-  || fail "instance did not reach running: ${WAIT_OUT:-}"
-echo "$WAIT_OUT" | grep -qiE '"running"|"state":"running"' || fail "unexpected wait response: $WAIT_OUT"
+log "wait for instance running (max 3m, 按 /instances/{id} 的 Running 状态轮询)"
+RUNNING=0
+for _ in $(seq 1 90); do
+  CUR_STATE="$(api GET "/instances/$INSTANCE_ID" | json_get state)"
+  if [[ "$CUR_STATE" == "Running" ]]; then RUNNING=1; break; fi
+  sleep 2
+done
+[[ "$RUNNING" == 1 ]] || fail "instance did not reach Running (last state=${CUR_STATE:-unknown})"
 log "instance running"
 
 # ---- exec (CLI, 可选但推荐) ----
@@ -124,16 +128,17 @@ log "instance deleted"
 log "residual check"
 RESIDUAL=0
 if command -v ip >/dev/null; then
-  LEAK="$(ip -o link show 2>/dev/null | grep -E 'firepaas[0-9]*|tap[0-9a-f]+' || true)"
-  if [[ -n "$LEAK" ]]; then
-    echo "$LEAK"
-    echo "[smoke] WARN: TAP/bridge 接口残留（可能包含其他 hypeman 实例，需人工确认）"
-    RESIDUAL=1
+  # hypeman 的 TAP 前缀是 hype-；firepaas0 是服务级共享 bridge，不属于实例残留
+  TAP_LEAK="$(ip -o link show 2>/dev/null | awk '{print $2}' | sed 's/[@:].*//' | grep -E '^hype-[0-9a-f]+' || true)"
+  if [[ -n "$TAP_LEAK" ]]; then
+    echo "$TAP_LEAK"
+    fail "TAP 接口残留（hype- 前缀）"
   fi
-  if command -v ip >/dev/null && ip netns list 2>/dev/null | grep -q .; then
-    ip netns list
-    echo "[smoke] WARN: 存在 netns（确认是否属于本实例）"
-    RESIDUAL=1
+  # k8s/CNI 的 cni-* netns 不属于 hypeman；只关注 hypeman 命名（当前 bridge 模式不建 netns）
+  HYPEMAN_NS="$(ip netns list 2>/dev/null | awk '{print $1}' | grep -viE '^cni-' || true)"
+  if [[ -n "$HYPEMAN_NS" ]]; then
+    echo "$HYPEMAN_NS"
+    fail "netns 残留（非 CNI）"
   fi
 fi
 # 只看本次实例 id 相关的 firecracker/hypeman 子进程
@@ -142,6 +147,6 @@ if [[ -n "$PROC_LEAK" ]]; then
   echo "$PROC_LEAK"
   fail "VM 进程残留"
 fi
-[[ "$RESIDUAL" == 0 ]] || echo "[smoke] WARN: 非进程类残留需人工核对（单机可能与其他实例共享 bridge）"
+[[ "$RESIDUAL" == 0 ]] || echo "[smoke] WARN: 非进程类残留需人工核对"
 
 log "P0 smoke PASS: pull/run/exec/logs/stop/delete 完成"

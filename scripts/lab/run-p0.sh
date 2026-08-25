@@ -18,7 +18,7 @@ curl -fsS "$NOMAD_ADDR/v1/status/leader" >/dev/null || { echo "ERROR: Nomad 不�
 
 cd "$ROOT_DIR"
 echo "==> nomad job plan"
-nomad job plan iac/nomad/hypeman-p0.hcl
+nomad job plan iac/nomad/hypeman-p0.hcl || echo "    (plan rc=$?, Nomad 2.x 在有待提交变更时返回 1，继续 run)"
 
 echo "==> nomad job run"
 nomad job run iac/nomad/hypeman-p0.hcl

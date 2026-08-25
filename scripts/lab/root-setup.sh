@@ -9,6 +9,14 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
+echo "==> 基础依赖（erofs-utils：hypeman 镜像转换必需）"
+if ! command -v mkfs.erofs >/dev/null; then
+  apt-get update -y
+  apt-get install -y --no-install-recommends erofs-utils
+else
+  echo "    mkfs.erofs already present"
+fi
+
 echo "==> KVM 检查"
 [[ -e /dev/kvm ]] || { echo "ERROR: /dev/kvm 不存在"; exit 1; }
 echo "    /dev/kvm OK"

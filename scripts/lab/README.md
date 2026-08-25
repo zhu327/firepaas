@@ -47,6 +47,7 @@ sudo bash scripts/lab/run-p0.sh
 sudo bash scripts/lab/smoke-p0.sh
 sudo bash scripts/bench-hypeman.sh cold 10
 sudo bash scripts/bench-hypeman.sh standby 10
+sudo bash scripts/bench-hypeman.sh fork 5
 sudo bash scripts/bench-hypeman.sh uncached 3
 sudo bash scripts/bench-hypeman.sh density 16
 ```
@@ -55,11 +56,26 @@ sudo bash scripts/bench-hypeman.sh density 16
 
 - Nomad agent 可以用普通用户跑（本目录启动脚本即如此），但 `raw_exec` driver 的
   任务在非 root 客户端上会被拒绝启动；因此 **job run 与冒烟/基准必须 root**。
+- `root-setup.sh` 会把 Nomad 切换到 root 运行（data_dir `/var/lib/firepaas-p0/nomad`），
+  用户仍可用 `NOMAD_ADDR=http://127.0.0.1:4646` 操作集群。
 - hypeman 需要 `/dev/kvm`（root:kvm 660）与 CAP_NET_ADMIN（bridge/TAP/iptables）。
-- root 跑 job 前请确认 artifact 路径与 config 路径对 root 可读：
-  `file:///home/zty/.local/firepaas-lab/bin/hypeman` 与
+- root 跑 job 前请确认执行路径与 config 路径对 root 可读：
+  `/home/zty/.local/firepaas-lab/bin/hypeman` 与
   `/home/zty/Learn/firepaas/scripts/lab/hypeman-p0.yaml`。
 - hypeman 的 `data_dir` 是 `/var/lib/firepaas-p0/hypeman`（root 所有）。
+
+## 受限网络（Docker Hub 被劫持/超时）
+
+- Docker 镜像经 `docker.m.daocloud.io` 拉取后 retag 为官方名再 compose up。
+- hypeman 直连 `index.docker.io` 拉 alpine initrd 基件，本机需给 P0 job 设置
+  `HYPEMAN_DOCKER_HUB_MIRROR=docker.m.daocloud.io`（已在 hypeman-p0.hcl 中默认配置；
+  补丁在 hypeman 的 `lab/docker-hub-mirror-env` 分支，见 capacity-model.md）。
+
+## 基准结果
+
+首轮结果与原始样本：`docs/benchmarks.md`、`scripts/lab/results/`（meta.json +
+raw.csv/raw.jsonl）。冷启动 p95 2.17s、restore p95 95ms、未缓存 p95 7.6s、
+fork p95 660ms、micro 密度 32（网络带宽准入上限）。
 
 ## 端口
 

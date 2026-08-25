@@ -155,3 +155,12 @@ plan 结果允许“raw_exec 需要 root”的放置说明，但 HCL 必须全�
 - `docs/capacity-model.md`：单机实测可售容量、快照/镜像预算、Firecracker 版本
   pin 与 compatibility key。
 - `docs/mvp-plan.md` §4 追加“单机版执行记录”，明确哪些出口在单机上降级验收。
+
+## 执行记录（2026-08-25）
+
+- T1–T8、T11 已完成；T9 Docker 依赖已用 `docker.m.daocloud.io` 镜像拉起。
+- T10 完成：P0 job 部署/冒烟/kill -9 恢复/全套基准见 `docs/benchmarks.md`。
+- 环境适配发现并落地：Nomad 2.0 `file://` artifact 不支持、`nomad fmt` 改名、
+  `node pool apply` 语法、hypeman 需要 `erofs-utils`、Docker Hub 需镜像站补丁。
+- 剩余：`DEFERRED-MULTI-NODE` 项（quorum/双节点/跨机快照）待第二台机器；
+  镜像大小/allowlist/凭证边界待 M1.3 前冻结；hypeman 镜像站补丁需上游化。

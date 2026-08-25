@@ -104,17 +104,39 @@ M0 → M1 → M2 → M3 → M4 → M5
 9. 冻结镜像入口约束：MVP 仅运行 digest-pinned OCI image，限制镜像/解包体积并明确 registry allowlist 与短期凭证边界；mutable tag 只在部署创建时解析一次。
 10. 将 `scripts/bench-hypeman.sh` 从提示脚本改成可执行 runner：固定样本数、输出原始 JSON/CSV 和 p50/p95，自动检查进程/TAP/netns/磁盘残留。
 
+### 单机执行记录（2026-08-25，ADR-0012）
+
+已在唯一物理机上完成折叠版实验室并跑通数据面验证：
+
+- 环境：用户态 Go/Nomad/Consul/hypeman 工具链（`scripts/lab/`），root 运行
+  Nomad client + raw_exec hypeman P0 job；compute 节点池已落地，job
+  fmt/validate/plan 全绿，smoke `pull → run → exec → logs → stop/delete` PASS。
+- 实测（详细与原始样本见 benchmarks.md）：冷启动(缓存) p95 2.17s；未缓存
+  冷启动(40MB 镜像) p95 7.6s；restore p95 95ms；warm fork p95 660ms；
+  密度 32×micro 后被网络带宽准入拦截（每 VM 默认 7.5MB/s）。
+- 崩溃恢复：kill -9 VM → state Unknown + 无 TAP 残留；kill -9 hypeman →
+  Nomad 6s 内恢复 /health。
+- 依赖策略初步结论（M0.4）：**直接依赖 + 小范围上游化**。
+  `agent/cmd/m0-spike` 已实际用 hypeman lib 完成 Create/List/Delete（PASS）；
+  需要上游化的点：`cmd/api/config` 提取到 `lib/config`、新增 agent 专用装配
+  函数，详见 agent/internal/README.md。
+- 关键环境适配：Nomad 2.0 不支持 `file://` artifact（改用 raw_exec 绝对路径）、
+  `nomad job fmt` 已改名 `nomad fmt`、node pool 用 `node pool apply`；受限网络下
+  hypeman 增加 `HYPEMAN_DOCKER_HUB_MIRROR` lab 补丁并记录在 capacity-model.md。
+- 单机不验证项：3-server quorum、双 compute 放置/反亲和、跨节点快照兼容
+  （全部标记 `DEFERRED-MULTI-NODE`）。
+
 ### 出口（Go/No-Go）
 
-- `docs/benchmarks.md` 与 `capacity-model.md` 有环境、命令、样本、p50/p95；
-- 冻结 MVP 默认 hypervisor 与初始参数，或记录参数不达标的产品降级；
-- 明确 snapshot 是否足以支持 M4；不达标即把 scale-to-zero 移至 v1.1；
-- 确认 agent 抽取路径可行并选定依赖策略（直接依赖 / fork / runtime core）；若 adapter 未实际跑通，M0 判定 No-Go，不进入 M1；
-- P0 job 可重复部署、重启与卸载，无未解释的 host 残留；
-- 节点池方案已在实验室实际落地（池已创建、节点已加入、job 可放置），bootstrap 脚本与作业文件一致；
-- Firecracker/内核/基件的分发、pin 与 snapshot compatibility key 已决定并记录；
-- benchmark runner 可重复执行并保留原始样本，不能以手工粘贴结果替代；
-- 镜像 digest、大小限制、registry allowlist 和凭证方案已确定。
+- `docs/benchmarks.md` 与 `capacity-model.md` 有环境、命令、样本、p50/p95；✅(单机)
+- 冻结 MVP 默认 hypervisor 与初始参数，或记录参数不达标的产品降级；✅ Firecracker v1.14.2，R=4/K=3/α=0.5/mem=1.0
+- 明确 snapshot 是否足以支持 M4；✅ restore p95 95ms，不降级 scale-to-zero；稳定性另验
+- 确认 agent 抽取路径可行并选定依赖策略（直接依赖 / fork / runtime core）；✅ 直接依赖 + 小范围上游化（spike PASS）
+- P0 job 可重复部署、重启与卸载，无未解释的 host 残留；✅(单机,kill -9 两项观测通过)
+- 节点池方案已在实验室实际落地；✅(单机 compute 池;多机 DEFERRED-MULTI-NODE)
+- Firecracker/内核/基件的分发、pin 与 snapshot compatibility key 已决定并记录；✅(capacity-model.md)
+- benchmark runner 可重复执行并保留原始样本；✅(raw.csv/jsonl/meta.json)
+- 镜像 digest、大小限制、registry allowlist 和凭证方案已确定；⚠️ digest-pinned 原则已定，大小/allowlist/凭证待 M1.3 前冻结
 
 ## 5. M1：契约与单节点 vertical slice（6–8 周）
 

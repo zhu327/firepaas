@@ -1,0 +1,14 @@
+{
+  "created_at": "2026-08-25T18:47:59+0800",
+  "command": "bench-hypeman.sh cold 10",
+  "image": "docker.io/library/nginx:alpine",
+  "hypeman_url": "http://127.0.0.1:4973",
+  "hypeman_git_sha": "72440f5ef8e7d1eadc4b387a340122357c63e2b6",
+  "hostname": "node1",
+  "kernel": "6.8.0-90-generic",
+  "cpu_model": "AMD Ryzen 7 8700G w/ Radeon 780M Graphics",
+  "cpu_cores": "16",
+  "mem_total_kb": "63373092",
+  "kvm": true,
+  "firecracker_version": "v1.14.2 (hypeman embedded)"
+}

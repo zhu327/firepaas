@@ -6,6 +6,7 @@
 #   sudo bash scripts/bench-hypeman.sh cold [N]       # 镜像已缓存冷启动,N 默认 10
 #   sudo bash scripts/bench-hypeman.sh uncached [N]   # 每次先删镜像再拉取,N 默认 3
 #   sudo bash scripts/bench-hypeman.sh standby [N]    # standby/restore 往返,N 默认 10
+#   sudo bash scripts/bench-hypeman.sh fork [N]       # warm fork(from_running),N 默认 5
 #   sudo bash scripts/bench-hypeman.sh density [MAX]  # 1vCPU/512MiB 实例逐步加满,MAX 默认 16
 #
 # 环境变量：
@@ -15,17 +16,45 @@
 # 结果目录：scripts/lab/results/<run-id>/（原始 JSONL/CSV），不靠手工粘贴。
 set -euo pipefail
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$HERE/env.sh" 2>/dev/null || true
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/lab" && pwd)"
+source "$HERE/env.sh"
 
 HYPEMAN_URL="${HYPEMAN_URL:-http://127.0.0.1:4973}"
 CONFIG_PATH="${CONFIG_PATH:-$HERE/hypeman-p0.yaml}"
 IMAGE="${HYPEMAN_IMAGE:-docker.io/library/nginx:alpine}"
 CMD="${1:-}"
 N="${2:-}"
-RUN_ID="$(date +%Y%m%dT%H%M%S)-$CMD"
+RUN_ID="$(date +%Y%m%dt%H%M%S)-$CMD"
 RESULT_DIR="$HERE/results/$RUN_ID"
 mkdir -p "$RESULT_DIR"
+
+# 每次运行都落一份环境元数据，保证原始样本可复现（M0 出口要求环境+命令+样本）
+CMD="$CMD" N="${N:-}" IMAGE="$IMAGE" HYPEMAN_URL="$HYPEMAN_URL" RESULT_DIR="$RESULT_DIR" \
+HYPEMAN_SHA="$(git -C "${HYPEMAN_SRC:-$HOME/Learn/hypeman}" rev-parse HEAD 2>/dev/null || echo unknown)" \
+python3 - <<'PY' > "$RESULT_DIR/meta.json"
+import json, os, platform, socket, time, subprocess
+def sh(cmd):
+    try:
+        return subprocess.check_output(cmd, shell=True, text=True).strip()
+    except Exception:
+        return ""
+meta = {
+    "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    "command": f"bench-hypeman.sh {os.environ['CMD']} {os.environ['N']}".strip(),
+    "image": os.environ["IMAGE"],
+    "hypeman_url": os.environ["HYPEMAN_URL"],
+    "hypeman_git_sha": os.environ["HYPEMAN_SHA"],
+    "hostname": socket.gethostname(),
+    "kernel": sh("uname -r"),
+    "cpu_model": sh("grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-"),
+    "cpu_cores": sh("nproc"),
+    "mem_total_kb": sh("awk '/MemTotal/{print $2}' /proc/meminfo"),
+    "kvm": os.path.exists("/dev/kvm"),
+    "firecracker_version": "v1.14.2 (hypeman embedded)",
+}
+json.dump(meta, __import__("sys").stdout, indent=2, ensure_ascii=False)
+print()
+PY
 
 log() { echo "[bench:$CMD] $*"; }
 fail() { echo "[bench:$CMD] FAIL: $*" >&2; exit 1; }
@@ -58,7 +87,12 @@ api() {
 
 json_get() {
   KEY="$1" python3 -c 'import json,sys,os
-d=json.load(sys.stdin)
+raw=sys.stdin.read()
+try:
+    d=json.loads(raw)
+except Exception as e:
+    print("json_get input (first 600 chars): "+raw[:600], file=sys.stderr)
+    raise
 for k in os.environ["KEY"].split("."):
     d = d.get(k) if isinstance(d, dict) else None
 print("" if d is None else d)'
@@ -92,9 +126,14 @@ image_ready_wait() {
 
 instance_wait_running() {
   local id="$1" timeout="${2:-180}"
-  curl -sS --max-time "$timeout" -H "Authorization: Bearer $TOKEN" \
-    "$HYPEMAN_URL/instances/$id/wait?state=running" \
-    | grep -qiE 'running' || fail "instance $id did not reach running (timeout ${timeout}s)"
+  local deadline=$(( $(date +%s) + timeout ))
+  while [[ "$(date +%s)" -lt "$deadline" ]]; do
+    local state
+    state="$(api GET "/instances/$id" | json_get state)" || true
+    [[ "$state" == "Running" ]] && return 0
+    sleep 2
+  done
+  fail "instance $id did not reach Running (timeout ${timeout}s)"
 }
 
 instance_state() {
@@ -103,7 +142,7 @@ instance_state() {
 
 instance_delete() {
   local id="$1"
-  curl -sS -o /dev/null -w '%{http_code}' --max-time 60 -X DELETE \
+  curl -sS -o /dev/null --max-time 60 -X DELETE \
     -H "Authorization: Bearer $TOKEN" "$HYPEMAN_URL/instances/$id" || true
 }
 
@@ -269,10 +308,11 @@ cmd_density() {
   log "density 1vCPU/512MiB up to $max (注意:本机与 k8s 共存,结果为参考值)"
   local ids=() i
   for i in $(seq 1 "$max"); do
-    local name id err
+    local name id err resp
     name="bench-density-$RUN_ID-$i"
     err=""
-    id="$(create_instance "$name" 512MB 1 | json_get id)" || err="create-failed"
+    resp="$(create_instance "$name" 512MB 1)"
+    id="$(echo "$resp" | json_get id)"
     if [[ -n "$id" && "$id" != None ]]; then
       ids+=("$id")
       if instance_wait_running "$id" 120; then
@@ -283,7 +323,7 @@ cmd_density() {
         break
       fi
     else
-      log "  [$i] create-failed (达到单节点上限或资源不足): $err"
+      log "  [$i] create-failed: $(echo "$resp" | head -c 500)"
       break
     fi
   done
@@ -293,13 +333,48 @@ cmd_density() {
   residual_check
 }
 
+cmd_fork() {
+  local n="${N:-5}"
+  health_wait
+  local enc_img; enc_img="$(enc "$IMAGE")"
+  local img_status
+  img_status="$(api GET "/images/$enc_img" | json_get status)" || true
+  if [[ "$img_status" != "ready" ]]; then
+    pull_image
+    image_ready_wait "$enc_img"
+  fi
+  local src_name id t0 t1
+  src_name="bench-fork-src-$RUN_ID"
+  log "create source instance $src_name"
+  id="$(create_instance "$src_name" | json_get id)"
+  instance_wait_running "$id"
+  for i in $(seq 1 "$n"); do
+    local fork_name body fork_json fork_id
+    fork_name="bench-fork-$RUN_ID-$i"
+    body="$(python3 -c 'import json,sys; print(json.dumps({"name":sys.argv[1],"from_running":True,"target_state":"Running"}))' "$fork_name")"
+    t0="$(now_ms)"
+    fork_json="$(api POST "/instances/$id/fork" "$body" 120)"
+    fork_id="$(echo "$fork_json" | json_get id)"
+    [[ -n "$fork_id" && "$fork_id" != None ]] || fail "fork failed: $fork_json"
+    instance_wait_running "$fork_id"
+    t1="$(now_ms)"
+    record fork_ms $((t1-t0))
+    log "  [$i/$n] fork_id=$fork_id fork=$((t1-t0))ms"
+    instance_delete "$fork_id"
+    sleep 1
+  done
+  instance_delete "$id"
+  residual_check
+}
+
 case "$CMD" in
   cold) cmd_cold ;;
   uncached) cmd_uncached ;;
   standby) cmd_standby ;;
+  fork) cmd_fork ;;
   density) cmd_density ;;
   *)
-    echo "usage: $0 <cold|uncached|standby|density> [N]" >&2
+    echo "usage: $0 <cold|uncached|standby|fork|density> [N]" >&2
     exit 2
     ;;
 esac

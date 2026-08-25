@@ -57,9 +57,13 @@ make build
 source scripts/lab/env.sh
 bash scripts/lab/build-hypeman.sh     # 构建嵌有 Firecracker 的 hypeman
 bash scripts/lab/start.sh             # 单节点 Nomad + compute 池
-# raw_exec + KVM 需要 root:
-sudo env PATH="$PATH" NOMAD_ADDR=http://127.0.0.1:4646 nomad job run iac/nomad/hypeman-p0.hcl
+sudo bash scripts/lab/root-setup.sh   # root 准备并切换 Nomad 到 root 运行
+sudo bash scripts/lab/run-p0.sh       # 部署 P0 job 并等 /health
+sudo bash scripts/lab/smoke-p0.sh     # P0 冒烟
 ```
+
+开发依赖（PG/Redis/MinIO/registry）：受限网络先经 `docker.m.daocloud.io` 拉取并
+retag，再 `docker compose -f iac/dev/docker-compose.yaml up -d`。
 
 详见 [scripts/lab/README.md](scripts/lab/README.md) 与 [docs/plans/2026-08-25-single-node-m0.md](docs/plans/2026-08-25-single-node-m0.md)。
 
