@@ -297,7 +297,7 @@ func (s *Store) ActiveRouteMachines(ctx context.Context) ([]Machine, error) {
 			coalesce(m.observed_readiness,''), m.last_observed_at,
 			m.created_at, m.updated_at
 		FROM machines m
-		WHERE m.desired_state IN ('CREATED','RUNNING') AND m.observed_state<>''`)
+		WHERE m.desired_state IN ('CREATED','RUNNING') AND m.observed_state='RUNNING'`)
 	if err != nil {
 		return nil, fmt.Errorf("active route machines: %w", err)
 	}
@@ -315,7 +315,7 @@ type RouteTarget struct {
 func (s *Store) ListRouteTargets(ctx context.Context) ([]RouteTarget, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT DISTINCT hostname, ingress_port FROM machines
-		WHERE desired_state IN ('CREATED','RUNNING') AND observed_state<>''`)
+		WHERE desired_state IN ('CREATED','RUNNING') AND observed_state='RUNNING'`)
 	if err != nil {
 		return nil, fmt.Errorf("list route targets: %w", err)
 	}

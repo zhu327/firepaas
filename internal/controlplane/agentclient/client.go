@@ -5,9 +5,12 @@ package agentclient
 import (
 	"context"
 	"fmt"
+	"os"
 
+	"github.com/example/firepaas/internal/security/mtls"
 	pb "github.com/example/firepaas/shared/gen/agent/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
@@ -19,9 +22,20 @@ type Client struct {
 	Info     pb.InfoServiceClient
 }
 
-// Dial 连接单节点 agent。
+// Dial 连接单节点 agent。设置 FIREPAAS_AGENT_TLS_CERT/KEY/CA 时启用 mTLS。
 func Dial(addr string) (*Client, error) {
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	var opts []grpc.DialOption
+	certFile, keyFile, caFile := os.Getenv("FIREPAAS_AGENT_TLS_CERT"), os.Getenv("FIREPAAS_AGENT_TLS_KEY"), os.Getenv("FIREPAAS_AGENT_TLS_CA")
+	if certFile != "" && keyFile != "" && caFile != "" {
+		tlsConf, err := mtls.ClientConfig(certFile, keyFile, caFile, "agentd")
+		if err != nil {
+			return nil, fmt.Errorf("agent mTLS config: %w", err)
+		}
+		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(tlsConf)))
+	} else {
+		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+	conn, err := grpc.NewClient(addr, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("dial agent %s: %w", addr, err)
 	}

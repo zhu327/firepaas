@@ -9,8 +9,10 @@ import (
 	"os"
 	"time"
 
+	"github.com/example/firepaas/internal/security/mtls"
 	pb "github.com/example/firepaas/shared/gen/agent/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
@@ -28,7 +30,19 @@ func main() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	conn, err := grpc.NewClient(*addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+
+	var opts []grpc.DialOption
+	certFile, keyFile, caFile := os.Getenv("FIREPAAS_AGENT_TLS_CERT"), os.Getenv("FIREPAAS_AGENT_TLS_KEY"), os.Getenv("FIREPAAS_AGENT_TLS_CA")
+	if certFile != "" && keyFile != "" && caFile != "" {
+		tlsConf, err := mtls.ClientConfig(certFile, keyFile, caFile, "agentd")
+		if err != nil {
+			fatal(err)
+		}
+		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(tlsConf)))
+	} else {
+		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+	conn, err := grpc.NewClient(*addr, opts...)
 	if err != nil {
 		fatal(err)
 	}

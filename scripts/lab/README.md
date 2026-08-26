@@ -69,11 +69,14 @@ sudo bash scripts/bench-hypeman.sh density 16
 M0 数据面验证已通过；M1 起 agentd 替代 hypeman-p0 job：
 
 ```bash
-sudo bash scripts/lab/run-agentd.sh   # 部署 firepaas-agentd（system job，root）
-agentctl info                          # gRPC ServiceInfo
-agentctl create -machine-id m1 -execution e1 -operation op1
-agentctl list
-agentctl delete -machine-id m1 -execution e1 -operation op2
+bash scripts/lab/gen-certs.sh        # 生成静态 mTLS 证书（gitignore）
+sudo bash scripts/lab/e2e-m1.sh      # 一键验证 API→PG→agent(mTLS)→Redis→edge→VM
+
+sudo bash scripts/lab/run-agentd.sh  # 仅部署 firepaas-agentd（system job，root）
+agentctl info                        # 明文失败；带证书（见下）成功
+FIREPAAS_AGENT_TLS_CERT=scripts/lab/certs/control-plane.crt \
+FIREPAAS_AGENT_TLS_KEY=scripts/lab/certs/control-plane.key \
+FIREPAAS_AGENT_TLS_CA=scripts/lab/certs/ca.crt agentctl info
 ```
 
 `firepaas-agentd` 与 `firepaas-hypeman-p0` 互斥（共享 data_dir），需要回退 P0 时先

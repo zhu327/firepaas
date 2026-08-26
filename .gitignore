@@ -10,6 +10,7 @@
 # Local data (agents, caddy, vm data)
 /data/
 /var/lib/firepaas/
+scripts/lab/certs/
 
 # Go
 vendor/

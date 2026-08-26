@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/example/firepaas/internal/controlplane/catalog"
+	"github.com/example/firepaas/internal/security/mtls"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -44,7 +46,17 @@ func run() error {
 	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
 	defer rdb.Close()
 	cat := catalog.New(rdb)
-	edge := &edge{catalog: cat}
+
+	var agentTLS *tls.Config
+	var err error
+	certFile, keyFile, caFile := os.Getenv("FIREPAAS_EDGE_TLS_CERT"), os.Getenv("FIREPAAS_EDGE_TLS_KEY"), os.Getenv("FIREPAAS_EDGE_TLS_CA")
+	if certFile != "" && keyFile != "" && caFile != "" {
+		agentTLS, err = mtls.ClientConfig(certFile, keyFile, caFile, "agentd")
+		if err != nil {
+			return fmt.Errorf("edge mTLS config: %w", err)
+		}
+	}
+	edge := &edge{catalog: cat, agentTLS: agentTLS}
 
 	lis, err := net.Listen("tcp", ":"+port)
 	if err != nil {
@@ -65,8 +77,9 @@ func run() error {
 }
 
 type edge struct {
-	catalog *catalog.Catalog
-	counter atomic.Uint64
+	catalog  *catalog.Catalog
+	counter  atomic.Uint64
+	agentTLS *tls.Config
 }
 
 func (e *edge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -86,7 +99,11 @@ func (e *edge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	proxy := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
-			req.URL.Scheme = "http"
+			if e.agentTLS != nil {
+				req.URL.Scheme = "https"
+			} else {
+				req.URL.Scheme = "http"
+			}
 			req.URL.Host = backend.NodeProxyEndpoint
 			req.Header.Set(headerMachineID, backend.MachineID)
 			req.Header.Set(headerExecutionID, backend.ExecutionID)
@@ -94,6 +111,7 @@ func (e *edge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 		},
+		Transport: &http.Transport{TLSClientConfig: e.agentTLS},
 	}
 	proxy.ServeHTTP(w, r)
 }

@@ -10,6 +10,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -27,8 +28,10 @@ import (
 	"github.com/example/firepaas/internal/agent/runtime"
 	"github.com/example/firepaas/internal/agent/server"
 	"github.com/example/firepaas/internal/agent/state"
+	"github.com/example/firepaas/internal/security/mtls"
 	pb "github.com/example/firepaas/shared/gen/agent/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 )
 
 const (
@@ -46,6 +49,7 @@ func main() {
 func run() error {
 	port := envOr("FIREPAAS_AGENT_GRPC_PORT", "5108")
 	proxyPort := envOr("FIREPAAS_AGENT_PROXY_PORT", "5107")
+	bind := envOr("FIREPAAS_AGENT_BIND", "127.0.0.1")
 	nodePool := envOr("FIREPAAS_AGENT_NODE_POOL", "compute")
 	nodeID := envOr("FIREPAAS_AGENT_NODE_ID", hostnameOr("firepaas-node"))
 	fcVersion := envOr("FIREPAAS_AGENT_FIRECRACKER_VERSION", "v1.14.2")
@@ -80,11 +84,23 @@ func run() error {
 	infoProvider := info.New(nodeID, serviceVersion, serviceCommit, nodePool, fcVersion, cfg.Network.SubnetCIDR)
 	srv := server.New(adapter, ledger, infoProvider)
 
-	lis, err := net.Listen("tcp", ":"+port)
+	lis, err := net.Listen("tcp", net.JoinHostPort(bind, port))
 	if err != nil {
-		return fmt.Errorf("listen :%s: %w", port, err)
+		return fmt.Errorf("listen %s:%s: %w", bind, port, err)
 	}
-	grpcServer := grpc.NewServer()
+
+	var grpcOpts []grpc.ServerOption
+	var proxyTLS *tls.Config
+	tlsConf, err := agentServerTLS()
+	if err != nil {
+		return err
+	}
+	if tlsConf != nil {
+		grpcOpts = append(grpcOpts, grpc.Creds(credentials.NewTLS(tlsConf)))
+		proxyTLS = tlsConf
+		slog.Info("agentd mTLS enabled (static certs, ADR-0006 degradation)")
+	}
+	grpcServer := grpc.NewServer(grpcOpts...)
 	pb.RegisterInfoServiceServer(grpcServer, srv)
 	pb.RegisterMachineServiceServer(grpcServer, srv)
 
@@ -99,10 +115,16 @@ func run() error {
 	}()
 
 	proxyHandler := proxy.New(adapter)
-	proxyServer := &http.Server{Addr: ":" + proxyPort, Handler: proxyHandler}
+	proxyServer := &http.Server{Addr: net.JoinHostPort(bind, proxyPort), Handler: proxyHandler, TLSConfig: proxyTLS}
 	go func() {
-		slog.Info("agentd workload proxy listening", "port", proxyPort)
-		if err := proxyServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		slog.Info("agentd workload proxy listening", "addr", proxyServer.Addr, "mtls", proxyTLS != nil)
+		var err error
+		if proxyTLS != nil {
+			err = proxyServer.ListenAndServeTLS("", "")
+		} else {
+			err = proxyServer.ListenAndServe()
+		}
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
 	}()
@@ -126,6 +148,20 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// agentServerTLS 当三个证书路径都提供时构造服务端 mTLS 配置，否则返回 nil（明文降级）。
+func agentServerTLS() (*tls.Config, error) {
+	certFile := os.Getenv("FIREPAAS_AGENT_TLS_CERT")
+	keyFile := os.Getenv("FIREPAAS_AGENT_TLS_KEY")
+	caFile := os.Getenv("FIREPAAS_AGENT_TLS_CA")
+	if certFile == "" && keyFile == "" && caFile == "" {
+		return nil, nil
+	}
+	if certFile == "" || keyFile == "" || caFile == "" {
+		return nil, fmt.Errorf("FIREPAAS_AGENT_TLS_CERT/KEY/CA must be set together")
+	}
+	return mtls.ServerConfig(certFile, keyFile, caFile)
 }
 
 func hostnameOr(def string) string {

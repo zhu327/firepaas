@@ -65,6 +65,7 @@ bash scripts/lab/start.sh             # 单节点 Nomad + compute 池
 sudo bash scripts/lab/root-setup.sh   # root 准备并切换 Nomad 到 root 运行
 sudo bash scripts/lab/run-p0.sh       # 部署 P0 job 并等 /health
 sudo bash scripts/lab/smoke-p0.sh     # P0 冒烟
+sudo bash scripts/lab/e2e-m1.sh       # M1 一键验证（API→agent→edge→VM→HTTP 200）
 ```
 
 开发依赖（PG/Redis/MinIO/registry）：受限网络先经 `docker.m.daocloud.io` 拉取并

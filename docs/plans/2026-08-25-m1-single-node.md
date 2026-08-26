@@ -103,3 +103,33 @@ Pause/Resume/Checkpoint/Image/Exec 保持实验状态（mvp-plan §5.2）。
 - agentd 若直接 import `lib/providers` 会引入 cmd/api/config 红线依赖；坚持
   lib/* + 自建装配（spike 已证明可行）。
 - 本机 k8s 与桌面负载可能让 p95 抖动；M1 验收以功能正确性为主，性能数据只做参考。
+
+## 执行记录（2026-08-26）
+
+- M1.1 完成：单根 module（`github.com/example/firepaas`）+ `cmd/*`/`internal/*`；
+  proto 生成接入 `make proto`（protoc 29.3 + go 插件）。
+- M1.2 完成：ADR-0013 稳定子集冻结；`internal/contracts/agentv1` 基于
+  protoreflect 的契约不变量测试接入 `make test`。
+- M1.4 完成：agentd 只 import hypeman `lib/*`（`lib/config` 别名入口已 upstream
+  到 hypeman lab 分支）；operation ledger 真机验证幂等重放与冲突拒绝；
+  Info/Create/List/Delete 经 Nomad system job 运行。
+- M1.5 完成：PG migrations（projects/api_keys/apps/machines/operations/routes/
+  route_backends）、controller reconcile、Redis route/location 投影；删除后
+  stale route 清理已验证。
+- M1.6 完成：agent proxy（execution 校验 + bridge endpoint）与最小 edge；
+  U1 通过：hostname → edge → Redis catalog → proxy → Firecracker nginx → HTTP 200。
+- M1.3 完成：静态 mTLS（scripts/lab/gen-certs.sh + internal/security/mtls）；
+  无证书访问 5108/5107 拒绝，持证书 API/agentctl/edge 全链路可用。
+- ⑦ 完成：`sudo bash scripts/lab/e2e-m1.sh` 一键 PASS。
+
+## 已知遗留（进入 M2 前记录）
+
+1. agentd 进程重启会带走其子进程（raw_exec 任务终止杀进程组），VM 丢失后
+   observed state 变 UNSPECIFIED；controller 已不再把非 RUNNING 放入 route。
+   M2 需要实现 orphan 收养/重建决策表（mvp-plan §6.4）。
+2. Nomad 2.0 system job 更新后 Latest Deployment 仍显示历史 failed；当前 alloc
+   healthy 且 service checks success，属展示层脏状态，M2 前清理或升级 Nomad 版本验证。
+3. PG operations 的 CLAIMED 状态在进程崩溃后不会自动回 PENDING（当前单实例
+   可接受）；M2 加 lease/超时回收。
+4. hostname 与 ingress_port 为 M1 实验字段（proto 编号 19 / NetworkSpec.4），
+   M3 route 冻结时转正。

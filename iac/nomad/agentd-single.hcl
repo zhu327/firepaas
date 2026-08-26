@@ -64,6 +64,10 @@ job "firepaas-agentd" {
         FIREPAAS_AGENT_PROXY_PORT    = "5107"
         FIREPAAS_AGENT_NODE_POOL     = "compute"
         FIREPAAS_AGENT_NODE_ID       = "${node.unique.name}"
+        FIREPAAS_AGENT_BIND          = "0.0.0.0"
+        FIREPAAS_AGENT_TLS_CERT      = "/home/zty/Learn/firepaas/scripts/lab/certs/agentd.crt"
+        FIREPAAS_AGENT_TLS_KEY       = "/home/zty/Learn/firepaas/scripts/lab/certs/agentd.key"
+        FIREPAAS_AGENT_TLS_CA        = "/home/zty/Learn/firepaas/scripts/lab/certs/ca.crt"
       }
 
       config {

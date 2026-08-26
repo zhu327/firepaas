@@ -21,7 +21,7 @@ echo "==> nomad job plan"
 nomad job plan iac/nomad/agentd-single.hcl || echo "    (plan rc=$?, Nomad 2.x 在有待提交变更时返回 1，继续 run)"
 
 echo "==> nomad job run"
-nomad job run iac/nomad/agentd-single.hcl
+nomad job run iac/nomad/agentd-single.hcl || echo "    (run rc=$?, 继续检查 alloc 就绪；旧 deployment 可能仍标记 failed)"
 
 echo "==> 等待 agentd gRPC :5108"
 for _ in $(seq 1 60); do
