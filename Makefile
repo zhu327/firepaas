@@ -2,7 +2,7 @@
 
 SHELL := /bin/bash
 
-.PHONY: help build test lint proto dev-up clean
+.PHONY: help build test lint proto dev-up check tidy-check clean
 
 help: ## 列出可用目标
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -13,9 +13,18 @@ build: ## 构建全部组件（根 module）
 test: ## 运行全部测试
 	go test ./...
 
+vet: ## go vet
+	go vet ./...
+
 lint: ## 静态检查(需要 golangci-lint)
 	@command -v golangci-lint >/dev/null || { echo "golangci-lint not installed"; exit 1; }
 	golangci-lint run ./...
+
+check: build vet test tidy-check ## CI 本地等价入口：build+vet+test+tidy 检查
+
+tidy-check: ## 验证 go.mod/go.sum 已 tidy（评审 P2-7）
+	go mod tidy
+	@git diff --exit-code go.mod go.sum || { echo "go.mod/go.sum not tidy: run 'go mod tidy' and commit"; exit 1; }
 
 LAB_ROOT ?= $(HOME)/.local/firepaas-lab
 PROTOC ?= $(LAB_ROOT)/bin/protoc

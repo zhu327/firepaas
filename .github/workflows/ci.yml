@@ -1,0 +1,67 @@
+# CI 骨架（M1.1 尾巴，评审 P2-7 补齐）。
+# 注意：go.mod 的 replace 指向同级 ../hypeman checkout，因此 CI 需要
+# 双仓 checkout。正式建仓时确认 hypeman 的可寻址 remote 与 pin 的
+# commit/tag（见 internal/agent/README.md 版本 pin 策略），并把
+# HYPEMAN_REF 固定为具体版本，禁止追踪默认分支。
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  # TODO: 建仓时替换为真实 org/repo 与固定 ref。
+  HYPEMAN_REPO: kernel/hypeman
+  HYPEMAN_REF: main
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout hypeman（replace 依赖）
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.HYPEMAN_REPO }}
+          ref: ${{ env.HYPEMAN_REF }}
+          path: hypeman
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Build + vet
+        run: |
+          go build ./...
+          go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: go.mod/go.sum tidy check
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+  proto:
+    # proto 生成一致性：生成物与 protos/agent/v1/agent.proto 同步。
+    # 契约 breaking 检查由 make test 里的 internal/contracts 测试承担。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout hypeman（replace 依赖）
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.HYPEMAN_REPO }}
+          ref: ${{ env.HYPEMAN_REF }}
+          path: hypeman
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+      - name: Install protoc + plugins
+        run: bash scripts/lab/install-protoc.sh
+      - name: Regenerate and diff
+        run: |
+          make proto
+          git diff --exit-code shared/gen/

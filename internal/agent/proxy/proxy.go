@@ -6,6 +6,7 @@
 package proxy
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httputil"
@@ -20,13 +21,44 @@ const (
 	HeaderExecutionID = "X-Firepaas-Execution-ID"
 )
 
+type targetKey struct{}
+
 // Proxy 按 machine_id + execution_id 把流量转发到 workload endpoint。
+// ReverseProxy 与 Transport 在构造时创建一次并复用（评审 P3：连接池不得
+// 每请求新建）；每次请求仅解析目标并挂到 request context。
 type Proxy struct {
 	machines *machine.Adapter
+	reverse  *httputil.ReverseProxy
 }
 
 // New 构造 Proxy。
-func New(machines *machine.Adapter) *Proxy { return &Proxy{machines: machines} }
+func New(machines *machine.Adapter) *Proxy {
+	p := &Proxy{machines: machines}
+	p.reverse = &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			target, _ := req.Context().Value(targetKey{}).(*url.URL)
+			if target == nil {
+				return
+			}
+			req.URL.Scheme = target.Scheme
+			req.URL.Host = target.Host
+			req.Host = target.Host
+			// 内部转发头不进入 guest。
+			req.Header.Del(HeaderMachineID)
+			req.Header.Del(HeaderExecutionID)
+		},
+		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+		},
+		Transport: &http.Transport{
+			MaxIdleConns:        64,
+			IdleConnTimeout:     30 * time.Second,
+			DisableCompression:  true,
+			MaxIdleConnsPerHost: 64,
+		},
+	}
+	return p
+}
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	machineID := r.Header.Get(HeaderMachineID)
@@ -42,29 +74,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	target, err := url.Parse(fmt.Sprintf("http://%s:%d", ip, port))
-	if err != nil {
-		http.Error(w, "bad target", http.StatusInternalServerError)
-		return
-	}
-
-	rp := &httputil.ReverseProxy{
-		Director: func(req *http.Request) {
-			req.URL.Scheme = target.Scheme
-			req.URL.Host = target.Host
-			req.Host = target.Host
-			// 内部转发头不进入 guest。
-			req.Header.Del(HeaderMachineID)
-			req.Header.Del(HeaderExecutionID)
-		},
-		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-		},
-		Transport: &http.Transport{
-			MaxIdleConns:       64,
-			IdleConnTimeout:    30 * time.Second,
-			DisableCompression: true,
-		},
-	}
-	rp.ServeHTTP(w, r)
+	target := &url.URL{Scheme: "http", Host: fmt.Sprintf("%s:%d", ip, port)}
+	r = r.WithContext(context.WithValue(r.Context(), targetKey{}, target))
+	p.reverse.ServeHTTP(w, r)
 }

@@ -79,10 +79,67 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// generation fence（P0-2）：machine → 已知最高 generation 高水位，
+	// 拒绝早于高水位的变更请求（重启保留；machine 删除后仍拒绝旧 re-create）。
+	fencesPath := envOr("FIREPAAS_AGENT_FENCES_PATH", filepath.Join(cfg.DataDir, "agent", "fences.json"))
+	fences, err := state.OpenFences(fencesPath)
+	if err != nil {
+		return err
+	}
+
+	// ledger/fences 年龄 GC（mvp-plan §5.5 可配置去重窗口，评审 P2-5）：
+	// 启动时清理一次，之后每小时一次。
+	retention, err := time.ParseDuration(envOr("FIREPAAS_AGENT_LEDGER_RETENTION", "24h"))
+	if err != nil || retention <= 0 {
+		return fmt.Errorf("invalid FIREPAAS_AGENT_LEDGER_RETENTION: %v", err)
+	}
+	pruneGC := func() {
+		cutoff := time.Now().Add(-retention)
+		if n, err := ledger.PruneBefore(cutoff); err != nil {
+			slog.Error("ledger gc", "error", err)
+		} else if n > 0 {
+			slog.Info("ledger gc pruned expired records", "removed", n)
+		}
+		if n, err := fences.PruneBefore(cutoff); err != nil {
+			slog.Error("fences gc", "error", err)
+		} else if n > 0 {
+			slog.Info("fences gc pruned expired entries", "removed", n)
+		}
+	}
+	pruneGC()
+	go func() {
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				pruneGC()
+			}
+		}
+	}()
 
 	adapter := machine.New(set.Instances, set.Images)
-	infoProvider := info.New(nodeID, serviceVersion, serviceCommit, nodePool, fcVersion, cfg.Network.SubnetCIDR)
-	srv := server.New(adapter, ledger, infoProvider)
+	// MemAllocated：已承诺给 machine 的内存（实例 Size 之和，MiB）。
+	memAllocated := func() uint64 {
+		listCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		listed, err := set.Instances.ListInstances(listCtx, nil)
+		if err != nil {
+			return 0
+		}
+		var total int64
+		for i := range listed {
+			total += listed[i].Size
+		}
+		if total <= 0 {
+			return 0
+		}
+		return uint64(total) / (1024 * 1024)
+	}
+	infoProvider := info.New(nodeID, serviceVersion, serviceCommit, nodePool, fcVersion, cfg.Network.SubnetCIDR, cfg.DataDir, memAllocated)
+	srv := server.New(adapter, ledger, fences, infoProvider)
 
 	lis, err := net.Listen("tcp", net.JoinHostPort(bind, port))
 	if err != nil {
@@ -95,10 +152,21 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	proxyHandler := http.Handler(proxy.New(adapter))
 	if tlsConf != nil {
-		grpcOpts = append(grpcOpts, grpc.Creds(credentials.NewTLS(tlsConf)))
+		// mTLS 已保证“持本 CA 证书才能连”；这里进一步按证书 CN 做最小授权：
+		// gRPC（5108）只接受控制面身份，proxy（5107）只接受 edge 身份
+		// （评审 P1-2，ADR-0006 的 M1 降级形态）。
+		grpcAllowed := mtls.SplitAllowlist(os.Getenv("FIREPAAS_AGENT_GRPC_ALLOWED_CLIENTS"), "control-plane")
+		proxyAllowed := mtls.SplitAllowlist(os.Getenv("FIREPAAS_AGENT_PROXY_ALLOWED_CLIENTS"), "edge-proxy")
+		grpcOpts = append(grpcOpts,
+			grpc.Creds(credentials.NewTLS(tlsConf)),
+			grpc.ChainUnaryInterceptor(mtls.UnaryServerIdentityInterceptor(grpcAllowed)),
+		)
 		proxyTLS = tlsConf
-		slog.Info("agentd mTLS enabled (static certs, ADR-0006 degradation)")
+		proxyHandler = mtls.RequireClientIdentity(proxyHandler, proxyAllowed)
+		slog.Info("agentd mTLS enabled (static certs, ADR-0006 degradation)",
+			"grpc_clients", grpcAllowed, "proxy_clients", proxyAllowed)
 	}
 	grpcServer := grpc.NewServer(grpcOpts...)
 	pb.RegisterInfoServiceServer(grpcServer, srv)
@@ -114,7 +182,6 @@ func run() error {
 		errCh <- nil
 	}()
 
-	proxyHandler := proxy.New(adapter)
 	proxyServer := &http.Server{Addr: net.JoinHostPort(bind, proxyPort), Handler: proxyHandler, TLSConfig: proxyTLS}
 	go func() {
 		slog.Info("agentd workload proxy listening", "addr", proxyServer.Addr, "mtls", proxyTLS != nil)

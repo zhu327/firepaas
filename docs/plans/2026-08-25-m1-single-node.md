@@ -130,6 +130,44 @@ Pause/Resume/Checkpoint/Image/Exec 保持实验状态（mvp-plan §5.2）。
 2. Nomad 2.0 system job 更新后 Latest Deployment 仍显示历史 failed；当前 alloc
    healthy 且 service checks success，属展示层脏状态，M2 前清理或升级 Nomad 版本验证。
 3. PG operations 的 CLAIMED 状态在进程崩溃后不会自动回 PENDING（当前单实例
-   可接受）；M2 加 lease/超时回收。
+   可接受）；M2 加 lease/超时回收。requeue 现只回退 CLAIMED、终态不复活，
+   agent 侧不可恢复错误（InvalidArgument/幂等冲突等）已直接落 FAILED。
 4. hostname 与 ingress_port 为 M1 实验字段（proto 编号 19 / NetworkSpec.4），
    M3 route 冻结时转正。
+5. 拉取不存在的镜像会被 agent 报为 Internal（非永久错误）：每次尝试 10 分钟
+   超时后 requeue，操作不会自动落 FAILED。区分“镜像不存在”与“网络暂时故障”
+   需要 agent 侧镜像错误分类，M2 调度重试语义时一并处理。
+
+## 评审修复记录（2026-08-26，P0/P1/P2/P3）
+
+M1 全量代码评审后修复以下问题（两轮：P1/P2/P3 一轮，P0 一轮）：
+
+| 项 | 修复 | 验证 |
+|---|---|---|
+| **P0-1 secret_env 回显泄漏** | adapter 将 secret 键名记入 tags（`firepaas/secret_keys`），值仍进 hypeman Env（VM 启动配置需要）；mapMachine 回显前剔除 secret 键——响应/ListMachines/ledger 持久化结果三处均不再含 secret 值（ADR-0013 不变量 3） | server 单测 + e2e 三处 grep 断言 |
+| **P0-2 generation fencing 未实现** | 新增 `state.Fences`（machine→最高 generation 高水位，fences.json 原子落盘）：变更请求先查 ledger 幂等（重放返回原结果），再 Check fence（旧代 → FailedPrecondition，永久错误落 FAILED）；成功后 Advance；machine 删除后高水位保留，旧代 re-create 仍被拒；与 ledger GC 共享 24h 窗口 | fences/server 单测 + e2e stale delete/recreate 拒绝 |
+| P1-1 API 默认无认证 | `FIREPAAS_API_TOKEN` 必填（fail-closed），仅显式 `FIREPAAS_AUTH_DISABLED=true` 可跳过；常数时间比较 | e2e 401 断言 |
+| P1-2 agent 无身份授权 | mtls 包新增 PeerCN/拦截器：gRPC(5108) 仅接受 control-plane CN，proxy(5107) 仅接受 edge CN；可配 env | e2e 越权拒绝断言 |
+| P2-3 无限 requeue | gRPC 状态码分类：InvalidArgument/AlreadyExists/FailedPrecondition/PermissionDenied/Unauthenticated/NotFound 落 FAILED；delete NotFound 幂等收敛为成功 | 注入坏操作验证 FAILED；e2e 后手工验证 NotFound 收敛 |
+| P2-3b（新发现）CompleteOperation 空 result 静默失败 | `''::jsonb` 非法导致 UPDATE 失败被 `_=` 吞掉，操作永滞 CLAIMED→PENDING 循环；改为空 result 写 NULL | 同上 |
+| P2-4 claim 行锁无效 | 单条 `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED) RETURNING` 原子领取；requeue 加 `AND status='CLAIMED'` 守卫 | 代码路径 + e2e |
+| P2-5 ledger 无 GC | Record 增加 machine_id；delete 后 PruneMachineExcept 清历史；启动+每小时 PruneBefore（默认 24h，可配） | ledger 单测 + e2e 重放 |
+| P2-6 routes 死 schema | controller 先写 PG routes/route_backends（ADR-0005 权威）再发 Redis 投影；迁移 0003 调整约束；stale 双侧清理 | e2e PG 落库/清理断言 |
+| P2-7 go.mod 未 tidy / 无 CI | `go mod tidy`；Makefile `check`；`.github/workflows/ci.yml`（build/vet/test/tidy/proto diff） | make check |
+| P2-8 控制面幂等冲突不检测 | store 同幂等键异 body 返回 ErrRequestConflict → HTTP 409 | e2e 409 断言 |
+| P3 proxy/edge 每请求新建代理 | 共享 ReverseProxy+Transport，backend/target 经 context 传递；edge 按 readiness/draining 过滤 backend | e2e |
+| P3 edge 每请求 SCAN | catalog 维护 hostidx:{hostname}→port 索引，Get 路径 O(1)；PruneRoutes 同步清理 | e2e |
+| P3 info 用 `/` 且缺 usage | statfs(dataDir)；MemAllocated=实例 Size 之和；DiskUsed=total-free | agentctl info |
+
+fencing 语义要点（M1 单写者，ADR-0007 count=1）：
+
+- 幂等优先：同 operation_id 重放命中 ledger 即返回原结果，不再过 fence；
+- machine 删除后旧 create 重放被拒：delete 触发的 ledger prune（P2-5）移除旧
+  create 记录，fence 高水位拒接旧代——不会返回已删 VM 的陈旧“成功”；
+- “检查→执行→推进”存在并发窗口，M2 per-machine 操作队列收口；
+- agentctl 新增 `-secret KEY=VALUE`（可重复）用于验证 secret 单向下发链路。
+
+e2e harness 同步扩充：认证 401、身份越权（403/拒连）、同 op 100 次重试、
+409 冲突、agent 原地重启后 ledger 重放、异 hash 拒绝、PG/Redis 双侧清理、
+stale generation 变更拒绝、secret 三处不泄漏；agentd 用 `nomad job restart`
+强制重执行新二进制。

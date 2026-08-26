@@ -102,6 +102,23 @@ fork p95 660ms、micro 密度 32（网络带宽准入上限）。
 | Nomad HTTP/RPC/Serf | 4646 / 4647 / 4648 |
 | Consul DNS/HTTP/RPC/Serf | 8600 / 8500 / 8300-8302 |
 | hypeman API | 4973 |
+| agentd gRPC / workload proxy | 5108 / 5107（仅 control-plane / 仅 edge） |
+| firepaas control-plane API | 8080（需 Bearer token） |
+| firepaas edge-proxy | 8081（实验室） |
 | Docker dev deps | 5432 / 6379 / 9000-9001 / 5000 |
 
 均已确认与本机现有 k8s/桌面服务不冲突。
+
+## M1 vertical slice（补充）
+
+M1 新增脚本/文件（详见 `docs/plans/2026-08-25-m1-single-node.md`）：
+
+```
+agentd.yaml        # agentd 配置（复用 P0 data_dir，与 hypeman-p0 job 互斥）
+run-agentd.sh      # root 部署 agentd system job 并等 :5108
+gen-certs.sh       # 生成静态 mTLS 证书（ca / agentd / control-plane / edge）
+e2e-m1.sh          # 一键 M1 验收：认证→PG→agent(mTLS+CN 白名单)→Redis→edge→VM
+```
+
+注意：重建 agentd 二进制后，`nomad job run` 不会重启已运行的 raw_exec 任务；
+用 `nomad job restart firepaas-agentd` 原地重启（e2e 脚本已内置）。

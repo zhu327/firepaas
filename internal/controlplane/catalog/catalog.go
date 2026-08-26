@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -36,7 +37,8 @@ type Catalog struct {
 // New 构造 Catalog。
 func New(rdb *redis.Client) *Catalog { return &Catalog{rdb: rdb} }
 
-// PublishRoute 原子发布 route 投影。
+// PublishRoute 原子发布 route 投影，并维护 hostname → port 索引
+// （评审 P3：edge 按 hostname 直查，不再每请求 SCAN）。
 func (c *Catalog) PublishRoute(ctx context.Context, hostname string, port int, route Route) error {
 	raw, err := json.Marshal(route)
 	if err != nil {
@@ -44,6 +46,10 @@ func (c *Catalog) PublishRoute(ctx context.Context, hostname string, port int, r
 	}
 	if err := c.rdb.Set(ctx, routeKey(hostname, port), raw, 0).Err(); err != nil {
 		return fmt.Errorf("publish route: %w", err)
+	}
+	// M1 语义：每 hostname 一个活跃端口（与 PG routes 表一致）。
+	if err := c.rdb.Set(ctx, hostIndexKey(hostname), strconv.Itoa(port), 0).Err(); err != nil {
+		return fmt.Errorf("publish host index: %w", err)
 	}
 	return nil
 }
@@ -64,28 +70,22 @@ func (c *Catalog) PublishLocation(ctx context.Context, machineID, executionID, n
 	return nil
 }
 
-// GetRouteForHostname 扫描 hostname 对应的任一端口 route（M1 单端口场景；
-// 多端口在 M3 路由模型里由 edge 显式携带目标端口）。
+// GetRouteForHostname 查询 hostname 对应的 route 投影（经 hostidx 索引）。
+// hostidx 缺失或指向的 route 已不存在时返回 nil；投影在 controller 的
+// sync 周期内重建，短暂 miss 是预期行为。
 func (c *Catalog) GetRouteForHostname(ctx context.Context, hostname string) (*Route, error) {
-	iter := c.rdb.Scan(ctx, 0, fmt.Sprintf("route:%s:*", hostname), 100).Iterator()
-	for iter.Next(ctx) {
-		raw, err := c.rdb.Get(ctx, iter.Val()).Bytes()
-		if err == redis.Nil {
-			continue
-		}
-		if err != nil {
-			return nil, fmt.Errorf("get route %s: %w", iter.Val(), err)
-		}
-		var route Route
-		if err := json.Unmarshal(raw, &route); err != nil {
-			return nil, fmt.Errorf("parse route %s: %w", iter.Val(), err)
-		}
-		return &route, nil
+	portStr, err := c.rdb.Get(ctx, hostIndexKey(hostname)).Result()
+	if err == redis.Nil {
+		return nil, nil
 	}
-	if err := iter.Err(); err != nil {
-		return nil, fmt.Errorf("scan hostname routes: %w", err)
+	if err != nil {
+		return nil, fmt.Errorf("get host index: %w", err)
 	}
-	return nil, nil
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return nil, fmt.Errorf("bad host index for %s: %q", hostname, portStr)
+	}
+	return c.GetRoute(ctx, hostname, port)
 }
 
 // GetRoute 读取 route 投影。
@@ -99,7 +99,7 @@ func (c *Catalog) GetRoute(ctx context.Context, hostname string, port int) (*Rou
 	}
 	var route Route
 	if err := json.Unmarshal(raw, &route); err != nil {
-		return nil, fmt.Errorf("parse route: %w", err)
+		return nil, fmt.Errorf("parse route %s: %w", routeKey(hostname, port), err)
 	}
 	return &route, nil
 }
@@ -109,26 +109,52 @@ func (c *Catalog) RemoveLocation(ctx context.Context, machineID, executionID str
 	return c.rdb.Del(ctx, locationKey(machineID, executionID)).Err()
 }
 
-// PruneRoutes 删除 keep 之外的 route:* 投影（PG 仍是权威，仅重建投影）。
-func (c *Catalog) PruneRoutes(ctx context.Context, keep map[string]bool) error {
-	iter := c.rdb.Scan(ctx, 0, "route:*", 100).Iterator()
-	var stale []string
-	for iter.Next(ctx) {
-		if !keep[iter.Val()] {
-			stale = append(stale, iter.Val())
+// PruneRoutes 删除 keep 之外的 route:* 与 hostidx:* 投影（PG 仍是权威，
+// 仅重建投影）。keepRoutes 的键形如 "route:{hostname}:{port}"。
+func (c *Catalog) PruneRoutes(ctx context.Context, keepRoutes, keepHosts map[string]bool) error {
+	routeIter := c.rdb.Scan(ctx, 0, "route:*", 100).Iterator()
+	var staleRoutes []string
+	for routeIter.Next(ctx) {
+		if !keepRoutes[routeIter.Val()] {
+			staleRoutes = append(staleRoutes, routeIter.Val())
 		}
 	}
-	if err := iter.Err(); err != nil {
+	if err := routeIter.Err(); err != nil {
 		return fmt.Errorf("scan routes: %w", err)
 	}
-	if len(stale) == 0 {
-		return nil
+
+	hostIter := c.rdb.Scan(ctx, 0, "hostidx:*", 100).Iterator()
+	var staleHosts []string
+	for hostIter.Next(ctx) {
+		key := hostIter.Val()
+		hostname := key[len("hostidx:"):]
+		if !keepHosts[hostname] {
+			staleHosts = append(staleHosts, key)
+		}
 	}
-	return c.rdb.Del(ctx, stale...).Err()
+	if err := hostIter.Err(); err != nil {
+		return fmt.Errorf("scan host indexes: %w", err)
+	}
+
+	if len(staleRoutes) > 0 {
+		if err := c.rdb.Del(ctx, staleRoutes...).Err(); err != nil {
+			return fmt.Errorf("prune routes: %w", err)
+		}
+	}
+	if len(staleHosts) > 0 {
+		if err := c.rdb.Del(ctx, staleHosts...).Err(); err != nil {
+			return fmt.Errorf("prune host indexes: %w", err)
+		}
+	}
+	return nil
 }
 
 func routeKey(hostname string, port int) string {
 	return fmt.Sprintf("route:%s:%d", hostname, port)
+}
+
+func hostIndexKey(hostname string) string {
+	return fmt.Sprintf("hostidx:%s", hostname)
 }
 
 func locationKey(machineID, executionID string) string {

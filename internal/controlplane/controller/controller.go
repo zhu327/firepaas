@@ -15,13 +15,15 @@ import (
 	"github.com/example/firepaas/internal/controlplane/catalog"
 	"github.com/example/firepaas/internal/controlplane/store"
 	pb "github.com/example/firepaas/shared/gen/agent/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
 // Config 是 controller 运行参数。
 type Config struct {
 	AgentAddr      string // 单节点 agent gRPC 地址
-	AgentProxyAddr string // 节点 agent proxy 地址（写入 Redis，edge 使用）
+	AgentProxyAddr string // 节点 agent proxy 地址（写入 PG/Redis，edge 使用）
 	DefaultAppPort int
 	OpPollInterval time.Duration
 	SyncInterval   time.Duration
@@ -78,6 +80,8 @@ func (c *Controller) reconcileOperations(ctx context.Context) error {
 	for _, op := range ops {
 		if err := c.processOperation(ctx, op); err != nil {
 			slog.Error("process operation", "op", op.ID, "kind", op.Kind, "error", err)
+			// RequeueOperation 只回退仍在 CLAIMED 的操作；已终态
+			// （SUCCEEDED/FAILED）的操作不会被复活。
 			_ = c.store.RequeueOperation(ctx, op.ID, err.Error())
 		}
 	}
@@ -85,6 +89,22 @@ func (c *Controller) reconcileOperations(ctx context.Context) error {
 		return c.buildRoutes(ctx)
 	}
 	return nil
+}
+
+// isPermanentAgentError 判断 agent 返回的错误是否不可重试：
+// 重试不可能改变结果的操作直接标记 FAILED，避免无限 requeue（M1 评审 P2-3）。
+func isPermanentAgentError(err error) bool {
+	switch status.Code(err) {
+	case codes.InvalidArgument, // 请求本身不合法
+		codes.AlreadyExists,     // 同 operation_id 不同 request hash（幂等冲突）
+		codes.FailedPrecondition, // 未来的 stale generation fencing（P0-2 落地后）
+		codes.PermissionDenied,
+		codes.Unauthenticated,
+		codes.NotFound:
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *Controller) processOperation(ctx context.Context, op store.Operation) error {
@@ -97,7 +117,12 @@ func (c *Controller) processOperation(ctx context.Context, op store.Operation) e
 		}
 		machine, err := c.client.Create(ctx, &req)
 		if err != nil {
-			return fmt.Errorf("agent create: %w", err)
+			if isPermanentAgentError(err) {
+				// 不可恢复：落终态，machine 期望行保留供排查/清理。
+				_ = c.store.CompleteOperation(ctx, op.ID, "FAILED", nil, err.Error())
+				return err
+			}
+			return fmt.Errorf("agent create: %w", err) // 暂时性失败，requeue
 		}
 		if err := c.store.UpdateMachineObserved(ctx, machine.MachineId, machine.ExecutionId,
 			machine.State.String(), machine.SlotIp, machine.Readiness.String()); err != nil {
@@ -113,7 +138,17 @@ func (c *Controller) processOperation(ctx context.Context, op store.Operation) e
 			return err
 		}
 		if err := c.client.Delete(ctx, &del); err != nil {
-			return fmt.Errorf("agent delete: %w", err)
+			switch {
+			case status.Code(err) == codes.NotFound:
+				// agent 侧已不存在（如节点数据被清理）：幂等成功收敛。
+				slog.Warn("delete target missing at agent; converging as deleted",
+					"machine", del.MachineId, "execution", del.ExecutionId)
+			case isPermanentAgentError(err):
+				_ = c.store.CompleteOperation(ctx, op.ID, "FAILED", nil, err.Error())
+				return err
+			default:
+				return fmt.Errorf("agent delete: %w", err) // 暂时性失败，requeue
+			}
 		}
 		if err := c.store.MarkMachineDeleted(ctx, del.MachineId); err != nil {
 			return err
@@ -151,6 +186,9 @@ func (c *Controller) syncObserved(ctx context.Context) error {
 	return c.buildRoutes(ctx)
 }
 
+// buildRoutes 把观测到的活跃 machine 集合发布为 route：
+// 先写 PG（routes/route_backends，ADR-0005 的权威），再写 Redis 投影，
+// 最后清理两侧的 stale 条目。edge 永不读取 slot IP（ADR-0013 不变量 4）。
 func (c *Controller) buildRoutes(ctx context.Context) error {
 	machines, err := c.store.ActiveRouteMachines(ctx)
 	if err != nil {
@@ -161,7 +199,7 @@ func (c *Controller) buildRoutes(ctx context.Context) error {
 		hostname string
 		port     int
 	}
-	grouped := map[routeKey]*catalog.Route{}
+	grouped := map[routeKey]*store.RouteRow{}
 	for _, m := range machines {
 		port := m.IngressPort
 		if port == 0 {
@@ -170,34 +208,56 @@ func (c *Controller) buildRoutes(ctx context.Context) error {
 		key := routeKey{hostname: m.Hostname, port: port}
 		route := grouped[key]
 		if route == nil {
-			route = &catalog.Route{RouteGeneration: m.Generation, Backends: []catalog.Backend{}}
+			route = &store.RouteRow{Hostname: m.Hostname, Port: port, AppID: m.AppID}
 			grouped[key] = route
 		}
-		route.Backends = append(route.Backends, catalog.Backend{
+		if m.Generation > route.Generation {
+			route.Generation = m.Generation
+		}
+		route.Backends = append(route.Backends, store.RouteBackendRow{
 			MachineID:         m.ID,
 			ExecutionID:       m.CurrentExecutionID,
 			NodeProxyEndpoint: c.cfg.AgentProxyAddr,
 			AppPort:           port,
-			Readiness:         m.ObservedReadiness,
 			Weight:            100,
+			Readiness:         m.ObservedReadiness,
 			Draining:          false,
 		})
 	}
 
-	for key, route := range grouped {
-		if err := c.catalog.PublishRoute(ctx, key.hostname, key.port, *route); err != nil {
+	active := make([]store.RouteRow, 0, len(grouped))
+	for _, route := range grouped {
+		active = append(active, *route)
+	}
+
+	// PG 先落权威（包含 stale 清理），失败则本轮不发布 Redis 投影。
+	if err := c.store.SyncRoutes(ctx, active); err != nil {
+		return err
+	}
+
+	keepRoutes := make(map[string]bool, len(active))
+	keepHosts := make(map[string]bool, len(active))
+	for _, r := range active {
+		keepRoutes[fmt.Sprintf("route:%s:%d", r.Hostname, r.Port)] = true
+		keepHosts[r.Hostname] = true
+		catalogRoute := catalog.Route{
+			RouteGeneration: r.Generation,
+			Backends:        make([]catalog.Backend, 0, len(r.Backends)),
+		}
+		for _, b := range r.Backends {
+			catalogRoute.Backends = append(catalogRoute.Backends, catalog.Backend{
+				MachineID:         b.MachineID,
+				ExecutionID:       b.ExecutionID,
+				NodeProxyEndpoint: b.NodeProxyEndpoint,
+				AppPort:           b.AppPort,
+				Readiness:         b.Readiness,
+				Weight:            b.Weight,
+				Draining:          b.Draining,
+			})
+		}
+		if err := c.catalog.PublishRoute(ctx, r.Hostname, r.Port, catalogRoute); err != nil {
 			return err
 		}
 	}
-
-	// 清理已删除/无观测 machine 的 stale route 投影。
-	targets, err := c.store.ListRouteTargets(ctx)
-	if err != nil {
-		return err
-	}
-	keep := map[string]bool{}
-	for _, rt := range targets {
-		keep[fmt.Sprintf("route:%s:%d", rt.Hostname, rt.Port)] = true
-	}
-	return c.catalog.PruneRoutes(ctx, keep)
+	return c.catalog.PruneRoutes(ctx, keepRoutes, keepHosts)
 }

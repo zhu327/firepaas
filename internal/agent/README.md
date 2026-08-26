@@ -29,12 +29,26 @@ internal/agent/state/       # agent operation ledger + 崩溃恢复缓存(非业
   Create/List/Delete，经 `iac/nomad/agentd-single.hcl` 以 root system job 部署。
 - `internal/agent/runtime`:只 import hypeman `lib/*`（配置经 `lib/config` 类型别名
   入口）；不 import `cmd/api` 与 `lib/providers`。
-- `internal/agent/state`:operation ledger（原子落盘/重启重放/同 ID 异 hash 拒绝）。
+- `internal/agent/state`:operation ledger（原子落盘/重启重放/同 ID 异 hash 拒绝）
+  + generation fence（P0-2：machine→最高 generation 高水位，fences.json；旧代
+  变更拒 FailedPrecondition，删除后高水位保留，与 ledger 共享 24h GC 窗口）。
+  2026-08-26 评审后补齐：Record 记录 machine_id，machine 删除后清理同 machine
+  历史 create 记录（保留 delete 自身去重记录），另有年龄 GC（默认 24h，
+  `FIREPAAS_AGENT_LEDGER_RETENTION` 可配，启动+每小时执行）。
 - `internal/agent/machine`:hypeman CreateInstanceRequest 映射；firepaas 业务标识
   经 hypeman tags 持久化；稳定 `machine_id` = hypeman instance Name，内部 ID 仅在
-  Delete 时解析。
-- `internal/agent/server`:fencing 校验 + request hash 幂等（protojson canonical）。
-- 身份：M1.3 前为明文 + 主机端口 ACL（ADR-0006 降级路径）。
+  Delete 时解析。secret_env 值进 hypeman Env（VM 启动配置），但键名记入
+  `firepaas/secret_keys` tag，回显路径（mapMachine）剔除 secret 键（P0-1，
+  ADR-0013 不变量 3：响应/ListMachines/ledger 持久化结果均不含 secret 值）。
+- `internal/agent/server`:fencing 校验 + request hash 幂等（protojson canonical）
+  + generation fence Check/Advance（幂等重放优先于 fence）；
+  Delete 的 NotFound 单独映射为 codes.NotFound（控制面据此幂等收敛）。
+- `internal/agent/info`:容量/用量取自 dataDir 所在文件系统；MemAllocated 为
+  实例 Size 之和（M2 换 lib/resources 实时采集）。
+- 身份（2026-08-26 评审后补齐）：静态 mTLS + 证书 CN 白名单——gRPC(5108) 仅
+  接受 control-plane，proxy(5107) 仅接受 edge（`FIREPAAS_AGENT_GRPC_ALLOWED_CLIENTS`
+  / `FIREPAAS_AGENT_PROXY_ALLOWED_CLIENTS` 可配，ADR-0006 M1 降级形态的
+  授权半边；轮换与完整矩阵仍属 M5）。
 
 ## M0.4 spike 状态(2026-08-25,运行 PASS)
 

@@ -29,6 +29,8 @@ const (
 	headerExecutionID = "X-Firepaas-Execution-ID"
 )
 
+type backendKey struct{}
+
 func main() {
 	if err := run(); err != nil {
 		slog.Error("edge-proxy terminated", "error", err)
@@ -56,7 +58,7 @@ func run() error {
 			return fmt.Errorf("edge mTLS config: %w", err)
 		}
 	}
-	edge := &edge{catalog: cat, agentTLS: agentTLS}
+	edge := newEdge(cat, agentTLS)
 
 	lis, err := net.Listen("tcp", ":"+port)
 	if err != nil {
@@ -76,10 +78,40 @@ func run() error {
 	return srv.Shutdown(shutdownCtx)
 }
 
+// edge 复用单个 ReverseProxy 与 Transport（评审 P3：连接池不得每请求新建）。
+// backend 选择结果经 request context 传给 Director。
 type edge struct {
 	catalog  *catalog.Catalog
 	counter  atomic.Uint64
 	agentTLS *tls.Config
+	proxy    *httputil.ReverseProxy
+}
+
+func newEdge(cat *catalog.Catalog, agentTLS *tls.Config) *edge {
+	e := &edge{catalog: cat, agentTLS: agentTLS}
+	e.proxy = &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			backend, _ := req.Context().Value(backendKey{}).(catalog.Backend)
+			if e.agentTLS != nil {
+				req.URL.Scheme = "https"
+			} else {
+				req.URL.Scheme = "http"
+			}
+			req.URL.Host = backend.NodeProxyEndpoint
+			req.Header.Set(headerMachineID, backend.MachineID)
+			req.Header.Set(headerExecutionID, backend.ExecutionID)
+		},
+		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+		},
+		Transport: &http.Transport{
+			TLSClientConfig:     agentTLS,
+			MaxIdleConns:        64,
+			MaxIdleConnsPerHost: 64,
+			IdleConnTimeout:     30 * time.Second,
+		},
+	}
+	return e
 }
 
 func (e *edge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -94,26 +126,29 @@ func (e *edge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// M1 简单 round-robin；权重/draining 在 M3 发布状态机实现。
-	backend := route.Backends[e.counter.Add(1)%uint64(len(route.Backends))]
-
-	proxy := &httputil.ReverseProxy{
-		Director: func(req *http.Request) {
-			if e.agentTLS != nil {
-				req.URL.Scheme = "https"
-			} else {
-				req.URL.Scheme = "http"
-			}
-			req.URL.Host = backend.NodeProxyEndpoint
-			req.Header.Set(headerMachineID, backend.MachineID)
-			req.Header.Set(headerExecutionID, backend.ExecutionID)
-		},
-		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-		},
-		Transport: &http.Transport{TLSClientConfig: e.agentTLS},
+	// 只转发可服务流量的 backend：非 draining 且 readiness 为
+	// READY/UNCONFIGURED（M1 降级语义：UNCONFIGURED = RUNNING 即 READY，ADR-0008）。
+	// 未知/未就绪的副本不入选（评审 P3：edge 此前不消费 readiness/draining 字段）。
+	eligible := make([]catalog.Backend, 0, len(route.Backends))
+	for _, b := range route.Backends {
+		if b.Draining {
+			continue
+		}
+		switch b.Readiness {
+		case "READY", "UNCONFIGURED", "":
+			eligible = append(eligible, b)
+		}
 	}
-	proxy.ServeHTTP(w, r)
+	if len(eligible) == 0 {
+		http.Error(w, "no ready backend for hostname", http.StatusServiceUnavailable)
+		return
+	}
+
+	// M1 简单 round-robin；权重/draining 在 M3 发布状态机实现。
+	backend := eligible[e.counter.Add(1)%uint64(len(eligible))]
+
+	r = r.WithContext(context.WithValue(r.Context(), backendKey{}, backend))
+	e.proxy.ServeHTTP(w, r)
 }
 
 func stripPort(hostport string) string {

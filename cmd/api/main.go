@@ -7,11 +7,15 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -54,6 +58,17 @@ func run() error {
 		return err
 	}
 
+	// 认证默认开启（评审 P1-1）：未显式设置 FIREPAAS_AUTH_DISABLED 时，
+	// 缺少 FIREPAAS_API_TOKEN 直接拒绝启动，而不是静默无认证。
+	apiToken := os.Getenv("FIREPAAS_API_TOKEN")
+	authDisabled := isTruthy(os.Getenv("FIREPAAS_AUTH_DISABLED"))
+	if apiToken == "" && !authDisabled {
+		return errors.New("FIREPAAS_API_TOKEN is required (or set FIREPAAS_AUTH_DISABLED=true for local dev only)")
+	}
+	if authDisabled {
+		slog.Warn("API authentication DISABLED (dev only; never in lab/production)")
+	}
+
 	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
 	defer rdb.Close()
 	cat := catalog.New(rdb)
@@ -75,7 +90,7 @@ func run() error {
 		}
 	}()
 
-	api := &API{store: st}
+	api := &API{store: st, apiToken: apiToken, authDisabled: authDisabled}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) })
 	mux.HandleFunc("POST /v1/machines", api.auth(api.createMachine))
@@ -103,7 +118,11 @@ func run() error {
 }
 
 // API 是 M1.5 最小 HTTP 服务。
-type API struct{ store *store.Store }
+type API struct {
+	store        *store.Store
+	apiToken     string
+	authDisabled bool
+}
 
 type createMachineBody struct {
 	MachineID    string            `json:"machine_id"`
@@ -184,6 +203,10 @@ func (a *API) createMachine(w http.ResponseWriter, r *http.Request) {
 		body.Port, body.MachineID, body.DeploymentID, body.ExecutionID, body.OperationID,
 		body.Generation, raw)
 	if err != nil {
+		if errors.Is(err, store.ErrRequestConflict) {
+			writeErr(w, 409, err.Error())
+			return
+		}
 		writeErr(w, 500, err.Error())
 		return
 	}
@@ -250,24 +273,35 @@ func (a *API) deleteMachine(w http.ResponseWriter, r *http.Request) {
 	}
 	op, err := a.store.EnqueueDelete(r.Context(), "dev", id, executionID, operationID, m.Generation, raw)
 	if err != nil {
+		if errors.Is(err, store.ErrRequestConflict) {
+			writeErr(w, 409, err.Error())
+			return
+		}
 		writeErr(w, 500, err.Error())
 		return
 	}
 	writeJSON(w, 202, map[string]any{"operation_id": op.ID, "status": op.Status})
 }
 
+// auth 校验 Bearer token（常数时间比较）。认证默认开启；仅显式设置
+// FIREPAAS_AUTH_DISABLED=true（本地开发）时跳过（评审 P1-1）。
 func (a *API) auth(next http.HandlerFunc) http.HandlerFunc {
-	token := os.Getenv("FIREPAAS_API_TOKEN")
-	if token == "" {
+	if a.authDisabled || a.apiToken == "" {
 		return next
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer "+token {
+		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if subtle.ConstantTimeCompare([]byte(got), []byte(a.apiToken)) != 1 {
 			writeErr(w, 401, "unauthorized")
 			return
 		}
 		next(w, r)
 	}
+}
+
+func isTruthy(v string) bool {
+	b, err := strconv.ParseBool(strings.TrimSpace(v))
+	return err == nil && b
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

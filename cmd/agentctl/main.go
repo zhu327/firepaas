@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/example/firepaas/internal/security/mtls"
@@ -18,6 +19,12 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
+
+// stringSlice 支持重复标志（标准 flag 无 StringArray）。
+type stringSlice []string
+
+func (s *stringSlice) String() string { return strings.Join(*s, ",") }
+func (s *stringSlice) Set(v string) error { *s = append(*s, v); return nil }
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:5108", "agent gRPC address")
@@ -76,23 +83,44 @@ func main() {
 		execution := fs.String("execution", "exec-1", "execution id")
 		generation := fs.Uint64("generation", 1, "fencing generation")
 		operation := fs.String("operation", "", "fencing operation id (required)")
+		hostname := fs.String("hostname", "", "route hostname (spec.hostname)")
+		port := fs.Uint64("port", 0, "ingress port (spec.network.ingress_port)")
+		var secrets stringSlice
+		fs.Var(&secrets, "secret", "secret env KEY=VALUE (repeatable); value must not echo in response")
 		_ = fs.Parse(args[1:])
 		if *machineID == "" || *operation == "" {
 			fatal(fmt.Errorf("-machine-id and -operation are required"))
+		}
+		spec := &pb.MachineSpec{
+			ProjectId:    *project,
+			AppId:        *app,
+			DeploymentId: *deployment,
+			ExecutionId:  *execution,
+			ImageRef:     *image,
+			Vcpu:         *vcpus,
+			MemMib:       *mem,
+		}
+		if *hostname != "" {
+			spec.Hostname = *hostname
+		}
+		if *port != 0 {
+			spec.Network = &pb.NetworkSpec{IngressPort: *port}
 		}
 		req := &pb.CreateMachineRequest{
 			MachineId:   *machineID,
 			Generation:  *generation,
 			OperationId: *operation,
-			Spec: &pb.MachineSpec{
-				ProjectId:    *project,
-				AppId:        *app,
-				DeploymentId: *deployment,
-				ExecutionId:  *execution,
-				ImageRef:     *image,
-				Vcpu:         *vcpus,
-				MemMib:       *mem,
-			},
+			Spec:        spec,
+		}
+		for _, kv := range secrets {
+			parts := strings.SplitN(kv, "=", 2)
+			if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+				fatal(fmt.Errorf("-secret must be KEY=VALUE, got %q", kv))
+			}
+			if req.SecretEnv == nil {
+				req.SecretEnv = map[string]string{}
+			}
+			req.SecretEnv[parts[0]] = parts[1]
 		}
 		resp, err := pb.NewMachineServiceClient(conn).CreateMachine(ctx, req)
 		if err != nil {
