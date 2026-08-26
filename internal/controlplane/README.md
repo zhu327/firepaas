@@ -1,18 +1,19 @@
-# control-plane 内部结构（M1.5 已落地，M2 补齐调度/对账）
+# control-plane 内部结构（M2 已落地：发现/调度/预约/leader/决策表）
 
 ```
-cmd/api/                        # 入口：REST machines 最小 CRUD + controller 启动
-internal/controlplane/db/       # PG 连接 + 嵌入式 migrations
-internal/controlplane/store/    # PG desired/operations（M1 单实例）
+cmd/api/                        # 入口：REST machines 最小 CRUD + /v1/nodes + /metrics
+internal/controlplane/db/       # PG 连接 + 嵌入式 migrations（0001-0005）
+internal/controlplane/store/    # PG desired/operations/nodes/scheduler_events 权威
 internal/controlplane/catalog/  # Redis route/location 投影（可重建，ADR-0005）
-internal/controlplane/agentclient/ # 单节点 agent gRPC 客户端（mTLS 可选）
-internal/controlplane/controller/  # operation reconcile + observed 同步 + 投影发布
-internal/controlplane/api/      # 完整 OpenAPI 路由（M2 起填）
-internal/controlplane/auth/     # JWT + API key + scopes（M1.3 后）
-internal/controlplane/nodemanager/ # Nomad 服务发现（M2）
-internal/scheduler/             # Best-of-K 放置算法（M2）
-internal/controlplane/reservations/ # Redis Lua 预约（M2）
-internal/controlplane/reconcile/    # orphan/ACK 丢失决策表（M2）
+internal/controlplane/agentclient/ # agent gRPC 客户端（mTLS fail-closed）
+internal/controlplane/nodemanager/ # Nomad discovery + 节点状态机 + 连接池（M2.1）
+internal/controlplane/leader/   # PG advisory lock 选主（M2a，ADR-0007）
+internal/controlplane/controller/  # 操作 reconcile + 决策表 R1-R8 + route 重建
+internal/controlplane/reservations/ # Redis Lua 预约：配额/pending TTL/重建（M2.4）
+internal/scheduler/             # 先过滤后打分 Best-of-K（ADR-0002/0009）
+internal/controlplane/api/      # 完整 OpenAPI 路由（M3 起填）
+internal/controlplane/auth/     # JWT + API key + scopes（M5）
+internal/controlplane/reconcile/# 按 app 分区的对账（M2b 后需要时再拆）
 ```
 
 关键参考(本地 ../infra)：

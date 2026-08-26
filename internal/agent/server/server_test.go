@@ -12,9 +12,9 @@ import (
 	"github.com/example/firepaas/internal/agent/info"
 	"github.com/example/firepaas/internal/agent/machine"
 	"github.com/example/firepaas/internal/agent/state"
+	pb "github.com/example/firepaas/shared/gen/agent/v1"
 	"github.com/kernel/hypeman/lib/images"
 	"github.com/kernel/hypeman/lib/instances"
-	pb "github.com/example/firepaas/shared/gen/agent/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -103,7 +103,7 @@ func newTestServer(t *testing.T) (*Server, *state.Ledger, *state.Fences) {
 		t.Fatal(err)
 	}
 	adapter := machine.New(&fakeInstances{byName: map[string]*instances.Instance{}}, fakeImages{})
-	provider := info.New("test-node", "test", "test", "compute", "v1.14.2", "10.100.0.0/16", dir, nil)
+	provider := info.New("test-node", "test", "test", "compute", "v1.14.2", "10.100.0.0/16", dir, nil, nil)
 	return New(adapter, ledger, fences, provider), ledger, fences
 }
 

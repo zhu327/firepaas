@@ -66,6 +66,8 @@ sudo bash scripts/lab/root-setup.sh   # root 准备并切换 Nomad 到 root 运�
 sudo bash scripts/lab/run-p0.sh       # 部署 P0 job 并等 /health
 sudo bash scripts/lab/smoke-p0.sh     # P0 冒烟
 sudo bash scripts/lab/e2e-m1.sh       # M1 一键验证（API→agent→edge→VM→HTTP 200）
+sudo bash scripts/lab/e2e-m2.sh       # M2 一键验证（并发幂等/调度/20 轮无泄漏）
+sudo bash scripts/lab/chaos-m2.sh     # M2 混沌验收（crash/ACK 丢失/Redis 清空收敛）
 ```
 
 开发依赖（PG/Redis/MinIO/registry）：受限网络先经 `docker.m.daocloud.io` 拉取并

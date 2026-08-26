@@ -20,7 +20,13 @@ lint: ## 静态检查(需要 golangci-lint)
 	@command -v golangci-lint >/dev/null || { echo "golangci-lint not installed"; exit 1; }
 	golangci-lint run ./...
 
-check: build vet test tidy-check ## CI 本地等价入口：build+vet+test+tidy 检查
+check: build vet test tidy-check ## CI 本地等价入口：build+vet+test+tidy 检查（不含 PG/Redis-gated 测试）
+
+check-lab: build vet ## 实验室全量检查：含需要 PG/Redis 的测试（make dev-up 后执行；P2-5）
+	FIREPAAS_TEST_POSTGRES='postgres://firepaas:firepaas@127.0.0.1:5432/firepaas?sslmode=disable' \
+		FIREPAAS_TEST_REDIS=127.0.0.1:6379 \
+		go test -count=1 ./...
+	go run ./tools/sim -n 100000
 
 tidy-check: ## 验证 go.mod/go.sum 已 tidy（评审 P2-7）
 	go mod tidy
@@ -40,6 +46,9 @@ proto: ## 生成 protobuf 代码（需要 scripts/lab/install-protoc.sh 先执�
 		--go-grpc_out=shared/gen --go-grpc_opt=paths=source_relative \
 		protos/agent/v1/agent.proto
 	@echo "generated: shared/gen/agent/v1/*.pb.go"
+
+sim: ## M2.6 调度仿真：10 万次放置断言（过滤先于打分/硬准入/反亲和/失联排除）
+	go run ./tools/sim -n 100000
 
 dev-up: ## 启动本地开发依赖(postgres/redis/minio,需要 docker)
 	docker compose -f iac/dev/docker-compose.yaml up -d

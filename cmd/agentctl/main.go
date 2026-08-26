@@ -23,7 +23,7 @@ import (
 // stringSlice 支持重复标志（标准 flag 无 StringArray）。
 type stringSlice []string
 
-func (s *stringSlice) String() string { return strings.Join(*s, ",") }
+func (s *stringSlice) String() string     { return strings.Join(*s, ",") }
 func (s *stringSlice) Set(v string) error { *s = append(*s, v); return nil }
 
 func main() {

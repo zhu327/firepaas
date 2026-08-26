@@ -199,6 +199,35 @@ M1 内部子排序（关键路径；任何单项延期不得顺延 proto 冻结�
 - 注入 API/agent crash、ACK 丢失、Redis 清空后，2 分钟内收敛且审计可解释；
 - 两节点创建/删除 20 轮无 VM、bridge endpoint、Redis lease 泄漏；slot 泄漏测试属于 M3。
 
+### 单机执行记录（2026-08-26，ADR-0014）
+
+单机折叠版 M2 已交付（双 compute 节点部署项 DEFERRED-MULTI-NODE）：
+
+- M2.1 Nomad discovery + 节点状态机（HEALTHY/DRAINING/UNHEALTHY）+
+  ServiceInfo 20s 投影进 PG `nodes`，真机 `/v1/nodes` HEALTHY 通过。
+- M2.2 scheduler 先过滤后打分（状态→node_pool/labels→资源硬准入→DEPLOYMENT
+  反亲和尽力→Best-of-K R=4/K=3/α=0.5），pending 从 PG 在途 create 推导；
+  agent 侧硬准入双保险（ResourceExhausted 换节点重试 ≤3）。
+- M2.3 reconcile 决策表 R1–R8：ACK 丢失换代重建、orphan 清理、旧 execution
+  reap、节点失联摘路由；全部动作写 scheduler_events 审计。
+- M2.4 Redis Lua 预约（节点硬上限+项目配额+pending TTL 120s+重建回收）。
+- M2a PG advisory lock leader（controller 只在持锁实例运行，备实例只读）。
+- M2.5 手写 Prometheus 文本计数器（/metrics）+ machine/operation/execution
+  ID 贯穿 slog。
+- M2.6 tools/sim：100k 放置断言 PASS（过滤先于打分/硬准入/反亲和 distinct/
+  失联排除；`make sim`）。
+- 验收：`sudo bash scripts/lab/e2e-m2.sh` PASS（1000 并发重试→1 machine、
+  多 ordinal 并发、20 轮创建/删除零泄漏、节点投影+metrics）；
+  `sudo bash scripts/lab/chaos-m2.sh` PASS（ACK 丢失 32s、agent crash 16s、
+  Redis 清空 3s、API crash 与在途 crash 均 <120s 收敛）。
+- 真机验收修掉的关键 bug：换代重建未清 observed 导致 R8 短路无限换代；
+  create 退避重试 opID 撞历史幂等键；reap delete 误把 desired 置 DELETED；
+  graceful agent 重启会收养存活 VM（crash 注入需同时 kill firecracker）。
+
+遗留（进入 M3 前）：两节点真实放置/反亲和验收（DEFERRED-MULTI-NODE）；
+Nomad 2.0 system job Latest Deployment 历史脏状态；PG operations 的
+CLAIMED 回收窗口为 30s 定时器（非精确租约）。
+
 ## 7. M3：slot 网络、多副本、滚动发布与路由（8–12 周）
 
 ### 目标

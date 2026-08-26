@@ -1,8 +1,10 @@
-// Command api 是 firepaas 控制面入口（M1.5 单实例 vertical slice）。
+// Command api 是 firepaas 控制面入口（M2 单实例 vertical slice + M2a leader）。
 //
-// 目标形态（mvp-plan §5.4）：
-//   - REST：machines 最小 CRUD（apps/deployments 完整模型在 M3）
-//   - PG desired/operations 权威，controller 调 agent，Redis 路由投影
+// 目标形态（mvp-plan §5.4/§6、ADR-0007/0014）：
+//   - REST：machines 最小 CRUD + nodes/events 观测端点 + /metrics
+//   - PG desired/operations 权威；controller 只在 leader 上运行
+//   - Nomad discovery → 节点 gRPC 池 → 调度（过滤+Best-of-K）→ Redis 预约
+//   - Redis route 投影可重建
 package main
 
 import (
@@ -10,6 +12,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -22,7 +25,12 @@ import (
 	"github.com/example/firepaas/internal/controlplane/catalog"
 	"github.com/example/firepaas/internal/controlplane/controller"
 	"github.com/example/firepaas/internal/controlplane/db"
+	"github.com/example/firepaas/internal/controlplane/leader"
+	"github.com/example/firepaas/internal/controlplane/nodemanager"
+	"github.com/example/firepaas/internal/controlplane/reservations"
 	"github.com/example/firepaas/internal/controlplane/store"
+	"github.com/example/firepaas/internal/observability/metrics"
+	"github.com/example/firepaas/internal/scheduler"
 	pb "github.com/example/firepaas/shared/gen/agent/v1"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -42,8 +50,8 @@ func run() error {
 	httpPort := envOr("FIREPAAS_HTTP_PORT", "8080")
 	pgURL := envOr("FIREPAAS_POSTGRES_URL", "postgres://firepaas:firepaas@127.0.0.1:5432/firepaas?sslmode=disable")
 	redisAddr := envOr("FIREPAAS_REDIS_ADDR", "127.0.0.1:6379")
-	agentAddr := envOr("FIREPAAS_AGENT_ADDR", "127.0.0.1:5108")
-	agentProxyAddr := envOr("FIREPAAS_AGENT_PROXY_ADDR", "127.0.0.1:5107")
+	nomadAddr := envOr("FIREPAAS_NOMAD_ADDR", "http://127.0.0.1:4646")
+	legacyProxyAddr := envOr("FIREPAAS_AGENT_PROXY_ADDR", "127.0.0.1:5107")
 
 	pool, err := db.Open(ctx, pgURL)
 	if err != nil {
@@ -72,21 +80,45 @@ func run() error {
 	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
 	defer rdb.Close()
 	cat := catalog.New(rdb)
+	resv := reservations.New(rdb, 120*time.Second)
+	reg := metrics.New()
+	placer := scheduler.New(scheduler.DefaultBestOfKConfig(), scheduler.Options{})
 
-	ctrl, err := controller.New(ctx, st, cat, controller.Config{
-		AgentAddr:      agentAddr,
-		AgentProxyAddr: agentProxyAddr,
-		DefaultAppPort: 8080,
-		OpPollInterval: time.Second,
-		SyncInterval:   5 * time.Second,
-	})
-	if err != nil {
-		return err
-	}
-	defer ctrl.Close()
+	// M2a leader：controller（reconcile+放置）只在持锁实例运行；备实例只读待命。
 	go func() {
-		if err := ctrl.Run(ctx); err != nil && ctx.Err() == nil {
-			slog.Error("controller exited", "error", err)
+		err := leader.Elect(ctx, pool, leader.Key, func(lctx context.Context) error {
+			nm, err := nodemanager.New(nodemanager.Config{
+				NomadAddr:     nomadAddr,
+				JobName:       "firepaas-agentd",
+				DiscoverEvery: 10 * time.Second,
+				InfoEvery:     20 * time.Second,
+				Store:         st,
+			})
+			if err != nil {
+				slog.Error("nodemanager", "error", err)
+				return err
+			}
+			defer nm.Close()
+			go func() {
+				if err := nm.Run(lctx); err != nil && lctx.Err() == nil {
+					slog.Error("nodemanager exited", "error", err)
+				}
+			}()
+
+			ctrl := controller.New(st, cat, nm, resv, placer, reg, controller.Config{
+				DefaultAppPort:       8080,
+				LegacyAgentProxyAddr: legacyProxyAddr,
+				OpPollInterval:       time.Second,
+				SyncInterval:         5 * time.Second,
+				RebuildInterval:      30 * time.Second,
+				ReconcileGrace:       30 * time.Second,
+				MaxPlacementAttempts: 3,
+			})
+			slog.Info("running control loop as leader")
+			return ctrl.Run(lctx)
+		})
+		if err != nil && ctx.Err() == nil {
+			slog.Error("leader loop exited", "error", err)
 		}
 	}()
 
@@ -97,6 +129,9 @@ func run() error {
 	mux.HandleFunc("GET /v1/machines", api.auth(api.listMachines))
 	mux.HandleFunc("GET /v1/machines/{id}", api.auth(api.getMachine))
 	mux.HandleFunc("DELETE /v1/machines/{id}", api.auth(api.deleteMachine))
+	mux.HandleFunc("GET /v1/nodes", api.auth(api.listNodes))
+	mux.HandleFunc("GET /v1/events", api.auth(api.listEvents))
+	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) { reg.Handler().ServeHTTP(w, nil) })
 
 	srv := &http.Server{Addr: ":" + httpPort, Handler: mux}
 	errCh := make(chan error, 1)
@@ -117,7 +152,7 @@ func run() error {
 	}
 }
 
-// API 是 M1.5 最小 HTTP 服务。
+// API 是 M2 最小 HTTP 服务。
 type API struct {
 	store        *store.Store
 	apiToken     string
@@ -125,19 +160,23 @@ type API struct {
 }
 
 type createMachineBody struct {
-	MachineID    string            `json:"machine_id"`
-	Hostname     string            `json:"hostname"`
-	Image        string            `json:"image"`
-	VCPU         int64             `json:"vcpu"`
-	MemMIB       int64             `json:"mem_mib"`
-	Port         int               `json:"port"`
-	ProjectID    string            `json:"project_id"`
-	AppID        string            `json:"app_id"`
-	DeploymentID string            `json:"deployment_id"`
-	ExecutionID  string            `json:"execution_id"`
-	Generation   int64             `json:"generation"`
-	OperationID  string            `json:"operation_id"`
-	Env          map[string]string `json:"env"`
+	MachineID      string            `json:"machine_id"`
+	Hostname       string            `json:"hostname"`
+	Image          string            `json:"image"`
+	VCPU           int64             `json:"vcpu"`
+	MemMIB         int64             `json:"mem_mib"`
+	Port           int               `json:"port"`
+	ProjectID      string            `json:"project_id"`
+	AppID          string            `json:"app_id"`
+	DeploymentID   string            `json:"deployment_id"`
+	ReplicaOrdinal uint32            `json:"replica_ordinal"`
+	ExecutionID    string            `json:"execution_id"`
+	Generation     int64             `json:"generation"`
+	OperationID    string            `json:"operation_id"`
+	Env            map[string]string `json:"env"`
+	NodePool       string            `json:"node_pool"`
+	Labels         map[string]string `json:"labels"`
+	AntiAffinity   string            `json:"anti_affinity"`
 }
 
 func (a *API) createMachine(w http.ResponseWriter, r *http.Request) {
@@ -146,8 +185,8 @@ func (a *API) createMachine(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "bad request: "+err.Error())
 		return
 	}
-	if body.MachineID == "" || body.Hostname == "" || body.Image == "" || body.OperationID == "" {
-		writeErr(w, 400, "machine_id, hostname, image and operation_id are required")
+	if body.Hostname == "" || body.Image == "" || body.OperationID == "" {
+		writeErr(w, 400, "hostname, image and operation_id are required")
 		return
 	}
 	if body.ProjectID == "" {
@@ -158,6 +197,11 @@ func (a *API) createMachine(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.DeploymentID == "" {
 		body.DeploymentID = "dep-" + body.Hostname
+	}
+	// M2 验收：同一 replica ordinal 的并发重试必须落同一 machine_id。
+	// machine_id 缺省按 (app_id, replica_ordinal) 稳定推导；显式提供时原样使用。
+	if body.MachineID == "" {
+		body.MachineID = fmt.Sprintf("%s-r%d", body.AppID, body.ReplicaOrdinal)
 	}
 	if body.ExecutionID == "" {
 		body.ExecutionID = "exec-1"
@@ -174,22 +218,32 @@ func (a *API) createMachine(w http.ResponseWriter, r *http.Request) {
 	if body.Port == 0 {
 		body.Port = 8080
 	}
+	antiAffinity := pb.PlacementConstraints_NONE
+	if body.AntiAffinity == "DEPLOYMENT" {
+		antiAffinity = pb.PlacementConstraints_DEPLOYMENT
+	}
 
 	req := &pb.CreateMachineRequest{
 		MachineId:   body.MachineID,
 		Generation:  uint64(body.Generation),
 		OperationId: body.OperationID,
 		Spec: &pb.MachineSpec{
-			ProjectId:    body.ProjectID,
-			AppId:        body.AppID,
-			DeploymentId: body.DeploymentID,
-			ExecutionId:  body.ExecutionID,
-			Hostname:     body.Hostname,
-			ImageRef:     body.Image,
-			Vcpu:         uint64(body.VCPU),
-			MemMib:       uint64(body.MemMIB),
-			Env:          body.Env,
-			Network:      &pb.NetworkSpec{IngressPort: uint64(body.Port)},
+			ProjectId:      body.ProjectID,
+			AppId:          body.AppID,
+			DeploymentId:   body.DeploymentID,
+			ReplicaOrdinal: body.ReplicaOrdinal,
+			ExecutionId:    body.ExecutionID,
+			Hostname:       body.Hostname,
+			ImageRef:       body.Image,
+			Vcpu:           uint64(body.VCPU),
+			MemMib:         uint64(body.MemMIB),
+			Env:            body.Env,
+			Network:        &pb.NetworkSpec{IngressPort: uint64(body.Port)},
+			Placement: &pb.PlacementConstraints{
+				NodePool:     body.NodePool,
+				Labels:       body.Labels,
+				AntiAffinity: antiAffinity,
+			},
 		},
 	}
 	raw, err := protojson.Marshal(req)
@@ -201,7 +255,7 @@ func (a *API) createMachine(w http.ResponseWriter, r *http.Request) {
 	op, err := a.store.EnsureAppAndEnqueueCreate(r.Context(),
 		body.ProjectID, body.AppID, body.Hostname, body.Image, body.VCPU, body.MemMIB,
 		body.Port, body.MachineID, body.DeploymentID, body.ExecutionID, body.OperationID,
-		body.Generation, raw)
+		body.Generation, int(body.ReplicaOrdinal), raw, placementJSON(req.Spec.Placement))
 	if err != nil {
 		if errors.Is(err, store.ErrRequestConflict) {
 			writeErr(w, 409, err.Error())
@@ -283,6 +337,32 @@ func (a *API) deleteMachine(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 202, map[string]any{"operation_id": op.ID, "status": op.Status})
 }
 
+// listNodes 输出节点 observed projection（调度器输入，审计用）。
+func (a *API) listNodes(w http.ResponseWriter, r *http.Request) {
+	nodes, err := a.store.ListNodes(r.Context())
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"nodes": nodes})
+}
+
+// listEvents 输出最近调度/对账事件。
+func (a *API) listEvents(w http.ResponseWriter, r *http.Request) {
+	limit := 200
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 2000 {
+			limit = n
+		}
+	}
+	events, err := a.store.ListSchedulerEvents(r.Context(), limit)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"events": events})
+}
+
 // auth 校验 Bearer token（常数时间比较）。认证默认开启；仅显式设置
 // FIREPAAS_AUTH_DISABLED=true（本地开发）时跳过（评审 P1-1）。
 func (a *API) auth(next http.HandlerFunc) http.HandlerFunc {
@@ -302,6 +382,18 @@ func (a *API) auth(next http.HandlerFunc) http.HandlerFunc {
 func isTruthy(v string) bool {
 	b, err := strconv.ParseBool(strings.TrimSpace(v))
 	return err == nil && b
+}
+
+// placementJSON 序列化放置约束（nil 返回空字节，存 NULL/默认）。
+func placementJSON(p *pb.PlacementConstraints) []byte {
+	if p == nil {
+		return nil
+	}
+	raw, err := protojson.Marshal(p)
+	if err != nil {
+		return nil
+	}
+	return raw
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

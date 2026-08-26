@@ -17,6 +17,14 @@ import (
 
 const mib = 1024 * 1024
 
+// hostMemReserveMib/Pct（P3-8）：容量上报与硬准入扣除 host 侧保留
+// （Nomad client、agentd、hypeman、页缓存安全余量），高密度下不给
+// host OOM 留窗口。保留 = max(固定 512MiB, 总量的 3%)。
+const (
+	hostMemReserveMib = 512
+	hostMemReservePct = 32 // 1/32 ≈ 3%
+)
+
 // Provider 实现 InfoService 的 ServiceInfo。
 type Provider struct {
 	NodeID          string
@@ -27,6 +35,7 @@ type Provider struct {
 	NetworkCIDR     string
 	dataDir         string
 	memAllocatedMib func() uint64 // 已承诺给 machine 的内存（M1：实例 Size 之和）
+	vcpuAllocated   func() int    // 已承诺给 machine 的 vcpu（实例 Vcpus 之和）
 	startedAt       time.Time
 	serviceInstance string
 	status          pb.ServiceInfoResponse_Status
@@ -34,8 +43,8 @@ type Provider struct {
 }
 
 // New 构造 Provider。dataDir 用于磁盘容量/用量统计（评审 P3：不得用 / 代替
-// 数据目录）；memAllocatedMib 可为 nil（视为 0）。
-func New(nodeID, version, commit, nodePool, fcVersion, networkCIDR, dataDir string, memAllocatedMib func() uint64) *Provider {
+// 数据目录）；memAllocatedMib/vcpuAllocated 可为 nil（视为 0）。
+func New(nodeID, version, commit, nodePool, fcVersion, networkCIDR, dataDir string, memAllocatedMib func() uint64, vcpuAllocated func() int) *Provider {
 	now := time.Now()
 	return &Provider{
 		NodeID:          nodeID,
@@ -46,11 +55,27 @@ func New(nodeID, version, commit, nodePool, fcVersion, networkCIDR, dataDir stri
 		NetworkCIDR:     networkCIDR,
 		dataDir:         dataDir,
 		memAllocatedMib: memAllocatedMib,
+		vcpuAllocated:   vcpuAllocated,
 		startedAt:       now,
 		serviceInstance: uuid.NewString(),
 		status:          pb.ServiceInfoResponse_HEALTHY,
 		statusChangedAt: now,
 	}
+}
+
+// AdmissionSnapshot 返回本机硬准入所需的容量/已承诺量（M2.2）。
+// 调度器是软决策，这里是与真实 cgroup/进程状态对齐的硬校验双保险（ADR-0002）。
+// memTotalMib 已扣除 host 保留（P3-8）。
+func (p *Provider) AdmissionSnapshot() (vcpuTotal, memTotalMib, vcpuAllocated, memAllocatedMib uint64) {
+	vcpuTotal = uint64(runtime.NumCPU())
+	memTotalMib = sellableMemMib(memTotal())
+	if p.vcpuAllocated != nil {
+		vcpuAllocated = uint64(p.vcpuAllocated())
+	}
+	if p.memAllocatedMib != nil {
+		memAllocatedMib = p.memAllocatedMib()
+	}
+	return vcpuTotal, memTotalMib, vcpuAllocated, memAllocatedMib
 }
 
 // Response 构造 ServiceInfoResponse。
@@ -72,7 +97,7 @@ func (p *Provider) Response() *pb.ServiceInfoResponse {
 		StatusChangedAt:   timestamppb.New(p.statusChangedAt),
 		Capacity: &pb.NodeCapacity{
 			VcpuTotal:    uint64(runtime.NumCPU()),
-			MemTotalMib:  totalMem / 1024,
+			MemTotalMib:  sellableMemMib(totalMem), // P3-8：扣除 host 保留
 			DiskTotalMib: diskTotal,
 		},
 		Usage: &pb.NodeUsage{
@@ -94,6 +119,20 @@ func (p *Provider) Response() *pb.ServiceInfoResponse {
 
 func memTotal() uint64 {
 	return readMeminfoField("MemTotal")
+}
+
+// sellableMemMib 返回可售内存（MiB）：总量扣除 host 保留（P3-8）。
+// 输入为 KiB（meminfo 单位）。
+func sellableMemMib(totalKiB uint64) uint64 {
+	totalMib := totalKiB / 1024
+	reserve := totalMib / hostMemReservePct
+	if reserve < hostMemReserveMib {
+		reserve = hostMemReserveMib
+	}
+	if totalMib <= reserve {
+		return 0 // 异常小内存：不售，保守拒绝
+	}
+	return totalMib - reserve
 }
 
 func memAvailable() uint64 {

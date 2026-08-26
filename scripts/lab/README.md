@@ -64,19 +64,20 @@ sudo bash scripts/bench-hypeman.sh density 16
   `/home/zty/Learn/firepaas/scripts/lab/hypeman-p0.yaml`。
 - hypeman 的 `data_dir` 是 `/var/lib/firepaas-p0/hypeman`（root 所有）。
 
-## M1（当前开发）
+## M2（当前开发）
 
-M0 数据面验证已通过；M1 起 agentd 替代 hypeman-p0 job：
+M2 调度与收敛（ADR-0014）：Nomad 节点发现 + 先过滤后打分 Best-of-K +
+Redis 预约 + PG advisory lock leader + reconcile 决策表 + 仿真与混沌。
 
 ```bash
 bash scripts/lab/gen-certs.sh        # 生成静态 mTLS 证书（gitignore）
-sudo bash scripts/lab/e2e-m1.sh      # 一键验证 API→PG→agent(mTLS)→Redis→edge→VM
+make sim                             # 10 万次放置仿真断言
+sudo bash scripts/lab/e2e-m2.sh      # 1000 并发幂等/多 ordinal/20 轮无泄漏
+sudo bash scripts/lab/chaos-m2.sh    # ACK 丢失/agent crash/Redis 清空/API crash
 
 sudo bash scripts/lab/run-agentd.sh  # 仅部署 firepaas-agentd（system job，root）
-agentctl info                        # 明文失败；带证书（见下）成功
-FIREPAAS_AGENT_TLS_CERT=scripts/lab/certs/control-plane.crt \
-FIREPAAS_AGENT_TLS_KEY=scripts/lab/certs/control-plane.key \
-FIREPAAS_AGENT_TLS_CA=scripts/lab/certs/ca.crt agentctl info
+curl -H 'Authorization: Bearer <token>' http://127.0.0.1:8080/v1/nodes   # 节点投影
+curl http://127.0.0.1:8080/metrics   # 调度/对账计数器
 ```
 
 `firepaas-agentd` 与 `firepaas-hypeman-p0` 互斥（共享 data_dir），需要回退 P0 时先
@@ -109,16 +110,16 @@ fork p95 660ms、micro 密度 32（网络带宽准入上限）。
 
 均已确认与本机现有 k8s/桌面服务不冲突。
 
-## M1 vertical slice（补充）
+## M2 vertical slice（补充）
 
-M1 新增脚本/文件（详见 `docs/plans/2026-08-25-m1-single-node.md`）：
+M2 新增脚本/文件（详见 `docs/plans/2026-08-25-m2-single-node.md`）：
 
 ```
-agentd.yaml        # agentd 配置（复用 P0 data_dir，与 hypeman-p0 job 互斥）
-run-agentd.sh      # root 部署 agentd system job 并等 :5108
-gen-certs.sh       # 生成静态 mTLS 证书（ca / agentd / control-plane / edge）
-e2e-m1.sh          # 一键 M1 验收：认证→PG→agent(mTLS+CN 白名单)→Redis→edge→VM
+e2e-m2.sh          # 一键 M2 验收：1000 并发幂等/多 ordinal/20 轮无泄漏
+chaos-m2.sh        # 混沌验收：ACK 丢失/agent crash/Redis 清空/API crash
 ```
 
 注意：重建 agentd 二进制后，`nomad job run` 不会重启已运行的 raw_exec 任务；
 用 `nomad job restart firepaas-agentd` 原地重启（e2e 脚本已内置）。
+graceful restart（SIGTERM）不杀 VM（新 agentd 会收养）；crash 注入需同时
+kill agentd 与 firecracker 子进程（chaos-m2 已内置）。

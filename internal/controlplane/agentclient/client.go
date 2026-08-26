@@ -5,6 +5,7 @@ package agentclient
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 
 	"github.com/example/firepaas/internal/security/mtls"
@@ -18,11 +19,15 @@ import (
 // Client 封装 Machine/Info 两个服务。
 type Client struct {
 	conn     *grpc.ClientConn
+	addr     string
 	Machines pb.MachineServiceClient
 	Info     pb.InfoServiceClient
 }
 
-// Dial 连接单节点 agent。设置 FIREPAAS_AGENT_TLS_CERT/KEY/CA 时启用 mTLS。
+// Dial 连接单节点 agent。mTLS 是唯一正式形态（ADR-0006/0014）：必须设置
+// FIREPAAS_AGENT_TLS_CERT/KEY/CA，缺失即失败（fail-closed，P3-5）；仅
+// 显式设置 FIREPAAS_AGENT_TLS_ALLOW_INSECURE=true（本地开发）时才允许
+// 明文连接，避免环境遗漏时静默降级为无认证 RPC。
 func Dial(addr string) (*Client, error) {
 	var opts []grpc.DialOption
 	certFile, keyFile, caFile := os.Getenv("FIREPAAS_AGENT_TLS_CERT"), os.Getenv("FIREPAAS_AGENT_TLS_KEY"), os.Getenv("FIREPAAS_AGENT_TLS_CA")
@@ -32,8 +37,11 @@ func Dial(addr string) (*Client, error) {
 			return nil, fmt.Errorf("agent mTLS config: %w", err)
 		}
 		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(tlsConf)))
-	} else {
+	} else if os.Getenv("FIREPAAS_AGENT_TLS_ALLOW_INSECURE") == "true" {
+		slog.Warn("agent connection running WITHOUT mTLS (dev only)")
 		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	} else {
+		return nil, fmt.Errorf("agent mTLS required: set FIREPAAS_AGENT_TLS_CERT/KEY/CA (or FIREPAAS_AGENT_TLS_ALLOW_INSECURE=true for dev)")
 	}
 	conn, err := grpc.NewClient(addr, opts...)
 	if err != nil {
@@ -41,10 +49,14 @@ func Dial(addr string) (*Client, error) {
 	}
 	return &Client{
 		conn:     conn,
+		addr:     addr,
 		Machines: pb.NewMachineServiceClient(conn),
 		Info:     pb.NewInfoServiceClient(conn),
 	}, nil
 }
+
+// Addr 返回连接目标地址（nodemanager 判断是否需要重拨）。
+func (c *Client) Addr() string { return c.addr }
 
 // Close 关闭连接。
 func (c *Client) Close() error { return c.conn.Close() }

@@ -248,6 +248,10 @@ func mapMachine(inst *instances.Instance) *pb.Machine {
 		machineID = inst.Id
 	}
 
+	generation := uint64(0)
+	if g, err := strconv.ParseUint(inst.Tags[tagGeneration], 10, 64); err == nil {
+		generation = g
+	}
 	m := &pb.Machine{
 		MachineId:   machineID,
 		ExecutionId: spec.ExecutionId,
@@ -256,6 +260,7 @@ func mapMachine(inst *instances.Instance) *pb.Machine {
 		SlotIp:      inst.IP,
 		CreatedAt:   timestamppb.New(inst.CreatedAt),
 		Readiness:   readiness,
+		Generation:  generation, // R6 orphan 清理按它下发 fence 安全的 delete（P1-2）
 	}
 	return m
 }

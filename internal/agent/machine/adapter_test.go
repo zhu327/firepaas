@@ -155,10 +155,10 @@ func TestAdapterListDoesNotEchoSecrets(t *testing.T) {
 
 func TestRedactSecretEnv(t *testing.T) {
 	cases := []struct {
-		name    string
-		env     map[string]string
-		tag     string
-		want    map[string]string
+		name string
+		env  map[string]string
+		tag  string
+		want map[string]string
 	}{
 		{"no secret tag", map[string]string{"A": "1"}, "", map[string]string{"A": "1"}},
 		{"single secret", map[string]string{"A": "1", "S": "x"}, "S", map[string]string{"A": "1"}},

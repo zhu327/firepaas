@@ -237,6 +237,7 @@ message Machine {
   google.protobuf.Timestamp updated_at = 9;
   MachineReadiness readiness = 10;                // ADR-0008
   google.protobuf.Timestamp last_readiness_change = 11;
+  uint64 generation = 12;      // 该 execution 的 generation（fence 水位；orphan 清理按它下发 delete）
 }
 
 message DeleteMachineRequest {

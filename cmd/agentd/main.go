@@ -121,24 +121,28 @@ func run() error {
 	}()
 
 	adapter := machine.New(set.Instances, set.Images)
-	// MemAllocated：已承诺给 machine 的内存（实例 Size 之和，MiB）。
-	memAllocated := func() uint64 {
+	// 已承诺资源（硬准入输入）：实例 Size / Vcpus 之和（M2.2）。
+	listedResources := func() (memMiB uint64, vcpus int) {
 		listCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		listed, err := set.Instances.ListInstances(listCtx, nil)
 		if err != nil {
-			return 0
+			return 0, 0
 		}
-		var total int64
+		var totalBytes int64
+		var totalVCPU int
 		for i := range listed {
-			total += listed[i].Size
+			totalBytes += listed[i].Size
+			totalVCPU += listed[i].Vcpus
 		}
-		if total <= 0 {
-			return 0
+		if totalBytes > 0 {
+			memMiB = uint64(totalBytes) / (1024 * 1024)
 		}
-		return uint64(total) / (1024 * 1024)
+		return memMiB, totalVCPU
 	}
-	infoProvider := info.New(nodeID, serviceVersion, serviceCommit, nodePool, fcVersion, cfg.Network.SubnetCIDR, cfg.DataDir, memAllocated)
+	memAllocated := func() uint64 { m, _ := listedResources(); return m }
+	vcpuAllocated := func() int { _, v := listedResources(); return v }
+	infoProvider := info.New(nodeID, serviceVersion, serviceCommit, nodePool, fcVersion, cfg.Network.SubnetCIDR, cfg.DataDir, memAllocated, vcpuAllocated)
 	srv := server.New(adapter, ledger, fences, infoProvider)
 
 	lis, err := net.Listen("tcp", net.JoinHostPort(bind, port))
