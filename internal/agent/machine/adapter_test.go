@@ -111,11 +111,80 @@ func TestAdapterCreateMapping(t *testing.T) {
 	if m.Spec.ExecutionId != "e1" || m.Readiness != pb.MachineReadiness_UNCONFIGURED {
 		t.Fatalf("unexpected machine: %+v", m)
 	}
+	// secret 值必须进入 hypeman 请求（VM 启动配置），但不得出现在回显 Machine。
 	if got := im.created.Env["SECRET_TOKEN"]; got != "s3cr3t" {
-		t.Fatalf("secret env not merged: %q", got)
+		t.Fatalf("secret env not merged into hypeman request: %q", got)
+	}
+	if _, ok := m.Spec.Env["SECRET_TOKEN"]; ok {
+		t.Fatal("secret env leaked into response Machine.Spec.Env (ADR-0013 invariant 3)")
+	}
+	if got := m.Spec.Env["PORT"]; got != "8080" {
+		t.Fatalf("non-secret env lost in echo: PORT=%q", got)
+	}
+	if im.created.Tags[tagSecretKeys] != "SECRET_TOKEN" {
+		t.Fatalf("secret keys tag = %q, want SECRET_TOKEN", im.created.Tags[tagSecretKeys])
 	}
 	if im.created.Name != "m1-test" || im.created.Vcpus != 1 || im.created.Size != 512*1024*1024 {
 		t.Fatalf("unexpected hypeman request mapping: %+v", im.created)
+	}
+}
+
+func TestAdapterListDoesNotEchoSecrets(t *testing.T) {
+	im := &fakeInstances{listed: []instances.Instance{
+		{StoredMetadata: instances.StoredMetadata{
+			Id: "i1", Name: "m1", Image: "img",
+			Env:  map[string]string{"PORT": "8080", "API_KEY": "s3cr3t"},
+			Tags: map[string]string{tagProject: "p1", tagExecution: "e1", tagSecretKeys: "API_KEY"},
+		}, State: instances.StateRunning},
+	}}
+	a := New(im, &fakeImages{})
+	got, err := a.List(context.Background(), "p1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want 1 machine, got %d", len(got))
+	}
+	if _, ok := got[0].Spec.Env["API_KEY"]; ok {
+		t.Fatal("ListMachines echoed secret env (ADR-0013 invariant 3)")
+	}
+	if got[0].Spec.Env["PORT"] != "8080" {
+		t.Fatal("non-secret env lost in list echo")
+	}
+}
+
+func TestRedactSecretEnv(t *testing.T) {
+	cases := []struct {
+		name    string
+		env     map[string]string
+		tag     string
+		want    map[string]string
+	}{
+		{"no secret tag", map[string]string{"A": "1"}, "", map[string]string{"A": "1"}},
+		{"single secret", map[string]string{"A": "1", "S": "x"}, "S", map[string]string{"A": "1"}},
+		{"multiple secrets", map[string]string{"A": "1", "S1": "x", "S2": "y"}, "S1,S2", map[string]string{"A": "1"}},
+		{"all secrets", map[string]string{"S": "x"}, "S", map[string]string{}},
+		{"empty env", map[string]string{}, "S", map[string]string{}},
+		{"nil env", nil, "S", nil},
+		{"unknown key in tag", map[string]string{"A": "1"}, "NOPE", map[string]string{"A": "1"}},
+	}
+	for _, tc := range cases {
+		got := redactSecretEnv(tc.env, tc.tag)
+		if len(got) != len(tc.want) {
+			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
+			continue
+		}
+		for k, v := range tc.want {
+			if got[k] != v {
+				t.Errorf("%s: key %s = %q, want %q", tc.name, k, got[k], v)
+			}
+		}
+		// 原 env 不得被修改（hypeman 侧数据不动）。
+		if tc.env != nil {
+			if _, ok := tc.env["S"]; ok && len(tc.env) == 0 {
+				t.Errorf("%s: input env mutated", tc.name)
+			}
+		}
 	}
 }
 

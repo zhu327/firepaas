@@ -7,7 +7,9 @@ package machine
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/kernel/hypeman/lib/images"
@@ -26,6 +28,10 @@ const (
 	tagHealth     = "firepaas/health_check"
 	tagHostname   = "firepaas/hostname"
 	tagPort       = "firepaas/port"
+	tagGeneration = "firepaas/generation"
+	// tagSecretKeys 记录经 secret_env 注入的键名（逗号分隔）。值本体留在
+	// hypeman Env（VM 启动配置需要）；回显路径（mapMachine）据此剔除。
+	tagSecretKeys = "firepaas/secret_keys"
 )
 
 // InstanceManager 是 Adapter 需要的 hypeman instance 能力子集。
@@ -67,9 +73,14 @@ func (a *Adapter) Create(ctx context.Context, req *pb.CreateMachineRequest) (*pb
 	for k, v := range spec.Env {
 		env[k] = v
 	}
+	// secret_env 单向注入：值进入 VM 启动配置（hypeman Env），但键名记录在
+	// tags，供回显路径剔除（ADR-0013 不变量 3）。排序保证确定性。
+	secretKeys := make([]string, 0, len(req.SecretEnv))
 	for k, v := range req.SecretEnv {
 		env[k] = v
+		secretKeys = append(secretKeys, k)
 	}
+	sort.Strings(secretKeys)
 
 	sizeBytes := int64(spec.MemMib) * 1024 * 1024
 	overlayBytes := int64(spec.DiskMib) * 1024 * 1024
@@ -89,6 +100,8 @@ func (a *Adapter) Create(ctx context.Context, req *pb.CreateMachineRequest) (*pb
 			tagHealth:     healthTag(spec.HealthCheck),
 			tagHostname:   spec.Hostname,
 			tagPort:       ingressPort(spec.Network),
+			tagGeneration: strconv.FormatUint(req.Generation, 10),
+			tagSecretKeys: strings.Join(secretKeys, ","),
 		},
 	}
 
@@ -162,6 +175,27 @@ func (a *Adapter) ensureImageReady(ctx context.Context, imageRef string) error {
 	return nil
 }
 
+// redactSecretEnv 从回显 env 中剔除 secret_env 注入的键。hypeman 侧保留
+// 完整 env（VM 启动配置需要）；只有回显/持久化路径走本函数。
+func redactSecretEnv(env map[string]string, secretKeysTag string) map[string]string {
+	if len(env) == 0 || secretKeysTag == "" {
+		return env
+	}
+	secret := make(map[string]bool)
+	for _, k := range strings.Split(secretKeysTag, ",") {
+		if k != "" {
+			secret[k] = true
+		}
+	}
+	out := make(map[string]string, len(env))
+	for k, v := range env {
+		if !secret[k] {
+			out[k] = v
+		}
+	}
+	return out
+}
+
 func healthTag(h *pb.HealthCheckSpec) string {
 	if h == nil {
 		return "0"
@@ -187,7 +221,9 @@ func mapMachine(inst *instances.Instance) *pb.Machine {
 		Vcpu:         uint64(inst.Vcpus),
 		MemMib:       uint64(inst.Size / (1024 * 1024)),
 		DiskMib:      uint64(inst.OverlaySize / (1024 * 1024)),
-		Env:          inst.Env,
+		// 回显前剔除 secret_env 注入的键（ADR-0013 不变量 3：secret 值不得
+		// 出现在 Machine/MachineSpec、ListMachines 与持久化 operation result）。
+		Env: redactSecretEnv(inst.Env, inst.Tags[tagSecretKeys]),
 	}
 	if portStr := inst.Tags[tagPort]; portStr != "" {
 		if port, err := strconv.ParseUint(portStr, 10, 32); err == nil {
