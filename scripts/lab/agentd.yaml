@@ -1,0 +1,20 @@
+# agentd M1 配置（复用 P0 数据目录：系统内核/initrd 与镜像缓存已就绪）。
+# P0 hypeman job 与 agentd 不得同时运行（共享 data_dir 会互相覆盖实例状态）。
+
+jwt_secret: "dev-agentd-m1"
+
+# 与 scripts/lab/hypeman-p0.yaml 相同，避免重复下载内核/initrd
+data_dir: /var/lib/firepaas-p0/hypeman
+
+hypervisor:
+  default: firecracker
+
+network:
+  bridge_name: firepaas0
+  subnet_cidr: 10.100.0.0/16
+  dns_server: 223.5.5.5
+
+logging:
+  level: info
+
+env: lab

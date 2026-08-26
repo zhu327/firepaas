@@ -23,6 +23,19 @@ internal/agent/state/       # agent operation ledger + 崩溃恢复缓存(非业
 - proxy credential 仅由 Create 请求单向接收并保存验证材料/摘要，不进入 Machine/ListMachines/日志/operation result。
 - gRPC 端口 5108、proxy 端口 5107(与 e2b 的 5008/5007 区分,避免混部冲突)。
 
+## M1.4 实现状态(2026-08-26)
+
+- `cmd/agentd`:已实现 InfoService.ServiceInfo 与 MachineService 的
+  Create/List/Delete，经 `iac/nomad/agentd-single.hcl` 以 root system job 部署。
+- `internal/agent/runtime`:只 import hypeman `lib/*`（配置经 `lib/config` 类型别名
+  入口）；不 import `cmd/api` 与 `lib/providers`。
+- `internal/agent/state`:operation ledger（原子落盘/重启重放/同 ID 异 hash 拒绝）。
+- `internal/agent/machine`:hypeman CreateInstanceRequest 映射；firepaas 业务标识
+  经 hypeman tags 持久化；稳定 `machine_id` = hypeman instance Name，内部 ID 仅在
+  Delete 时解析。
+- `internal/agent/server`:fencing 校验 + request hash 幂等（protojson canonical）。
+- 身份：M1.3 前为明文 + 主机端口 ACL（ADR-0006 降级路径）。
+
 ## M0.4 spike 状态(2026-08-25,运行 PASS)
 
 `cmd/m0-spike` 不经 HTTP API,直接 import hypeman lib 实际执行 Create/List/Delete:

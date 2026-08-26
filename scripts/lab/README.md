@@ -64,6 +64,21 @@ sudo bash scripts/bench-hypeman.sh density 16
   `/home/zty/Learn/firepaas/scripts/lab/hypeman-p0.yaml`。
 - hypeman 的 `data_dir` 是 `/var/lib/firepaas-p0/hypeman`（root 所有）。
 
+## M1（当前开发）
+
+M0 数据面验证已通过；M1 起 agentd 替代 hypeman-p0 job：
+
+```bash
+sudo bash scripts/lab/run-agentd.sh   # 部署 firepaas-agentd（system job，root）
+agentctl info                          # gRPC ServiceInfo
+agentctl create -machine-id m1 -execution e1 -operation op1
+agentctl list
+agentctl delete -machine-id m1 -execution e1 -operation op2
+```
+
+`firepaas-agentd` 与 `firepaas-hypeman-p0` 互斥（共享 data_dir），需要回退 P0 时先
+`nomad job stop firepaas-agentd` 再运行 `scripts/lab/run-p0.sh`。
+
 ## 受限网络（Docker Hub 被劫持/超时）
 
 - Docker 镜像经 `docker.m.daocloud.io` 拉取后 retag 为官方名再 compose up。
