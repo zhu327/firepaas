@@ -113,6 +113,8 @@ func run() error {
 				RebuildInterval:      30 * time.Second,
 				ReconcileGrace:       30 * time.Second,
 				MaxPlacementAttempts: 3,
+				RolloutTimeout:       envDur("FIREPAAS_ROLLOUT_TIMEOUT", 300*time.Second),
+				RolloutDrainGrace:    envDur("FIREPAAS_ROLLOUT_DRAIN", 30*time.Second),
 			})
 			slog.Info("running control loop as leader")
 			return ctrl.Run(lctx)
@@ -131,6 +133,14 @@ func run() error {
 	mux.HandleFunc("DELETE /v1/machines/{id}", api.auth(api.deleteMachine))
 	mux.HandleFunc("GET /v1/nodes", api.auth(api.listNodes))
 	mux.HandleFunc("GET /v1/events", api.auth(api.listEvents))
+	// M3：app/deployment/rollout（mvp-plan §7.4、ADR-0015）。
+	mux.HandleFunc("POST /v1/apps", api.auth(api.createApp))
+	mux.HandleFunc("GET /v1/apps", api.auth(api.listApps))
+	mux.HandleFunc("GET /v1/apps/{id}", api.auth(api.getApp))
+	mux.HandleFunc("POST /v1/apps/{id}/deployments", api.auth(api.deployApp))
+	mux.HandleFunc("POST /v1/apps/{id}/scale", api.auth(api.scaleApp))
+	mux.HandleFunc("POST /v1/apps/{id}/rollback", api.auth(api.rollbackApp))
+	mux.HandleFunc("DELETE /v1/apps/{id}", api.auth(api.deleteApp))
 	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) { reg.Handler().ServeHTTP(w, nil) })
 
 	srv := &http.Server{Addr: ":" + httpPort, Handler: mux}
@@ -177,6 +187,15 @@ type createMachineBody struct {
 	NodePool       string            `json:"node_pool"`
 	Labels         map[string]string `json:"labels"`
 	AntiAffinity   string            `json:"anti_affinity"`
+	HealthCheck    *healthCheckBody  `json:"health_check"`
+}
+
+type healthCheckBody struct {
+	Type               string `json:"type"` // http | tcp
+	Target             string `json:"target"`
+	IntervalSeconds    uint32 `json:"interval_seconds"`
+	TimeoutSeconds     uint32 `json:"timeout_seconds"`
+	UnhealthyThreshold uint32 `json:"unhealthy_threshold"`
 }
 
 func (a *API) createMachine(w http.ResponseWriter, r *http.Request) {
@@ -222,6 +241,26 @@ func (a *API) createMachine(w http.ResponseWriter, r *http.Request) {
 	if body.AntiAffinity == "DEPLOYMENT" {
 		antiAffinity = pb.PlacementConstraints_DEPLOYMENT
 	}
+	var healthCheck *pb.HealthCheckSpec
+	if body.HealthCheck != nil {
+		hc := body.HealthCheck
+		hcType := pb.HealthCheckSpec_TYPE_UNSPECIFIED
+		switch strings.ToUpper(hc.Type) {
+		case "HTTP":
+			hcType = pb.HealthCheckSpec_HTTP
+		case "TCP":
+			hcType = pb.HealthCheckSpec_TCP
+		}
+		if hcType != pb.HealthCheckSpec_TYPE_UNSPECIFIED {
+			healthCheck = &pb.HealthCheckSpec{
+				Type:               hcType,
+				Target:             hc.Target,
+				IntervalSeconds:    hc.IntervalSeconds,
+				TimeoutSeconds:     hc.TimeoutSeconds,
+				UnhealthyThreshold: hc.UnhealthyThreshold,
+			}
+		}
+	}
 
 	req := &pb.CreateMachineRequest{
 		MachineId:   body.MachineID,
@@ -239,6 +278,7 @@ func (a *API) createMachine(w http.ResponseWriter, r *http.Request) {
 			MemMib:         uint64(body.MemMIB),
 			Env:            body.Env,
 			Network:        &pb.NetworkSpec{IngressPort: uint64(body.Port)},
+			HealthCheck:    healthCheck,
 			Placement: &pb.PlacementConstraints{
 				NodePool:     body.NodePool,
 				Labels:       body.Labels,
@@ -411,4 +451,17 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// envDur 解析时长环境变量（非法值回退默认）。
+func envDur(key string, def time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return def
+	}
+	return d
 }

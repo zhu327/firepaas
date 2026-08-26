@@ -41,6 +41,8 @@ type Config struct {
 	CreateRetryMax       time.Duration // create FAILED 退避封顶，默认 5m
 	ClaimStaleAfter      time.Duration // CLAIMED 滞留回收阈值（P1-1），默认 2×AgentRPCTimeout+60s
 	NodeMissingThreshold int           // 节点连续 List 失败次数才摘路由（P3-9），默认 3
+	RolloutTimeout       time.Duration // M3 PREPARING 超时→自动回滚（S3），默认 300s
+	RolloutDrainGrace    time.Duration // M3 CUTOVER 后旧代 drain 期限，默认 30s
 }
 
 // Controller 执行 reconcile。
@@ -119,6 +121,10 @@ func (c *Controller) Run(ctx context.Context) error {
 		c.metrics.Inc("firepaas_operation_stale_claims_recovered_total", nil, uint64(n))
 		slog.Warn("recovered orphaned CLAIMED operations on leader start", "count", n)
 	}
+	// M3：app scale + rollout 状态机（5s 节奏与 sync 同拍，首轮立即跑一次）。
+	if err := c.reconcileApps(ctx); err != nil {
+		slog.Error("reconcile apps (startup)", "error", err)
+	}
 
 	for {
 		select {
@@ -131,6 +137,9 @@ func (c *Controller) Run(ctx context.Context) error {
 		case <-syncTicker.C:
 			if err := c.syncObserved(ctx); err != nil {
 				slog.Error("sync observed", "error", err)
+			}
+			if err := c.reconcileApps(ctx); err != nil {
+				slog.Error("reconcile apps", "error", err)
 			}
 		case <-rebuildTicker.C:
 			if err := c.rebuildLeases(ctx); err != nil {
@@ -148,6 +157,38 @@ func (c *Controller) Run(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+// rolloutHoldsRecreate 判断该机器是否处于“发布持有”状态（S4/S6）：
+// CUTOVER 中的旧代机器、ROLLING_BACK 中的新代机器死亡时不重建。
+func (c *Controller) rolloutHoldsRecreate(ctx context.Context, m store.Machine) bool {
+	if m.DeploymentID == "" {
+		return false
+	}
+	rl, err := c.store.ActiveRolloutForApp(ctx, m.AppID)
+	if err != nil || rl == nil {
+		return false
+	}
+	dep, err := c.store.GetDeployment(ctx, m.DeploymentID)
+	if err != nil || dep == nil {
+		return false
+	}
+	switch rl.Status {
+	case "CUTOVER":
+		return dep.Generation != rl.ToGeneration
+	case "ROLLING_BACK":
+		return dep.Generation != rl.FromGeneration
+	}
+	return false
+}
+
+// reconcileApps 是 M3 的 app 层对账（scale + rollout），错误只记日志不中断
+// 主循环（单个 app 的脏状态不能拖垮 machine reconcile）。
+func (c *Controller) reconcileApps(ctx context.Context) error {
+	if err := c.reconcileRollouts(ctx); err != nil {
+		return err
+	}
+	return c.reconcileAppScale(ctx)
 }
 
 // ---------------------------------------------------------------------------
@@ -667,6 +708,14 @@ func (c *Controller) processPGMachine(ctx context.Context, m store.Machine,
 		return
 	}
 
+	// S4/S6（ADR-0015）：发布 CUTOVER/回滚期间，非目标代的机器死亡不重建——
+	// drain/rollback 会按 ordinal 回收它；重建只会制造马上要删的浪费。
+	if c.rolloutHoldsRecreate(ctx, m) {
+		c.recordEvent(ctx, "rollout", m.ID, "", nodeID,
+			"non-target generation machine missing; drain/rollback owns lifecycle", nil)
+		return
+	}
+
 	// R3 尾部决策（P1-3）：只有 ACK 丢失（create 已成功、agent 却没有）
 	// 或清理完成（reap delete SUCCEEDED）才换代重建；create FAILED 走
 	// 同 execution 的退避重派，不推动 generation，消除无限换代循环。
@@ -1011,6 +1060,34 @@ func (c *Controller) buildRoutes(ctx context.Context) error {
 		proxyByNode[v.agentID] = v.proxy
 	}
 
+	// M3（ADR-0015）：active generation 与 draining 由 rollout 状态机决定，
+	// 而不是 machine 的 fence generation 最大值（machine.generation 会在
+	// R3 换代重建时 +1，与发布代无关）。发布轴是 deployment.generation。
+	rolloutByApp := map[string]*store.Rollout{}
+	depGen := map[string]int64{}
+	{
+		active, err := c.store.ListActiveRollouts(ctx)
+		if err != nil {
+			return err
+		}
+		for i := range active {
+			rolloutByApp[active[i].AppID] = &active[i]
+		}
+		apps := map[string]bool{}
+		for _, m := range machines {
+			apps[m.AppID] = true
+		}
+		for appID := range apps {
+			deps, err := c.store.ListDeployments(ctx, appID)
+			if err != nil {
+				return err
+			}
+			for i := range deps {
+				depGen[deps[i].ID] = deps[i].Generation
+			}
+		}
+	}
+
 	type routeKey struct {
 		hostname string
 		port     int
@@ -1027,9 +1104,7 @@ func (c *Controller) buildRoutes(ctx context.Context) error {
 			route = &store.RouteRow{Hostname: m.Hostname, Port: port, AppID: m.AppID}
 			grouped[key] = route
 		}
-		if m.Generation > route.Generation {
-			route.Generation = m.Generation
-		}
+
 		proxy := proxyByNode[m.NodeID]
 		if proxy == "" {
 			proxy = c.cfg.LegacyAgentProxyAddr
@@ -1038,6 +1113,22 @@ func (c *Controller) buildRoutes(ctx context.Context) error {
 			// 节点视图缺失：该 backend 暂时不可达，不写入投影（受控收敛）。
 			continue
 		}
+
+		// 发布状态机：PREPARING 新代不可服务；CUTOVER 旧代 draining、
+		// 新代服务；ROLLING_BACK 新代摘除、旧代恢复。
+		draining := false
+		publishGen := depGen[m.DeploymentID]
+		if rl := rolloutByApp[m.AppID]; rl != nil {
+			switch rl.Status {
+			case "PREPARING":
+				draining = publishGen != rl.FromGeneration
+			case "CUTOVER":
+				draining = publishGen != rl.ToGeneration
+			case "ROLLING_BACK":
+				draining = publishGen != rl.FromGeneration
+			}
+		}
+
 		route.Backends = append(route.Backends, store.RouteBackendRow{
 			MachineID:         m.ID,
 			ExecutionID:       m.CurrentExecutionID,
@@ -1045,8 +1136,13 @@ func (c *Controller) buildRoutes(ctx context.Context) error {
 			AppPort:           port,
 			Weight:            100,
 			Readiness:         m.ObservedReadiness,
-			Draining:          false,
+			Draining:          draining,
 		})
+		// 活跃 generation = 可服务代（PREPARING/ROLLING_BACK 用旧代，
+		// CUTOVER 用新代；无 rollout 时取可服务 backend 的发布代最大值）。
+		if !draining && publishGen > route.Generation {
+			route.Generation = publishGen
+		}
 	}
 
 	active := make([]store.RouteRow, 0, len(grouped))

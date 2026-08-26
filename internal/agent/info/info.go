@@ -118,7 +118,33 @@ func (p *Provider) Response() *pb.ServiceInfoResponse {
 }
 
 func memTotal() uint64 {
-	return readMeminfoField("MemTotal")
+	host := readMeminfoField("MemTotal")
+	// P3/M3：agent 进程常驻在带 memory limit 的 cgroup 里（Nomad task），
+	// firecracker 子进程共享同一限额；硬准入必须按 min(host, cgroup) 计算，
+	// 否则 VM 数量超过 cgroup 限额时会触发 cgroup OOM（M3 真机事故：
+	// task 限额 1GiB，scale 3 + 发布窗口双代共存 → 成波杀 firecracker）。
+	if cg := readCgroupMemMax(); cg > 0 && cg < host {
+		return cg
+	}
+	return host
+}
+
+// readCgroupMemMax 读取当前 cgroup v2 的 memory.max（字节）；无限制或不可读
+// 返回 0。Nomad raw_exec 任务在自身 cgroup 中运行。
+func readCgroupMemMax() uint64 {
+	data, err := os.ReadFile("/sys/fs/cgroup/memory.max")
+	if err != nil {
+		return 0
+	}
+	s := strings.TrimSpace(string(data))
+	if s == "max" || s == "" {
+		return 0
+	}
+	v, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return v / 1024 // KiB，与 meminfo 单位对齐
 }
 
 // sellableMemMib 返回可售内存（MiB）：总量扣除 host 保留（P3-8）。

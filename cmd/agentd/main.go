@@ -22,8 +22,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kernel/hypeman/lib/network"
+
+	"github.com/example/firepaas/internal/agent/health"
 	"github.com/example/firepaas/internal/agent/info"
 	"github.com/example/firepaas/internal/agent/machine"
+	"github.com/example/firepaas/internal/agent/network/slot"
 	"github.com/example/firepaas/internal/agent/proxy"
 	"github.com/example/firepaas/internal/agent/runtime"
 	"github.com/example/firepaas/internal/agent/server"
@@ -120,7 +124,44 @@ func run() error {
 		}
 	}()
 
-	adapter := machine.New(set.Instances, set.Images)
+	// slot 网络后端（ADR-0004 feature flag：bridge|slot，默认 bridge）。
+	// slot 模式启动时先对账：回收孤儿 netns，为存活实例补齐 slot。
+	networkBackend := envOr("FIREPAAS_NETWORK_BACKEND", "bridge")
+	var slotManager *slot.Manager
+	if networkBackend == "slot" {
+		slotManager, err = slot.New(slot.Config{
+			SubnetCIDR: cfg.Network.SubnetCIDR,
+			Gateway:    cfg.Network.SubnetGateway,
+			StatePath:  filepath.Join(cfg.DataDir, "agent", "slots.json"),
+		})
+		if err != nil {
+			return err
+		}
+		if err := slotManager.Load(); err != nil {
+			return err
+		}
+		live := make([]slot.LiveInstance, 0)
+		if listed, err := set.Instances.ListInstances(ensureCtx, nil); err == nil {
+			for i := range listed {
+				inst := &listed[i]
+				id := inst.Name
+				if id == "" {
+					id = inst.Id
+				}
+				live = append(live, slot.LiveInstance{
+					MachineID: id,
+					Tap:       network.GenerateTAPName(inst.Id),
+					GuestIP:   inst.IP,
+				})
+			}
+		}
+		if err := slotManager.Reconcile(ensureCtx, live); err != nil {
+			return fmt.Errorf("slot reconcile: %w", err)
+		}
+		slog.Info("slot network backend active", "slots", slotManager.Count())
+	}
+
+	adapter := machine.New(set.Instances, set.Images, slotManager, health.New())
 	// 已承诺资源（硬准入输入）：实例 Size / Vcpus 之和（M2.2）。
 	listedResources := func() (memMiB uint64, vcpus int) {
 		listCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

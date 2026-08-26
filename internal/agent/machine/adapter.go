@@ -6,6 +6,7 @@ package machine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -14,8 +15,11 @@ import (
 
 	"github.com/kernel/hypeman/lib/images"
 	"github.com/kernel/hypeman/lib/instances"
+	"github.com/kernel/hypeman/lib/network"
 	"github.com/kernel/hypeman/lib/tags"
 
+	"github.com/example/firepaas/internal/agent/health"
+	"github.com/example/firepaas/internal/agent/network/slot"
 	pb "github.com/example/firepaas/shared/gen/agent/v1"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -49,16 +53,24 @@ type ImageManager interface {
 	WaitForReady(ctx context.Context, name string) error
 }
 
-// Adapter 包装 hypeman 的 instance/image manager。
+// Adapter 包装 hypeman 的 instance/image manager。slots 非空时启用 slot
+// 网络后端（ADR-0004）：create 后把 hypeman TAP 移入 slot netns，delete 后回收。
 type Adapter struct {
 	instances InstanceManager
 	images    ImageManager
+	slots     *slot.Manager
+	health    *health.Tracker
 }
 
-// New 构造 Adapter。
-func New(instances InstanceManager, images ImageManager) *Adapter {
-	return &Adapter{instances: instances, images: images}
+// New 构造 Adapter。slotManager 为 nil 时保持 M1 bridge 行为；
+// healthTracker 为 nil 时 readiness 退化为 UNKNOWN/UNCONFIGURED。
+func New(instances InstanceManager, images ImageManager, slotManager *slot.Manager, healthTracker *health.Tracker) *Adapter {
+	return &Adapter{instances: instances, images: images, slots: slotManager, health: healthTracker}
 }
+
+// ErrImageNotFound 表示镜像引用无法解析/拉取（永久性业务错误：重试不会
+// 改变结果）。controller 据此把 create 置为终态 FAILED，避免无限重派。
+var ErrImageNotFound = errors.New("image not found")
 
 // Create 确保镜像就绪后创建 VM。返回的 Machine 只含回显安全字段。
 func (a *Adapter) Create(ctx context.Context, req *pb.CreateMachineRequest) (*pb.Machine, error) {
@@ -66,6 +78,9 @@ func (a *Adapter) Create(ctx context.Context, req *pb.CreateMachineRequest) (*pb
 	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 	if err := a.ensureImageReady(waitCtx, spec.ImageRef); err != nil {
+		if errors.Is(err, images.ErrNotFound) {
+			return nil, fmt.Errorf("%w: %s", ErrImageNotFound, err)
+		}
 		return nil, err
 	}
 
@@ -82,6 +97,15 @@ func (a *Adapter) Create(ctx context.Context, req *pb.CreateMachineRequest) (*pb
 	}
 	sort.Strings(secretKeys)
 
+	// 完整探针策略 JSON 入 tag（ADR-0008）；EXEC 或非法 target 降级为
+	// 未声明（UNCONFIGURED = RUNNING 即 READY）。
+	healthTag := "0"
+	if spec.HealthCheck != nil {
+		if encoded, err := health.EncodePolicy(spec.HealthCheck); err == nil && encoded != "" {
+			healthTag = encoded
+		}
+	}
+
 	sizeBytes := int64(spec.MemMib) * 1024 * 1024
 	overlayBytes := int64(spec.DiskMib) * 1024 * 1024
 	hreq := instances.CreateInstanceRequest{
@@ -97,7 +121,7 @@ func (a *Adapter) Create(ctx context.Context, req *pb.CreateMachineRequest) (*pb
 			tagApp:        spec.AppId,
 			tagDeployment: spec.DeploymentId,
 			tagExecution:  spec.ExecutionId,
-			tagHealth:     healthTag(spec.HealthCheck),
+			tagHealth:     healthTag,
 			tagHostname:   spec.Hostname,
 			tagPort:       ingressPort(spec.Network),
 			tagGeneration: strconv.FormatUint(req.Generation, 10),
@@ -108,6 +132,15 @@ func (a *Adapter) Create(ctx context.Context, req *pb.CreateMachineRequest) (*pb
 	inst, err := a.instances.CreateInstance(ctx, hreq)
 	if err != nil {
 		return nil, fmt.Errorf("hypeman create: %w", err)
+	}
+	if a.slots != nil {
+		// slot 后端：把 hypeman 刚创建的 TAP 移入 slot netns。失败时回收
+		// 刚创建的实例并返回错误（controller 会按退避重试）。
+		tap := network.GenerateTAPName(inst.Id)
+		if _, err := a.slots.Attach(ctx, req.MachineId, tap, inst.IP); err != nil {
+			_ = a.instances.DeleteInstance(ctx, inst.Id)
+			return nil, fmt.Errorf("slot attach: %w", err)
+		}
 	}
 	return mapMachine(inst), nil
 }
@@ -120,7 +153,17 @@ func (a *Adapter) List(ctx context.Context, projectID string) ([]*pb.Machine, er
 	}
 	out := make([]*pb.Machine, 0, len(listed))
 	for _, inst := range listed {
+		if a.health != nil {
+			a.health.Observe(ctx, &inst)
+		}
 		m := mapMachine(&inst)
+		if a.health != nil {
+			id := inst.Name
+			if id == "" {
+				id = inst.Id
+			}
+			m.Readiness, m.LastReadinessChange = a.health.Readiness(id)
+		}
 		if projectID != "" && m.Spec.GetProjectId() != projectID {
 			continue
 		}
@@ -138,6 +181,14 @@ func (a *Adapter) Delete(ctx context.Context, machineID string) error {
 	}
 	if err := a.instances.DeleteInstance(ctx, inst.Id); err != nil {
 		return fmt.Errorf("hypeman delete: %w", err)
+	}
+	if a.slots != nil {
+		if err := a.slots.Release(ctx, machineID); err != nil {
+			return fmt.Errorf("slot release: %w", err)
+		}
+	}
+	if a.health != nil {
+		a.health.Remove(machineID)
 	}
 	return nil
 }
@@ -196,13 +247,6 @@ func redactSecretEnv(env map[string]string, secretKeysTag string) map[string]str
 	return out
 }
 
-func healthTag(h *pb.HealthCheckSpec) string {
-	if h == nil {
-		return "0"
-	}
-	return "1"
-}
-
 func ingressPort(n *pb.NetworkSpec) string {
 	if n == nil || n.IngressPort == 0 {
 		return "8080"
@@ -230,14 +274,14 @@ func mapMachine(inst *instances.Instance) *pb.Machine {
 			spec.Network = &pb.NetworkSpec{IngressPort: port}
 		}
 	}
-	if inst.Tags[tagHealth] == "1" {
+	if inst.Tags[tagHealth] != "" && inst.Tags[tagHealth] != "0" && inst.Tags[tagHealth] != "null" {
+		// 探针策略已在 List 路径注册；回显的 HealthCheckSpec 只用于确认声明存在。
 		spec.HealthCheck = &pb.HealthCheckSpec{}
 	}
 
 	readiness := pb.MachineReadiness_UNKNOWN
 	if spec.HealthCheck == nil {
-		// ADR-0008：未声明 health_check 时上报 UNCONFIGURED，M1 降级为
-		// RUNNING 即 READY。
+		// ADR-0008：未声明 health_check 时上报 UNCONFIGURED，等价 RUNNING 即 READY。
 		readiness = pb.MachineReadiness_UNCONFIGURED
 	}
 

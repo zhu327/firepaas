@@ -100,7 +100,7 @@ func validCreateRequest() *pb.CreateMachineRequest {
 
 func TestAdapterCreateMapping(t *testing.T) {
 	im := &fakeInstances{}
-	a := New(im, &fakeImages{})
+	a := New(im, &fakeImages{}, nil, nil)
 	m, err := a.Create(context.Background(), validCreateRequest())
 	if err != nil {
 		t.Fatal(err)
@@ -137,7 +137,7 @@ func TestAdapterListDoesNotEchoSecrets(t *testing.T) {
 			Tags: map[string]string{tagProject: "p1", tagExecution: "e1", tagSecretKeys: "API_KEY"},
 		}, State: instances.StateRunning},
 	}}
-	a := New(im, &fakeImages{})
+	a := New(im, &fakeImages{}, nil, nil)
 	got, err := a.List(context.Background(), "p1")
 	if err != nil {
 		t.Fatal(err)
@@ -193,7 +193,7 @@ func TestAdapterListProjectFilter(t *testing.T) {
 		{StoredMetadata: instances.StoredMetadata{Id: "i1", Name: "m1", Image: "img", Tags: map[string]string{tagProject: "p1", tagExecution: "e1"}}, State: instances.StateRunning},
 		{StoredMetadata: instances.StoredMetadata{Id: "i2", Name: "m2", Image: "img", Tags: map[string]string{tagProject: "p2", tagExecution: "e2"}}, State: instances.StateStopped},
 	}}
-	a := New(im, &fakeImages{})
+	a := New(im, &fakeImages{}, nil, nil)
 	got, err := a.List(context.Background(), "p1")
 	if err != nil {
 		t.Fatal(err)
@@ -205,7 +205,7 @@ func TestAdapterListProjectFilter(t *testing.T) {
 
 func TestAdapterDeleteResolvesNameToInternalID(t *testing.T) {
 	im := &fakeInstances{}
-	a := New(im, &fakeImages{})
+	a := New(im, &fakeImages{}, nil, nil)
 	if _, err := a.Create(context.Background(), validCreateRequest()); err != nil {
 		t.Fatal(err)
 	}

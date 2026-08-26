@@ -102,7 +102,7 @@ func newTestServer(t *testing.T) (*Server, *state.Ledger, *state.Fences) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	adapter := machine.New(&fakeInstances{byName: map[string]*instances.Instance{}}, fakeImages{})
+	adapter := machine.New(&fakeInstances{byName: map[string]*instances.Instance{}}, fakeImages{}, nil, nil)
 	provider := info.New("test-node", "test", "test", "compute", "v1.14.2", "10.100.0.0/16", dir, nil, nil)
 	return New(adapter, ledger, fences, provider), ledger, fences
 }

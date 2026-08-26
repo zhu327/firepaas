@@ -90,6 +90,11 @@ func (s *Server) CreateMachine(ctx context.Context, req *pb.CreateMachineRequest
 
 	m, err := s.machines.Create(ctx, req)
 	if err != nil {
+		// 镜像不可解析/拉取是永久性错误：InvalidArgument 让 controller 停止
+		// 无限重派（发布失败自动回滚依赖这一点快速触发）。
+		if errors.Is(err, machine.ErrImageNotFound) {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	resp := &pb.CreateMachineResponse{Machine: m}

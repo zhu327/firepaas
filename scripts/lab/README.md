@@ -64,21 +64,22 @@ sudo bash scripts/bench-hypeman.sh density 16
   `/home/zty/Learn/firepaas/scripts/lab/hypeman-p0.yaml`。
 - hypeman 的 `data_dir` 是 `/var/lib/firepaas-p0/hypeman`（root 所有）。
 
-## M2（当前开发）
+## M3（当前开发）
 
-M2 调度与收敛（ADR-0014）：Nomad 节点发现 + 先过滤后打分 Best-of-K +
-Redis 预约 + PG advisory lock leader + reconcile 决策表 + 仿真与混沌。
+M3 正式 slot 数据面 + 多副本 + 滚动发布（ADR-0004/0015）：
 
 ```bash
 bash scripts/lab/gen-certs.sh        # 生成静态 mTLS 证书（gitignore）
-make sim                             # 10 万次放置仿真断言
-sudo bash scripts/lab/e2e-m2.sh      # 1000 并发幂等/多 ordinal/20 轮无泄漏
-sudo bash scripts/lab/chaos-m2.sh    # ACK 丢失/agent crash/Redis 清空/API crash
+sudo bash scripts/lab/e2e-m3.sh      # 一键 M3 验收（U1/U2/U3/隔离/无泄漏）
 
-sudo bash scripts/lab/run-agentd.sh  # 仅部署 firepaas-agentd（system job，root）
-curl -H 'Authorization: Bearer <token>' http://127.0.0.1:8080/v1/nodes   # 节点投影
-curl http://127.0.0.1:8080/metrics   # 调度/对账计数器
+FP_API_ADDR=http://127.0.0.1:8080 FP_API_TOKEN=<token> fpctl app create \
+  --hostname nginx.firepaas.local --image docker.io/library/nginx:alpine --port 80
+fpctl app status <app_id>            # 最小 CLI（deploy/scale/rollback/delete）
 ```
+
+slot 网络后端由 agentd 环境变量 `FIREPAAS_NETWORK_BACKEND=bridge|slot` 控制
+（agentd-single.hcl 默认 slot）。guest 隔离由 root ns nftables 表
+`fp-isolation` 保证（O(1) ifname 集合，只增删自有表/规则）。
 
 `firepaas-agentd` 与 `firepaas-hypeman-p0` 互斥（共享 data_dir），需要回退 P0 时先
 `nomad job stop firepaas-agentd` 再运行 `scripts/lab/run-p0.sh`。
@@ -110,16 +111,19 @@ fork p95 660ms、micro 密度 32（网络带宽准入上限）。
 
 均已确认与本机现有 k8s/桌面服务不冲突。
 
-## M2 vertical slice（补充）
+## M3 vertical slice（补充）
 
-M2 新增脚本/文件（详见 `docs/plans/2026-08-25-m2-single-node.md`）：
+M3 新增（详见 `docs/plans/2026-08-26-m3-single-node.md`）：
 
 ```
-e2e-m2.sh          # 一键 M2 验收：1000 并发幂等/多 ordinal/20 轮无泄漏
-chaos-m2.sh        # 混沌验收：ACK 丢失/agent crash/Redis 清空/API crash
+e2e-m3.sh          # 一键 M3 验收：U1/隔离/U2 发布与回滚/U3/1000 次 slot 无泄漏
+fpctl              # app CLI（create/list/status/deploy/scale/rollback/delete）
 ```
 
-注意：重建 agentd 二进制后，`nomad job run` 不会重启已运行的 raw_exec 任务；
-用 `nomad job restart firepaas-agentd` 原地重启（e2e 脚本已内置）。
-graceful restart（SIGTERM）不杀 VM（新 agentd 会收养）；crash 注入需同时
-kill agentd 与 firecracker 子进程（chaos-m2 已内置）。
+注意事项：
+- 重建 agentd 二进制后用 `nomad job restart firepaas-agentd` 原地重启；
+  SIGTERM 会带走 VM（hypeman teardown），重建由 controller 收敛——这正是
+  e2e-m3 步骤 10 的验收项。
+- agentd task 内存限额（agentd-single.hcl）必须覆盖双代共存峰值；agent 硬
+  准入按 min(host, cgroup memory.max) 计算。
+- slot 泄漏回归测试：`sudo FIREPAAS_TEST_NETNS=1 go test ./internal/agent/network/slot/`。

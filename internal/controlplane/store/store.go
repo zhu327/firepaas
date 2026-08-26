@@ -990,6 +990,13 @@ func jsonEqual(a, b []byte) bool {
 
 type scanner interface{ Scan(dest ...any) error }
 
+// machineColumns 是所有 machine 扫描路径的公共列序（与 scanMachine 对齐）。
+const machineColumns = `id, app_id, deployment_id, replica_ordinal, hostname,
+	desired_state, generation, current_execution_id, requested_vcpu,
+	requested_mem_mib, ingress_port, image_ref, coalesce(env::text,'{}'),
+	coalesce(placement::text,'null'), node_id, observed_state, observed_slot_ip,
+	observed_readiness, last_observed_at, created_at, updated_at`
+
 func scanMachines(rows pgx.Rows) ([]Machine, error) {
 	var out []Machine
 	for rows.Next() {

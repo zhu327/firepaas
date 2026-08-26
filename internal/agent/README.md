@@ -5,7 +5,8 @@ cmd/agentd/                 # 入口:配置/启动 gRPC + 后台控制器
 internal/agent/server/      # gRPC 服务实现(InfoService/MachineService/ImageService)
 internal/agent/machine/     # 包装 hypeman lib/instances 的 Machine 生命周期
 internal/agent/image/       # 包装 hypeman lib/images + 本地缓存
-internal/agent/network/     # workload endpoint 抽象：M1 bridge adapter，M3 netns slot
+internal/agent/network/slot/# M3 slot 管理器：netns/veth/TAP/nftables 原子管理
+internal/agent/health/      # M3 host 侧 readiness 探针(ADR-0008)
 internal/agent/proxy/       # M1 起唯一流量入口，edge mTLS + execution/credential 校验
 internal/agent/info/        # 容量/用量采集(基于 hypeman lib/resources + lib/vm_metrics)
 internal/agent/state/       # agent operation ledger + 崩溃恢复缓存(非业务源真相)

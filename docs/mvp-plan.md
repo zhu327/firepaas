@@ -253,6 +253,46 @@ CLAIMED 回收窗口为 30s 定时器（非精确租约）。
 - U3：`scale 3` 在可用节点间放置（候选充足时副本不落同节点，候选不足时降级并产生调度事件，ADR-0009）；杀掉一个无状态 VM 后 controller 仅重建缺失 ordinal；
 - catalog 过期、backend 失联、route 更新期间 edge 受控返回/重试，不向 stale execution 转发。
 
+### 单机执行记录（2026-08-26，ADR-0015）
+
+单机折叠版 M3 已交付（跨节点放置/反亲和验收 DEFERRED-MULTI-NODE）：
+
+- M3.1 slot 网络：`internal/agent/network/slot`——每 VM 一个 netns（veth/30
+  桥接+TAP 移入+独立网关）、slot 内一级 NAT、root 侧 nftables O(1) 隔离
+  （INPUT 默认拒 guest、FORWARD 拒私网/组播、10.12/16 出口 masquerade）、
+  /32 guest 路由代理通道；`FIREPAAS_NETWORK_BACKEND=bridge|slot` 灰度开关；
+  1000 次 attach/release 与 agent 重启 reconcile 无泄漏（含回归测试）。
+- M3.2 readiness（ADR-0008）：`internal/agent/health` 复用 hypeman
+  lib/healthcheck 阈值语义，策略 base64url 存 tag；READY/NOT_READY 随
+  ListMachines 上报并投影进 route_backends（真机验证 READY/NOT_READY 分流）。
+- M3.3 app/deployment/replica：migration 0006（deployments/rollouts 表 +
+  machine 唯一键放宽为 (app_id, ordinal, deployment_id)）；AppController
+  稳定 ordinal 对账；REST /v1/apps 全套 + fpctl CLI。
+- M3.4 发布状态机（ADR-0015）：PREPARING→CUTOVER→COMPLETE / 失败
+  ROLLING_BACK；全部目标 ordinal RUNNING+READY 才切流；旧代 draining、
+  drain 期限后回收；单 rollout 互斥（唯一部分索引 + 409）；坏镜像
+  create InvalidArgument 快速终态 → 自动回滚。
+- M3.5 验收：`sudo bash scripts/lab/e2e-m3.sh` PASS（U1/隔离/U2 成功与
+  失败发布/U3 重建/1000 次 slot 无泄漏/agent 重启收敛全部通过）。
+
+真机验收修掉的关键 bug：
+1. **Nomad task cgroup 内存限额（1GiB）成波杀 firecracker**——agent 硬准入
+   改为 min(host, cgroup memory.max)，task 限额提到 16GiB。
+2. rollout 时间戳解析（PG 文本格式 ≠ RFC3339）导致 PREPARING 立即超时回滚。
+3. machine 唯一键用 generation 会被 R3 换代重建的 fence +1 撞坏——改用
+   deployment_id 轴；AppController 的 have 判断同样改 deployment 轴。
+4. 镜像不可拉取映射为 InvalidArgument（永久错误），否则失败发布靠 5 分钟
+   超时才回滚且无限重派。
+5. slot Reconcile 遇僵尸 guest 目录 crash-loop agentd——降级容错
+   （attach 失败记日志继续，TAP 不在 root 时跳过）。
+6. app 删除必须墓碑化（replicas=0 + deployment SUPERSEDED），否则 scale
+   对账会无限重建副本。
+
+遗留（进入 M4 前）：EXEC 探针不支持（需 vsock 通道）；registry LRU/预热与
+共享 registry 部署物 DEFERRED；NetworkManager 会在 root ns 对新 TAP 短暂
+“assume connection”（无实测危害，M4 记录）；agentd 重启（SIGTERM）当前会
+带走 VM（hypeman teardown），重建由 R1-R8 收敛（chaos 验收已覆盖）。
+
 ## 8. M4：安全入口、proxy hardening 与条件弹性（6–8 周）
 
 ### 目标
