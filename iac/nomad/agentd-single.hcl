@@ -13,6 +13,9 @@ job "firepaas-agentd" {
       port "grpc" {
         static = 5108
       }
+      port "proxy" {
+        static = 5107
+      }
     }
 
     service {
@@ -24,6 +27,18 @@ job "firepaas-agentd" {
         name     = "agentd-grpc"
         interval = "20s"
         timeout  = "5s"
+      }
+    }
+
+    service {
+      name     = "firepaas-agentd-proxy"
+      port     = "proxy"
+      provider = "nomad"
+      check {
+        type     = "tcp"
+        name     = "agentd-proxy"
+        interval = "30s"
+        timeout  = "1s"
       }
     }
 
@@ -46,6 +61,7 @@ job "firepaas-agentd" {
         CONFIG_PATH                  = "/home/zty/Learn/firepaas/scripts/lab/agentd.yaml"
         HYPEMAN_DOCKER_HUB_MIRROR    = "docker.m.daocloud.io"
         FIREPAAS_AGENT_GRPC_PORT     = "5108"
+        FIREPAAS_AGENT_PROXY_PORT    = "5107"
         FIREPAAS_AGENT_NODE_POOL     = "compute"
         FIREPAAS_AGENT_NODE_ID       = "${node.unique.name}"
       }

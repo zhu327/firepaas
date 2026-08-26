@@ -1,0 +1,375 @@
+// Package store 是控制面的 PG 持久层（M1.5 最小实现）。
+// desired/business truth 只在这里落库；Redis 投影见 catalog 包。
+package store
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Store 聚合 PG 访问。
+type Store struct {
+	pool *pgxpool.Pool
+}
+
+// New 构造 Store。
+func New(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
+
+// Machine 是 machines 表行。
+type Machine struct {
+	ID                 string
+	AppID              string
+	DeploymentID       string
+	ReplicaOrdinal     int
+	Hostname           string
+	DesiredState       string
+	Generation         int64
+	CurrentExecutionID string
+	RequestedVCPU      int64
+	RequestedMemMIB    int64
+	IngressPort        int
+	ImageRef           string
+	Env                map[string]string
+	NodeID             string
+	ObservedState      string
+	ObservedSlotIP     string
+	ObservedReadiness  string
+	LastObservedAt     *time.Time
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
+}
+
+// Operation 是 operations 表行。
+type Operation struct {
+	ID          string
+	ProjectID   string
+	MachineID   string
+	ExecutionID string
+	Generation  int64
+	Kind        string
+	Status      string
+	Request     json.RawMessage
+	Result      json.RawMessage
+	Error       string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+// EnsureProject 幂等创建 project（M1 dev 用）。
+func (s *Store) EnsureProject(ctx context.Context, id, name string) error {
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO projects(id, name) VALUES($1,$2) ON CONFLICT (id) DO NOTHING`, id, name)
+	return err
+}
+
+// EnsureAppAndEnqueueCreate 在事务中保证 app + machine 期望行存在，并登记 create 操作。
+// 相同 (project_id, idempotency_key) 的操作重复提交直接返回已有操作，不产生第二个副本。
+func (s *Store) EnsureAppAndEnqueueCreate(
+	ctx context.Context,
+	projectID, appID, hostname, imageRef string,
+	vcpu, memMIB int64, ingressPort int,
+	machineID, deploymentID, executionID, operationID string,
+	generation int64,
+	requestJSON []byte,
+) (Operation, error) {
+	var op Operation
+	err := s.inTx(ctx, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO apps(id, project_id, hostname, image_ref, vcpu, mem_mib)
+			VALUES($1,$2,$3,$4,$5,$6)
+			ON CONFLICT (id) DO UPDATE SET image_ref=EXCLUDED.image_ref,
+				vcpu=EXCLUDED.vcpu, mem_mib=EXCLUDED.mem_mib, updated_at=now()`,
+			appID, projectID, hostname, imageRef, vcpu, memMIB); err != nil {
+			return fmt.Errorf("upsert app: %w", err)
+		}
+
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO machines(id, app_id, deployment_id, replica_ordinal, hostname,
+				desired_state, generation, current_execution_id, requested_vcpu,
+				requested_mem_mib, image_ref, node_id, ingress_port)
+			VALUES($1,$2,$3,0,$4,'CREATED',$5,$6,$7,$8,$9,'',$10)
+			ON CONFLICT (id) DO UPDATE SET desired_state='CREATED',
+				generation=EXCLUDED.generation,
+				current_execution_id=EXCLUDED.current_execution_id,
+				ingress_port=EXCLUDED.ingress_port,
+				updated_at=now()`,
+			machineID, appID, deploymentID, hostname, generation, executionID, vcpu, memMIB, imageRef, ingressPort); err != nil {
+			return fmt.Errorf("upsert machine: %w", err)
+		}
+
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO operations(id, project_id, machine_id, execution_id, generation,
+				kind, idempotency_key, status, request)
+			VALUES($1,$2,$3,$4,$5,'create',$1,'PENDING',$6::jsonb)
+			ON CONFLICT (project_id, idempotency_key) DO NOTHING`,
+			operationID, projectID, machineID, executionID, generation, string(requestJSON)); err != nil {
+			return fmt.Errorf("enqueue create: %w", err)
+		}
+
+		return tx.QueryRow(ctx, `
+			SELECT id, project_id, machine_id, execution_id, generation, kind, status,
+				coalesce(request::text,'{}'), coalesce(result::text,'{}'), coalesce(error,''),
+				created_at, updated_at
+			FROM operations WHERE project_id=$1 AND idempotency_key=$2`,
+			projectID, operationID).
+			Scan(&op.ID, &op.ProjectID, &op.MachineID, &op.ExecutionID, &op.Generation,
+				&op.Kind, &op.Status, &op.Request, &op.Result, &op.Error,
+				&op.CreatedAt, &op.UpdatedAt)
+	})
+	if err != nil {
+		return Operation{}, err
+	}
+	return op, nil
+}
+
+// EnqueueDelete 登记 delete 操作。
+func (s *Store) EnqueueDelete(ctx context.Context, projectID, machineID, executionID, operationID string, generation int64, requestJSON []byte) (Operation, error) {
+	var op Operation
+	err := s.inTx(ctx, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO operations(id, project_id, machine_id, execution_id, generation,
+				kind, idempotency_key, status, request)
+			VALUES($1,$2,$3,$4,$5,'delete',$1,'PENDING',$6::jsonb)
+			ON CONFLICT (project_id, idempotency_key) DO NOTHING`,
+			operationID, projectID, machineID, executionID, generation, string(requestJSON)); err != nil {
+			return fmt.Errorf("enqueue delete: %w", err)
+		}
+		return tx.QueryRow(ctx, `
+			SELECT id, project_id, machine_id, execution_id, generation, kind, status,
+				coalesce(request::text,'{}'), coalesce(result::text,'{}'), coalesce(error,''),
+				created_at, updated_at
+			FROM operations WHERE project_id=$1 AND idempotency_key=$2`,
+			projectID, operationID).
+			Scan(&op.ID, &op.ProjectID, &op.MachineID, &op.ExecutionID, &op.Generation,
+				&op.Kind, &op.Status, &op.Request, &op.Result, &op.Error,
+				&op.CreatedAt, &op.UpdatedAt)
+	})
+	if err != nil {
+		return Operation{}, err
+	}
+	return op, nil
+}
+
+// ClaimPendingOperations 领取最多 limit 个 PENDING 操作（skip locked）。
+func (s *Store) ClaimPendingOperations(ctx context.Context, limit int) ([]Operation, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, project_id, machine_id, execution_id, generation, kind, status,
+			coalesce(request::text,'{}'), coalesce(result::text,'{}'), coalesce(error,''),
+			created_at, updated_at
+		FROM operations
+		WHERE status='PENDING'
+		ORDER BY created_at
+		LIMIT $1
+		FOR UPDATE SKIP LOCKED`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("claim ops: %w", err)
+	}
+	defer rows.Close()
+
+	var ops []Operation
+	for rows.Next() {
+		var op Operation
+		if err := rows.Scan(&op.ID, &op.ProjectID, &op.MachineID, &op.ExecutionID, &op.Generation,
+			&op.Kind, &op.Status, &op.Request, &op.Result, &op.Error,
+			&op.CreatedAt, &op.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan op: %w", err)
+		}
+		ops = append(ops, op)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for i := range ops {
+		_, err := s.pool.Exec(ctx, `UPDATE operations SET status='CLAIMED', claimed_at=now(), updated_at=now() WHERE id=$1`, ops[i].ID)
+		if err != nil {
+			return nil, fmt.Errorf("mark claimed %s: %w", ops[i].ID, err)
+		}
+		ops[i].Status = "CLAIMED"
+	}
+	return ops, nil
+}
+
+// RequeueOperation 把失败操作放回 PENDING 供下次重试（agent 暂时不可达等）。
+func (s *Store) RequeueOperation(ctx context.Context, opID, opErr string) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE operations SET status='PENDING', error=$1, claimed_at=NULL, updated_at=now()
+		WHERE id=$2`, opErr, opID)
+	if err != nil {
+		return fmt.Errorf("requeue op %s: %w", opID, err)
+	}
+	return nil
+}
+
+// CompleteOperation 记录操作结果。
+func (s *Store) CompleteOperation(ctx context.Context, opID, statusText string, result []byte, opErr string) error {
+	if opErr != "" && statusText == "SUCCEEDED" {
+		statusText = "FAILED"
+	}
+	_, err := s.pool.Exec(ctx, `
+		UPDATE operations SET status=$1, result=$2::jsonb, error=$3,
+			completed_at=now(), updated_at=now()
+		WHERE id=$4`,
+		statusText, string(result), opErr, opID)
+	if err != nil {
+		return fmt.Errorf("complete op %s: %w", opID, err)
+	}
+	return nil
+}
+
+// ListMachines 返回所有（或按 project）machine。
+func (s *Store) ListMachines(ctx context.Context, projectID string) ([]Machine, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT m.id, m.app_id, m.deployment_id, m.replica_ordinal, m.hostname,
+			m.desired_state, m.generation, m.current_execution_id,
+			m.requested_vcpu, m.requested_mem_mib, m.ingress_port, m.image_ref,
+			coalesce(m.env::text,'{}'), coalesce(m.node_id,''),
+			coalesce(m.observed_state,''), coalesce(m.observed_slot_ip,''),
+			coalesce(m.observed_readiness,''), m.last_observed_at,
+			m.created_at, m.updated_at
+		FROM machines m
+		JOIN apps a ON a.id = m.app_id
+		WHERE ($1='' OR a.project_id=$1)
+		ORDER BY m.created_at`, projectID)
+	if err != nil {
+		return nil, fmt.Errorf("list machines: %w", err)
+	}
+	defer rows.Close()
+	return scanMachines(rows)
+}
+
+// GetMachine 按 id 查询。
+func (s *Store) GetMachine(ctx context.Context, id string) (*Machine, error) {
+	row := s.pool.QueryRow(ctx, `
+		SELECT m.id, m.app_id, m.deployment_id, m.replica_ordinal, m.hostname,
+			m.desired_state, m.generation, m.current_execution_id,
+			m.requested_vcpu, m.requested_mem_mib, m.ingress_port, m.image_ref,
+			coalesce(m.env::text,'{}'), coalesce(m.node_id,''),
+			coalesce(m.observed_state,''), coalesce(m.observed_slot_ip,''),
+			coalesce(m.observed_readiness,''), m.last_observed_at,
+			m.created_at, m.updated_at
+		FROM machines m WHERE m.id=$1`, id)
+	m, err := scanMachine(row)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get machine: %w", err)
+	}
+	return m, nil
+}
+
+// UpdateMachineObserved 写入 agent 观测状态。
+func (s *Store) UpdateMachineObserved(ctx context.Context, id, executionID, state, slotIP, readiness string) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE machines SET observed_state=$1, observed_slot_ip=$2, observed_readiness=$3,
+			last_observed_at=now(), updated_at=now()
+		WHERE id=$4`,
+		state, slotIP, readiness, id)
+	if err != nil {
+		return fmt.Errorf("update observed %s: %w", id, err)
+	}
+	return nil
+}
+
+// MarkMachineDeleted 更新期望状态为 DELETED。
+func (s *Store) MarkMachineDeleted(ctx context.Context, id string) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE machines SET desired_state='DELETED', updated_at=now() WHERE id=$1`, id)
+	if err != nil {
+		return fmt.Errorf("mark deleted %s: %w", id, err)
+	}
+	return nil
+}
+
+// ActiveRouteMachines 返回可用于路由投影的 machines（desired=CREATED 且已观测）。
+func (s *Store) ActiveRouteMachines(ctx context.Context) ([]Machine, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT m.id, m.app_id, m.deployment_id, m.replica_ordinal, m.hostname,
+			m.desired_state, m.generation, m.current_execution_id,
+			m.requested_vcpu, m.requested_mem_mib, m.ingress_port, m.image_ref,
+			coalesce(m.env::text,'{}'), coalesce(m.node_id,''),
+			coalesce(m.observed_state,''), coalesce(m.observed_slot_ip,''),
+			coalesce(m.observed_readiness,''), m.last_observed_at,
+			m.created_at, m.updated_at
+		FROM machines m
+		WHERE m.desired_state IN ('CREATED','RUNNING') AND m.observed_state<>''`)
+	if err != nil {
+		return nil, fmt.Errorf("active route machines: %w", err)
+	}
+	defer rows.Close()
+	return scanMachines(rows)
+}
+
+// RouteTarget 是当前应有路由投影的 (hostname, port)。
+type RouteTarget struct {
+	Hostname string
+	Port     int
+}
+
+// ListRouteTargets 返回当前应有路由投影的 hostname+port 组合。
+func (s *Store) ListRouteTargets(ctx context.Context) ([]RouteTarget, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT hostname, ingress_port FROM machines
+		WHERE desired_state IN ('CREATED','RUNNING') AND observed_state<>''`)
+	if err != nil {
+		return nil, fmt.Errorf("list route targets: %w", err)
+	}
+	defer rows.Close()
+	var out []RouteTarget
+	for rows.Next() {
+		var rt RouteTarget
+		if err := rows.Scan(&rt.Hostname, &rt.Port); err != nil {
+			return nil, err
+		}
+		out = append(out, rt)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) inTx(ctx context.Context, fn func(pgx.Tx) error) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+type scanner interface{ Scan(dest ...any) error }
+
+func scanMachines(rows pgx.Rows) ([]Machine, error) {
+	var out []Machine
+	for rows.Next() {
+		m, err := scanMachine(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *m)
+	}
+	return out, rows.Err()
+}
+
+func scanMachine(row scanner) (*Machine, error) {
+	var m Machine
+	var envJSON string
+	err := row.Scan(&m.ID, &m.AppID, &m.DeploymentID, &m.ReplicaOrdinal, &m.Hostname,
+		&m.DesiredState, &m.Generation, &m.CurrentExecutionID,
+		&m.RequestedVCPU, &m.RequestedMemMIB, &m.IngressPort, &m.ImageRef,
+		&envJSON, &m.NodeID, &m.ObservedState, &m.ObservedSlotIP,
+		&m.ObservedReadiness, &m.LastObservedAt, &m.CreatedAt, &m.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	if envJSON != "" && envJSON != "null" {
+		_ = json.Unmarshal([]byte(envJSON), &m.Env)
+	}
+	return &m, nil
+}

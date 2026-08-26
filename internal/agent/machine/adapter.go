@@ -7,6 +7,7 @@ package machine
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/kernel/hypeman/lib/images"
@@ -23,6 +24,8 @@ const (
 	tagDeployment = "firepaas/deployment_id"
 	tagExecution  = "firepaas/execution_id"
 	tagHealth     = "firepaas/health_check"
+	tagHostname   = "firepaas/hostname"
+	tagPort       = "firepaas/port"
 )
 
 // InstanceManager 是 Adapter 需要的 hypeman instance 能力子集。
@@ -84,6 +87,8 @@ func (a *Adapter) Create(ctx context.Context, req *pb.CreateMachineRequest) (*pb
 			tagDeployment: spec.DeploymentId,
 			tagExecution:  spec.ExecutionId,
 			tagHealth:     healthTag(spec.HealthCheck),
+			tagHostname:   spec.Hostname,
+			tagPort:       ingressPort(spec.Network),
 		},
 	}
 
@@ -124,6 +129,29 @@ func (a *Adapter) Delete(ctx context.Context, machineID string) error {
 	return nil
 }
 
+// GetEndpoint 解析 proxy 需要的 workload endpoint（M1 bridge guest IP）。
+// 校验 execution_id 与 tags 一致，防止 edge 向 stale execution 转发。
+func (a *Adapter) GetEndpoint(ctx context.Context, machineID, executionID string) (ip string, port int, err error) {
+	inst, err := a.instances.GetInstance(ctx, machineID)
+	if err != nil {
+		return "", 0, fmt.Errorf("get instance %s: %w", machineID, err)
+	}
+	if executionID != "" && inst.Tags[tagExecution] != executionID {
+		return "", 0, fmt.Errorf("execution mismatch for %s: want %s got %s",
+			machineID, executionID, inst.Tags[tagExecution])
+	}
+	if inst.IP == "" {
+		return "", 0, fmt.Errorf("instance %s has no workload endpoint yet", machineID)
+	}
+	port = 8080
+	if portStr := inst.Tags[tagPort]; portStr != "" {
+		if p, err := strconv.Atoi(portStr); err == nil && p > 0 {
+			port = p
+		}
+	}
+	return inst.IP, port, nil
+}
+
 func (a *Adapter) ensureImageReady(ctx context.Context, imageRef string) error {
 	if _, err := a.images.CreateImage(ctx, images.CreateImageRequest{Name: imageRef}); err != nil {
 		// 已在队列/已存在等错误继续等待 ready。
@@ -141,17 +169,30 @@ func healthTag(h *pb.HealthCheckSpec) string {
 	return "1"
 }
 
+func ingressPort(n *pb.NetworkSpec) string {
+	if n == nil || n.IngressPort == 0 {
+		return "8080"
+	}
+	return strconv.FormatUint(n.IngressPort, 10)
+}
+
 func mapMachine(inst *instances.Instance) *pb.Machine {
 	spec := &pb.MachineSpec{
 		ProjectId:    inst.Tags[tagProject],
 		AppId:        inst.Tags[tagApp],
 		DeploymentId: inst.Tags[tagDeployment],
 		ExecutionId:  inst.Tags[tagExecution],
+		Hostname:     inst.Tags[tagHostname],
 		ImageRef:     inst.Image,
 		Vcpu:         uint64(inst.Vcpus),
 		MemMib:       uint64(inst.Size / (1024 * 1024)),
 		DiskMib:      uint64(inst.OverlaySize / (1024 * 1024)),
 		Env:          inst.Env,
+	}
+	if portStr := inst.Tags[tagPort]; portStr != "" {
+		if port, err := strconv.ParseUint(portStr, 10, 32); err == nil {
+			spec.Network = &pb.NetworkSpec{IngressPort: port}
+		}
 	}
 	if inst.Tags[tagHealth] == "1" {
 		spec.HealthCheck = &pb.HealthCheckSpec{}

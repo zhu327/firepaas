@@ -120,6 +120,7 @@ message MachineSpec {
   reserved 15; // 原 traffic_access_token；凭证不得进入会被 Machine 回显的 MachineSpec
   repeated SecretRef secret_refs = 17; // secret 引用,值经 secret_env 一次性下发
   PlacementConstraints placement = 18;  // 放置约束(ADR-0009),agent 不消费决策,仅记录
+  string hostname = 19;                 // M1 vertical slice 用;M3 route 冻结时转正(ADR-0005)
 }
 
 // SecretRef 引用控制面 secrets 表中的一个版本化 secret(ADR-0010)。

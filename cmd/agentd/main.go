@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/example/firepaas/internal/agent/info"
 	"github.com/example/firepaas/internal/agent/machine"
+	"github.com/example/firepaas/internal/agent/proxy"
 	"github.com/example/firepaas/internal/agent/runtime"
 	"github.com/example/firepaas/internal/agent/server"
 	"github.com/example/firepaas/internal/agent/state"
@@ -43,6 +45,7 @@ func main() {
 
 func run() error {
 	port := envOr("FIREPAAS_AGENT_GRPC_PORT", "5108")
+	proxyPort := envOr("FIREPAAS_AGENT_PROXY_PORT", "5107")
 	nodePool := envOr("FIREPAAS_AGENT_NODE_POOL", "compute")
 	nodeID := envOr("FIREPAAS_AGENT_NODE_ID", hostnameOr("firepaas-node"))
 	fcVersion := envOr("FIREPAAS_AGENT_FIRECRACKER_VERSION", "v1.14.2")
@@ -85,7 +88,7 @@ func run() error {
 	pb.RegisterInfoServiceServer(grpcServer, srv)
 	pb.RegisterMachineServiceServer(grpcServer, srv)
 
-	errCh := make(chan error, 1)
+	errCh := make(chan error, 2)
 	go func() {
 		slog.Info("agentd gRPC listening", "port", port, "node_id", nodeID, "node_pool", nodePool)
 		if err := grpcServer.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
@@ -95,13 +98,26 @@ func run() error {
 		errCh <- nil
 	}()
 
+	proxyHandler := proxy.New(adapter)
+	proxyServer := &http.Server{Addr: ":" + proxyPort, Handler: proxyHandler}
+	go func() {
+		slog.Info("agentd workload proxy listening", "port", proxyPort)
+		if err := proxyServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+		}
+	}()
+
 	select {
 	case <-ctx.Done():
 		slog.Info("agentd shutting down")
 		grpcServer.GracefulStop()
+		_ = proxyServer.Close()
 		return nil
 	case err := <-errCh:
-		return err
+		if err != nil {
+			return err
+		}
+		return nil
 	}
 }
 
