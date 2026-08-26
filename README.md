@@ -19,13 +19,18 @@
 
 ```
 firepaas/
-├── control-plane/       # 新写:控制面 API + 调度器 + 节点管理 + 预约
-├── agent/               # 从 hypeman 抽取:每节点 gRPC agent(VM/镜像/网络数据面)
-├── edge/                # 新写:边缘路由(TLS + catalog 路由 + 自动唤醒)
-├── shared/              # proto 生成代码、ID/错误/存储客户端等公共库（M1 默认并入单根 module）
-├── protos/agent/v1/     # agent gRPC 契约(唯一数据面契约)
-├── iac/                 # Nomad jobs + Terraform(参考 e2b-dev/infra 裁剪)
-├── tools/               # CLI、调度仿真器
+├── cmd/agentd/          # 每节点 gRPC agent（VM/镜像/网络数据面）
+├── cmd/api/             # 控制面 API + 调度器 + 节点管理 + 预约
+├── cmd/edge-proxy/      # 边缘路由（TLS + catalog 路由 + 自动唤醒）
+├── cmd/m0-spike/        # M0.4 agent adapter spike（实际调用 hypeman lib）
+├── internal/agent/      # agent 实现（server/machine/network/proxy/state）
+├── internal/controlplane/ # 控制面实现（api/db/store/controllers/...）
+├── internal/edge/       # edge 实现（router/catalog/autoresume/tls）
+├── internal/scheduler/  # Best-of-K 放置算法
+├── shared/pkg/          # ID/错误等公共库
+├── shared/gen/          # proto 生成代码（make proto，不提交）
+├── protos/agent/v1/     # agent gRPC 契约（唯一数据面契约）
+├── iac/                 # Nomad jobs + Terraform（参考 e2b-dev/infra 裁剪）
 ├── scripts/             # 实验室搭建、基准测试脚本
 └── docs/                # 架构、MVP 方案、ADR
 ```
@@ -69,9 +74,11 @@ retag，再 `docker compose -f iac/dev/docker-compose.yaml up -d`。
 
 ## Go 工程策略
 
-当前使用占位 module path `github.com/example/firepaas/*`。M1 工程基线默认收敛为**一个根 `go.mod` + 多个 `cmd/*`**；如确有独立版本/依赖隔离需求才保留多 module，并以 ADR 记录。正式建仓时替换组织路径。
+当前为**单根 module**（`github.com/example/firepaas`，占位组织路径，正式建仓时替换）：
+`go.mod` + 多个 `cmd/*` + `internal/*`。如确有独立版本/依赖隔离需求再拆 module，并以 ADR 记录。
 
-本地 `go.work` 可引用同级 `../hypeman` 做联调；CI/release 必须以 pin 到具体 commit/tag 的 hypeman 依赖执行 `GOWORK=off` 构建，避免发布结果随工作区漂移。
+本地根 `go.work` 引用同级 `../hypeman` 做联调；CI/release 必须 pin 具体 commit/tag，
+并以 `GOWORK=off` 走根 `go.mod` 的 replace 构建，避免发布结果随工作区漂移。
 
 ## 核心原则(来自可行性分析)
 

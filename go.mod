@@ -1,16 +1,14 @@
-module github.com/example/firepaas/agent
+module github.com/example/firepaas
 
 go 1.25.4
 
-// P1 阶段按需添加依赖:
-//   github.com/kernel/hypeman  (本地 replace => ../../hypeman,先 import lib/hypervisor 与 lib/instances)
-//   google.golang.org/grpc
-//   google.golang.org/protobuf
-
-// 本地开发用 go.work 引用 ../hypeman（根 go.work）。
-// 独立构建/CI 用 GOWORK=off 时走下面 replace 指向同级 checkout；
-// 发布前必须改为 pin 具体 commit/tag（见 agent/internal/README.md）。
-replace github.com/kernel/hypeman => ../../hypeman
+// 占位组织路径：正式建仓时替换（见 README 工程策略）。
+//
+// hypeman 依赖策略：
+//   - 本地开发：go.work use ../hypeman（根 go.work）
+//   - 独立构建/CI：GOWORK=off 时走下面的 replace 指向同级 checkout
+//   - 发布：必须 pin 具体 commit/tag 并删除 replace（CI 检查）
+replace github.com/kernel/hypeman => ../hypeman
 
 require github.com/kernel/hypeman v0.3.0
 

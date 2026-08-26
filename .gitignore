@@ -29,8 +29,8 @@ iac/terraform/**/*.tfvars
 .vscode/
 .DS_Store
 
-# Built command binaries
-/agent/agentd
-/agent/m0-spike
-/control-plane/api
-/edge/edge-proxy
+# Built command binaries (usually built via scripts/lab into ~/.local/firepaas-lab)
+/agentd
+/api
+/edge-proxy
+/m0-spike
