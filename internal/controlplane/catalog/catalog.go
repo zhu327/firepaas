@@ -160,3 +160,20 @@ func hostIndexKey(hostname string) string {
 func locationKey(machineID, executionID string) string {
 	return fmt.Sprintf("machine:location:%s:%s", machineID, executionID)
 }
+
+// PublishLocationState 在 location 投影上附加状态位（M4.5）：
+// paused=true 时 agent proxy 对该 machine 的请求将同步唤醒（autoresume）。
+func (c *Catalog) PublishLocationState(ctx context.Context, machineID, executionID,
+	nodeProxyEndpoint string, appPort int, paused bool) error {
+
+	loc := map[string]any{
+		"node_proxy_endpoint": nodeProxyEndpoint,
+		"app_port":            appPort,
+		"paused":              paused,
+	}
+	raw, err := json.Marshal(loc)
+	if err != nil {
+		return fmt.Errorf("marshal location: %w", err)
+	}
+	return c.rdb.Set(ctx, locationKey(machineID, executionID), raw, 0).Err()
+}

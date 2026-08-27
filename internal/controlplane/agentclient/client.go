@@ -89,3 +89,19 @@ func (c *Client) Delete(ctx context.Context, req *pb.DeleteMachineRequest) error
 func (c *Client) ServiceInfo(ctx context.Context) (*pb.ServiceInfoResponse, error) {
 	return c.Info.ServiceInfo(ctx, &emptypb.Empty{})
 }
+
+// Pause 调用 PauseMachine（M4.5 scale-to-zero）。
+func (c *Client) Pause(ctx context.Context, machineID, executionID string, generation uint64, opID string) (*pb.Machine, error) {
+	return c.Machines.PauseMachine(ctx, &pb.PauseMachineRequest{Operation: &pb.MachineOperationRequest{
+		MachineId: machineID, ExecutionId: executionID, Generation: generation,
+		OperationId: opID, ExpectedState: pb.MachineState_RUNNING,
+	}})
+}
+
+// Resume 调用 ResumeMachine。
+func (c *Client) Resume(ctx context.Context, machineID, executionID string, generation uint64, opID string) (*pb.Machine, error) {
+	return c.Machines.ResumeMachine(ctx, &pb.ResumeMachineRequest{Operation: &pb.MachineOperationRequest{
+		MachineId: machineID, ExecutionId: executionID, Generation: generation,
+		OperationId: opID, ExpectedState: pb.MachineState_PAUSED,
+	}})
+}

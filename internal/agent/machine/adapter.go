@@ -45,6 +45,14 @@ type InstanceManager interface {
 	ListInstances(ctx context.Context, filter *instances.ListInstancesFilter) ([]instances.Instance, error)
 	GetInstance(ctx context.Context, idOrName string) (*instances.Instance, error)
 	DeleteInstance(ctx context.Context, id string) error
+	// M4.5（mvp-plan §8.4）：scale-to-zero。hypeman 语义：
+	//   Standby = pause + snapshot + 删除 VMM（快照留在节点上）；
+	//   Restore = 从 standby 快照恢复 VM 到 Running。
+	// 两者对已处目标态的实例均幂等；Restore 在无快照时报错 → 由
+	// controller 走 cold-start 重建降级。
+	// hypeman.Manager 签名带 request 参数（保留压缩配置等），Adapter 包装为单参。
+	StandbyInstance(ctx context.Context, id string, req instances.StandbyInstanceRequest) (*instances.Instance, error)
+	RestoreInstance(ctx context.Context, id string) (*instances.Instance, error)
 }
 
 // ImageManager 是 Adapter 需要的 hypeman image 能力子集。
@@ -60,13 +68,20 @@ type Adapter struct {
 	images    ImageManager
 	slots     *slot.Manager
 	health    *health.Tracker
+	// M4.5：GetEndpoint 遇 Standby 实例时同步唤醒（autoresume，<5s SLO 来自
+	// M0 restore p95 基准）。默认开启；FIREPAAS_AGENT_AUTORESUME=false 关闭。
+	autoResume bool
 }
 
 // New 构造 Adapter。slotManager 为 nil 时保持 M1 bridge 行为；
 // healthTracker 为 nil 时 readiness 退化为 UNKNOWN/UNCONFIGURED。
 func New(instances InstanceManager, images ImageManager, slotManager *slot.Manager, healthTracker *health.Tracker) *Adapter {
-	return &Adapter{instances: instances, images: images, slots: slotManager, health: healthTracker}
+	return &Adapter{instances: instances, images: images, slots: slotManager,
+		health: healthTracker, autoResume: true}
 }
+
+// SetAutoResume 控制 GetEndpoint 的 standby 同步唤醑。
+func (a *Adapter) SetAutoResume(v bool) { a.autoResume = v }
 
 // ErrImageNotFound 表示镜像引用无法解析/拉取（永久性业务错误：重试不会
 // 改变结果）。controller 据此把 create 置为终态 FAILED，避免无限重派。
@@ -146,6 +161,9 @@ func (a *Adapter) Create(ctx context.Context, req *pb.CreateMachineRequest) (*pb
 }
 
 // List 返回全部（或按 project 过滤）的 machine。
+// P1-1：探针执行已移入 health.Worker（agentd 后台循环），本路径只做
+// O(1) 的 Observe 注册（刷新实例视图/策略/换代重置）与缓存读，不再有
+// 网络 IO——不再与 gRPC 的 10s deadline 竞争。
 func (a *Adapter) List(ctx context.Context, projectID string) ([]*pb.Machine, error) {
 	listed, err := a.instances.ListInstances(ctx, nil)
 	if err != nil {
@@ -203,6 +221,27 @@ func (a *Adapter) GetEndpoint(ctx context.Context, machineID, executionID string
 	if executionID != "" && inst.Tags[tagExecution] != executionID {
 		return "", 0, fmt.Errorf("execution mismatch for %s: want %s got %s",
 			machineID, executionID, inst.Tags[tagExecution])
+	}
+	// M4.5 autoresume：首个流量请求触发 standby→Running 同步恢复。
+	// 失败返回错误（502/503 由 proxy 转化）；控制器侧不感知此路径——
+	// 恢复后的 Running 实例随下次 sync 自然回到投影。
+	// 注意 RestoreInstance 需要内部 ID（loadMetadata 按目录名加载）：
+	// 用上面 GetInstance 已解析的 inst.Id，不能直接传 machineID（名字）。
+	if inst.State == instances.StateStandby {
+		if !a.autoResume {
+			return "", 0, fmt.Errorf("instance %s is standby and autoresume is disabled", machineID)
+		}
+		wakeCtx, wakeCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer wakeCancel()
+		restored, rerr := a.instances.RestoreInstance(wakeCtx, inst.Id)
+		if rerr != nil {
+			return "", 0, fmt.Errorf("autoresume %s failed (cold-start will be needed): %w", machineID, rerr)
+		}
+		// restore 在 root ns 重建 TAP：重挂 slot 后才有数据面。
+		if aerr := a.reattachSlot(wakeCtx, machineID, restored); aerr != nil {
+			return "", 0, fmt.Errorf("autoresume %s: %w", machineID, aerr)
+		}
+		inst = restored
 	}
 	if inst.IP == "" {
 		return "", 0, fmt.Errorf("instance %s has no workload endpoint yet", machineID)
@@ -325,3 +364,74 @@ func mapState(s instances.State) pb.MachineState {
 		return pb.MachineState_MACHINE_STATE_UNSPECIFIED
 	}
 }
+
+// Pause 将 machine 转入 standby（pause+snapshot+释放 VMM）。已 standby 直接
+// 返回（幂等）。slot 后端无需改动：TAP/netns 保留，恢复后 IP/端口不变。
+// executionID 非空时校验实例当前 execution 与之匹配（P3-18：旧代操作
+// 不误停新代实例；与 GetEndpoint/Delete 同一纪律）。
+func (a *Adapter) Pause(ctx context.Context, machineID, executionID string) (*pb.Machine, error) {
+	inst, err := a.instances.GetInstance(ctx, machineID)
+	if err != nil {
+		if errors.Is(err, instances.ErrNotFound) {
+			return nil, fmt.Errorf("%w: %s", ErrMachineNotFound, machineID)
+		}
+		return nil, fmt.Errorf("get instance %s: %w", machineID, err)
+	}
+	if executionID != "" && inst.Tags[tagExecution] != executionID {
+		return nil, fmt.Errorf("execution mismatch for %s: want %s got %s",
+			machineID, executionID, inst.Tags[tagExecution])
+	}
+	inst, err = a.instances.StandbyInstance(ctx, inst.Id, instances.StandbyInstanceRequest{})
+	if err != nil {
+		return nil, fmt.Errorf("hypeman standby: %w", err)
+	}
+	return mapMachine(inst), nil
+}
+
+// reattachSlot 在 restore 后重建 slot 网络基座：hypeman standby 会释放网络，
+// restore 在 root ns 重建同名 TAP；slot 后端要求 TAP 位于 slot netns 内。
+// Attach 幂等（ensureKernel 会把 root ns 的 TAP 补移入 netns 并重加 /32 路由）。
+// 不重挂则 VM Running 但流量 502（M4 真机验收发现的 autoresume 盲区）。
+func (a *Adapter) reattachSlot(ctx context.Context, machineID string, inst *instances.Instance) error {
+	if a.slots == nil || inst == nil {
+		return nil
+	}
+	tap := network.GenerateTAPName(inst.Id)
+	if _, err := a.slots.Attach(ctx, machineID, tap, inst.IP); err != nil {
+		return fmt.Errorf("slot re-attach after restore: %w", err)
+	}
+	return nil
+}
+
+// Resume 从 standby 恢复到 Running。M0 基准 restore p95≈95ms + guest 启动；
+// 失败由 controller 决定重试或 cold-start 重建。恢复后重挂 slot（standby
+// 释放了网络，restore 在 root ns 重建 TAP）——失败则本 op 报错重试，
+// RestoreInstance 对已 Running 实例幂等，重试安全。
+func (a *Adapter) Resume(ctx context.Context, machineID, executionID string) (*pb.Machine, error) {
+	inst, err := a.instances.GetInstance(ctx, machineID)
+	if err != nil {
+		if errors.Is(err, instances.ErrNotFound) {
+			return nil, fmt.Errorf("%w: %s", ErrMachineNotFound, machineID)
+		}
+		return nil, fmt.Errorf("get instance %s: %w", machineID, err)
+	}
+	if executionID != "" && inst.Tags[tagExecution] != executionID {
+		return nil, fmt.Errorf("execution mismatch for %s: want %s got %s",
+			machineID, executionID, inst.Tags[tagExecution])
+	}
+	inst, err = a.instances.RestoreInstance(ctx, inst.Id)
+	if err != nil {
+		return nil, fmt.Errorf("hypeman restore: %w", err)
+	}
+	if err := a.reattachSlot(ctx, machineID, inst); err != nil {
+		return nil, err
+	}
+	return mapMachine(inst), nil
+}
+
+// ErrMachineNotFound 表示 machine 在 agent 侧不存在（实例已删/未建）。
+// 与 ErrImageNotFound（永久性业务错误）区分：前者是生命周期状态，
+// controller 的 reconcile 决策表会把 NotFound 收敛为幂等成功，不应
+// 误判成镜像不可拉取的终态失败（P2-9）。
+var ErrMachineNotFound = errors.New("machine not found at agent")
+

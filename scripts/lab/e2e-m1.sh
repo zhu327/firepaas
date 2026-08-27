@@ -16,6 +16,9 @@ RUN_ID="e2e-$(date +%s)"
 HOSTNAME="$RUN_ID.local"
 MACHINE_ID="$RUN_ID"
 API_TOKEN="e2e-token-$RUN_ID"
+# M4：execution-bound proxy credential（旧脚本与新链路共用同一密钥；
+# API 不配 key 则不下发凭证，agent 默认强制校验会拒绝 create）。
+TRAFFIC_KEY="$(openssl rand -base64 32)"
 OP_CREATE="op-$RUN_ID-create"
 OP_DELETE="op-$RUN_ID-delete"
 
@@ -65,6 +68,7 @@ nohup env \
   FIREPAAS_AGENT_PROXY_ADDR=127.0.0.1:5107 \
   FIREPAAS_HTTP_PORT=8080 \
   FIREPAAS_API_TOKEN="$API_TOKEN" \
+  FIREPAAS_TRAFFIC_TOKEN_KEY="$TRAFFIC_KEY" \
   FIREPAAS_AGENT_TLS_CERT="$CERT_DIR/control-plane.crt" \
   FIREPAAS_AGENT_TLS_KEY="$CERT_DIR/control-plane.key" \
   FIREPAAS_AGENT_TLS_CA="$CERT_DIR/ca.crt" \
@@ -76,6 +80,8 @@ pkill -f "$LAB_BIN/edge-proxy" 2>/dev/null || true
 nohup env \
   FIREPAAS_REDIS_ADDR=127.0.0.1:6379 \
   FIREPAAS_EDGE_PORT=8081 \
+  FIREPAAS_API_ADDR=http://127.0.0.1:8080 \
+  FIREPAAS_API_TOKEN="$API_TOKEN" \
   FIREPAAS_EDGE_TLS_CERT="$CERT_DIR/edge.crt" \
   FIREPAAS_EDGE_TLS_KEY="$CERT_DIR/edge.key" \
   FIREPAAS_EDGE_TLS_CA="$CERT_DIR/ca.crt" \

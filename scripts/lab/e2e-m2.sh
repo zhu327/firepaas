@@ -14,6 +14,7 @@ CERT_DIR="$HERE/certs"
 RUN_DIR="/var/lib/firepaas-p0/e2e-m2"
 RUN_ID="e2e-m2-$(date +%s)"
 API_TOKEN="e2e-m2-token-$RUN_ID"
+TRAFFIC_KEY="$(openssl rand -base64 32)"   # M4：proxy credential 密钥（与 agent 强制校验配套）
 PG="docker exec dev-postgres-1 psql -U firepaas -d firepaas -tAc"
 RD="docker exec dev-redis-1 redis-cli"
 
@@ -66,6 +67,7 @@ nohup env \
   FIREPAAS_AGENT_PROXY_ADDR=127.0.0.1:5107 \
   FIREPAAS_HTTP_PORT=8080 \
   FIREPAAS_API_TOKEN="$API_TOKEN" \
+  FIREPAAS_TRAFFIC_TOKEN_KEY="$TRAFFIC_KEY" \
   FIREPAAS_AGENT_TLS_CERT="$CERT_DIR/control-plane.crt" \
   FIREPAAS_AGENT_TLS_KEY="$CERT_DIR/control-plane.key" \
   FIREPAAS_AGENT_TLS_CA="$CERT_DIR/ca.crt" \
@@ -74,6 +76,8 @@ echo $! >"$RUN_DIR/api.pid"
 nohup env \
   FIREPAAS_REDIS_ADDR=127.0.0.1:6379 \
   FIREPAAS_EDGE_PORT=8081 \
+  FIREPAAS_API_ADDR=http://127.0.0.1:8080 \
+  FIREPAAS_API_TOKEN="$API_TOKEN" \
   FIREPAAS_EDGE_TLS_CERT="$CERT_DIR/edge.crt" \
   FIREPAAS_EDGE_TLS_KEY="$CERT_DIR/edge.key" \
   FIREPAAS_EDGE_TLS_CA="$CERT_DIR/ca.crt" \

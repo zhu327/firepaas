@@ -273,6 +273,60 @@ func (s *Store) EnqueueReapDelete(ctx context.Context, projectID, machineID, exe
 	return s.enqueueDeleteKind(ctx, projectID, machineID, executionID, operationID, generation, requestJSON, "reap")
 }
 
+// EnqueueLifecycle 入队 pause/resume 生命周期操作（M4.5 scale-to-zero）。
+// 幂等键 = operationID（调用方用 op-lifecycle-{machine}-{exec}-{n} 形态，
+// 含时间窗序号防与历史 op 冲突）。kind ∈ {pause, resume}。
+func (s *Store) EnqueueLifecycle(ctx context.Context, projectID, machineID, executionID,
+	operationID string, generation int64, kind string, requestJSON []byte) (Operation, error) {
+
+	var op Operation
+	err := s.inTx(ctx, func(tx pgx.Tx) error {
+		existing, err := selectOperationByKey(ctx, tx, projectID, operationID)
+		if err != nil {
+			return err
+		}
+		if existing != nil {
+			if !jsonEqual(existing.Request, requestJSON) {
+				return ErrRequestConflict
+			}
+			op = *existing
+			return nil
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO operations(id, project_id, machine_id, execution_id, generation,
+				kind, idempotency_key, status, request)
+			VALUES($1,$2,$3,$4,$5,$6,$1,'PENDING',$7::jsonb)
+			ON CONFLICT (project_id, idempotency_key) DO NOTHING`,
+			operationID, projectID, machineID, executionID, generation, kind, string(requestJSON)); err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+				traced, terr := selectOperationByKey(ctx, tx, projectID, operationID)
+				if terr != nil {
+					return terr
+				}
+				if traced != nil && !jsonEqual(traced.Request, requestJSON) {
+					return ErrRequestConflict
+				}
+				if traced != nil {
+					op = *traced
+					return nil
+				}
+			}
+			return fmt.Errorf("enqueue %s: %w", kind, err)
+		}
+		fresh, ferr := selectOperationByKey(ctx, tx, projectID, operationID)
+		if ferr != nil {
+			return ferr
+		}
+		if fresh == nil {
+			return fmt.Errorf("enqueue %s: operation vanished", kind)
+		}
+		op = *fresh
+		return nil
+	})
+	return op, err
+}
+
 func (s *Store) enqueueDeleteKind(ctx context.Context, projectID, machineID, executionID, operationID string, generation int64, requestJSON []byte, kind string) (Operation, error) {
 	var op Operation
 	err := s.inTx(ctx, func(tx pgx.Tx) error {

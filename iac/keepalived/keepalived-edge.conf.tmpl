@@ -1,0 +1,71 @@
+# M4 keepalived VIP 模板（ADR-0011：edge 入口高可用，实验室/生产通用骨架）。
+#
+# 部署形态：VIP 属节点层配置（不进 Nomad job）。两个 control 节点各跑一个
+# keepalived 实例，MASTER 持有 VIP；泛域名 *.<domain> 只解析到 VIP。
+#
+# 使用：
+#   1. 复制为每节点实例：cp keepalived-edge.conf.tmpl /etc/keepalived/keepalived.conf
+#   2. 替换占位符：
+#      __VIP__            虚拟 IP（如 10.0.0.100）
+#      __INTERFACE__      承载 VIP 的网卡（如 ens192/eth0）
+#      __PEER_IP__        对端节点 IP（unicast 直连，二层环境也可用 vrrp 组播）
+#      __NODE_PRIORITY__  MASTER=150，BACKUP=100
+#      __EDGE_CHECK_PORT__edge 明文监听端口（默认 80；/healthz 探针）
+#   3. systemctl enable --now keepalived
+#   4. DNS：*.<domain> 与 <domain> A 记录全部指向 __VIP__
+#
+# 无二层环境（VRRP 组播/vrrp-unicast 均不可用，如某些公有云 VPC）：
+#   保留 DNS 轮询降级（*.<domain> 解析到各 edge 实例地址），ADR-0011 已留口。
+#
+# 健康检查说明：track_script 探测本节点 edge :80/healthz；edge 挂掉时本节点
+# 放弃 VIP（自动漂移到对端）。检查脚本必须是幂等、无副作用的。
+#
+# 证书：step-ca ACME 按需签发 *.<domain> 泛域名证书（Caddy 集成，生产形态）；
+# 实验室用 gen-certs.sh 的静态 CA 证书。客户端根证书预置见 README「信任链」。
+
+global_defs {
+    # 唯一实例标识；多 VIP 部署时每实例不同。
+    router_id firepaas_edge_$(hostname)
+
+    # 不向对端发送 vrrp 通告的额外通知（降低噪音）。
+    enable_script_security
+    script_user root
+}
+
+vrrp_script check_edge {
+    # edge 健康探测：HTTP 200 才算活。curl 不存在时可用 wget 等价替换。
+    script "/usr/bin/curl -fsS -m 2 http://127.0.0.1:__EDGE_CHECK_PORT__/healthz >/dev/null"
+    interval 2          # 2s 探一次
+    timeout  3
+    fall 3              # 连续 3 次失败 → 本节点不合格
+    rise 2              # 连续 2 次成功 → 恢复合格
+}
+
+vrrp_instance FIREPAAS_EDGE {
+    # 单 MASTER + PREEMPT：低优先级节点恢复后抢回（确定性优于震荡规避；
+    # 如需非抢占改 NOPREEMPT 并固定初始角色）。
+    state __INITIAL_STATE__          # MASTER / BACKUP（与 priority 对应）
+    interface __INTERFACE__
+    virtual_router_id 51             # 同二层内唯一（0-255）
+    priority __NODE_PRIORITY__       # MASTER 150 / BACKUP 100
+
+    # 组播不可用的环境（多数公有云/部分 VPC）改 unicast：
+    unicast_src_ip __NODE_IP__
+    unicast_peer {
+        __PEER_IP__
+    }
+
+    advert_int 1
+    authentication {
+        auth_type PASS
+        auth_pass __VRRP_PASSWORD__  # ≤8 字符；VRRPv2 明文，仅防误配置
+    }
+
+    virtual_ipaddress {
+        __VIP__/32 dev __INTERFACE__
+    }
+
+    track_script {
+        check_edge
+    }
+}

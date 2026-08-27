@@ -13,6 +13,7 @@ CERT_DIR="$HERE/certs"
 RUN_DIR="/var/lib/firepaas-p0/chaos-m2"
 RUN_ID="chaos-$(date +%s)"
 API_TOKEN="chaos-token-$RUN_ID"
+TRAFFIC_KEY="$(openssl rand -base64 32)"   # M4：proxy credential 密钥（与 agent 强制校验配套）
 MID="chaos-vm-$RUN_ID"
 HN="$MID.local"
 PG="docker exec dev-postgres-1 psql -U firepaas -d firepaas -tAc"
@@ -39,6 +40,7 @@ start_api() {
     FIREPAAS_AGENT_PROXY_ADDR=127.0.0.1:5107 \
     FIREPAAS_HTTP_PORT=8080 \
     FIREPAAS_API_TOKEN="$API_TOKEN" \
+    FIREPAAS_TRAFFIC_TOKEN_KEY="$TRAFFIC_KEY" \
     FIREPAAS_AGENT_TLS_CERT="$CERT_DIR/control-plane.crt" \
     FIREPAAS_AGENT_TLS_KEY="$CERT_DIR/control-plane.key" \
     FIREPAAS_AGENT_TLS_CA="$CERT_DIR/ca.crt" \
@@ -82,6 +84,7 @@ log "0) 环境：Nomad/agentd/edge + API（新 token）"
 pkill -f "$LAB_BIN/edge-proxy" 2>/dev/null || true
 sleep 1
 nohup env FIREPAAS_REDIS_ADDR=127.0.0.1:6379 FIREPAAS_EDGE_PORT=8081 \
+  FIREPAAS_API_ADDR=http://127.0.0.1:8080 FIREPAAS_API_TOKEN="$API_TOKEN" \
   FIREPAAS_EDGE_TLS_CERT="$CERT_DIR/edge.crt" FIREPAAS_EDGE_TLS_KEY="$CERT_DIR/edge.key" \
   FIREPAAS_EDGE_TLS_CA="$CERT_DIR/ca.crt" \
   "$LAB_BIN/edge-proxy" >"$RUN_DIR/edge.log" 2>&1 &

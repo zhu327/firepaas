@@ -10,6 +10,7 @@ package main
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,10 +26,13 @@ import (
 	"github.com/example/firepaas/internal/controlplane/catalog"
 	"github.com/example/firepaas/internal/controlplane/controller"
 	"github.com/example/firepaas/internal/controlplane/db"
+	"github.com/example/firepaas/internal/controlplane/imagepolicy"
 	"github.com/example/firepaas/internal/controlplane/leader"
 	"github.com/example/firepaas/internal/controlplane/nodemanager"
 	"github.com/example/firepaas/internal/controlplane/reservations"
+	"github.com/example/firepaas/internal/controlplane/secrets"
 	"github.com/example/firepaas/internal/controlplane/store"
+	"github.com/example/firepaas/internal/controlplane/traffic"
 	"github.com/example/firepaas/internal/observability/metrics"
 	"github.com/example/firepaas/internal/scheduler"
 	pb "github.com/example/firepaas/shared/gen/agent/v1"
@@ -77,6 +81,31 @@ func run() error {
 		slog.Warn("API authentication DISABLED (dev only; never in lab/production)")
 	}
 
+	// M4：secrets 信封加密主密钥 + proxy credential HMAC 密钥（部署注入）。
+	// 都可选：未配置 secrets 时 /v1/secrets 全部 503；未配置 traffic key 时
+	// create 不下发凭证（需 agent 侧同步关校验，仅过渡期）。
+	var secretsMgr *secrets.Manager
+	if mk := os.Getenv("FIREPAAS_SECRETS_MASTER_KEY"); mk != "" {
+		m, err := secrets.NewManager(mk)
+		if err != nil {
+			return fmt.Errorf("FIREPAAS_SECRETS_MASTER_KEY: %w", err)
+		}
+		secretsMgr = m
+		slog.Info("secrets envelope encryption enabled", "key_version", secrets.KeyVersion)
+	}
+	var trafficSigner *traffic.Signer
+	if tk := os.Getenv("FIREPAAS_TRAFFIC_TOKEN_KEY"); tk != "" {
+		raw, err := base64.StdEncoding.DecodeString(tk)
+		if err != nil || len(raw) < 32 {
+			return errors.New("FIREPAAS_TRAFFIC_TOKEN_KEY must be base64 of >=32 bytes")
+		}
+		trafficSigner, err = traffic.NewSigner(raw)
+		if err != nil {
+			return err
+		}
+		slog.Info("proxy credential signer enabled")
+	}
+
 	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
 	defer rdb.Close()
 	cat := catalog.New(rdb)
@@ -115,6 +144,8 @@ func run() error {
 				MaxPlacementAttempts: 3,
 				RolloutTimeout:       envDur("FIREPAAS_ROLLOUT_TIMEOUT", 300*time.Second),
 				RolloutDrainGrace:    envDur("FIREPAAS_ROLLOUT_DRAIN", 30*time.Second),
+				Secrets:              secretsMgr,
+				Traffic:              trafficSigner,
 			})
 			slog.Info("running control loop as leader")
 			return ctrl.Run(lctx)
@@ -124,15 +155,29 @@ func run() error {
 		}
 	}()
 
-	api := &API{store: st, apiToken: apiToken, authDisabled: authDisabled}
+	api := &API{store: st, apiToken: apiToken, authDisabled: authDisabled,
+		images:  imagepolicy.New(envOr("FIREPAAS_REGISTRY_ALLOWLIST", "")),
+		secrets: secretsMgr, traffic: trafficSigner}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) })
 	mux.HandleFunc("POST /v1/machines", api.auth(api.createMachine))
 	mux.HandleFunc("GET /v1/machines", api.auth(api.listMachines))
 	mux.HandleFunc("GET /v1/machines/{id}", api.auth(api.getMachine))
 	mux.HandleFunc("DELETE /v1/machines/{id}", api.auth(api.deleteMachine))
+	// M4.5 scale-to-zero（mvp-plan §8.4）：显式 pause/resume；proxy 侧
+	// autoresume 负责 standby → Running 的首流量唤醑。
+	mux.HandleFunc("POST /v1/machines/{id}/pause", api.auth(api.pauseMachine))
+	mux.HandleFunc("POST /v1/machines/{id}/resume", api.auth(api.resumeMachine))
 	mux.HandleFunc("GET /v1/nodes", api.auth(api.listNodes))
 	mux.HandleFunc("GET /v1/events", api.auth(api.listEvents))
+	// M4：secrets v1（ADR-0010，值只进不出——无 reveal 端点）。
+	mux.HandleFunc("POST /v1/secrets", api.auth(api.putSecret))
+	mux.HandleFunc("GET /v1/secrets", api.auth(api.listSecrets))
+	mux.HandleFunc("GET /v1/secrets/{name}", api.auth(api.getSecretMeta))
+	mux.HandleFunc("DELETE /v1/secrets/{name}", api.auth(api.deleteSecret))
+	// M4（ADR-0006）：execution-bound proxy credential 按需现算给 edge。
+	mux.HandleFunc("GET /v1/machines/{id}/traffic-token", api.auth(api.trafficToken))
+	mux.HandleFunc("PUT /v1/apps/{id}/secret-refs", api.auth(api.setAppSecretRefs))
 	// M3：app/deployment/rollout（mvp-plan §7.4、ADR-0015）。
 	mux.HandleFunc("POST /v1/apps", api.auth(api.createApp))
 	mux.HandleFunc("GET /v1/apps", api.auth(api.listApps))
@@ -143,7 +188,7 @@ func run() error {
 	mux.HandleFunc("DELETE /v1/apps/{id}", api.auth(api.deleteApp))
 	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) { reg.Handler().ServeHTTP(w, nil) })
 
-	srv := &http.Server{Addr: ":" + httpPort, Handler: mux}
+	srv := &http.Server{Addr: ":" + httpPort, Handler: auditMiddleware(mux)}
 	errCh := make(chan error, 1)
 	go func() {
 		slog.Info("control-plane API listening", "port", httpPort)
@@ -167,6 +212,9 @@ type API struct {
 	store        *store.Store
 	apiToken     string
 	authDisabled bool
+	images       *imagepolicy.Policy // 镜像引用策略（P1-2：digest/allowlist）
+	secrets      *secrets.Manager    // M4：信封加密（nil = /v1/secrets 返回 503）
+	traffic      *traffic.Signer     // M4：execution-bound credential 现算
 }
 
 type createMachineBody struct {

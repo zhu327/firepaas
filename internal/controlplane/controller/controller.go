@@ -17,7 +17,9 @@ import (
 	"github.com/example/firepaas/internal/controlplane/catalog"
 	"github.com/example/firepaas/internal/controlplane/nodemanager"
 	"github.com/example/firepaas/internal/controlplane/reservations"
+	"github.com/example/firepaas/internal/controlplane/secrets"
 	"github.com/example/firepaas/internal/controlplane/store"
+	"github.com/example/firepaas/internal/controlplane/traffic"
 	"github.com/example/firepaas/internal/observability/metrics"
 	"github.com/example/firepaas/internal/scheduler"
 	pb "github.com/example/firepaas/shared/gen/agent/v1"
@@ -30,19 +32,21 @@ import (
 // Config 是 controller 运行参数。
 type Config struct {
 	DefaultAppPort       int
-	LegacyAgentProxyAddr string        // 节点视图缺失时的兜底（M1 单节点兼容）
-	OpPollInterval       time.Duration // 默认 1s
-	SyncInterval         time.Duration // 默认 5s
-	RebuildInterval      time.Duration // 预约/投影重建，默认 30s
-	ReconcileGrace       time.Duration // ACK 丢失判定宽限，默认 30s
-	MaxPlacementAttempts int           // ResourceExhausted 换节点上限，默认 3
-	AgentRPCTimeout      time.Duration // 默认 2m（未缓存镜像 pull 可达 60s）
-	CreateRetryBase      time.Duration // create FAILED 首次重派退避（P1-3），默认 10s
-	CreateRetryMax       time.Duration // create FAILED 退避封顶，默认 5m
-	ClaimStaleAfter      time.Duration // CLAIMED 滞留回收阈值（P1-1），默认 2×AgentRPCTimeout+60s
-	NodeMissingThreshold int           // 节点连续 List 失败次数才摘路由（P3-9），默认 3
-	RolloutTimeout       time.Duration // M3 PREPARING 超时→自动回滚（S3），默认 300s
-	RolloutDrainGrace    time.Duration // M3 CUTOVER 后旧代 drain 期限，默认 30s
+	LegacyAgentProxyAddr string           // 节点视图缺失时的兜底（M1 单节点兼容）
+	OpPollInterval       time.Duration    // 默认 1s
+	SyncInterval         time.Duration    // 默认 5s
+	RebuildInterval      time.Duration    // 预约/投影重建，默认 30s
+	ReconcileGrace       time.Duration    // ACK 丢失判定宽限，默认 30s
+	MaxPlacementAttempts int              // ResourceExhausted 换节点上限，默认 3
+	AgentRPCTimeout      time.Duration    // 默认 2m（未缓存镜像 pull 可达 60s）
+	CreateRetryBase      time.Duration    // create FAILED 首次重派退避（P1-3），默认 10s
+	CreateRetryMax       time.Duration    // create FAILED 退避封顶，默认 5m
+	ClaimStaleAfter      time.Duration    // CLAIMED 滞留回收阈值（P1-1），默认 2×AgentRPCTimeout+60s
+	NodeMissingThreshold int              // 节点连续 List 失败次数才摘路由（P3-9），默认 3
+	RolloutTimeout       time.Duration    // M3 PREPARING 超时→自动回滚（S3），默认 300s
+	RolloutDrainGrace    time.Duration    // M3 CUTOVER 后旧代 drain 期限，默认 30s
+	Secrets              *secrets.Manager // M4：信封加密（nil = secret 引用不可用）
+	Traffic              *traffic.Signer  // M4：execution-bound proxy credential（nil = 不下发）
 }
 
 // Controller 执行 reconcile。
@@ -219,6 +223,81 @@ func (c *Controller) reconcileOperations(ctx context.Context) error {
 	return nil
 }
 
+// processLifecycle 执行 pause/resume 操作（M4.5）。
+// 成功：把 observed_state 写为 PAUSED/RUNNING 并落账 SUCCEEDED；
+// 失败（无快照等 FailedPrecondition）：pause 可安全重试；resume 视为
+// 快照不可用 → 将机器转 R3 重建路径（observed 清空 + desired CREATED，
+// 生成新 execution 走 cold-start），本 op 终态 FAILED。
+func (c *Controller) processLifecycle(ctx context.Context, op store.Operation) error {
+	var req pb.MachineOperationRequest
+	if err := protojson.Unmarshal(op.Request, &req); err != nil {
+		_ = c.store.CompleteOperation(ctx, op.ID, "FAILED", nil, err.Error())
+		return err
+	}
+	m, err := c.store.GetMachine(ctx, op.MachineID)
+	if err != nil || m == nil {
+		_ = c.store.CompleteOperation(ctx, op.ID, "FAILED", nil, "machine gone")
+		return err
+	}
+	gen := uint64(m.Generation)
+	exec := m.CurrentExecutionID
+
+	client := c.nodes.ClientFor(m.NodeID)
+	if client == nil {
+		return fmt.Errorf("no agent client for machine %s", op.MachineID)
+	}
+	rpcCtx, cancel := context.WithTimeout(ctx, c.cfg.AgentRPCTimeout)
+	defer cancel()
+
+	var pbm *pb.Machine
+	// agent 侧 opID = 控制面 op.ID（每次 API 调用唯一）：同一 op 重试命中
+	// ledger 重放（正确幂等）；不同 pause/resume 调用各自真执行。此前用
+	// "op-pause-{machine}-{exec8}" 固定后缀，同 execution 的后续
+	// pause/resume 全被 ledger 重放吞掉——VM 从未真正 standby，sync 循环
+	// 又把 observed 回写为 RUNNING，e2e 50 循环在第 N 次撞输竞态（真机
+	/// 验收发现）。
+	if op.Kind == "pause" {
+		pbm, err = client.Pause(rpcCtx, op.MachineID, exec, gen, op.ID)
+	} else {
+		pbm, err = client.Resume(rpcCtx, op.MachineID, exec, gen, op.ID)
+	}
+	if err != nil {
+		if status.Code(err) == codes.FailedPrecondition && op.Kind == "resume" {
+			// 快照不可恢复 → 冷启动重建。
+			slog.Warn("resume failed; scheduling cold-start recreate",
+				"machine_id", op.MachineID, "error", err)
+			c.recreateMachine(ctx, *m, true)
+			_ = c.store.CompleteOperation(ctx, op.ID, "FAILED", nil,
+				"snapshot restore failed; cold-start scheduled")
+			return nil
+		}
+		return fmt.Errorf("agent %s: %w", op.Kind, err)
+	}
+
+	// 落账：observed_state 写为目标态（pause→PAUSED / resume→RUNNING）。
+	// 以 agent 返回的实际状态为准（幂等路径可能已是目标态），但 M4.5
+	// 的 agent 契约保证 Pause/Resume 返回即目标态；防御性兼容 PAUSED/
+	// RUNNING 之外的值（不写未知状态）。
+	want := "PAUSED"
+	if op.Kind == "resume" {
+		want = "RUNNING"
+	}
+	switch pbm.GetState() {
+	case pb.MachineState_PAUSED, pb.MachineState_RESUMING:
+		want = "PAUSED"
+	case pb.MachineState_RUNNING:
+		want = "RUNNING"
+	}
+	if err := c.store.UpdateMachineNodeAndObserved(ctx, op.MachineID, m.NodeID,
+		m.CurrentExecutionID, want, m.ObservedSlotIP, m.ObservedReadiness); err != nil {
+		return err
+	}
+	result, _ := protojson.Marshal(pbm)
+	c.metrics.Inc("firepaas_operations_total",
+		map[string]string{"kind": op.Kind, "result": "succeeded"}, 1)
+	return c.store.CompleteOperation(ctx, op.ID, "SUCCEEDED", result, "")
+}
+
 func (c *Controller) processOperation(ctx context.Context, op store.Operation) error {
 	switch op.Kind {
 	case "create":
@@ -228,6 +307,8 @@ func (c *Controller) processOperation(ctx context.Context, op store.Operation) e
 	case "reap":
 		// reconcile 清理（旧代/死亡残留）：成功后不得推进 desired→DELETED。
 		return c.processDelete(ctx, op, false)
+	case "pause", "resume":
+		return c.processLifecycle(ctx, op)
 	default:
 		err := fmt.Errorf("unknown operation kind %q", op.Kind)
 		_ = c.store.CompleteOperation(ctx, op.ID, "FAILED", nil, err.Error())
@@ -249,6 +330,29 @@ func (c *Controller) processCreate(ctx context.Context, op store.Operation) erro
 		c.metrics.Inc("firepaas_reconcile_actions_total", map[string]string{"kind": "ack_lost_reconcile"}, 1)
 		_ = c.resv.Release(ctx, op.ID)
 		return c.store.CompleteOperation(ctx, op.ID, "SUCCEEDED", nil, "")
+	}
+
+	// M4（ADR-0006/0010）：一次性字段在派发时现算，不进 op.Request 持久化。
+	// - proxy credential：HMAC 确定性派生 → agent 重试的 request hash 天然一致；
+	// - secret_refs → secret_env：按 deployment 固化的引用解析明文。
+	// 引用缺失/解密失败视为终态失败（不换节点重试）。
+	if c.cfg.Secrets != nil && req.Spec.GetDeploymentId() != "" {
+		env, serr := store.ResolveDeploymentSecretRefs(ctx, c.store, c.cfg.Secrets,
+			op.ProjectID, req.Spec.GetDeploymentId())
+		if serr != nil {
+			_ = c.store.CompleteOperation(ctx, op.ID, "FAILED", nil,
+				"resolve secret refs: "+serr.Error())
+			return fmt.Errorf("resolve secret refs: %w", serr)
+		}
+		for k, v := range env {
+			if req.SecretEnv == nil {
+				req.SecretEnv = map[string]string{}
+			}
+			req.SecretEnv[k] = v
+		}
+	}
+	if c.cfg.Traffic != nil {
+		req.ProxyCredential = c.cfg.Traffic.Token(req.MachineId, req.Spec.GetExecutionId())
 	}
 
 	excluded := map[string]bool{}

@@ -19,9 +19,11 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/kernel/hypeman/lib/instances"
 	"github.com/kernel/hypeman/lib/network"
 
 	"github.com/example/firepaas/internal/agent/health"
@@ -161,7 +163,23 @@ func run() error {
 		slog.Info("slot network backend active", "slots", slotManager.Count())
 	}
 
-	adapter := machine.New(set.Instances, set.Images, slotManager, health.New())
+	tracker := health.New()
+	adapter := machine.New(set.Instances, set.Images, slotManager, tracker)
+	// M4.5：standby 实例的首流量同步唤醑（autoresume）。
+	if strings.EqualFold(envOr("FIREPAAS_AGENT_AUTORESUME", "true"), "false") {
+		adapter.SetAutoResume(false)
+		slog.Info("agent autoresume disabled")
+	}
+	// P1-1：探针 worker 独立于 ListMachines gRPC 路径执行（预算内串行，
+	// 不再共享 gRPC deadline）；controller 每 5s 的 List 只读缓存。
+	probeWorker := health.NewWorker(tracker, func(ctx context.Context) ([]instances.Instance, error) {
+		return set.Instances.ListInstances(ctx, nil)
+	})
+	go func() {
+		if err := probeWorker.Run(ctx); err != nil && ctx.Err() == nil {
+			slog.Error("health probe worker stopped", "error", err)
+		}
+	}()
 	// 已承诺资源（硬准入输入）：实例 Size / Vcpus 之和（M2.2）。
 	listedResources := func() (memMiB uint64, vcpus int) {
 		listCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -184,7 +202,17 @@ func run() error {
 	memAllocated := func() uint64 { m, _ := listedResources(); return m }
 	vcpuAllocated := func() int { _, v := listedResources(); return v }
 	infoProvider := info.New(nodeID, serviceVersion, serviceCommit, nodePool, fcVersion, cfg.Network.SubnetCIDR, cfg.DataDir, memAllocated, vcpuAllocated)
-	srv := server.New(adapter, ledger, fences, infoProvider)
+
+	// M4（ADR-0006 收口）：proxy credential 验证材料（仅 SHA-256 摘要落盘）。
+	credsPath := envOr("FIREPAAS_AGENT_CREDS_PATH", filepath.Join(cfg.DataDir, "agent", "credentials.json"))
+	creds, err := state.OpenCreds(credsPath)
+	if err != nil {
+		return err
+	}
+	// 兼容开关：默认强制 create 携带 execution-bound credential。
+	requireCred := strings.ToLower(envOr("FIREPAAS_PROXY_CREDENTIAL_REQUIRED", "true")) != "false"
+	srv := server.New(adapter, ledger, fences, infoProvider,
+		server.WithCreds(creds), server.WithCredentialRequired(requireCred))
 
 	lis, err := net.Listen("tcp", net.JoinHostPort(bind, port))
 	if err != nil {
@@ -197,7 +225,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	proxyHandler := http.Handler(proxy.New(adapter))
+	proxyHandler := http.Handler(proxy.NewWithVerifier(adapter, creds))
 	if tlsConf != nil {
 		// mTLS 已保证“持本 CA 证书才能连”；这里进一步按证书 CN 做最小授权：
 		// gRPC（5108）只接受控制面身份，proxy（5107）只接受 edge 身份

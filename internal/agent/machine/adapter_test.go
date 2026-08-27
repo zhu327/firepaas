@@ -2,6 +2,7 @@ package machine
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -70,6 +71,26 @@ func (f *fakeInstances) DeleteInstance(_ context.Context, id string) error {
 	}
 	f.deleted = id
 	return nil
+}
+
+// M4.5：standby/restore 替身（按状态机迁移，供 autoresume 断言）。
+// 语义对齐 hypeman：Standby/Restore 只接受**内部 ID**（loadMetadata 按目录
+// 名加载，传 name 会 ErrNotFound）——曾经的替身两者都收，把
+// "autoresume 传了 name"的真机 bug 藏到了单测盲区。
+func (f *fakeInstances) StandbyInstance(_ context.Context, id string, _ instances.StandbyInstanceRequest) (*instances.Instance, error) {
+	if f.created == nil || f.created.Id != id {
+		return nil, instances.ErrNotFound
+	}
+	f.created.State = instances.StateStandby
+	return f.created, nil
+}
+
+func (f *fakeInstances) RestoreInstance(_ context.Context, id string) (*instances.Instance, error) {
+	if f.created == nil || f.created.Id != id {
+		return nil, instances.ErrNotFound
+	}
+	f.created.State = instances.StateRunning
+	return f.created, nil
 }
 
 type fakeImages struct{ err error }
@@ -214,5 +235,93 @@ func TestAdapterDeleteResolvesNameToInternalID(t *testing.T) {
 	}
 	if im.deleted != "internal-1" {
 		t.Fatalf("deleted %q, want internal-1", im.deleted)
+	}
+}
+
+// M4.5 autoresume：GetEndpoint 遇 Standby 实例时同步唤醒并返回新地址。
+func TestGetEndpointAutoResumesStandby(t *testing.T) {
+	im := &fakeInstances{}
+	a := New(im, &fakeImages{}, nil, nil)
+	if _, err := a.Create(context.Background(), validCreateRequest()); err != nil {
+		t.Fatal(err)
+	}
+	// 转 standby（模拟 scale-to-zero）。
+	if _, err := a.Pause(context.Background(), "m1-test", "e1"); err != nil {
+		t.Fatal(err)
+	}
+	if im.created.State != instances.StateStandby {
+		t.Fatalf("state = %s, want Standby", im.created.State)
+	}
+	ip, port, err := a.GetEndpoint(context.Background(), "m1-test", "e1")
+	if err != nil {
+		t.Fatalf("GetEndpoint: %v", err)
+	}
+	if im.created.State != instances.StateRunning {
+		t.Fatalf("autoresume did not run: state=%s", im.created.State)
+	}
+	if ip == "" || port == 0 {
+		t.Fatalf("endpoint after wake: ip=%q port=%d", ip, port)
+	}
+}
+
+// 关闭 autoresume 时，standby 实例的 GetEndpoint 必须失败（不静默黑转发）。
+func TestGetEndpointAutoResumeDisabled(t *testing.T) {
+	im := &fakeInstances{}
+	a := New(im, &fakeImages{}, nil, nil)
+	if _, err := a.Create(context.Background(), validCreateRequest()); err != nil {
+		t.Fatal(err)
+	}
+	a.SetAutoResume(false)
+	if _, err := a.Pause(context.Background(), "m1-test", "e1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := a.GetEndpoint(context.Background(), "m1-test", "e1"); err == nil {
+		t.Fatal("standby without autoresume must error")
+	}
+}
+
+// P3-18：Pause/Resume 的 execution 绑定校验——旧代操作不得误停/误启新代。
+func TestPauseResumeExecutionBinding(t *testing.T) {
+	im := &fakeInstances{}
+	a := New(im, &fakeImages{}, nil, nil)
+	if _, err := a.Create(context.Background(), validCreateRequest()); err != nil {
+		t.Fatal(err)
+	}
+	// execution 不匹配 → 拒绝。
+	if _, err := a.Pause(context.Background(), "m1-test", "wrong-exec"); err == nil {
+		t.Fatal("pause with stale execution must be rejected")
+	}
+	if im.created.State == instances.StateStandby {
+		t.Fatal("rejected pause must not change state")
+	}
+	// 匹配 → 成功。
+	if _, err := a.Pause(context.Background(), "m1-test", "e1"); err != nil {
+		t.Fatalf("pause with current execution: %v", err)
+	}
+	if _, err := a.Resume(context.Background(), "m1-test", "wrong-exec"); err == nil {
+		t.Fatal("resume with stale execution must be rejected")
+	}
+	if im.created.State != instances.StateStandby {
+		t.Fatal("rejected resume must not change state")
+	}
+	if _, err := a.Resume(context.Background(), "m1-test", "e1"); err != nil {
+		t.Fatalf("resume with current execution: %v", err)
+	}
+	if im.created.State != instances.StateRunning {
+		t.Fatalf("resume must restore Running, got %s", im.created.State)
+	}
+}
+
+// P2-9：实例不存在时 Pause/Resume 返回 ErrMachineNotFound（而非
+// ErrImageNotFound 的镜像语义）。
+func TestPauseResumeMachineNotFound(t *testing.T) {
+	a := New(&fakeInstances{}, &fakeImages{}, nil, nil)
+	_, err := a.Pause(context.Background(), "no-such", "e1")
+	if !errors.Is(err, ErrMachineNotFound) {
+		t.Fatalf("pause missing machine: want ErrMachineNotFound, got %v", err)
+	}
+	_, err = a.Resume(context.Background(), "no-such", "e1")
+	if !errors.Is(err, ErrMachineNotFound) {
+		t.Fatalf("resume missing machine: want ErrMachineNotFound, got %v", err)
 	}
 }

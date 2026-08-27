@@ -57,3 +57,11 @@ func TestFilterMachines(t *testing.T) {
 		t.Fatalf("filtered len = %d", len(got))
 	}
 }
+
+// TestUserDeleteOpIDContract：controller 的 opID 规则与 store 约定一致
+// （P0-2：API 与 controller 不得发散）。
+func TestUserDeleteOpIDContract(t *testing.T) {
+	if got := userDeleteOpID("m-1", "exec-11111111-2222"); got != store.UserDeleteOpID("m-1", "exec-11111111-2222") {
+		t.Fatalf("controller opID rule diverged from store: %q vs %q", got, store.UserDeleteOpID("m-1", "exec-11111111-2222"))
+	}
+}

@@ -288,6 +288,30 @@ CLAIMED 回收窗口为 30s 定时器（非精确租约）。
 6. app 删除必须墓碑化（replicas=0 + deployment SUPERSEDED），否则 scale
    对账会无限重建副本。
 
+### 评审修复（2026-08-27）
+
+M3 全量代码评审发现两类 P0 与若干 P1/P2/P3，已全部修复并重跑验收
+（详见 plans/2026-08-26-m3-single-node.md 评审修复节）：
+
+- **P0-1**：删除的 app 被 AppController 无限复活——墓碑化改
+  `apps.deleted_at`（migration 0007）+ `SoftDeleteApp` 事务（先墓碑后
+  下发 delete），ListApps/reconcileApp 双层过滤，重复删除幂等 202。
+- **P0-2**：`op-del-{machineID}` 裸幂等键在 scale down→up→down 后撞
+  同键不同请求体永久 409——改 `store.UserDeleteOpID` 嵌 execution 尾缀，
+  API/controller 共用同一约定。
+- **P1-1**：探针内联在 ListMachines（共享 gRPC 10s deadline，副本多时
+  探针耗尽预算引发 readiness 抖动/摘路由）——移入独立 health.Worker
+  （每轮 8s 预算 + per-request 超时）。
+- **P1-2**：镜像 digest 校验 + registry allowlist（`imagepolicy` 包，
+  `FIREPAAS_REGISTRY_ALLOWLIST` 环境变量），create/deploy 入口拦截。
+- **P2**：ROLLING_BACK 期间 scale 目标改 from 代（S6）；readiness 随
+  execution 换代重置（防新代虚报 READY 提前切流）；deploy/rollout 终态
+  多语句转移事务化；e2e 补 catalog 过期/stale execution/删除不复活回归。
+- **P3**：rollback 404、createApp 409、探针超时配置不被客户端硬上限
+  截断、fpctl deploy 支持 --env/--port。
+- 重跑：e2e-m3 全绿（含新增回归步骤）；单测/PG-gated/sim 10 万次全绿；
+  实验室历史僵尸 app 清理归零。
+
 遗留（进入 M4 前）：EXEC 探针不支持（需 vsock 通道）；registry LRU/预热与
 共享 registry 部署物 DEFERRED；NetworkManager 会在 root ns 对新 TAP 短暂
 “assume connection”（无实测危害，M4 记录）；agentd 重启（SIGTERM）当前会
@@ -313,6 +337,70 @@ CLAIMED 回收窗口为 30s 定时器（非精确租约）。
 - 两节点多副本通过同 hostname 稳定服务；
 - Redis 宕机注入：数据面在声明的 stale 窗口内继续服务或受控降级，恢复后投影在时限内重建；
 - 若启用 scale-to-zero：50 次 pause/resume 无泄漏，且只在适用 SLO 范围内达标；否则正式记录为 v1.1。
+
+### 单机执行记录（2026-08-27）
+
+单机折叠版 M4 已交付（跨节点入口 HA/多 edge 验收 DEFERRED-MULTI-NODE）：
+
+- **M4.1 secrets v1**：migration 0008（secrets 表 + deployments.secret_refs）；
+  信封加密（主密钥环境变量 + 随机 DEK，AES-256-GCM，AAD 绑定
+  project/name/version 防行间密文互换）；`/v1/secrets` CRUD（无 reveal
+  端点）；`PUT /v1/apps/{id}/secret-refs` 换绑定走 rollout 状态机；
+  create 派发时解析引用为 secret_env（不入 op.Request 持久化）；
+  幂等哈希剔除单向字段；auditMiddleware 字段经 redact 黑名单过滤；
+  fpctl secrets set（支持 stdin）/env/rm/ls。并发版本冲突 409+Retry-After。
+- **M4.2 proxy hardening**：credential = HMAC-SHA256(key, machine/execution)
+  确定性派生（两侧同源，零持久化）；API `/v1/machines/{id}/traffic-token`
+  按需现算给 edge（仅内存缓存）；agent 侧只存 SHA-256 摘要
+  （state/creds.go，0600 原子落盘），恒时比较；delete/换代即 Drop；
+  默认 fail-closed（FIREPAAS_PROXY_CREDENTIAL_REQUIRED）。评审修复：
+  token 缓存按 (machine, execution) 命中，换代不命中；agent 403 →
+  Invalidate + 重取一次（ModifyResponse 哨兵拦截，不半写响应）；
+  API 不可达时 token 走 serve-stale（execution 匹配才复用）。
+  真机追加修复：processLifecycle agent opID 改用控制面 op.ID（固定后缀
+  会被 ledger 重放吞掉后续 pause/resume）；autoresume/resume 传 hypeman
+  内部 ID（名字会 ErrNotFound）+ restore 后重挂 slot（reattachSlot）；
+  ensureKernel 移入前清理 netns 残留同名 TAP。
+- **M4.3 edge TLS/限流/缓存**：泛域名证书（内部 CA）+ :443 TLS + :80→308
+  （非标端口保留）；每 hostname 令牌桶 429；路由缓存 fresh 5s +
+  serve-stale 120s + 超窗 503；**权威 miss（路由已删）立即 404 + 负缓存，
+  不 serve-stale**；token serve-stale 同源窗口。计数器（stale serves/
+  redis errors/token errors/429/403 重试）+ FIREPAAS_EDGE_METRICS_PORT
+  /metrics（Prometheus 文本）。
+- **M4.4 Redis 可用性**：e2e-m4 F 步——stop redis → stale 窗口内持续
+  200（X-Firepaas-Stale 头）；宕机窗口 deploy 受理不悬挂（PG 事务，
+  rollout 恢复后收敛 COMPLETE）；恢复后 **FLUSHALL**（AOF 下旧实现
+  未真测重建）→ 权威 miss 404 → ≤75s 投影重建回源 200。
+  **sentinel 结论：不引入**——stale 窗口（120s）+ 重建时限（30s 周期）
+  已满足数据面可用性目标，Redis 持久化仅加速恢复非必需。
+- **M4.5 scale-to-zero（显式 API + proxy autoresume 形态交付）**：
+  PauseMachine/ResumeMachine RPC（fencing+ledger+execution 绑定校验）；
+  controller processLifecycle（resume 失败 → R3 cold-start 重建）；
+  `POST /v1/machines/{id}/pause|resume` 显式 API；agent proxy GetEndpoint
+  遇 standby 同步唤醒（autoresume，<8s SLO 含 HTTP 往返）；e2e-m4 H 步
+  50 次 pause/resume 无 netns/TAP/firecracker 漂移。
+  **自动化 idle 检测（CPU 阈值×时长）未实现**：需要 agent 侧 per-VM
+  usage 管道（List 暴露 VM metrics → PG 投影 → app 级开关），列入 v1.1
+  （见 §11 风险表）；v1 以显式 pause API + autoresume 组合覆盖核心价值
+  （快照释放 VMM 内存 + 流量唤醒），origin-node 优先恢复已由 R4
+  节点健康检查 + 快照本地性自然满足（无快照时 cold-start 降级）。
+
+### 偏差与遗留（进入 M5 前）
+
+- **keepalived VIP**：交付配置模板与 runbook（iac/keepalived/），双节点
+  漂移演练 DEFERRED-MULTI-NODE；单机实验室保持 DNS 形态（ADR-0011 分层）。
+- **step-ca ACME**：实验室用静态 CA（gen-certs.sh 签发泛域名），生产
+  step-ca 集成记为 M5 运维前置；证书信任链预置已在 iac/keepalived/README
+  文档化。
+- **CLI 形态变化**：`apps env set --secret` 合并为 `fpctl app deploy
+  --secret VAR=NAME[@V]` 与 `fpctl app create --secret`（同一发布语义：
+  改 refs 即新 deployment）；`--secret VAR=`（空值）为移除绑定。
+- **旧 e2e 脚本兼容**：e2e-m1/m2/m3/chaos-m2 已补 FIREPAAS_TRAFFIC_TOKEN_KEY
+  + edge 的 FIREPAAS_API_ADDR/TOKEN（与新链路同一强制校验），重跑全绿。
+- 多 edge 实例各自内存缓存 token（无共享状态）——多 edge 验收
+  DEFERRED-MULTI-NODE。
+- 主密钥管理仅环境变量注入，轮换/KMS 是 M5 工作项（ADR-0010 已切分）。
+- agentd SIGTERM 仍会带走运行中 VM（M3 已知行为，chaos 验收覆盖重建）。
 
 ## 9. M5：内部生产就绪（8–12 周）
 
@@ -364,4 +452,6 @@ CLAIMED 回收窗口为 30s 定时器（非精确租约）。
 | readiness 探针实现延期 | M1 用 UNCONFIGURED 语义；M3 前未补齐时 route 发布降级为 RUNNING 即 READY 并显式记录（ADR-0008） |
 | 反亲和候选不足（小集群） | 尽力而为降级 + 调度事件；不为反亲和牺牲可用性（ADR-0009） |
 | 无二层环境无法 keepalived | 保留 DNS 轮询降级（ADR-0011 已留口） |
+| 自动 idle 检测（per-VM usage 管道）延期 | v1 交付显式 pause API + proxy autoresume；自动化判定进 v1.1（M4 执行记录已注明） |
+| Redis 单点（无 sentinel） | 120s serve-stale + ≤75s 投影重建验收通过；M4 结论不引入 sentinel，数据面可用性目标已满足 |
 | 客户端无法预置内部 CA 根证书 | 泛域名证书改用自签 + 文档化手动信任；身份 mTLS 不受影响（ADR-0011） |

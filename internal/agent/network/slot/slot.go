@@ -443,8 +443,15 @@ func (m *Manager) ensureKernel(ctx context.Context, s Slot, tap, guestIP string)
 	if err := execCmd(ctx, "ip", "route", "replace", guestIP+"/32", "via", nsAddr, "dev", vh); err != nil {
 		return fmt.Errorf("re-add guest route: %w", err)
 	}
-	// TAP 若还在 root ns（崩溃窗口），补一次移动。
+	// TAP 若还在 root ns（崩溃窗口/restore 后重建），补一次移动。
+	// M4.5 restore 场景：hypeman standby 释放的是 root ns 视角的网络（TAP
+	// 已被移入 slot netns，root 删除沉默跳过），restore 在 root ns 重建同名
+	// TAP——此时 netns 内可能残留旧 TAP，直接 move 会撞 "File exists"。
+	// 先清理 netns 内同名残留，再移入。
 	if tapExistsInRoot(tap) {
+		// 先清理 netns 内同名残留（restore 场景：旧 TAP 残留在 netns 里）；
+		// 删除失败（不存在）为正常路径，忽略。
+		_ = execCmd(ctx, "ip", "netns", "exec", nsName(s.Index), "ip", "link", "del", tap)
 		if err := execCmd(ctx, "ip", "link", "set", tap, "netns", nsName(s.Index)); err != nil {
 			return fmt.Errorf("re-move tap: %w", err)
 		}

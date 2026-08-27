@@ -77,6 +77,34 @@
 - DEFERRED-MULTI-NODE：双节点反亲和 U3、跨节点发布窗口、两节点 slot 网络
   独立性验收（上线前必须补测）。
 
+## 评审修复（2026-08-27，代码评审 P0–P3 全量修复）
+
+评审发现两类 P0（删除的 app 被 controller 无限复活；`op-del-{id}` 裸幂等键
+在 scale down→up→down 后永久 409）与 P1/P2/P3 若干，全部修复并重跑 e2e：
+
+- **P0-1 app 删除收敛**：migration 0007 新增 `apps.deleted_at`；
+  `SoftDeleteApp` 事务墓碑化（deleted_at + 终结 rollout + deployment
+  SUPERSEDED）；`ListApps` 过滤墓碑；`reconcileApp` 双保险不再补建；
+  `deleteApp` 先墓碑后下发 delete，重复删除幂等 202。
+- **P0-2 delete 幂等键**：`store.UserDeleteOpID` 嵌 execution 尾部 8 字符
+  （API 与 controller 共用，不发散）；冲突降级为事件审计不阻断对账。
+- **P1-1 探针与 List 解耦**：探针移入 `health.Worker` 独立循环（每轮 8s
+  预算 + 单探针 per-request 超时），ListMachines 只做 O(1) Observe/Read。
+- **P1-2 镜像策略**：`imagepolicy` 包（digest 形态校验 + registry
+  allowlist 环境变量 `FIREPAAS_REGISTRY_ALLOWLIST`），create/deploy 均拦。
+- **P2-1** ROLLING_BACK 期间 scale 对账目标改为 from 代（S6 语义）。
+- **P2-2** readiness 随 execution 换代重置（Observe 检测 CreatedAt 变晚
+  即 runtime=nil/readiness=UNKNOWN，防新代虚报 READY 提前切流）。
+- **P2-3** `DeployApp`/`CompleteRolloutWithStatus` 事务化（app 行锁串行化
+  deploy 互斥；CUTOVER 完成与 deployment 终态同事务）。
+- **P2-4** e2e 新增回归：7.5 非法镜像 400 / 7.6 catalog 过期 404+重建
+  200 / 7.7 stale execution 请求 agent proxy 拒绝 / 11 删除后无复活。
+- **P3**：rollback 无活跃 rollout → 404；createApp 重复 → 409；探针 HTTP
+  客户端不再截断用户超时；fpctl deploy 支持 --env/--port；strconvUpper
+  手卷函数删除。
+- 重跑验收：`e2e-m3.sh` 全绿（含新增 7.5/7.6/7.7/11 回归）；单元/PG-gated
+  测试全绿；`make sim` 10 万次断言 PASS；实验室僵尸 app 已清理。
+
 ## 风险
 
 - nftables 与主机既有规则共存：只增删自有表（ip fp-slot / ip fp-isolation），

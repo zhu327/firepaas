@@ -16,6 +16,7 @@ CERT_DIR="$HERE/certs"
 RUN_DIR="/var/lib/firepaas-p0/e2e-m3"
 RUN_ID="e2e-m3-$(date +%s)"
 API_TOKEN="e2e-m3-token-$RUN_ID"
+TRAFFIC_KEY="$(openssl rand -base64 32)"   # M4：proxy credential 密钥（与 agent 强制校验配套）
 PG="docker exec dev-postgres-1 psql -U firepaas -d firepaas -tAc"
 
 export PATH="$LAB_BIN:/home/zty/.local/firepaas-lab/go/bin:$PATH"
@@ -66,11 +67,13 @@ sleep 1
 nohup env FIREPAAS_POSTGRES_URL='postgres://firepaas:firepaas@127.0.0.1:5432/firepaas?sslmode=disable' \
   FIREPAAS_REDIS_ADDR=127.0.0.1:6379 FIREPAAS_NOMAD_ADDR=http://127.0.0.1:4646 \
   FIREPAAS_AGENT_PROXY_ADDR=127.0.0.1:5107 FIREPAAS_HTTP_PORT=8080 FIREPAAS_API_TOKEN="$API_TOKEN" \
+  FIREPAAS_TRAFFIC_TOKEN_KEY="$TRAFFIC_KEY" \
   FIREPAAS_ROLLOUT_TIMEOUT=240s FIREPAAS_ROLLOUT_DRAIN=20s \
   FIREPAAS_AGENT_TLS_CERT="$CERT_DIR/control-plane.crt" FIREPAAS_AGENT_TLS_KEY="$CERT_DIR/control-plane.key" \
   FIREPAAS_AGENT_TLS_CA="$CERT_DIR/ca.crt" \
   "$LAB_BIN/firepaas-api" > "$RUN_DIR/api.log" 2>&1 &
-nohup env FIREPAAS_EDGE_PORT=8081 FIREPAAS_EDGE_TLS_CERT="$CERT_DIR/edge.crt" FIREPAAS_EDGE_TLS_KEY="$CERT_DIR/edge.key" \
+nohup env FIREPAAS_EDGE_PORT=8081 FIREPAAS_API_ADDR=http://127.0.0.1:8080 FIREPAAS_API_TOKEN="$API_TOKEN" \
+  FIREPAAS_EDGE_TLS_CERT="$CERT_DIR/edge.crt" FIREPAAS_EDGE_TLS_KEY="$CERT_DIR/edge.key" \
   FIREPAAS_REDIS_ADDR=127.0.0.1:6379 FIREPAAS_EDGE_TLS_CA="$CERT_DIR/ca.crt" \
   "$LAB_BIN/edge-proxy" > "$RUN_DIR/edge.log" 2>&1 &
 for _ in $(seq 1 30); do
@@ -193,6 +196,64 @@ code=$(curl -s -m 8 -o /dev/null -w '%{http_code}' -H "Host: $HN" http://127.0.0
 [[ "$code" == "200" ]] || fail "回滚后 edge != 200"
 log "    409 互斥 + 自动回滚 + 旧代持续服务 OK"
 
+log "7.5) 镜像策略回归（P1-2）：非法 digest / 非法引用 → 400"
+status=$(curl -s -m 10 -o /dev/null -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer $API_TOKEN" -H 'Content-Type: application/json' \
+  "http://127.0.0.1:8080/v1/apps/$APP/deployments" \
+  -d '{"image":"docker.io/library/nginx@sha256:short"}' || true)
+[[ "$status" == "400" ]] || fail "非法 digest 应 400（got $status）"
+status=$(curl -s -m 10 -o /dev/null -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer $API_TOKEN" -H 'Content-Type: application/json' \
+  "http://127.0.0.1:8080/v1/apps/$APP/deployments" \
+  -d '{"image":"not a valid ref !!"}' || true)
+[[ "$status" == "400" ]] || fail "非法引用应 400（got $status）"
+log "    非法镜像引用全部 400 OK"
+
+log "7.6) P2-4 回归：catalog 过期 → edge 受控 404；恢复后重建"
+REDIS_CLI="docker exec dev-redis-1 redis-cli"
+$REDIS_CLI DEL "hostidx:$HN" >/dev/null
+# 同时删 route 本体，验证 hostidx+route 双重建。
+# M4 后 edge 有 fresh TTL(5s) 本地缓存：删除后的 5s 内 fresh 命中仍可能
+# 200（声明的一致性窗口）；过 fresh TTL 后：未重建 → 权威 miss 404（P2-8：
+# 不 serve-stale），重建后 → 200。断言覆盖两个阶段。
+saw404=0
+for _ in $(seq 1 8); do
+  code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' -H "Host: $HN" http://127.0.0.1:8081/ || true)
+  [[ "$code" == "404" || "$code" == "503" ]] && saw404=1
+  [[ "$saw404" == "1" ]] && break
+  sleep 2
+done
+# 若 controller 事件驱动重建够快（删除后 5s 内重建），fresh 窗口内全程 200
+# 也是合法收敛——两种部接受，但至少不能一直非 200 或直接 5xx 之外的状态。
+if [[ "$saw404" != "1" ]]; then
+  # 验证当前确实已重建（200）；否则是断言窗口内既无 miss 又未恢复的异常。
+  code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' -H "Host: $HN" http://127.0.0.1:8081/ || true)
+  [[ "$code" == "200" ]] || fail "catalog 删除后既无 404 也未恢复（got $code）"
+  log "    （快速重建路径：删除后 fresh 窗口内投影已重建，无 miss 窗口）"
+fi
+# 等投影重建（controller 下一轮 buildRoutes，≤ sync 周期 + 余量）
+ok=0
+for _ in $(seq 1 24); do
+  code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' -H "Host: $HN" http://127.0.0.1:8081/ || true)
+  [[ "$code" == "200" ]] && ok=1 && break
+  sleep 5
+done
+[[ "$ok" == "1" ]] || fail "catalog 重建后 edge 未恢复 200（got $code）"
+log "    catalog 过期 404 + 重建恢复 200 OK"
+
+log "7.7) P2-4 回归：stale execution 请求 → agent proxy 拒绝"
+STALE_EXEC="exec-stale-e2e-m3"
+# agent proxy 直连（edge 身份 mTLS）：携 stale execution 头的请求必须被拒
+# （execution mismatch → 502，而非转发到 workload）。
+NODE_PROXY="127.0.0.1:5107"
+MACH=$(pg "SELECT id FROM machines WHERE app_id='$APP' AND desired_state!='DELETED' LIMIT 1")
+code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' \
+  --cert "$CERT_DIR/edge.crt" --key "$CERT_DIR/edge.key" --cacert "$CERT_DIR/ca.crt" \
+  -H "X-Firepaas-Machine-ID: $MACH" -H "X-Firepaas-Execution-ID: $STALE_EXEC" \
+  "https://$NODE_PROXY/" || true)
+[[ "$code" != "200" ]] || fail "stale execution 请求被转发（隔离失效，got $code）"
+log "    stale execution 请求被拒（$code）OK"
+
 log "8) U3：杀一个 VM → 仅重建缺失 ordinal"
 M1="$APP-r1-g2"
 BEFORE=$(pg "SELECT id||'='||current_execution_id FROM machines WHERE app_id='$APP' AND desired_state!='DELETED' ORDER BY id" | tr '\n' ' ')
@@ -233,14 +294,25 @@ done
 [[ "$code" == "200" ]] || fail "agent 重启后 edge != 200"
 log "    重启后 3 VM 重建、3 slots 一致，edge 200 OK"
 
-log "11) 清理 + 终态泄漏检查"
+log "11) 清理 + 终态泄漏检查（P0-1：删除后不得复活）"
 curl -fsS -m 10 -X DELETE -H "Authorization: Bearer $API_TOKEN" "http://127.0.0.1:8080/v1/apps/$APP" >/dev/null
+# 重复删除幂等（P0-1：返回 202 already_deleted，不是 404/500）
+status=$(curl -s -m 10 -o /dev/null -w '%{http_code}' -X DELETE \
+  -H "Authorization: Bearer $API_TOKEN" "http://127.0.0.1:8080/v1/apps/$APP" || true)
+[[ "$status" == "202" ]] || fail "重复删除应幂等 202（got $status）"
 for _ in $(seq 1 60); do
   left=$(pg "SELECT count(*) FROM machines WHERE desired_state!='DELETED'")
   [[ "$left" == "0" ]] && break
   sleep 5
 done
 [[ "$left" == "0" ]] || fail "清理后仍有 desired!=DELETED 的机器"
+# P0-1 回归：等待两个 controller 周期，确认被删 app 不再补建。
+sleep 15
+resurrected=$(pg "SELECT count(*) FROM machines WHERE app_id='$APP' AND desired_state!='DELETED'")
+[[ "$resurrected" == "0" ]] || fail "已删 app 复活了 $resurrected 台机器（P0-1 回归）"
+app_deleted=$(pg "SELECT (deleted_at IS NOT NULL) FROM apps WHERE id='$APP'")
+[[ "$app_deleted" == "t" ]] || fail "app 未墓碑化（deleted_at 为空）"
+log "    app 删除后墓碑化且无复活 OK"
 # 收敛窗口（删除是异步的：轮询至内核对象清零，而不是固定等待）
 for _ in $(seq 1 60); do
   fc=$(ps -eo args | grep -c "[b]inaries/firecracker" || true)

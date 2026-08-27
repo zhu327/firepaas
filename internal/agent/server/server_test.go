@@ -72,6 +72,41 @@ func (f *fakeInstances) GetInstance(_ context.Context, idOrName string) (*instan
 	return nil, instances.ErrNotFound
 }
 
+// M4.5：standby/restore 替身（记录调用并按状态机迁移）。
+func (f *fakeInstances) StandbyInstance(_ context.Context, id string, _ instances.StandbyInstanceRequest) (*instances.Instance, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	inst := f.byID(id)
+	if inst == nil {
+		return nil, instances.ErrNotFound
+	}
+	inst.State = instances.StateStandby
+	return inst, nil
+}
+
+func (f *fakeInstances) RestoreInstance(_ context.Context, id string) (*instances.Instance, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	inst := f.byID(id)
+	if inst == nil {
+		return nil, instances.ErrNotFound
+	}
+	inst.State = instances.StateRunning
+	return inst, nil
+}
+
+func (f *fakeInstances) byID(id string) *instances.Instance {
+	if inst, ok := f.byName[id]; ok {
+		return inst // test ids double as internal ids
+	}
+	for _, inst := range f.byName {
+		if inst.Id == id {
+			return inst
+		}
+	}
+	return nil
+}
+
 func (f *fakeInstances) DeleteInstance(_ context.Context, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -104,7 +139,12 @@ func newTestServer(t *testing.T) (*Server, *state.Ledger, *state.Fences) {
 	}
 	adapter := machine.New(&fakeInstances{byName: map[string]*instances.Instance{}}, fakeImages{}, nil, nil)
 	provider := info.New("test-node", "test", "test", "compute", "v1.14.2", "10.100.0.0/16", dir, nil, nil)
-	return New(adapter, ledger, fences, provider), ledger, fences
+	creds, err := state.OpenCreds(filepath.Join(dir, "credentials.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return New(adapter, ledger, fences, provider,
+		WithCreds(creds), WithCredentialRequired(true)), ledger, fences
 }
 
 func createReq(machineID string, generation uint64, opID string) *pb.CreateMachineRequest {
@@ -122,6 +162,7 @@ func createReq(machineID string, generation uint64, opID string) *pb.CreateMachi
 			MemMib:       256,
 			Env:          map[string]string{"PORT": "8080"},
 		},
+		ProxyCredential: "test-execution-credential",
 	}
 }
 

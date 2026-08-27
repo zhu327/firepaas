@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/example/firepaas/internal/agent/machine"
+	"github.com/example/firepaas/internal/controlplane/traffic"
 )
 
 const (
@@ -28,12 +29,23 @@ type targetKey struct{}
 // 每请求新建）；每次请求仅解析目标并挂到 request context。
 type Proxy struct {
 	machines *machine.Adapter
+	creds    credentialVerifier // nil = 不校验凭证（测试/过渡期）
 	reverse  *httputil.ReverseProxy
 }
 
-// New 构造 Proxy。
+// credentialVerifier 校验 execution-bound proxy credential（M4）。
+type credentialVerifier interface {
+	Verify(machineID, executionID, rawCredential string) bool
+}
+
+// New 构造 Proxy（不校验凭证：仅测试用）。
 func New(machines *machine.Adapter) *Proxy {
-	p := &Proxy{machines: machines}
+	return NewWithVerifier(machines, nil)
+}
+
+// NewWithVerifier 构造带 credential 校验的 Proxy。
+func NewWithVerifier(machines *machine.Adapter, creds credentialVerifier) *Proxy {
+	p := &Proxy{machines: machines, creds: creds}
 	p.reverse = &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			target, _ := req.Context().Value(targetKey{}).(*url.URL)
@@ -46,6 +58,7 @@ func New(machines *machine.Adapter) *Proxy {
 			// 内部转发头不进入 guest。
 			req.Header.Del(HeaderMachineID)
 			req.Header.Del(HeaderExecutionID)
+			req.Header.Del(traffic.HeaderCredential)
 		},
 		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
 			http.Error(w, err.Error(), http.StatusBadGateway)
@@ -65,6 +78,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	executionID := r.Header.Get(HeaderExecutionID)
 	if machineID == "" || executionID == "" {
 		http.Error(w, "missing machine/execution routing headers", http.StatusBadRequest)
+		return
+	}
+
+	// M4（ADR-0006）：execution-bound credential 摘要校验。缺头/错值一律 403，
+	// 不区分原因；execution 替换/删除后立即失效。
+	if p.creds != nil && !p.creds.Verify(machineID, executionID,
+		r.Header.Get(traffic.HeaderCredential)) {
+		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 

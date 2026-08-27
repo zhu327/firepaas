@@ -49,5 +49,24 @@ gen control-plane "$CN_CP" "clientAuth" "DNS:$CN_CP"
 echo "==> edge client"
 gen edge "$CN_EDGE" "clientAuth" "DNS:$CN_EDGE"
 
+# M4（ADR-0011 实验室形态）：客户端入口泛域名证书。
+# 生产用 step-ca ACME 按需签发；实验室由内部 CA 直接签 10 年 leaf，
+# 客户端信任 = 预置 ca.crt（runbook：curl --cacert ca.crt https://...）。
+WILDCARD_DOMAIN="${FIREPAAS_INGRESS_DOMAIN:-firepaas.local}"
+echo "==> ingress wildcard (SAN: *.$WILDCARD_DOMAIN + $WILDCARD_DOMAIN + localhost)"
+if [[ ! -f "wildcard-$WILDCARD_DOMAIN.crt" ]]; then
+  openssl req -newkey rsa:2048 -nodes     -keyout "wildcard-$WILDCARD_DOMAIN.key"     -out "wildcard-$WILDCARD_DOMAIN.csr"     -subj "/CN=*.$WILDCARD_DOMAIN"
+  cat > "wildcard-$WILDCARD_DOMAIN.ext" <<XEOF
+basicConstraints=CA:FALSE
+keyUsage=digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectAltName=DNS:*.$WILDCARD_DOMAIN,DNS:$WILDCARD_DOMAIN,IP:127.0.0.1
+XEOF
+  openssl x509 -req -in "wildcard-$WILDCARD_DOMAIN.csr" -CA ca.crt -CAkey ca.key     -CAcreateserial -days 3650 -out "wildcard-$WILDCARD_DOMAIN.crt"     -extfile "wildcard-$WILDCARD_DOMAIN.ext"
+  rm -f "wildcard-$WILDCARD_DOMAIN.csr" "wildcard-$WILDCARD_DOMAIN.ext"
+else
+  echo "    wildcard-$WILDCARD_DOMAIN already exists, skip"
+fi
+
 chmod 600 *.key
 echo "==> done: $CERT_DIR"

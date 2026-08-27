@@ -15,6 +15,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -135,12 +136,14 @@ func (c *Controller) reconcileRollout(ctx context.Context, app *store.App, r *st
 			}
 			_ = c.enqueueUserDelete(ctx, m, "rollout drain: recycle old generation")
 		}
-		if err := c.store.CompleteRollout(ctx, app.ID, false); err != nil {
-			return err
-		}
-		_ = c.store.SetDeploymentStatus(ctx, toDep.ID, "ACTIVE")
+		// P2-3：rollout 完成 + deployment ACTIVE/SUPERSEDED 同事务，中途崩溃
+		// 不再留下「ACTIVE 指向旧代」的不自愈状态。
+		fromID, fromStatus := "", ""
 		if fromDep, err := c.deploymentForGeneration(ctx, app.ID, r.FromGeneration); err == nil && fromDep != nil {
-			_ = c.store.SetDeploymentStatus(ctx, fromDep.ID, "SUPERSEDED")
+			fromID, fromStatus = fromDep.ID, "SUPERSEDED"
+		}
+		if err := c.store.CompleteRolloutWithStatus(ctx, app.ID, false, toDep.ID, "ACTIVE", fromID, fromStatus); err != nil {
+			return err
 		}
 		c.recordEvent(ctx, "rollout", "", r.ID, "", "complete: old generation recycled", nil)
 		c.metrics.Inc("firepaas_rollout_transitions_total", map[string]string{"from": "CUTOVER", "to": "COMPLETE"}, 1)
@@ -153,10 +156,10 @@ func (c *Controller) reconcileRollout(ctx context.Context, app *store.App, r *st
 			remaining++
 		}
 		if remaining == 0 {
-			if err := c.store.CompleteRollout(ctx, app.ID, true); err != nil {
+			// P2-3：rollout 完成 + deployment FAILED 同事务。
+			if err := c.store.CompleteRolloutWithStatus(ctx, app.ID, true, toDep.ID, "FAILED", "", ""); err != nil {
 				return err
 			}
-			_ = c.store.SetDeploymentStatus(ctx, toDep.ID, "FAILED")
 			c.recordEvent(ctx, "rollout", "", r.ID, "", "rollback complete", nil)
 			c.metrics.Inc("firepaas_rollout_transitions_total", map[string]string{"from": "ROLLING_BACK", "to": "COMPLETE_FAILED"}, 1)
 		}
@@ -189,8 +192,10 @@ func (c *Controller) reconcileAppScale(ctx context.Context) error {
 }
 
 func (c *Controller) reconcileApp(ctx context.Context, app *store.App) error {
-	// 删除后的墓碑（replicas=0）不再对账。
-	if app.DesiredReplicas <= 0 {
+	// P0-1：已删除的 app 不补建副本。机器由 deleteApp 经 outbox 下发的
+	// delete 操作收敛（R5 会补齐 agent 侧残留）。ListApps 已过滤墓碑行，
+	// 这里是双保险（防未来新调用方漏过滤）。
+	if app.Deleted {
 		return nil
 	}
 	target, err := c.targetDeployment(ctx, app)
@@ -333,12 +338,16 @@ func (c *Controller) enqueueAppMachineCreate(ctx context.Context, app *store.App
 }
 
 // enqueueUserDelete 是 app 语义的删除（kind=delete，成功即 desired=DELETED）。
+// opID 必须嵌入 execution 后缀（P0-2）：墓碑行复活会换新 execution，若 opID
+// 只用 machineID，scale down→up→down 的第二次缩容会撞「同幂等键不同请求体」
+// 的 ErrRequestConflict，永远 409（与 M2 recreateMachine 撞键问题同类）。
 func (c *Controller) enqueueUserDelete(ctx context.Context, m store.Machine, reason string) error {
+	opID := userDeleteOpID(m.ID, m.CurrentExecutionID)
 	req := &pb.DeleteMachineRequest{
 		MachineId:   m.ID,
 		ExecutionId: m.CurrentExecutionID,
 		Generation:  uint64(m.Generation),
-		OperationId: "op-del-" + m.ID,
+		OperationId: opID,
 	}
 	raw, err := protojson.Marshal(req)
 	if err != nil {
@@ -349,14 +358,26 @@ func (c *Controller) enqueueUserDelete(ctx context.Context, m store.Machine, rea
 		project = pg.ProjectID
 	}
 	op, err := c.store.EnqueueDelete(ctx, project, m.ID, m.CurrentExecutionID,
-		req.OperationId, m.Generation, raw)
+		opID, m.Generation, raw)
 	if err != nil {
+		if errors.Is(err, store.ErrRequestConflict) {
+			// 同 execution 下的重复删除请求体必然一致；冲突只来自异常路径，
+			// 记事件供审计，不中断对账循环。
+			c.recordEvent(ctx, "scale", m.ID, opID, "", "user delete idempotency conflict: "+err.Error(), nil)
+			return nil
+		}
 		return err
 	}
 	if op.Status == "PENDING" {
 		c.recordEvent(ctx, "scale", m.ID, op.ID, "", reason, nil)
 	}
 	return nil
+}
+
+// userDeleteOpID 是用户语义 delete 的幂等键：machine + execution 后缀
+// （execution 尾部 8 字符，与 create 路径 op-{id}-{exec8} 对齐）。
+func userDeleteOpID(machineID, executionID string) string {
+	return store.UserDeleteOpID(machineID, executionID)
 }
 
 // allReady 判定目标代全部 ordinal 就绪（S3 切流条件）：

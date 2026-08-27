@@ -32,6 +32,10 @@ type Server struct {
 	ledger   *state.Ledger
 	fences   *state.Fences
 	info     *info.Provider
+	creds    *state.Creds // M4：proxy credential 验证材料（仅摘要，ADR-0006）
+
+	// M4：强制要求 create 携带 proxy credential（兼容开关，默认 true）。
+	requireCredential bool
 
 	// P3-7：在途 create 的资源计数。admit 的快照（实例 Size 之和）只能
 	// 看到已落地的 machine；并发 create 在“检查→落地”窗口内互相不可见，
@@ -43,9 +47,25 @@ type Server struct {
 
 // New 构造 Server。fences 提供 generation 高水位（P0-2）：
 // 变更请求先查 ledger 幂等（重放返回原结果），再校验/推进 generation fence。
-func New(machines *machine.Adapter, ledger *state.Ledger, fences *state.Fences, info *info.Provider) *Server {
-	return &Server{machines: machines, ledger: ledger, fences: fences, info: info}
+// New 构造 Server。fences 提供 generation 高水位（P0-2）；creds 为 M4 proxy
+// credential 验证材料（可 nil = 不校验，仅测试用）。opts 可选扩展。
+func New(machines *machine.Adapter, ledger *state.Ledger, fences *state.Fences, info *info.Provider, opts ...Option) *Server {
+	s := &Server{machines: machines, ledger: ledger, fences: fences, info: info,
+		requireCredential: true}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
 }
+
+// Option 定制 Server（M4：向后兼容的可选参数）。
+type Option func(*Server)
+
+// WithCreds 注入验证材料存储（nil 之外）。同时关闭强制校验时用 WithCredentialRequired。
+func WithCreds(c *state.Creds) Option { return func(s *Server) { s.creds = c } }
+
+// WithCredentialRequired 控制 create 是否强制携带 proxy credential。
+func WithCredentialRequired(v bool) Option { return func(s *Server) { s.requireCredential = v } }
 
 // ServiceInfo 实现 InfoService。
 func (s *Server) ServiceInfo(context.Context, *emptypb.Empty) (*pb.ServiceInfoResponse, error) {
@@ -58,6 +78,13 @@ func (s *Server) CreateMachine(ctx context.Context, req *pb.CreateMachineRequest
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	hash := hashRequest(req)
+
+	// M4（ADR-0006 收口）：execution-bound proxy credential 单向下发。
+	// 缺失即拒绝（fail-closed；兼容开关仅限过渡期）。
+	if s.creds != nil && s.requireCredential && req.GetProxyCredential() == "" {
+		return nil, status.Error(codes.InvalidArgument,
+			"missing proxy_credential (execution-bound traffic token required)")
+	}
 
 	if raw, ok, err := s.ledger.Check(req.OperationId, hash); err != nil {
 		return nil, status.Error(codes.AlreadyExists, err.Error())
@@ -98,6 +125,14 @@ func (s *Server) CreateMachine(ctx context.Context, req *pb.CreateMachineRequest
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	resp := &pb.CreateMachineResponse{Machine: m}
+
+	// M4：create 成功即登记/替换验证材料（execution 替换时旧凭证自动失效）。
+	if s.creds != nil && req.GetProxyCredential() != "" {
+		if err := s.creds.Set(req.MachineId, req.Spec.GetExecutionId(),
+			state.Digest(req.GetProxyCredential())); err != nil {
+			return nil, status.Errorf(codes.Internal, "persist credential digest: %v", err)
+		}
+	}
 
 	raw, err := protojson.Marshal(resp)
 	if err != nil {
@@ -146,10 +181,14 @@ func (s *Server) DeleteMachine(ctx context.Context, req *pb.DeleteMachineRequest
 		// NotFound 单独映射：控制面把“agent 侧已不存在”当作幂等成功收敛，
 		// 其余错误保持 Internal（M1 评审 P2-3 配套）。
 		if errors.Is(err, instances.ErrNotFound) {
+			// M4：实例已不在也照样撤销验证材料（fail-closed 优先）。
+			_ = s.creds.Drop(req.MachineId)
 			return nil, status.Errorf(codes.NotFound, "machine %s not found at agent", req.MachineId)
 		}
 		return nil, status.Error(codes.Internal, err.Error())
 	}
+	// M4：删除成功 → 立即撤销验证材料，stale 流量 fail-closed。
+	_ = s.creds.Drop(req.MachineId)
 	if err := s.ledger.Put(req.OperationId, req.MachineId, hash, []byte(`{}`)); err != nil {
 		return nil, status.Error(codes.AlreadyExists, err.Error())
 	}
@@ -202,11 +241,93 @@ func admitSize(req *pb.CreateMachineRequest) (vcpu, memMib uint64) {
 }
 
 // hashRequest 生成 request hash。只用于幂等比较，不持久化敏感字段。
+// CreateMachineRequest 的 secret_env / proxy_credential 是单向下发的一次性
+// 字段（ADR-0006/0010）：重派时控制面会重新解析引用值、凭证按需现算，
+// 二者不参与幂等比较——首次执行的成功结果仍按 ledger 原样重放。
 func hashRequest(msg proto.Message) string {
+	if cr, ok := msg.(*pb.CreateMachineRequest); ok {
+		cp := proto.Clone(cr).(*pb.CreateMachineRequest)
+		cp.SecretEnv = nil
+		cp.ProxyCredential = ""
+		msg = cp
+	}
 	raw, err := protojson.MarshalOptions{UseProtoNames: true, EmitUnpopulated: true}.Marshal(msg)
 	if err != nil {
 		return fmt.Sprintf("hash-error-%v", err)
 	}
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
+}
+
+// PauseMachine / ResumeMachine（M4.5 scale-to-zero，mvp-plan §8.4）：
+// generation fencing + ledger 幂等，与其它变更 RPC 同一纪律。suspend 期间
+// observed PAUSED 不摘路由？——由 controller 决策：proxy 端首个请求触发
+// 同步 restore（autoresume），路由保留但请求有唤醒延迟。
+func (s *Server) PauseMachine(ctx context.Context, req *pb.PauseMachineRequest) (*pb.Machine, error) {
+	op := req.GetOperation()
+	if op == nil || op.MachineId == "" || op.ExecutionId == "" || op.OperationId == "" {
+		return nil, status.Error(codes.InvalidArgument, "operation with machine_id/execution_id/operation_id is required")
+	}
+	hash := hashRequest(req)
+	if raw, ok, err := s.ledger.Check(op.OperationId, hash); err != nil {
+		return nil, status.Error(codes.AlreadyExists, err.Error())
+	} else if ok {
+		var resp pb.Machine
+		if err := protojson.Unmarshal(raw, &resp); err != nil {
+			return nil, status.Errorf(codes.Internal, "replay ledger result: %v", err)
+		}
+		return &resp, nil
+	}
+	if err := s.fences.Check(op.MachineId, op.Generation); err != nil {
+		return nil, status.Error(codes.FailedPrecondition, err.Error())
+	}
+	// execution 绑定校验（P3-18）：暂停/恢复必须针对当前 execution，旧代
+	// 操作不得误停/误启新代实例（与 GetEndpoint/Delete 同一纪律；adapter 内
+	// 实现 tags 比对，mismatch 返回错误）。
+	m, err := s.machines.Pause(ctx, op.MachineId, op.ExecutionId)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	raw, merr := protojson.Marshal(m)
+	if merr != nil {
+		return nil, status.Errorf(codes.Internal, "marshal pause result: %v", merr)
+	}
+	if err := s.ledger.Put(op.OperationId, op.MachineId, hash, raw); err != nil {
+		return nil, status.Error(codes.AlreadyExists, err.Error())
+	}
+	return m, nil
+}
+
+func (s *Server) ResumeMachine(ctx context.Context, req *pb.ResumeMachineRequest) (*pb.Machine, error) {
+	op := req.GetOperation()
+	if op == nil || op.MachineId == "" || op.ExecutionId == "" || op.OperationId == "" {
+		return nil, status.Error(codes.InvalidArgument, "operation with machine_id/execution_id/operation_id is required")
+	}
+	hash := hashRequest(req)
+	if raw, ok, err := s.ledger.Check(op.OperationId, hash); err != nil {
+		return nil, status.Error(codes.AlreadyExists, err.Error())
+	} else if ok {
+		var resp pb.Machine
+		if err := protojson.Unmarshal(raw, &resp); err != nil {
+			return nil, status.Errorf(codes.Internal, "replay ledger result: %v", err)
+		}
+		return &resp, nil
+	}
+	if err := s.fences.Check(op.MachineId, op.Generation); err != nil {
+		return nil, status.Error(codes.FailedPrecondition, err.Error())
+	}
+	// execution 绑定校验（P3-18）：同 Pause。
+	m, err := s.machines.Resume(ctx, op.MachineId, op.ExecutionId)
+	if err != nil {
+		// 无快照等恢复失败：让上层决定 cold-start 重建。
+		return nil, status.Error(codes.FailedPrecondition, err.Error())
+	}
+	raw, merr := protojson.Marshal(m)
+	if merr != nil {
+		return nil, status.Errorf(codes.Internal, "marshal resume result: %v", merr)
+	}
+	if err := s.ledger.Put(op.OperationId, op.MachineId, hash, raw); err != nil {
+		return nil, status.Error(codes.AlreadyExists, err.Error())
+	}
+	return m, nil
 }
