@@ -3,6 +3,7 @@ package machine
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -99,6 +100,25 @@ func (f *fakeImages) CreateImage(context.Context, images.CreateImageRequest) (*i
 	return nil, f.err
 }
 func (f *fakeImages) WaitForReady(context.Context, string) error { return f.err }
+
+func (f *fakeImages) GetImage(context.Context, string) (*images.Image, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	sz := int64(50 << 20) // 50MiB：低于默认上限，高于本文件超限测试自设阈值
+	return &images.Image{Name: "docker.io/library/nginx:alpine", SizeBytes: &sz}, nil
+}
+
+func (f *fakeImages) ListImages(context.Context) ([]images.Image, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	sz := int64(50 << 20)
+	return []images.Image{
+		{Name: "docker.io/library/nginx:alpine@sha256:" + strings.Repeat("a", 64),
+			Status: images.StatusReady, SizeBytes: &sz},
+	}, nil
+}
 
 func validCreateRequest() *pb.CreateMachineRequest {
 	return &pb.CreateMachineRequest{
@@ -323,5 +343,23 @@ func TestPauseResumeMachineNotFound(t *testing.T) {
 	_, err = a.Resume(context.Background(), "no-such", "e1")
 	if !errors.Is(err, ErrMachineNotFound) {
 		t.Fatalf("resume missing machine: want ErrMachineNotFound, got %v", err)
+	}
+}
+
+// M5.1：解包大小超限 = 永久错误（ErrImageTooBig）。
+func TestEnsureImageReadySizeLimit(t *testing.T) {
+	im := &fakeInstances{}
+	img := &fakeImages{}
+	a := New(im, img, nil, nil)
+	// 上限 1MiB，fake 镜像 50MiB。
+	a.SetMaxUnpackMib(1)
+	err := a.ensureImageReady(context.Background(), "docker.io/library/nginx:alpine")
+	if !errors.Is(err, ErrImageTooBig) {
+		t.Fatalf("err = %v, want ErrImageTooBig", err)
+	}
+	// 上限调高后通过。
+	a.SetMaxUnpackMib(1000)
+	if err := a.ensureImageReady(context.Background(), "docker.io/library/nginx:alpine"); err != nil {
+		t.Fatalf("within limit must pass: %v", err)
 	}
 }

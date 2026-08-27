@@ -6,6 +6,8 @@
 package redact
 
 import (
+	"encoding/json"
+	"regexp"
 	"strings"
 )
 
@@ -69,4 +71,29 @@ func normalize(s string) string {
 		}
 	}
 	return b.String()
+}
+
+// RedactJSONBytes 对 jsonb/JSON 原始字节做整树脱敏（M5.3 operation trace
+// 用：operations.request/result 可能含 secret_env/proxy_credential）。
+// 解析失败时返回保守占位，不放行原文。
+func RedactJSONBytes(raw []byte) []byte {
+	if len(raw) == 0 {
+		return []byte("{}")
+	}
+	var v map[string]any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		// 非对象（数组等）或非法 JSON：逐个敏感键兜底替换。
+		sanitized := raw
+		for _, key := range sensitive {
+			re := regexp.MustCompile(`(?i)"` + regexp.QuoteMeta(key) + `"\s*:\s*"[^"]*"`)
+			sanitized = re.ReplaceAll(sanitized, []byte(`"`+key+`":"[REDACTED]"`))
+		}
+		return sanitized
+	}
+	out := RedactMap(v)
+	b, err := json.Marshal(out)
+	if err != nil {
+		return []byte("{}")
+	}
+	return b
 }

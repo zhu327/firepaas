@@ -9,7 +9,6 @@ package main
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -23,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/example/firepaas/internal/controlplane/apikeys"
 	"github.com/example/firepaas/internal/controlplane/catalog"
 	"github.com/example/firepaas/internal/controlplane/controller"
 	"github.com/example/firepaas/internal/controlplane/db"
@@ -69,6 +69,8 @@ func run() error {
 	if err := st.EnsureProject(ctx, "dev", "development"); err != nil {
 		return err
 	}
+	// M5.1（mvp-plan §9.1）：api_keys 哈希存储 + 最小 scope。
+	apiKeyMgr := apikeys.New(pool)
 
 	// 认证默认开启（评审 P1-1）：未显式设置 FIREPAAS_AUTH_DISABLED 时，
 	// 缺少 FIREPAAS_API_TOKEN 直接拒绝启动，而不是静默无认证。
@@ -111,6 +113,8 @@ func run() error {
 	cat := catalog.New(rdb)
 	resv := reservations.New(rdb, 120*time.Second)
 	reg := metrics.New()
+	// M5.2：单机宿主资源 gauge 采样（只读 /proc，15s 周期）。
+	go hostSampler(ctx, reg)
 	placer := scheduler.New(scheduler.DefaultBestOfKConfig(), scheduler.Options{})
 
 	// M2a leader：controller（reconcile+放置）只在持锁实例运行；备实例只读待命。
@@ -156,8 +160,10 @@ func run() error {
 	}()
 
 	api := &API{store: st, apiToken: apiToken, authDisabled: authDisabled,
-		images:  imagepolicy.New(envOr("FIREPAAS_REGISTRY_ALLOWLIST", "")),
-		secrets: secretsMgr, traffic: trafficSigner}
+		images: imagepolicy.NewWithOptions(envOr("FIREPAAS_REGISTRY_ALLOWLIST", ""),
+			isTruthy(envOr("FIREPAAS_IMAGE_REQUIRE_DIGEST", "false"))),
+		secrets: secretsMgr, traffic: trafficSigner, apiKeys: apiKeyMgr,
+		cat: cat, metrics: reg}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) })
 	mux.HandleFunc("POST /v1/machines", api.auth(api.createMachine))
@@ -186,6 +192,18 @@ func run() error {
 	mux.HandleFunc("POST /v1/apps/{id}/scale", api.auth(api.scaleApp))
 	mux.HandleFunc("POST /v1/apps/{id}/rollback", api.auth(api.rollbackApp))
 	mux.HandleFunc("DELETE /v1/apps/{id}", api.auth(api.deleteApp))
+	// M5.1（mvp-plan §9.1）：API key 管理（admin scope，routeScope 表收口）。
+	mux.HandleFunc("POST /v1/apikeys", api.auth(api.createAPIKey))
+	mux.HandleFunc("GET /v1/apikeys", api.auth(api.listAPIKeys))
+	mux.HandleFunc("DELETE /v1/apikeys/{id}", api.auth(api.revokeAPIKey))
+	// M5.3：操作追踪（请求/结果字段已脱敏）。
+	mux.HandleFunc("GET /v1/operations", api.auth(api.listOperations))
+	mux.HandleFunc("GET /v1/operations/{id}", api.auth(api.getOperation))
+	// M5.4：显式投影重建（admin scope）。
+	mux.HandleFunc("POST /v1/system/reprojections", api.auth(api.reproject))
+	// M5.5：节点排水/复原（admin scope，drain/rebuild 升级承诺）。
+	mux.HandleFunc("POST /v1/nodes/{id}/drain", api.auth(api.drainNode))
+	mux.HandleFunc("POST /v1/nodes/{id}/ready", api.auth(api.readyNode))
 	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) { reg.Handler().ServeHTTP(w, nil) })
 
 	srv := &http.Server{Addr: ":" + httpPort, Handler: auditMiddleware(mux)}
@@ -215,6 +233,9 @@ type API struct {
 	images       *imagepolicy.Policy // 镜像引用策略（P1-2：digest/allowlist）
 	secrets      *secrets.Manager    // M4：信封加密（nil = /v1/secrets 返回 503）
 	traffic      *traffic.Signer     // M4：execution-bound credential 现算
+	apiKeys      *apikeys.Manager    // M5.1：API key 哈希库（nil = 只认 root token）
+	cat          *catalog.Catalog    // M5.4：显式重投影（Redis 投影句柄）
+	metrics      *metrics.Registry   // M5.4：重投影计数等系统指标
 }
 
 type createMachineBody struct {
@@ -360,7 +381,7 @@ func (a *API) createMachine(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) listMachines(w http.ResponseWriter, r *http.Request) {
-	project := r.URL.Query().Get("project_id")
+	project := effectiveProjectID(r, "")
 	machines, err := a.store.ListMachines(r.Context(), project)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -449,22 +470,6 @@ func (a *API) listEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"events": events})
-}
-
-// auth 校验 Bearer token（常数时间比较）。认证默认开启；仅显式设置
-// FIREPAAS_AUTH_DISABLED=true（本地开发）时跳过（评审 P1-1）。
-func (a *API) auth(next http.HandlerFunc) http.HandlerFunc {
-	if a.authDisabled || a.apiToken == "" {
-		return next
-	}
-	return func(w http.ResponseWriter, r *http.Request) {
-		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if subtle.ConstantTimeCompare([]byte(got), []byte(a.apiToken)) != 1 {
-			writeErr(w, 401, "unauthorized")
-			return
-		}
-		next(w, r)
-	}
 }
 
 func isTruthy(v string) bool {

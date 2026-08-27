@@ -81,6 +81,25 @@ slot 网络后端由 agentd 环境变量 `FIREPAAS_NETWORK_BACKEND=bridge|slot` 
 （agentd-single.hcl 默认 slot）。guest 隔离由 root ns nftables 表
 `fp-isolation` 保证（O(1) ifname 集合，只增删自有表/规则）。
 
+## M5（内部生产就绪）
+
+M5 安全/稳定性/可观测/可靠性/升级（mvp-plan §9 执行记录见 docs/）：
+
+```bash
+sudo bash scripts/lab/e2e-m5.sh           # 六段验收（安全/时钟/指标/备份/重投影/升级/泄漏）
+sudo bash scripts/lab/host-hardening-check.sh   # 只读安全审计
+sudo bash scripts/lab/pg-backup.sh && sudo bash scripts/lab/pg-restore-rehearsal.sh
+sudo bash scripts/lab/minio-backup-rehearsal.sh
+FP_API_ADDR=http://127.0.0.1:8083 FP_API_TOKEN=<root> sudo bash scripts/lab/upgrade-agentd.sh
+sudo bash scripts/lab/soak-m5.sh --duration 72h   # 浸泡 runner（结果 results/soak-m5/）
+```
+
+- API key：`fpctl apikey create/ls/rm`（scope read<write<admin，project 级限制）。
+- 操作追踪：`fpctl ops ls/show`；指标：`GET /metrics`（宿主 gauge）；
+  可观测栈：`docker compose --profile observability -f iac/dev/docker-compose.yaml up -d`。
+- ontime 时钟探针镜像：`tools/ontime`（构建→push 127.0.0.1:5000/firepaas/ontime:2，
+  alpine base 必须保留发行版 init，见 docs/runbook-capacity.md）。
+
 `firepaas-agentd` 与 `firepaas-hypeman-p0` 互斥（共享 data_dir），需要回退 P0 时先
 `nomad job stop firepaas-agentd` 再运行 `scripts/lab/run-p0.sh`。
 

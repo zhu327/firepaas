@@ -1,0 +1,93 @@
+// apikeys.go：M5.1（mvp-plan §9.1）API key 管理端点（admin scope，routeScope 表已收口）。
+//
+//	POST   /v1/apikeys       创建（响应仅此一次携带明文 key）
+//	GET    /v1/apikeys       列表（永不回显 key 与 hash）
+//	DELETE /v1/apikeys/{id}  撤销（软删，幂等）
+package main
+
+import (
+	"encoding/json"
+	"net/http"
+	"time"
+)
+
+type createAPIKeyBody struct {
+	Name      string   `json:"name"`
+	Scopes    []string `json:"scopes"`     // 缺省 ["read"]；subset of {read,write,admin}
+	ProjectID string   `json:"project_id"` // 空 = 全部项目
+	TTLHours  int      `json:"ttl_hours"`  // 0 = 不过期
+}
+
+func (a *API) createAPIKey(w http.ResponseWriter, r *http.Request) {
+	if a.apiKeys == nil {
+		writeErr(w, 503, "api keys disabled (no pool)")
+		return
+	}
+	var b createAPIKeyBody
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&b); err != nil {
+		writeErr(w, 400, "bad request: "+err.Error())
+		return
+	}
+	if b.Name == "" {
+		writeErr(w, 400, "name is required")
+		return
+	}
+	if len(b.Scopes) == 0 {
+		b.Scopes = []string{"read"}
+	}
+	k, plain, err := a.apiKeys.Create(r.Context(), b.Name, b.Scopes, b.ProjectID,
+		time.Duration(b.TTLHours)*time.Hour)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	writeJSON(w, 201, map[string]any{
+		"id":         k.ID,
+		"name":       k.Name,
+		"scopes":     k.Scopes,
+		"project_id": k.ProjectID,
+		"expires_at": k.ExpiresAt,
+		// 明文只有这一次；客户端丢失即重新创建。
+		"key": plain,
+	})
+}
+
+func (a *API) listAPIKeys(w http.ResponseWriter, r *http.Request) {
+	if a.apiKeys == nil {
+		writeErr(w, 503, "api keys disabled")
+		return
+	}
+	keys, err := a.apiKeys.List(r.Context())
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	out := make([]map[string]any, 0, len(keys))
+	for _, k := range keys {
+		revoked := k.RevokedAt != nil
+		out = append(out, map[string]any{
+			"id":           k.ID,
+			"name":         k.Name,
+			"scopes":       k.Scopes,
+			"project_id":   k.ProjectID,
+			"created_at":   k.CreatedAt,
+			"expires_at":   k.ExpiresAt,
+			"last_used_at": k.LastUsedAt,
+			"revoked_at":   k.RevokedAt,
+			"revoked":      revoked,
+		})
+	}
+	writeJSON(w, 200, map[string]any{"keys": out})
+}
+
+func (a *API) revokeAPIKey(w http.ResponseWriter, r *http.Request) {
+	if a.apiKeys == nil {
+		writeErr(w, 503, "api keys disabled")
+		return
+	}
+	if err := a.apiKeys.Revoke(r.Context(), r.PathValue("id")); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]string{"id": r.PathValue("id"), "status": "revoked"})
+}

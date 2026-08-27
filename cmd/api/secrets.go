@@ -35,8 +35,13 @@ func auditMiddleware(next http.Handler) http.Handler {
 			"path":        r.URL.Path,
 			"status":      rec.status,
 			"duration_ms": time.Since(start).Milliseconds(),
+			// M5.1：调用方标识（root/key 名），无凭证明文。
+			"caller": keyNameForAudit(r),
 			// 显式约定：query/body/authorization 永不入审计。
 		})
+		if v, ok := fields["caller"]; ok && v == "" {
+			delete(fields, "caller")
+		}
 		args := make([]any, 0, len(fields)*2)
 		for k, v := range fields {
 			args = append(args, k, v)
@@ -147,7 +152,7 @@ func (a *API) listSecrets(w http.ResponseWriter, r *http.Request) {
 	if !a.secretsEnabled(w) {
 		return
 	}
-	metas, err := a.store.ListSecrets(r.Context(), projectOr(r, "dev"))
+	metas, err := a.store.ListSecrets(r.Context(), effectiveProjectID(r, "dev"))
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return

@@ -523,6 +523,17 @@ func (c *Controller) placeFor(ctx context.Context, op store.Operation, req *pb.C
 	for _, p := range pending {
 		pendingByNode[p.NodeID] = p
 	}
+	// M5.5：排水节点不进放置候选（scheduler filter "draining"）。
+	storedNodes, err := c.store.ListNodes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	drainingByID := map[string]bool{}
+	for _, sn := range storedNodes {
+		if sn.Draining {
+			drainingByID[sn.ID] = true
+		}
+	}
 	deployNodes, err := c.store.MachineNodesByDeployment(ctx)
 	if err != nil {
 		return nil, err
@@ -531,7 +542,8 @@ func (c *Controller) placeFor(ctx context.Context, op store.Operation, req *pb.C
 	spec := req.GetSpec()
 	nodes := make([]scheduler.Node, 0, len(views))
 	for _, v := range views {
-		n := scheduler.Node{ID: v.agentID, Status: v.status, Pool: v.n.NodePool}
+		n := scheduler.Node{ID: v.agentID, Status: v.status, Pool: v.n.NodePool,
+			Draining: drainingByID[v.agentID] || drainingByID[v.nomadID]}
 		if v.n.Info != nil {
 			info := v.n.Info
 			n.Labels = info.Labels
@@ -653,6 +665,12 @@ func (c *Controller) syncObserved(ctx context.Context) error {
 	for _, v := range views {
 		client := c.nodes.ClientFor(v.nomadID)
 		if client == nil {
+			// M5 诊断：之前静默跳过掩盖了 node client 未建立的问题。
+			c.nodeListFailures[v.agentID]++
+			if c.nodeListFailures[v.agentID]%5 == 1 {
+				slog.Warn("no agent client for node view", "node", v.agentID,
+					"nomad_id", v.nomadID, "status", v.status, "consecutive", c.nodeListFailures[v.agentID])
+			}
 			continue
 		}
 		listCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -693,7 +711,37 @@ func (c *Controller) syncObserved(ctx context.Context) error {
 	for _, m := range pgMachines {
 		c.processPGMachine(ctx, m, seen, agentByMachine)
 	}
-	return c.buildRoutes(ctx)
+	if err := c.buildRoutes(ctx); err != nil {
+		return err
+	}
+	c.publishGauges(ctx, views, pgMachines)
+	return nil
+}
+
+// publishGauges：M5.2/M5.3 观测 gauge 快照（每 sync 周期刷新，供 /metrics + 告警规则）。
+func (c *Controller) publishGauges(ctx context.Context, views []nodeView, machines []store.Machine) {
+	unhealthy := 0
+	for _, v := range views {
+		if v.status != "READY" {
+			unhealthy++
+		}
+	}
+	c.metrics.Set("firepaas_nodes_unhealthy", nil, uint64(unhealthy))
+	c.metrics.Set("firepaas_nodes_total", nil, uint64(len(views)))
+
+	byState := map[string]uint64{}
+	for _, m := range machines {
+		if m.DesiredState == "DELETED" {
+			continue
+		}
+		byState[m.ObservedState]++
+	}
+	for state, n := range byState {
+		c.metrics.Set("firepaas_machines_observed", map[string]string{"state": state}, n)
+	}
+	if n, err := c.store.CountOperations(ctx, "PENDING"); err == nil {
+		c.metrics.Set("firepaas_operations_pending", nil, uint64(n))
+	}
 }
 
 // processAgentMachine：agent 视角 → PG（orphan/旧 execution/正常 observed）。

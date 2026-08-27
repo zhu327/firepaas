@@ -1,0 +1,14 @@
+[upgrade 19:10:23] 1/5 构建 agentd
+[upgrade 19:10:24] 2/5 排水节点（node drain）
+[upgrade 19:10:24] node 949cfd3a-81a8-0726-9902-b6db12614b04 draining
+[upgrade 19:10:29] 3/5 rebuild：原子替换二进制并重启 system job
+==> 2026-08-27T19:10:29+08:00: Restarting 1 allocation
+    2026-08-27T19:10:29+08:00: Restarting running tasks in allocation "5c6f1ddb" for group "agent"
+==> 2026-08-27T19:10:30+08:00: Job restart finished
+
+Job restarted successfully!
+[upgrade 19:12:31] 4/5 恢复节点（node ready）
+[upgrade 19:12:31] 5/5 对账收敛检查（nodes READY + 无 PENDING 积压）
+FAIL ['949cfd3a-81a8-0726-9902-b6db12614b04']
+PASS pending=0
+[upgrade 19:12:46] upgrade rehearsal done

@@ -59,7 +59,15 @@ type InstanceManager interface {
 type ImageManager interface {
 	CreateImage(ctx context.Context, req images.CreateImageRequest) (*images.Image, error)
 	WaitForReady(ctx context.Context, name string) error
+	// M5.1：列出全部镜像（ready 轮询 + 解包大小准入）。hypeman 对 OCI index
+	// digest 引用（多平台镜像）的 GetImage 按平台 manifest 路径寻址会 404，
+	// 而上游 ListImages 返回 metadata 原始 name（含 digest 形态）——firepaas
+	// 只用这个稳定面。
+	ListImages(ctx context.Context) ([]images.Image, error)
 }
+
+// ErrImageTooBig：镜像解包大小超 FIREPAAS_IMAGE_MAX_UNPACK_MIB（永久错误）。
+var ErrImageTooBig = errors.New("image unpack size exceeds limit")
 
 // Adapter 包装 hypeman 的 instance/image manager。slots 非空时启用 slot
 // 网络后端（ADR-0004）：create 后把 hypeman TAP 移入 slot netns，delete 后回收。
@@ -71,6 +79,8 @@ type Adapter struct {
 	// M4.5：GetEndpoint 遇 Standby 实例时同步唤醒（autoresume，<5s SLO 来自
 	// M0 restore p95 基准）。默认开启；FIREPAAS_AGENT_AUTORESUME=false 关闭。
 	autoResume bool
+	// maxUnpackMib：镜像解包大小上限 MiB（0 = 不限制）。M5.1。
+	maxUnpackMib int64
 }
 
 // New 构造 Adapter。slotManager 为 nil 时保持 M1 bridge 行为；
@@ -80,8 +90,11 @@ func New(instances InstanceManager, images ImageManager, slotManager *slot.Manag
 		health: healthTracker, autoResume: true}
 }
 
-// SetAutoResume 控制 GetEndpoint 的 standby 同步唤醑。
+// SetAutoResume 控制 GetEndpoint 的 standby 同步唤醔。
 func (a *Adapter) SetAutoResume(v bool) { a.autoResume = v }
+
+// SetMaxUnpackMib 配置镜像解包大小上限（FIREPAAS_IMAGE_MAX_UNPACK_MIB）。
+func (a *Adapter) SetMaxUnpackMib(mib int64) { a.maxUnpackMib = mib }
 
 // ErrImageNotFound 表示镜像引用无法解析/拉取（永久性业务错误：重试不会
 // 改变结果）。controller 据此把 create 置为终态 FAILED，避免无限重派。
@@ -259,10 +272,49 @@ func (a *Adapter) ensureImageReady(ctx context.Context, imageRef string) error {
 	if _, err := a.images.CreateImage(ctx, images.CreateImageRequest{Name: imageRef}); err != nil {
 		// 已在队列/已存在等错误继续等待 ready。
 	}
-	if err := a.images.WaitForReady(ctx, imageRef); err != nil {
-		return fmt.Errorf("image %s not ready: %w", imageRef, err)
+	// M5.1：改为 ListImages 轮询取代 WaitForReady——hypeman 对 OCI index
+	// digest 引用的 GetImage 寻址有缺陷（目录键是平台 manifest digest），
+	// 而 ListImages 的 Name 保留请求时的 digest 形态，可用于匹配。
+	return a.waitImageReady(ctx, imageRef)
+}
+
+// waitImageReady 轮询 ListImages 直到匹配 imageRef 的镜像 ready；
+// ctx 超时或镜像进入 error 态则返回永久错误。匹配规则：
+// Name 全等，或者 imageRef 为 digest 形态时 Name 的前缀（仓库路径）相同。
+func (a *Adapter) waitImageReady(ctx context.Context, imageRef string) error {
+	prefix := imageRef
+	if i := strings.Index(prefix, "@"); i >= 0 {
+		prefix = prefix[:i]
 	}
-	return nil
+	tick := time.NewTicker(500 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		ims, err := a.images.ListImages(ctx)
+		if err != nil {
+			return fmt.Errorf("list images: %w", err)
+		}
+		for _, img := range ims {
+			if img.Name != imageRef && !strings.HasPrefix(img.Name, prefix+"@") {
+				continue
+			}
+			if img.Error != nil {
+				return fmt.Errorf("image %s failed: %s", imageRef, *img.Error)
+			}
+			if img.Status == images.StatusReady {
+				if a.maxUnpackMib > 0 && img.SizeBytes != nil &&
+					*img.SizeBytes > a.maxUnpackMib<<20 {
+					return fmt.Errorf("%w: %s unpacked %d MiB > limit %d MiB",
+						ErrImageTooBig, imageRef, *img.SizeBytes>>20, a.maxUnpackMib)
+				}
+				return nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("image %s not ready: %w", imageRef, ctx.Err())
+		case <-tick.C:
+		}
+	}
 }
 
 // redactSecretEnv 从回显 env 中剔除 secret_env 注入的键。hypeman 侧保留
@@ -434,4 +486,3 @@ func (a *Adapter) Resume(ctx context.Context, machineID, executionID string) (*p
 // controller 的 reconcile 决策表会把 NotFound 收敛为幂等成功，不应
 // 误判成镜像不可拉取的终态失败（P2-9）。
 var ErrMachineNotFound = errors.New("machine not found at agent")
-

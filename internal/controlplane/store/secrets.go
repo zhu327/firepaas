@@ -256,3 +256,16 @@ func secretRefsJSON(refs map[string]SecretRef) string {
 	}
 	return string(b)
 }
+
+// AnySecretProject 返回该 name 的 secret 归属 project（M5.1 跨 project 防线）。
+// name 在多个 project 下同名时取任意一个：防线只用于拒绝"明显不属于本
+// project"的访问，放行路径由 handler 按实际 project 精确查询兜底。
+func (s *Store) AnySecretProject(ctx context.Context, name string) (string, bool) {
+	var p string
+	err := s.pool.QueryRow(ctx,
+		`SELECT project_id FROM secrets WHERE name=$1 ORDER BY version DESC LIMIT 1`, name).Scan(&p)
+	if err != nil {
+		return "", false
+	}
+	return p, true
+}

@@ -125,6 +125,19 @@ func (fakeImages) CreateImage(context.Context, images.CreateImageRequest) (*imag
 	return nil, nil
 }
 func (fakeImages) WaitForReady(context.Context, string) error { return nil }
+func (fakeImages) GetImage(context.Context, string) (*images.Image, error) {
+	return &images.Image{Name: "x", SizeBytes: ptr(int64(1 << 20))}, nil
+}
+
+func (fakeImages) ListImages(context.Context) ([]images.Image, error) {
+	return []images.Image{{
+		Name:      "docker.io/library/nginx:alpine@sha256:" + strings.Repeat("a", 64),
+		Status:    images.StatusReady,
+		SizeBytes: ptr(int64(1 << 20)),
+	}}, nil
+}
+
+func ptr[T any](v T) *T { return &v }
 
 func newTestServer(t *testing.T) (*Server, *state.Ledger, *state.Fences) {
 	t.Helper()

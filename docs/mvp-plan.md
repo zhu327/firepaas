@@ -421,6 +421,51 @@ M3 全量代码评审发现两类 P0 与若干 P1/P2/P3，已全部修复并重�
 - 支持矩阵、SLO 前提、限制和 runbook 对内部用户公开；
 - 进入 30 天观察期（日历时间，不占工作量排期，对外汇报排期时单独列出）后再决定 GA 扩大范围。
 
+### 单机执行记录（2026-08-27，M5）
+
+- **M5.1 安全**：`api_keys` 表（SHA-256 哈希、revoke/expiry、`read<write<admin`
+  三档 scope、`project_id` NULL=全部项目）+ `POST/GET/DELETE /v1/apikeys` +
+  `fpctl apikey`；路由最小 scope 表 + 跨 project 防线（by-id 资源路径）+
+  审计带 caller 名；镜像准入：`FIREPAAS_IMAGE_REQUIRE_DIGEST`/
+  `FIREPAAS_REGISTRY_ALLOWLIST`（API 侧）+ `FIREPAAS_IMAGE_MAX_UNPACK_MIB`
+  （agent 侧 ListImages 轮询 size 校验，超限永久 InvalidArgument）。
+  注：实验室 DB 先行落地了同版本号 `0009_m5_api_keys.sql`（scopes text[]）；
+  仓内 0009 与线上对齐，`0010_m5_apikey_meta.sql` 补齐 name/expires/revoked/
+  hash 唯一索引，双轨一致。host hardening 只读审计脚本
+  `scripts/lab/host-hardening-check.sh`（PASS/WARN/FAIL + runbook 链接）。
+- **M5.2 稳定性**：宿主 gauge 采样器（15s：FD/inode/conntrack/entropy/load/内存）
+  → `/metrics`；Prometheus 告警规则 `iac/observability/prometheus-alerts.yml`。
+  实测（scripts/lab/results/m5/）：20 次 pause/resume guest 时钟漂移 **-5ms**
+  （FC snapshot 在本实验节奏下不丢 wall clock）；宿主 entropy 稳定 256；
+  conntrack 725→649。阈值与告警见 docs/runbook-capacity.md。
+- **M5.3 可观测**：`GET /v1/operations[/{id}]` operation trace（request/result
+  全树脱敏）+ `fpctl ops ls/show`；controller sync 每拍发布 machines_by_state/
+  nodes_unhealthy/ops_pending gauge；Grafana datasource+dashboard provisioning
+  入库 `iac/observability/grafan*`，compose `--profile observability` 可选拉起。
+- **M5.4 可靠性**：`scripts/lab/pg-backup.sh`（保留 7 份）+ `pg-restore-rehearsal
+  .sh`（scratch 库恢复+行数断言，e2e 实测一致）；`POST /v1/system/reprojections`
+  清投影→controller sync 重建（e2e flushall 后 ≤15s route 回源）；
+  `minio-backup-rehearsal.sh`（distroless 容器双拷贝清单一致，基线入结果目录）；
+  节点替换 runbook（docs/runbook-node-replacement.md，双机执行）。
+- **M5.5 升级**：`nodes.draining`（0011）+ `POST /v1/nodes/{id}/drain|ready` +
+  scheduler 过滤「draining」+ `scripts/lab/upgrade-agentd.sh` 全流程演练
+  （nomad job restart + 对账收敛，e2e PASS）。首版承诺 drain/rebuild 不承诺
+  零中断，写入 runbook。
+- **M5.6 e2e-m5** 六段验收 FULL PASS（约 4.5 min，日志入 results/m5/）：
+  A 错 key/只读 scope/跨 project 负路径 + registry allowlist/require-digest
+  拒绝路径；B 20 循环 pause/resume + guest 时钟采样（-5ms）；C /metrics
+  宿主 gauge + op trace 零明文；D PG 备份→恢复行数一致 + flushall→显式
+  重投影→edge 200；E drain→rebuild→ready→换版后建 app 200；F hardening
+  审计无 FAIL + 终态 fc=0/netns=0/pending=0。
+- **遗留与偏差**：1) 自动 idle 检测（per-VM usage 管道）→ v1.1（同 M4 记录）；
+  2) hypeman 对 OCI index digest 的 `GetImage` 寻址缺陷（多平台镜像的 digest
+  引用无法 lane 匹配）→ firepaas 侧改用 `ListImages` 轮询矩阵（Match on
+  metadata Name）；上游修复另开 DEFERRED-hypeman-upstream；3) `FROM scratch`
+  镜像无发行版 init，guest 不写 boot marker → 挂起 Initializing；文档必备
+  基础镜像要求（runbook-capacity）；4) 72h soak 以 `scripts/lab/soak-m5.sh`
+  交付并后台运行（结果 results/soak-m5/summary.csv），本里程碑记录 60min 排练。
+- **多 edge/双机项**继续累积 DEFERRED-MULTI-NODE。
+
 ## 10. 依赖与分工
 
 | 工作流 | 前置 | 可并行 |

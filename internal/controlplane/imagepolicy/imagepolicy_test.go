@@ -1,6 +1,9 @@
 package imagepolicy
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestValidate(t *testing.T) {
 	cases := []struct {
@@ -25,5 +28,19 @@ func TestValidate(t *testing.T) {
 		if (err != nil) != c.wantErr {
 			t.Errorf("%s: Validate(%q) allowlist=%q err = %v, wantErr %v", c.name, c.ref, c.allowlist, err, c.wantErr)
 		}
+	}
+}
+
+func TestRequireDigest(t *testing.T) {
+	p := NewWithOptions("", true)
+	if _, err := p.Validate("docker.io/library/nginx:alpine"); err == nil {
+		t.Fatal("mutable tag must be rejected under RequireDigest")
+	}
+	if _, err := p.Validate("docker.io/library/nginx@sha256:" + strings.Repeat("a", 64)); err != nil {
+		t.Fatalf("digest ref must pass: %v", err)
+	}
+	off := NewWithOptions("", false)
+	if _, err := off.Validate("docker.io/library/nginx:alpine"); err != nil {
+		t.Fatalf("tag ref must pass when RequireDigest off: %v", err)
 	}
 }

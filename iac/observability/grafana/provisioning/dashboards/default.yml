@@ -1,0 +1,11 @@
+# Grafana dashboard provisioning（M5.3）：启动即从仓库加载 firepaas 总览。
+apiVersion: 1
+providers:
+  - name: firepaas
+    orgId: 1
+    folder: firepaas
+    type: file
+    disableDeletion: true
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/provisioning/dashboards

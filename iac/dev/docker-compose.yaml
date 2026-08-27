@@ -40,6 +40,29 @@ services:
     volumes:
       - registry-data:/var/lib/registry
 
+  # M5.3 可观测栈（默认不启动）：docker compose --profile observability up -d
+  # 详见 iac/observability/README（数据源/dashboard provisioning 已入仓）。
+  prometheus:
+    image: docker.m.daocloud.io/prom/prometheus:latest
+    profiles: ["observability"]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ../observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../observability/prometheus-alerts.yml:/etc/prometheus/alerts.yml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+  grafana:
+    image: docker.m.daocloud.io/grafana/grafana:latest
+    profiles: ["observability"]
+    ports:
+      - "3000:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ../observability/grafana/provisioning:/etc/grafana/provisioning:ro
+
 volumes:
   pg-data:
   redis-data:

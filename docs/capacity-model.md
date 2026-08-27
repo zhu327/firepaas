@@ -76,3 +76,18 @@ agentd 依赖 firecracker 二进制、内核与 guest rootfs 基件;分发与版
 ## 变更记录
 
 - (冻结日期 + 依据)
+
+## M5 实测校准（2026-08-27，results/m5/）
+
+20 次 pause/resume 循环（ontime 探针，slot 后端）：
+
+| 采样点 | FD(file-nr) | conntrack | entropy | guest 时钟漂移 |
+|---|---|---|---|---|
+| 循环前 | 10592/9223372036854775807 | 725 | 256 | — |
+| 循环后 | 10592/9223372036854775807 | 649 | 符合 | **-5ms**（4 次采样全一致）|
+
+- 结论 1：FC snapshot 短 pause 不丢 wall clock；长 pause 建议 guest chrony
+  （一次性 -5ms 级校准即可，属预防性建议）。
+- 结论 2：pause/resume 无 FD/conntrack 漂移——M4.5 的恢复路径不占新资源面。
+- 结论 3：镜像必须带发行版 init（scratch 不用），解包上限默认 4096MiB。
+- 阈值进 `iac/observability/prometheus-alerts.yml` 与 docs/runbook-capacity.md。

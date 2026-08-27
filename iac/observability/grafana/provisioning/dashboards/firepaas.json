@@ -1,0 +1,65 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "id": 1,
+      "title": "宿主容量（内存/FD/conntrack/entropy/load）",
+      "type": "timeseries",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        { "refId": "A", "expr": "firepaas_host_mem_available_kb / 1024 / 1024", "legendFormat": "mem_avail_gib" },
+        { "refId": "B", "expr": "firepaas_host_fds_allocated / firepaas_host_fds_max", "legendFormat": "fd_usage" },
+        { "refId": "C", "expr": "firepaas_host_conntrack_count / firepaas_host_conntrack_max", "legendFormat": "conntrack_usage" },
+        { "refId": "D", "expr": "firepaas_host_entropy_avail", "legendFormat": "entropy" },
+        { "refId": "E", "expr": "firepaas_host_load1_x100 / 100", "legendFormat": "load1" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "调度与机器状态",
+      "type": "timeseries",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        { "refId": "A", "expr": "firepaas_machines_observed", "legendFormat": "{{state}}" },
+        { "refId": "B", "expr": "firepaas_operations_pending", "legendFormat": "ops_pending" },
+        { "refId": "C", "expr": "firepaas_nodes_unhealthy", "legendFormat": "nodes_unhealthy" },
+        { "refId": "D", "expr": "firepaas_nodes_total", "legendFormat": "nodes_total" },
+        { "refId": "E", "expr": "sum by (kind) (rate(firepaas_operations_total[5m]))", "legendFormat": "ops_{{kind}}/s" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "发布状态机转换",
+      "type": "timeseries",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 9 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (from,to) (rate(firepaas_rollout_transitions_total[5m]))", "legendFormat": "{{from}}→{{to}}" },
+        { "refId": "B", "expr": "sum by (result) (rate(firepaas_placements_total[5m]))", "legendFormat": "place_{{result}}" },
+        { "refId": "C", "expr": "sum by (reason) (rate(firepaas_filter_rejections_total[5m]))", "legendFormat": "reject_{{reason}}" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "对账与 RPC 健康",
+      "type": "timeseries",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 9 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (kind) (rate(firepaas_agent_rpc_errors_total[5m]))", "legendFormat": "rpc_err_{{kind}}" },
+        { "refId": "B", "expr": "sum by (action) (rate(firepaas_reconcile_actions_total[5m]))", "legendFormat": "{{action}}" },
+        { "refId": "C", "expr": "rate(firepaas_operation_stale_claims_recovered_total[5m])", "legendFormat": "stale_recovered" },
+        { "refId": "D", "expr": "rate(firepaas_operation_requeues_total[5m])", "legendFormat": "requeues" }
+      ]
+    }
+  ],
+  "refresh": "15s",
+  "schemaVersion": 39,
+  "tags": ["firepaas"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timezone": "browser",
+  "title": "firepaas 单机总览",
+  "uid": "firepaas-single",
+  "version": 1
+}

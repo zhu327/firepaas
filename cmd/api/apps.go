@@ -147,7 +147,8 @@ func (a *API) createApp(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) listApps(w http.ResponseWriter, r *http.Request) {
-	apps, err := a.store.ListApps(r.Context())
+	project := effectiveProjectID(r, "")
+	apps, err := a.store.ListAppsFiltered(r.Context(), project)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return

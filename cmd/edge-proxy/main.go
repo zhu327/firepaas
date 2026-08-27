@@ -396,9 +396,9 @@ func (e *edge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if nr, ok := nv.(*catalog.Route); ok && nr != nil && len(nr.Backends) > 0 {
 			for _, b := range nr.Backends {
 				if !b.Draining {
-				retryBackend = b
-				break
-			}
+					retryBackend = b
+					break
+				}
 			}
 		}
 	}

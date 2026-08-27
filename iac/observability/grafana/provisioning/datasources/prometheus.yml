@@ -1,0 +1,8 @@
+# Grafana datasource provisioning（M5.3）：firepaas-api /metrics。
+apiVersion: 1
+datasources:
+  - name: firepaas
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true

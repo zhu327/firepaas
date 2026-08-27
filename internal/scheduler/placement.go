@@ -53,6 +53,8 @@ type Node struct {
 	Pool   string
 	Labels map[string]string
 	Status string
+	// Draining：M5.5 手动排水——不再接受新放置（已有负载继续）。
+	Draining bool
 
 	CPUTotal    uint64
 	MemTotalMib uint64
@@ -146,8 +148,10 @@ func (p *Placer) Place(req Request, nodes []Node, rnd *rand.Rand) (Placement, er
 	// 1) 状态过滤：只接受 HEALTHY，排除重试黑名单。
 	var statusPass []Node
 	for _, n := range nodes {
-		if n.Status == StatusHealthy {
+		if n.Status == StatusHealthy && !n.Draining {
 			statusPass = append(statusPass, n)
+		} else if n.Draining {
+			addEvent("filter_rejection", n.ID, "draining")
 		} else {
 			addEvent("filter_rejection", n.ID, "status="+n.Status)
 		}

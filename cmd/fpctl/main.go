@@ -41,6 +41,10 @@ func run(args []string) error {
 		return runApp(args[1:])
 	case "secrets":
 		return runSecrets(args[1:])
+	case "apikey":
+		return runAPIKey(args[1:])
+	case "ops":
+		return runOps(args[1:])
 	default:
 		return fmt.Errorf("unknown command %q (see fpctl secrets / fpctl app)", args[0])
 	}

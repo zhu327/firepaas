@@ -111,8 +111,19 @@ func (s *Store) GetApp(ctx context.Context, appID string) (*App, error) {
 
 // ListApps 返回全部未删除的 app（P0-1：墓碑不参与对账/展示）。
 func (s *Store) ListApps(ctx context.Context) ([]App, error) {
-	rows, err := s.pool.Query(ctx, `SELECT `+appColumns+`
-		FROM apps WHERE deleted_at IS NULL ORDER BY id`)
+	return s.ListAppsFiltered(ctx, "")
+}
+
+// ListAppsFiltered 按 project 过滤（M5.1 受限 key 的列表行过滤；空 = 全部）。
+func (s *Store) ListAppsFiltered(ctx context.Context, projectID string) ([]App, error) {
+	q := `SELECT ` + appColumns + ` FROM apps WHERE deleted_at IS NULL`
+	args := []any{}
+	if projectID != "" {
+		q += ` AND project_id=$1`
+		args = append(args, projectID)
+	}
+	q += ` ORDER BY id`
+	rows, err := s.pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list apps: %w", err)
 	}

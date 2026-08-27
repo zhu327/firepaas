@@ -177,3 +177,27 @@ func (c *Catalog) PublishLocationState(ctx context.Context, machineID, execution
 	}
 	return c.rdb.Set(ctx, locationKey(machineID, executionID), raw, 0).Err()
 }
+
+// WipeProjections 删除全部 route/hostidx/location 投影键（M5.4 显式重投影）。
+// PG 仍是权威；controller 下一个 sync 周期（5s routes/30s leases）即重建。
+// 返回删除键数。
+func (c *Catalog) WipeProjections(ctx context.Context) (int64, error) {
+	var total int64
+	for _, pattern := range []string{"route:*", "hostidx:*", "machine:location:*"} {
+		it := c.rdb.Scan(ctx, 0, pattern, 200).Iterator()
+		var keys []string
+		for it.Next(ctx) {
+			keys = append(keys, it.Val())
+		}
+		if err := it.Err(); err != nil {
+			return total, fmt.Errorf("scan %s: %w", pattern, err)
+		}
+		if len(keys) > 0 {
+			if err := c.rdb.Del(ctx, keys...).Err(); err != nil {
+				return total, fmt.Errorf("wipe %s: %w", pattern, err)
+			}
+			total += int64(len(keys))
+		}
+	}
+	return total, nil
+}

@@ -1,0 +1,73 @@
+# prometheus-alerts.yml：M5.2 告警规则（mvp-plan §9.2/§9.3）。
+#
+# 实验室单机形态：Prometheus 由 iac/dev/docker-compose.yaml 的 observability
+# profile 可选拉起（见 iac/README.md），scrape /metrics：firepaas-api:8081。
+# 阈值与 capacity model 数值对齐；调整阈值请同步 docs/capacity-model.md。
+groups:
+  - name: firepaas-host
+    rules:
+      - alert: FirePaasHostMemLow
+        expr: firepaas_host_mem_available_kb < 4 * 1024 * 1024
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "宿主可用内存低于 4GiB（虚拟机 OOM 风险，M3 教训：cgroup 16GiB 上限）"
+          runbook: docs/runbook-capacity.md#memory
+
+      - alert: FirePaasFDPressure
+        expr: firepaas_host_fds_allocated / firepaas_host_fds_max > 0.8
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "宿主 FD 用量超 80%（每 VM 消费 TAP/文件描述符面）"
+          runbook: docs/runbook-capacity.md#fds
+
+      - alert: FirePaasConntrackPressure
+        expr: firepaas_host_conntrack_count / firepaas_host_conntrack_max > 0.7
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "conntrack 用量超 70%（新连接将被丢，数据面受损）"
+          runbook: docs/runbook-capacity.md#conntrack
+
+      - alert: FirePaasEntropyLow
+        expr: firepaas_host_entropy_avail < 128
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "宿主 entropy 低于 128（VM 内 /dev/urandom 不受阻，但 getrandom 可能阻塞）"
+          runbook: docs/runbook-capacity.md#entropy
+
+      - alert: FirePaasLoadHigh
+        expr: firepaas_host_load1_x100 > 1600
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "load1 > 16（16C 主机）持续 10 分钟"
+          runbook: docs/runbook-capacity.md#cpu
+
+  - name: firepaas-platform
+    rules:
+      - alert: FirePaasOpsBacklog
+        expr: firepaas_operations_pending > 20
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "PENDING 操作积压 > 20（controller 失速或 agent 不可达）"
+          runbook: docs/runbook-operations.md
+
+      - alert: FirePaasNodesUnhealthy
+        expr: firepaas_nodes_unhealthy > 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "存在 UNKNOWN/DEAD 节点（放置被过滤，可能无节点可用）"
+          runbook: docs/runbook-node-replacement.md
+
+      - alert: FirePaasAgentRPCErrors
+        expr: rate(firepaas_agent_rpc_errors_total[5m]) > 0.1
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "agent RPC 错误速率上升（凭证/网络/容量拒绝）"
+          runbook: docs/runbook-operations.md

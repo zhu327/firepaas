@@ -197,3 +197,29 @@ func TestPendingAccountingCountsAgainstAdmission(t *testing.T) {
 		t.Fatalf("pending accounting must reject overcommitted node, got %s", pl.NodeID)
 	}
 }
+
+// M5.5：排水节点不进候选（filter_rejection reason=draining）。
+func TestPlacementExcludesDraining(t *testing.T) {
+	nodes := []Node{
+		{ID: "n1", Pool: "compute", Status: StatusHealthy, CPUTotal: 8, MemTotalMib: 16000},
+		{ID: "n2", Pool: "compute", Status: StatusHealthy, Draining: true, CPUTotal: 8, MemTotalMib: 16000},
+	}
+	req := Request{VCPU: 1, MemMib: 128}
+	p := New(DefaultBestOfKConfig(), Options{})
+	placement, err := p.Place(req, nodes, nil)
+	if err != nil {
+		t.Fatalf("place: %v", err)
+	}
+	if placement.NodeID != "n1" {
+		t.Fatalf("placed on %s, want n1", placement.NodeID)
+	}
+	found := false
+	for _, e := range placement.Events {
+		if e.Kind == "filter_rejection" && e.NodeID == "n2" && e.Reason == "draining" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("missing draining rejection event: %+v", placement.Events)
+	}
+}

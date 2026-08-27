@@ -19,6 +19,8 @@ import (
 type Policy struct {
 	// Allowlist 为空表示不限制。
 	allowlist []string
+	// requireDigest：拒绝 mutable tag（生产入口可开，实验室默认关）。
+	requireDigest bool
 }
 
 // New 构造策略。allowlist 是逗号分隔的 registry host 列表（可含端口）。
@@ -33,12 +35,24 @@ func New(allowlistCSV string) *Policy {
 	return &Policy{allowlist: allow}
 }
 
+// NewWithOptions 构造带 digest 要求的策略（M5.1）。
+func NewWithOptions(allowlistCSV string, requireDigest bool) *Policy {
+	p := New(allowlistCSV)
+	p.requireDigest = requireDigest
+	return p
+}
+
 // Validate 返回规范化后的引用与错误。接受 tag 或 digest 引用；digest 形态
 // 校验 sha256 前缀与十六进制长度（64）。
 func (p *Policy) Validate(imageRef string) (string, error) {
 	ref, err := reference.ParseNormalizedNamed(imageRef)
 	if err != nil {
 		return "", fmt.Errorf("invalid image reference %q: %w", imageRef, err)
+	}
+	if p.requireDigest {
+		if _, ok := ref.(reference.Canonical); !ok {
+			return "", fmt.Errorf("image %q: digest-pinned reference required (FIREPAAS_IMAGE_REQUIRE_DIGEST)", imageRef)
+		}
 	}
 	if canonical, ok := ref.(reference.Canonical); ok {
 		d := canonical.Digest()

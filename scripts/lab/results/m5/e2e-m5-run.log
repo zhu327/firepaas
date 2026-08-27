@@ -1,0 +1,43 @@
+[e2e-m5 19:09:10] 0) 启动：root setup + agentd + API/edge（require-digest + 允许列表）
+
+
+==> View this job in the Web UI: http://127.0.0.1:4646/ui/jobs/firepaas-agentd@default
+
+[e2e-m5 19:09:21]     (累计 11s) agentd ready
+[e2e-m5 19:09:23]     (累计 13s) api/edge up
+[e2e-m5 19:09:23] 0.5) 预清理历史验收机
+[e2e-m5 19:09:23] A) 安全负路径
+[e2e-m5 19:09:24]     错 key/只读 scope/镜像 tag+allowlist 拒绝 全部符合预期 OK
+[e2e-m5 19:09:24] B) 稳定性：ontime 探针 + 20 循环 pause/resume 时钟漂移
+[e2e-m5 19:09:33]     基线 FD=10592	0	9223372036854775807 conntrack=725 entropy=256
+[e2e-m5 19:09:46]     cycle 5 guest-host drift=-5ms
+[e2e-m5 19:09:58]     cycle 10 guest-host drift=-5ms
+[e2e-m5 19:10:09]     cycle 15 guest-host drift=-5ms
+[e2e-m5 19:10:20]     cycle 20 guest-host drift=-5ms
+[e2e-m5 19:10:20]     20 循环后 FD=10592	0	9223372036854775807 conntrack=649（漂移序列: -5 -5 -5 -5 max=5ms）
+[e2e-m5 19:10:20]     guest 时钟漂移 < 10min（snapshot 语义，runbook 建议 guest chrony）OK
+[e2e-m5 19:10:20] C) 可观测：/metrics 宿主 gauge + operation trace 脱敏
+[e2e-m5 19:10:20]     /metrics 已含 host gauge（fds/entropy/conntrack/load）
+[e2e-m5 19:10:20]     operation trace 全字段 + 零明文 OK
+[e2e-m5 19:10:20] D) 可靠性：PG 备份/恢复演练 + flushall → 显式重投影
+[e2e-m5 19:10:20]     PG 备份→scratch 恢复→行数一致 PASS
+[e2e-m5 19:10:20]     显式重投影响应: {"deleted_keys":0,"duration_ms":0,"rebuild":"controller sync cycle (routes ≤5s, leases ≤30s)"}
+[e2e-m5 19:10:23]     flushall→显式重投影→≤15s 重建→edge 200 OK
+[e2e-m5 19:10:23] E) 升级：node drain → agentd rebuild → ready → 对账
+[upgrade 19:10:24] node 949cfd3a-81a8-0726-9902-b6db12614b04 draining
+[upgrade 19:12:31] 4/5 恢复节点（node ready）
+PASS pending=0
+[e2e-m5 19:12:46]     drain→rebuild→ready→对账 PASS
+[e2e-m5 19:12:53]     升级后创建+路由 200 OK
+[e2e-m5 19:12:53] F) host hardening 审计 + 清理 + 终态零泄漏
+[hardening 19:12:53] FAIL  kernel.randomize_va_space != 2
+[hardening 19:12:53] WARN  fs.protected_hardlinks != 1
+[hardening 19:12:53] WARN  fs.protected_symlinks != 1
+[hardening 19:12:53] PASS  kptr_restrict
+[hardening 19:12:53] PASS  SUID 二进制 12 个
+[hardening 19:12:53] WARN  sshd PermitRootLogin 未禁（实验室允许，生产必须 no）
+[hardening 19:12:53] WARN  sshd 允许密码登录（生产建议公私钥+2FA）
+[hardening 19:12:53] PASS  entropy_avail=256
+[e2e-m5 19:12:53]     hardening 审计执行（PASS/无 FAIL）
+[e2e-m5 19:13:03]     终态 fc=0 netns=0 veth=4 pending_ops=0
+[e2e-m5 19:13:03] M5 e2e PASS：安全负路径 / 镜像准入 / 时钟漂移采样 / operation trace 脱敏 / PG 备份恢复 / 显式重投影 / drain-rebuild 升级 / hardening 审计 / 零泄漏 全部通过

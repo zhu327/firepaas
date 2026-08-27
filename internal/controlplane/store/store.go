@@ -106,6 +106,7 @@ type Node struct {
 	DiskUsedMib     int64
 	GRPCAddr        string
 	ProxyAddr       string
+	Draining        bool // M5.5：手动排水标记（调度不再放置）
 	LastSeenAt      time.Time
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
@@ -577,13 +578,24 @@ func (s *Store) UpsertNode(ctx context.Context, n Node) error {
 	return nil
 }
 
-// ListNodes 返回全部节点。
+// SetNodeDraining 置/清节点排水标记（M5.5）。nodeID = /v1/nodes 里的 id。
+func (s *Store) SetNodeDraining(ctx context.Context, nodeID string, draining bool) error {
+	ct, err := s.pool.Exec(ctx,
+		`UPDATE nodes SET draining=$2, updated_at=now() WHERE id=$1`, nodeID, draining)
+	if err != nil {
+		return fmt.Errorf("set node draining: %w", err)
+	}
+	if ct.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
 func (s *Store) ListNodes(ctx context.Context) ([]Node, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, nomad_node_id, node_pool, status, labels::text,
 			vcpu_total, mem_total_mib, disk_total_mib, cpu_percent,
 			mem_used_mib, mem_allocated_mib, disk_used_mib, grpc_addr, proxy_addr,
-			last_seen_at, created_at, updated_at
+			last_seen_at, created_at, updated_at, draining
 		FROM nodes ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("list nodes: %w", err)
@@ -596,7 +608,7 @@ func (s *Store) ListNodes(ctx context.Context) ([]Node, error) {
 		if err := rows.Scan(&n.ID, &n.NomadNodeID, &n.NodePool, &n.Status, &labels,
 			&n.VCPUTotal, &n.MemTotalMib, &n.DiskTotalMib, &n.CPUPercent,
 			&n.MemUsedMib, &n.MemAllocatedMib, &n.DiskUsedMib, &n.GRPCAddr, &n.ProxyAddr,
-			&n.LastSeenAt, &n.CreatedAt, &n.UpdatedAt); err != nil {
+			&n.LastSeenAt, &n.CreatedAt, &n.UpdatedAt, &n.Draining); err != nil {
 			return nil, fmt.Errorf("scan node: %w", err)
 		}
 		if labels != "" && labels != "null" {

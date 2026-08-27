@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -165,6 +166,10 @@ func run() error {
 
 	tracker := health.New()
 	adapter := machine.New(set.Instances, set.Images, slotManager, tracker)
+	// M5.1：镜像解包大小准入（默认 4096MiB；0 = 不限）。
+	if v, err := strconv.ParseInt(envOr("FIREPAAS_IMAGE_MAX_UNPACK_MIB", "4096"), 10, 64); err == nil && v >= 0 {
+		adapter.SetMaxUnpackMib(v)
+	}
 	// M4.5：standby 实例的首流量同步唤醑（autoresume）。
 	if strings.EqualFold(envOr("FIREPAAS_AGENT_AUTORESUME", "true"), "false") {
 		adapter.SetAutoResume(false)

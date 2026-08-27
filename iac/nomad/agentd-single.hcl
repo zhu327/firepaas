@@ -66,6 +66,8 @@ job "firepaas-agentd" {
         FIREPAAS_AGENT_NODE_ID       = "${node.unique.id}"
         FIREPAAS_AGENT_BIND          = "0.0.0.0"
         FIREPAAS_NETWORK_BACKEND     = "slot"
+        # M5.1：镜像解包大小上限（agent 侧准入，超限永久拒绝）。
+        FIREPAAS_IMAGE_MAX_UNPACK_MIB = "4096"
         FIREPAAS_AGENT_TLS_CERT      = "/home/zty/Learn/firepaas/scripts/lab/certs/agentd.crt"
         FIREPAAS_AGENT_TLS_KEY       = "/home/zty/Learn/firepaas/scripts/lab/certs/agentd.key"
         FIREPAAS_AGENT_TLS_CA        = "/home/zty/Learn/firepaas/scripts/lab/certs/ca.crt"

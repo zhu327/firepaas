@@ -69,6 +69,8 @@ sudo bash scripts/lab/e2e-m1.sh       # M1 一键验证（API→agent→edge→V
 sudo bash scripts/lab/e2e-m2.sh       # M2 一键验证（并发幂等/调度/20 轮无泄漏）
 sudo bash scripts/lab/chaos-m2.sh     # M2 混沌验收（crash/ACK 丢失/Redis 清空收敛）
 sudo bash scripts/lab/e2e-m3.sh       # M3 一键验收（slot 网络/发布/回滚/隔离/无泄漏）
+sudo bash scripts/lab/e2e-m5.sh       # M5 一键验收（安全/时钟/指标/备份/重投影/升级/零泄漏）
+sudo bash scripts/lab/soak-m5.sh --duration 72h   # 72h 浸泡 runner（后台运行）
 ```
 
 开发依赖（PG/Redis/MinIO/registry）：受限网络先经 `docker.m.daocloud.io` 拉取并
