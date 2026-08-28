@@ -195,46 +195,34 @@ func TestCreateMachineDoesNotLeakSecretEnv(t *testing.T) {
 	req := createReq("m-secret", 1, "op-secret-1")
 	req.SecretEnv = map[string]string{"API_KEY": "super-secret-value", "DB_PASSWORD": "hunter2"}
 
-	resp, err := srv.CreateMachine(context.Background(), req)
-	if err != nil {
-		t.Fatal(err)
+	_, err := srv.CreateMachine(context.Background(), req)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("secret_env without safe injection API: want InvalidArgument, got %v", err)
 	}
-	for _, key := range []string{"API_KEY", "DB_PASSWORD"} {
-		if _, ok := resp.Machine.Spec.Env[key]; ok {
-			t.Fatalf("secret key %s leaked into CreateMachineResponse", key)
-		}
-	}
-	if resp.Machine.Spec.Env["PORT"] != "8080" {
-		t.Fatal("non-secret env lost from response")
-	}
-
-	// 持久化 ledger 结果不含 secret 值。
-	raw, ok, err := ledger.Check("op-secret-1", hashRequest(req))
-	if err != nil || !ok {
-		t.Fatalf("ledger check: ok=%v err=%v", ok, err)
-	}
-	for _, val := range []string{"super-secret-value", "hunter2"} {
-		if strings.Contains(string(raw), val) {
-			t.Fatalf("secret value %q leaked into persisted ledger result", val)
-		}
-	}
-
-	// ListMachines 同样不回显。
-	list, err := srv.ListMachines(context.Background(), &pb.ListMachinesRequest{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, m := range list.Machines {
-		for _, key := range []string{"API_KEY", "DB_PASSWORD"} {
-			if _, ok := m.Spec.Env[key]; ok {
-				t.Fatalf("secret key %s leaked into ListMachines", key)
-			}
-		}
+	// fail-closed 请求不写入幂等账本，且不能把值持久化在结果中。
+	_, ok, err := ledger.Check("op-secret-1", hashRequest(req))
+	if err != nil || ok {
+		t.Fatalf("rejected secret request must not enter ledger: ok=%v err=%v", ok, err)
 	}
 }
 
 // P0-2：generation fencing——旧 generation 的变更被拒绝；
 // 删除后旧 generation 的 re-create 也被拒绝；幂等重放不受影响。
+func TestDeleteRejectsStaleExecution(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	ctx := context.Background()
+	if _, err := srv.CreateMachine(ctx, createReq("m-exec", 1, "op-create")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.DeleteMachine(ctx, deleteReq("m-exec", 1, "op-delete", "wrong-execution")); status.Code(err) != codes.Internal {
+		t.Fatalf("stale execution delete: want Internal, got %v", err)
+	}
+	list, err := srv.ListMachines(ctx, &pb.ListMachinesRequest{})
+	if err != nil || len(list.Machines) != 1 {
+		t.Fatalf("stale delete removed machine: list=%+v err=%v", list, err)
+	}
+}
+
 func TestGenerationFencing(t *testing.T) {
 	srv, _, _ := newTestServer(t)
 	ctx := context.Background()

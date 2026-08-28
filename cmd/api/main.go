@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -19,6 +20,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -115,9 +117,20 @@ func run() error {
 	reg := metrics.New()
 	// M5.2：单机宿主资源 gauge 采样（只读 /proc，15s 周期）。
 	go hostSampler(ctx, reg)
-	placer := scheduler.New(scheduler.DefaultBestOfKConfig(), scheduler.Options{})
+	// v1.1（ADR-0018）：镜像亲和权重（默认 0.5；0 = 关闭）——与 R/K/α 同一
+	// 配置面（Best-of-K 打分参数的可运维热调入口，v1.1 以 env 暴露）。
+	placerCfg := scheduler.DefaultBestOfKConfig()
+	if raw := os.Getenv("FIREPAAS_SCHED_WEIGHT_IMAGE"); raw != "" {
+		if v, err := strconv.ParseFloat(raw, 64); err == nil && v >= 0 {
+			placerCfg.WeightImage = v
+		}
+	}
+	placer := scheduler.New(placerCfg, scheduler.Options{})
 
 	// M2a leader：controller（reconcile+放置）只在持锁实例运行；备实例只读待命。
+	// P3-13：routeKicker 把 leader 内 controller 的即时重建能力暴露给重投影
+	// 端点（幂等：buildRoutes 只读 PG 写投影，非 leader 调用也无害）。
+	kicker := &routeKicker{}
 	go func() {
 		err := leader.Elect(ctx, pool, leader.Key, func(lctx context.Context) error {
 			nm, err := nodemanager.New(nodemanager.Config{
@@ -139,19 +152,25 @@ func run() error {
 			}()
 
 			ctrl := controller.New(st, cat, nm, resv, placer, reg, controller.Config{
-				DefaultAppPort:       8080,
-				LegacyAgentProxyAddr: legacyProxyAddr,
-				OpPollInterval:       time.Second,
-				SyncInterval:         5 * time.Second,
-				RebuildInterval:      30 * time.Second,
-				ReconcileGrace:       30 * time.Second,
-				MaxPlacementAttempts: 3,
-				RolloutTimeout:       envDur("FIREPAAS_ROLLOUT_TIMEOUT", 300*time.Second),
-				RolloutDrainGrace:    envDur("FIREPAAS_ROLLOUT_DRAIN", 30*time.Second),
-				Secrets:              secretsMgr,
-				Traffic:              trafficSigner,
+				DefaultAppPort:        8080,
+				LegacyAgentProxyAddr:  legacyProxyAddr,
+				OpPollInterval:        time.Second,
+				SyncInterval:          5 * time.Second,
+				RebuildInterval:       30 * time.Second,
+				ReconcileGrace:        30 * time.Second,
+				NodeLossRecreateAfter: envDur("FIREPAAS_NODE_LOSS_RECREATE_AFTER", time.Minute),
+				MaxPlacementAttempts:  3,
+				RolloutTimeout:        envDur("FIREPAAS_ROLLOUT_TIMEOUT", 300*time.Second),
+				RolloutDrainGrace:     envDur("FIREPAAS_ROLLOUT_DRAIN", 30*time.Second),
+				Secrets:               secretsMgr,
+				Traffic:               trafficSigner,
+				// v1.1（ADR-0018/0021）：部署预取 top-K 与 evacuate 步超时。
+				PrefetchTopK:        envInt("FIREPAAS_PREFETCH_TOPK", 3),
+				EvacuateStepTimeout: envDur("FIREPAAS_EVACUATE_STEP_TIMEOUT", 5*time.Minute),
 			})
 			slog.Info("running control loop as leader")
+			kicker.Set(ctrl.KickRouteRebuild)
+			defer kicker.Clear()
 			return ctrl.Run(lctx)
 		})
 		if err != nil && ctx.Err() == nil {
@@ -163,7 +182,7 @@ func run() error {
 		images: imagepolicy.NewWithOptions(envOr("FIREPAAS_REGISTRY_ALLOWLIST", ""),
 			isTruthy(envOr("FIREPAAS_IMAGE_REQUIRE_DIGEST", "false"))),
 		secrets: secretsMgr, traffic: trafficSigner, apiKeys: apiKeyMgr,
-		cat: cat, metrics: reg}
+		cat: cat, metrics: reg, kicker: kicker}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) })
 	mux.HandleFunc("POST /v1/machines", api.auth(api.createMachine))
@@ -204,7 +223,19 @@ func run() error {
 	// M5.5：节点排水/复原（admin scope，drain/rebuild 升级承诺）。
 	mux.HandleFunc("POST /v1/nodes/{id}/drain", api.auth(api.drainNode))
 	mux.HandleFunc("POST /v1/nodes/{id}/ready", api.auth(api.readyNode))
-	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) { reg.Handler().ServeHTTP(w, nil) })
+	// P3-15（M5 评审）：/metrics 默认开放（Prometheus 内网抓取）；生产可设
+	// FIREPAAS_METRICS_TOKEN 收口（Bearer 匹配，与 API token 相互独立）。
+	metricsToken := envOr("FIREPAAS_METRICS_TOKEN", "")
+	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
+		if metricsToken != "" {
+			got := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+			if subtle.ConstantTimeCompare([]byte(got), []byte(metricsToken)) != 1 {
+				writeErr(w, 401, "unauthorized")
+				return
+			}
+		}
+		reg.Handler().ServeHTTP(w, r)
+	})
 
 	srv := &http.Server{Addr: ":" + httpPort, Handler: auditMiddleware(mux)}
 	errCh := make(chan error, 1)
@@ -236,6 +267,40 @@ type API struct {
 	apiKeys      *apikeys.Manager    // M5.1：API key 哈希库（nil = 只认 root token）
 	cat          *catalog.Catalog    // M5.4：显式重投影（Redis 投影句柄）
 	metrics      *metrics.Registry   // M5.4：重投影计数等系统指标
+	kicker       *routeKicker        // P3-13：leader controller 的即时重建句柄
+}
+
+// routeKicker 把 leader 实例 controller 的 KickRouteRebuild 递给 API 层
+// （controller 在 leader 回调内构造，无法重排到 API 之前）。
+type routeKicker struct {
+	mu sync.Mutex
+	fn func() (time.Duration, error)
+}
+
+func (k *routeKicker) Set(fn func() (time.Duration, error)) {
+	k.mu.Lock()
+	k.fn = fn
+	k.mu.Unlock()
+}
+
+// Clear 在 leader 回调退出时撤销旧 controller 的函数指针，避免失锁实例
+// 继续从 API goroutine 写投影。
+func (k *routeKicker) Clear() {
+	k.mu.Lock()
+	k.fn = nil
+	k.mu.Unlock()
+}
+
+// Kick 立即重建路由投影；leader 未就绪时返回 false（端点降级为等 ticker）。
+func (k *routeKicker) Kick() (time.Duration, error, bool) {
+	k.mu.Lock()
+	fn := k.fn
+	k.mu.Unlock()
+	if fn == nil {
+		return 0, nil, false
+	}
+	d, err := fn()
+	return d, err, true
 }
 
 type createMachineBody struct {
@@ -269,7 +334,7 @@ type healthCheckBody struct {
 
 func (a *API) createMachine(w http.ResponseWriter, r *http.Request) {
 	var body createMachineBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		writeErr(w, 400, "bad request: "+err.Error())
 		return
 	}
@@ -277,6 +342,13 @@ func (a *API) createMachine(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "hostname, image and operation_id are required")
 		return
 	}
+	// P1-2（M5 评审）：受限 key 只能建自己 project 的 machine（同 createApp）。
+	project, ok := clampBodyProject(r, body.ProjectID)
+	if !ok {
+		writeErr(w, 403, "cross-project access denied")
+		return
+	}
+	body.ProjectID = project
 	if body.ProjectID == "" {
 		body.ProjectID = "dev"
 	}
@@ -286,6 +358,14 @@ func (a *API) createMachine(w http.ResponseWriter, r *http.Request) {
 	if body.DeploymentID == "" {
 		body.DeploymentID = "dep-" + body.Hostname
 	}
+	// 与 app/deployment 路径一致执行镜像策略，不能留下绕过 image validation
+	// 的 public machine-create 端点。
+	normalizedImage, err := a.images.Validate(body.Image)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	body.Image = normalizedImage
 	// M2 验收：同一 replica ordinal 的并发重试必须落同一 machine_id。
 	// machine_id 缺省按 (app_id, replica_ordinal) 稳定推导；显式提供时原样使用。
 	if body.MachineID == "" {
@@ -434,7 +514,16 @@ func (a *API) deleteMachine(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "marshal delete: "+err.Error())
 		return
 	}
-	op, err := a.store.EnqueueDelete(r.Context(), "dev", id, executionID, operationID, m.Generation, raw)
+	project, err := a.store.ProjectForApp(r.Context(), m.AppID)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if project == "" {
+		writeErr(w, 409, "machine app has no project")
+		return
+	}
+	op, err := a.store.EnqueueDelete(r.Context(), project, id, executionID, operationID, m.Generation, raw)
 	if err != nil {
 		if errors.Is(err, store.ErrRequestConflict) {
 			writeErr(w, 409, err.Error())
@@ -464,7 +553,7 @@ func (a *API) listEvents(w http.ResponseWriter, r *http.Request) {
 			limit = n
 		}
 	}
-	events, err := a.store.ListSchedulerEvents(r.Context(), limit)
+	events, err := a.store.ListSchedulerEvents(r.Context(), effectiveProjectID(r, ""), limit)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -517,4 +606,14 @@ func envDur(key string, def time.Duration) time.Duration {
 		return def
 	}
 	return d
+}
+
+// envInt 解析整数环境变量（非法值回退默认）。
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
 }

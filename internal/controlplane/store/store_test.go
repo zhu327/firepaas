@@ -11,6 +11,36 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+func TestProjectUsageIncludesAllocatedAndPending(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	project := fmt.Sprintf("p-usage-%d", os.Getpid())
+	if err := s.EnsureProject(ctx, project, "usage-test"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cleanupProject(t, s, project) })
+
+	machineID := "m-usage-" + fmt.Sprint(os.Getpid())
+	op, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-usage", "usage.local", "img:1",
+		2, 1024, 80, machineID, "dep-usage", "exec-1", "op-usage-"+fmt.Sprint(os.Getpid()),
+		1, 0, []byte(`{}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vcpu, mem, err := s.ProjectUsage(ctx, project); err != nil || vcpu != 2 || mem != 1024 {
+		t.Fatalf("pending usage = (%d,%d), err=%v; want (2,1024)", vcpu, mem, err)
+	}
+	if err := s.UpdateMachineNodeAndObserved(ctx, machineID, "node-1", "exec-1", "RUNNING", "", "READY"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CompleteOperation(ctx, op.ID, "SUCCEEDED", []byte(`{}`), ""); err != nil {
+		t.Fatal(err)
+	}
+	if vcpu, mem, err := s.ProjectUsage(ctx, project); err != nil || vcpu != 2 || mem != 1024 {
+		t.Fatalf("allocated usage = (%d,%d), err=%v; want (2,1024)", vcpu, mem, err)
+	}
+}
+
 func TestJSONEqual(t *testing.T) {
 	cases := []struct {
 		name string
@@ -216,6 +246,65 @@ func TestEnsureCreateGenerationMonotonic(t *testing.T) {
 // M2 真机验收修复：换代（execution 变化）时旧 observed 必须作废，否则
 // R8 的“已 RUNNING 即补账”会把重建循环里的 create 永远短路成 SUCCEEDED，
 // agent 侧实际没有这台 machine，形成无限换代。
+func TestMarkMachineObservedMissingPreservesLastObservation(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	project := fmt.Sprintf("p-missing-%d", os.Getpid())
+	if err := s.EnsureProject(ctx, project, "missing-test"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cleanupProject(t, s, project) })
+	machineID := "m-missing-" + fmt.Sprint(os.Getpid())
+	if _, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-missing", "missing.local", "img:1",
+		1, 512, 80, machineID, "dep-missing", "exec-1", "op-missing-"+fmt.Sprint(os.Getpid()),
+		1, 0, []byte(`{}`), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateMachineObserved(ctx, machineID, "exec-1", "RUNNING", "10.0.0.1", "READY"); err != nil {
+		t.Fatal(err)
+	}
+	before, err := s.GetMachine(ctx, machineID)
+	if err != nil || before == nil || before.LastObservedAt == nil {
+		t.Fatalf("missing initial observation: %v", err)
+	}
+	if err := s.MarkMachineObservedMissing(ctx, machineID); err != nil {
+		t.Fatal(err)
+	}
+	after, err := s.GetMachine(ctx, machineID)
+	if err != nil || after == nil {
+		t.Fatal(err)
+	}
+	if after.ObservedState != "UNKNOWN" || after.LastObservedAt == nil || !after.LastObservedAt.Equal(*before.LastObservedAt) {
+		t.Fatalf("missing mark must retain last successful observation, before=%+v after=%+v", before, after)
+	}
+}
+
+func TestUpdateObservedRejectsStaleExecution(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	project := fmt.Sprintf("p-observed-cas-%d", os.Getpid())
+	if err := s.EnsureProject(ctx, project, "observed-cas-test"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cleanupProject(t, s, project) })
+	machineID := "m-observed-cas-" + fmt.Sprint(os.Getpid())
+	if _, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-observed-cas", "cas.local", "img:1",
+		1, 512, 80, machineID, "dep-cas", "exec-current", "op-cas-"+fmt.Sprint(os.Getpid()),
+		2, 0, []byte(`{}`), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateMachineObserved(ctx, machineID, "exec-stale", "RUNNING", "10.0.0.1", "READY"); err != nil {
+		t.Fatal(err)
+	}
+	m, err := s.GetMachine(ctx, machineID)
+	if err != nil || m == nil {
+		t.Fatal(err)
+	}
+	if m.ObservedState != "" || m.ObservedSlotIP != "" {
+		t.Fatalf("stale execution overwrote observed state: %+v", m)
+	}
+}
+
 func TestEnsureCreateExecutionChangeClearsObserved(t *testing.T) {
 	s := testStore(t)
 	ctx := context.Background()

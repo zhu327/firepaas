@@ -3,6 +3,10 @@
 // M1 身份降级（ADR-0006）：先接受 edge 单向下发的
 // X-Firepaas-Machine-ID / X-Firepaas-Execution-ID 头并校验 execution；
 // mTLS + proxy credential 在 M1.3/M4 补齐。
+//
+// v1.1（ADR-0022）：接受 edge 的 X-Firepaas-App-Port 请求头（命中 route 的
+// service internal_port）；缺失 = 旧行为（主 service 端口）。未声明端口被
+// services 白名单拒绝（502）。
 package proxy
 
 import (
@@ -11,6 +15,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/example/firepaas/internal/agent/machine"
@@ -20,6 +25,14 @@ import (
 const (
 	HeaderMachineID   = "X-Firepaas-Machine-ID"
 	HeaderExecutionID = "X-Firepaas-Execution-ID"
+	// HeaderAppPort（v1.1，ADR-0022）：edge→proxy 的目标 service 端口头。
+	// 缺失 = 旧行为（spec 声明的主 service 端口），向后兼容。
+	HeaderAppPort = "X-Firepaas-App-Port"
+	// HeaderRetryable marks an agent-generated 502 that edge may retry after
+	// refreshing its route. It is strictly an internal agent→edge signal and
+	// must never be forwarded to a workload or client.
+	HeaderRetryable = "X-Firepaas-Proxy-Retryable"
+	retryableValue  = "true"
 )
 
 type targetKey struct{}
@@ -59,8 +72,16 @@ func NewWithVerifier(machines *machine.Adapter, creds credentialVerifier) *Proxy
 			req.Header.Del(HeaderMachineID)
 			req.Header.Del(HeaderExecutionID)
 			req.Header.Del(traffic.HeaderCredential)
+			req.Header.Del(HeaderAppPort)
+			req.Header.Del(HeaderRetryable)
+		},
+		// A workload must not be able to forge the agent→edge retry signal.
+		ModifyResponse: func(resp *http.Response) error {
+			resp.Header.Del(HeaderRetryable)
+			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
+			w.Header().Set(HeaderRetryable, retryableValue)
 			http.Error(w, err.Error(), http.StatusBadGateway)
 		},
 		Transport: &http.Transport{
@@ -89,8 +110,23 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ip, port, err := p.machines.GetEndpoint(r.Context(), machineID, executionID)
+	// v1.1（ADR-0022）：目标 service 端口（缺失/非法 = 0 → 主端口旧行为）。
+	wantPort := 0
+	if raw := r.Header.Get(HeaderAppPort); raw != "" {
+		port, err := strconv.Atoi(raw)
+		if err != nil || port < 1 || port > 65535 {
+			http.Error(w, "invalid "+HeaderAppPort, http.StatusBadRequest)
+			return
+		}
+		wantPort = port
+	}
+
+	ip, port, err := p.machines.GetEndpointForPort(r.Context(), machineID, executionID, wantPort)
 	if err != nil {
+		// Endpoint lookup failure means this agent cannot serve the catalogued
+		// backend (for example a stale rolling route), rather than a workload
+		// response. Tell edge that this particular 502 is safe to retry.
+		w.Header().Set(HeaderRetryable, retryableValue)
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}

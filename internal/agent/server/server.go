@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"sync/atomic"
+	"syscall"
 
 	"github.com/example/firepaas/internal/agent/info"
 	"github.com/example/firepaas/internal/agent/machine"
@@ -23,10 +24,11 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
-// Server 聚合 InfoService / MachineService。
+// Server 聚合 InfoService / MachineService / ImageService。
 type Server struct {
 	pb.UnimplementedInfoServiceServer
 	pb.UnimplementedMachineServiceServer
+	pb.UnimplementedImageServiceServer
 
 	machines *machine.Adapter
 	ledger   *state.Ledger
@@ -36,6 +38,10 @@ type Server struct {
 
 	// M4：强制要求 create 携带 proxy credential（兼容开关，默认 true）。
 	requireCredential bool
+
+	// diskWatermark（v1.1，ADR-0018）：PullImage（部署预取）的磁盘水位守护，
+	// 已用比例 ≥ 该值时拒绝预取（0 = 不启用；create 路径不受影响）。
+	diskWatermark float64
 
 	// P3-7：在途 create 的资源计数。admit 的快照（实例 Size 之和）只能
 	// 看到已落地的 machine；并发 create 在“检查→落地”窗口内互相不可见，
@@ -66,6 +72,10 @@ func WithCreds(c *state.Creds) Option { return func(s *Server) { s.creds = c } }
 
 // WithCredentialRequired 控制 create 是否强制携带 proxy credential。
 func WithCredentialRequired(v bool) Option { return func(s *Server) { s.requireCredential = v } }
+
+// WithDiskWatermark 设置 PullImage（部署预取）的磁盘水位守护
+// （已用比例 ≥ v 时拒绝预取；0 = 不启用）。
+func WithDiskWatermark(v float64) Option { return func(s *Server) { s.diskWatermark = v } }
 
 // ServiceInfo 实现 InfoService。
 func (s *Server) ServiceInfo(context.Context, *emptypb.Empty) (*pb.ServiceInfoResponse, error) {
@@ -98,11 +108,6 @@ func (s *Server) CreateMachine(ctx context.Context, req *pb.CreateMachineRequest
 		return &resp, nil
 	}
 
-	// generation fencing（P0-2）：拒绝早于已知高水位的请求。
-	if err := s.fences.Check(req.MachineId, req.Generation); err != nil {
-		return nil, status.Error(codes.FailedPrecondition, err.Error())
-	}
-
 	// P3-7：把本请求计入在途后再做硬准入；defer 扣回，保证并发 create 互可见。
 	wantVCPU, wantMem := admitSize(req)
 	s.inflightVCPU.Add(int64(wantVCPU))
@@ -115,11 +120,30 @@ func (s *Server) CreateMachine(ctx context.Context, req *pb.CreateMachineRequest
 		return nil, err
 	}
 
-	m, err := s.machines.Create(ctx, req)
+	// 与 Delete 共用 machine 临界区，避免新代 create 与旧代 delete 在
+	// "读取实例→验证 execution→删除"窗口交错。
+	var m *pb.Machine
+	var createErr error
+	err := s.fences.WithMachine(req.MachineId, func() error {
+		if err := s.fences.Check(req.MachineId, req.Generation); err != nil {
+			return err
+		}
+		m, createErr = s.machines.Create(ctx, req)
+		if createErr != nil {
+			return createErr
+		}
+		// 在释放 machine 锁之前推进高水位。否则旧代 Delete 可在新实例
+		// 创建完成与 Advance 之间通过 fence，继而删除新 execution。
+		return s.fences.Advance(req.MachineId, req.Generation, req.Spec.GetExecutionId())
+	})
 	if err != nil {
-		// 镜像不可解析/拉取、解包超限是永久性错误：InvalidArgument 让
-		// controller 停止无限重派（发布失败自动回滚依赖这一点快速触发）。
-		if errors.Is(err, machine.ErrImageNotFound) || errors.Is(err, machine.ErrImageTooBig) {
+		if errors.Is(err, state.ErrStaleGeneration) {
+			return nil, status.Error(codes.FailedPrecondition, err.Error())
+		}
+		// 镜像不可解析/拉取、解包超限和不安全的 secret 注入均为永久错误：
+		// InvalidArgument 让控制面停止重试并避免降级泄露。
+		if errors.Is(err, machine.ErrImageNotFound) || errors.Is(err, machine.ErrImageTooBig) ||
+			errors.Is(err, machine.ErrSecretEnvInjectionUnsupported) {
 			return nil, status.Error(codes.InvalidArgument, err.Error())
 		}
 		return nil, status.Error(codes.Internal, err.Error())
@@ -140,9 +164,6 @@ func (s *Server) CreateMachine(ctx context.Context, req *pb.CreateMachineRequest
 	}
 	if err := s.ledger.Put(req.OperationId, req.MachineId, hash, raw); err != nil {
 		return nil, status.Error(codes.AlreadyExists, err.Error())
-	}
-	if err := s.fences.Advance(req.MachineId, req.Generation, req.Spec.GetExecutionId()); err != nil {
-		return nil, status.Errorf(codes.Internal, "advance generation fence: %v", err)
 	}
 	return resp, nil
 }
@@ -172,33 +193,34 @@ func (s *Server) DeleteMachine(ctx context.Context, req *pb.DeleteMachineRequest
 		return &emptypb.Empty{}, nil
 	}
 
-	// generation fencing（P0-2）：拒绝早于已知高水位的删除。
-	if err := s.fences.Check(req.MachineId, req.Generation); err != nil {
-		return nil, status.Error(codes.FailedPrecondition, err.Error())
-	}
-
-	if err := s.machines.Delete(ctx, req.MachineId); err != nil {
-		// NotFound 单独映射：控制面把“agent 侧已不存在”当作幂等成功收敛，
-		// 其余错误保持 Internal（M1 评审 P2-3 配套）。
-		if errors.Is(err, instances.ErrNotFound) {
-			// M4：实例已不在也照样撤销验证材料（fail-closed 优先）。
-			_ = s.creds.Drop(req.MachineId)
-			return nil, status.Errorf(codes.NotFound, "machine %s not found at agent", req.MachineId)
+	// 对同一 machine 串行化 fence 验证、execution 验证与删除。否则并发的
+	// 新代 create 可在 Check 后替换实例，旧 execution 的 Delete 会误删新代。
+	var deleteErr error
+	if err := s.fences.WithMachine(req.MachineId, func() error {
+		if err := s.fences.Check(req.MachineId, req.Generation); err != nil {
+			return status.Error(codes.FailedPrecondition, err.Error())
 		}
-		return nil, status.Error(codes.Internal, err.Error())
+		if err := s.machines.Delete(ctx, req.MachineId, req.ExecutionId); err != nil {
+			if errors.Is(err, instances.ErrNotFound) {
+				_ = s.creds.Drop(req.MachineId)
+				return status.Errorf(codes.NotFound, "machine %s not found at agent", req.MachineId)
+			}
+			return status.Error(codes.Internal, err.Error())
+		}
+		_ = s.creds.Drop(req.MachineId)
+		if err := s.ledger.Put(req.OperationId, req.MachineId, hash, []byte(`{}`)); err != nil {
+			return status.Error(codes.AlreadyExists, err.Error())
+		}
+		_, _ = s.ledger.PruneMachineExcept(req.MachineId, req.OperationId)
+		if err := s.fences.Advance(req.MachineId, req.Generation, req.ExecutionId); err != nil {
+			return status.Errorf(codes.Internal, "advance generation fence: %v", err)
+		}
+		return nil
+	}); err != nil {
+		deleteErr = err
 	}
-	// M4：删除成功 → 立即撤销验证材料，stale 流量 fail-closed。
-	_ = s.creds.Drop(req.MachineId)
-	if err := s.ledger.Put(req.OperationId, req.MachineId, hash, []byte(`{}`)); err != nil {
-		return nil, status.Error(codes.AlreadyExists, err.Error())
-	}
-	// machine 已删除：清掉同 machine 的历史记录（保留 delete 自身的去重记录），
-	// 避免重放旧 create 时返回已删除 VM 的“成功”结果（M1 评审 P2-5）。
-	// 清理失败不影响删除结果（残留记录会在年龄 GC 窗口内自然过期）。
-	_, _ = s.ledger.PruneMachineExcept(req.MachineId, req.OperationId)
-	// 高水位保留：更旧 generation 的 re-create 仍被拒绝（P0-2）。
-	if err := s.fences.Advance(req.MachineId, req.Generation, req.ExecutionId); err != nil {
-		return nil, status.Errorf(codes.Internal, "advance generation fence: %v", err)
+	if deleteErr != nil {
+		return nil, deleteErr
 	}
 	return &emptypb.Empty{}, nil
 }
@@ -330,4 +352,74 @@ func (s *Server) ResumeMachine(ctx context.Context, req *pb.ResumeMachineRequest
 		return nil, status.Error(codes.AlreadyExists, err.Error())
 	}
 	return m, nil
+}
+
+// ---------------------------------------------------------------------------
+// ImageService（v1.1，ADR-0018 部署预取）
+// ---------------------------------------------------------------------------
+
+// diskStatsFraction 返回 dataDir 所在文件系统已用比例（0-1）；不可用时返回 0。
+func diskStatsFraction(dataDir string) float64 {
+	total, used := diskStats(dataDir)
+	if total == 0 {
+		return 0
+	}
+	return float64(used) / float64(total)
+}
+
+// diskStats 复用 info 包的 statfs 逻辑（避免重复实现）。
+func diskStats(dataDir string) (totalMib, usedMib uint64) {
+	if dataDir == "" {
+		dataDir = "/"
+	}
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(dataDir, &stat); err != nil {
+		return 0, 0
+	}
+	bsize := uint64(stat.Bsize)
+	total := stat.Blocks * bsize
+	free := stat.Bfree * bsize
+	return total / mib, (total - free) / mib
+}
+
+const mib = 1024 * 1024
+
+// PullImage 确保镜像就绪（幂等）。v1.1 部署预取的 agent 侧入口：
+// 控制面在 rollout PREPARING 前向 top-K 候选节点异步下发，失败/超时不
+// 阻塞 rollout（尽力而为）。磁盘水位守护：已用比例 ≥ watermark 时拒绝
+// （capacity-model 既有约束；imageretention GC 为兜底）。
+func (s *Server) PullImage(ctx context.Context, req *pb.PullImageRequest) (*pb.PullImageResponse, error) {
+	if req.GetImageRef() == "" {
+		return nil, status.Error(codes.InvalidArgument, "image_ref is required")
+	}
+	if s.diskWatermark > 0 && s.info != nil {
+		if frac := diskStatsFraction(s.info.DataDir()); frac >= s.diskWatermark {
+			return nil, status.Errorf(codes.ResourceExhausted,
+				"prefetch rejected: disk usage %.1f%% >= watermark %.1f%%", frac*100, s.diskWatermark*100)
+		}
+	}
+	if err := s.machines.EnsureImage(ctx, req.GetImageRef()); err != nil {
+		if errors.Is(err, machine.ErrImageNotFound) {
+			return nil, status.Error(codes.NotFound, err.Error())
+		}
+		if errors.Is(err, machine.ErrImageTooBig) {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	digest, sizeMib := s.machines.ImageInfo(ctx, req.GetImageRef())
+	return &pb.PullImageResponse{ImageRef: req.GetImageRef(), Digest: digest, SizeMib: sizeMib}, nil
+}
+
+// ListImages 返回节点本地镜像列表（ready 镜像）。
+func (s *Server) ListImages(ctx context.Context, _ *pb.ListImagesRequest) (*pb.ListImagesResponse, error) {
+	digests := s.machines.CachedImageDigests(ctx, 512)
+	// CachedImageDigests 只含 digest 形态；ListImages 语义要求完整条目。
+	// 用 adapter 的 ImageInfo 无法批量取，这里直接返回 digest 列表条目
+	//（控制面当前只用 digest 集合，不为 Name 字段扩展契约）。
+	out := make([]*pb.PullImageResponse, 0, len(digests))
+	for _, d := range digests {
+		out = append(out, &pb.PullImageResponse{Digest: d})
+	}
+	return &pb.ListImagesResponse{Images: out}, nil
 }

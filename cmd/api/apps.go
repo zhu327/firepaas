@@ -35,6 +35,7 @@ type createAppBody struct {
 	VCPU         int64                      `json:"vcpu"`
 	MemMIB       int64                      `json:"mem_mib"`
 	Port         int                        `json:"port"`
+	Services     []serviceBody              `json:"services"` // v1.1（ADR-0022）：多端口声明；nil = 单端口（port）
 	Replicas     int                        `json:"replicas"`
 	Env          map[string]string          `json:"env"`
 	NodePool     string                     `json:"node_pool"`
@@ -42,6 +43,22 @@ type createAppBody struct {
 	AntiAffinity string                     `json:"anti_affinity"`
 	HealthCheck  *healthCheckBody           `json:"health_check"`
 	SecretRefs   map[string]store.SecretRef `json:"secret_refs"`
+	AutoStandby  *autoStandbyBody           `json:"auto_standby"` // v1.1（ADR-0017）
+}
+
+// serviceBody 是 services 声明的单条（v1.1，ADR-0022）。
+type serviceBody struct {
+	Name         string `json:"name"`
+	InternalPort int    `json:"internal_port"`
+}
+
+// autoStandbyBody 是 auto_standby 策略声明（v1.1，ADR-0017）。
+// ignore_destination_ports 透传 app 声明（如监控拨测端口不计入活跃）；
+// ignore_source_cidrs 是平台保留字段，不对外暴露（错配会破坏唤醒语义）。
+type autoStandbyBody struct {
+	Enabled                bool     `json:"enabled"`
+	IdleTimeoutSeconds     uint32   `json:"idle_timeout_seconds"`
+	IgnoreDestinationPorts []uint32 `json:"ignore_destination_ports"`
 }
 
 func (a *API) createApp(w http.ResponseWriter, r *http.Request) {
@@ -54,6 +71,14 @@ func (a *API) createApp(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "hostname and image are required")
 		return
 	}
+	// P1-2（M5 评审）：受限 key 只能创建自己 project 的 app；body.project_id
+	// 显式越权 → 403，留空 → 归一到 identity project。
+	project, ok := clampBodyProject(r, body.ProjectID)
+	if !ok {
+		writeErr(w, 403, "cross-project access denied")
+		return
+	}
+	body.ProjectID = project
 	// P1-2：镜像引用策略（digest 形态 + registry allowlist）。
 	normalizedImage, err := a.images.Validate(body.Image)
 	if err != nil {
@@ -86,7 +111,9 @@ func (a *API) createApp(w http.ResponseWriter, r *http.Request) {
 	if body.MemMIB == 0 {
 		body.MemMIB = 512
 	}
-	if body.Port == 0 {
+	// 仅纯单端口请求默认 8080。services 请求的主端口由第一项决定，
+	// 不能先注入 8080 再与合法的 services[0] 冲突。
+	if len(body.Services) == 0 && body.Port == 0 {
 		body.Port = 8080
 	}
 	if body.Replicas == 0 {
@@ -107,12 +134,19 @@ func (a *API) createApp(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-
-	if err := a.store.EnsureApp(r.Context(), body.ProjectID, body.AppID, body.Hostname,
-		body.Image, body.VCPU, body.MemMIB, body.Port, body.Replicas); err != nil {
-		writeErr(w, 500, err.Error())
+	// v1.1（ADR-0022）：services 声明校验与归一（与单端口 port 互斥）。
+	services, port, err := resolveServices(body.Services, body.Port)
+	if err != nil {
+		writeErr(w, 400, err.Error())
 		return
 	}
+	// v1.1（ADR-0017）：auto_standby 策略校验与 protojson 固化。
+	autoStandbyJSON, err := marshalAutoStandby(body.AutoStandby)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+
 	// M4：create 时的 secret 引用校验（值不经 API 出现）。
 	if len(body.SecretRefs) > 0 {
 		if a.secrets == nil {
@@ -128,9 +162,15 @@ func (a *API) createApp(w http.ResponseWriter, r *http.Request) {
 		body.SecretRefs = refs
 	}
 	depID := "dep-" + body.AppID + "-1"
-	if err := a.store.CreateDeployment(r.Context(), store.Deployment{
+	// app 与其初始 deployment 必须作为一个业务单元提交；否则请求在两次
+	// 写之间失败会留下没有 ACTIVE deployment 的 app。
+	if err := a.store.CreateAppAndDeployment(r.Context(), body.ProjectID, store.App{
+		ID: body.AppID, Hostname: body.Hostname, ImageRef: body.Image,
+		VCPU: body.VCPU, MemMIB: body.MemMIB, DesiredReplicas: body.Replicas,
+	}, store.Deployment{
 		ID: depID, AppID: body.AppID, Generation: 1,
-		ImageRef: body.Image, VCPU: body.VCPU, MemMIB: body.MemMIB, Port: body.Port,
+		ImageRef: body.Image, VCPU: body.VCPU, MemMIB: body.MemMIB, Port: port,
+		Services: services, AutoStandby: autoStandbyJSON,
 		Env: body.Env, SecretRefs: body.SecretRefs,
 		Placement: placeJSON, HealthCheck: hcJSON, Status: "ACTIVE",
 	}); err != nil {
@@ -192,12 +232,15 @@ type deployBody struct {
 	VCPU         int64                      `json:"vcpu"`
 	MemMIB       int64                      `json:"mem_mib"`
 	Port         int                        `json:"port"`
+	Services     []serviceBody              `json:"services"` // v1.1（ADR-0022）；nil = 继承/单端口
+	Strategy     string                     `json:"strategy"` // v1.1-F：bluegreen（默认）| rolling
 	Env          map[string]string          `json:"env"`
 	NodePool     string                     `json:"node_pool"`
 	Labels       map[string]string          `json:"labels"`
 	AntiAffinity string                     `json:"anti_affinity"`
 	HealthCheck  *healthCheckBody           `json:"health_check"`
-	SecretRefs   map[string]store.SecretRef `json:"secret_refs"` // M4（ADR-0010）
+	SecretRefs   map[string]store.SecretRef `json:"secret_refs"`  // M4（ADR-0010）
+	AutoStandby  *autoStandbyBody           `json:"auto_standby"` // v1.1（ADR-0017）；nil = 继承
 }
 
 func (a *API) deployApp(w http.ResponseWriter, r *http.Request) {
@@ -243,8 +286,25 @@ func (a *API) deployApp(w http.ResponseWriter, r *http.Request) {
 	if body.MemMIB == 0 {
 		body.MemMIB = active.MemMIB
 	}
-	if body.Port == 0 {
-		body.Port = active.Port
+	// v1.1（ADR-0022）：services/port 继承语义——services 与 port 均未提供时
+	// 继承 ACTIVE deployment（多 service 声明原样继承）；只提供 port = 回到
+	// 单端口声明（清空 services）；只提供 services = 多端口声明。
+	if body.Services == nil && body.Port == 0 {
+		if len(active.Services) > 0 {
+			body.Services = make([]serviceBody, 0, len(active.Services))
+			for _, svc := range active.Services {
+				body.Services = append(body.Services, serviceBody{Name: svc.Name, InternalPort: svc.InternalPort})
+			}
+		} else {
+			body.Port = active.Port
+		}
+	}
+	// v1.1（ADR-0017）：auto_standby 未提供时继承（含“显式关闭”的继承）。
+	if body.AutoStandby == nil && len(active.AutoStandby) > 0 && string(active.AutoStandby) != "null" {
+		var inherited autoStandbyBody
+		if err := json.Unmarshal(active.AutoStandby, &inherited); err == nil {
+			body.AutoStandby = &inherited
+		}
 	}
 	if body.Env == nil {
 		body.Env = active.Env
@@ -266,9 +326,31 @@ func (a *API) deployApp(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	// v1.1：探针声明随 deployment 继承（与 vcpu/mem/port/env 同语义）。
+	// 此前 deploy 未携带 health_check 时新代静默丢掉探针（UNCONFIGURED
+	// 即入路由），rolling 逐批切流会在 guest 服务未起时打出 502。
+	if body.HealthCheck == nil && len(active.HealthCheck) > 0 && string(active.HealthCheck) != "null" {
+		hcJSON = active.HealthCheck
+	}
 	placeJSON, err := marshalPlacement(body.NodePool, body.Labels, body.AntiAffinity)
 	if err != nil {
 		writeErr(w, 500, err.Error())
+		return
+	}
+	// v1.1（ADR-0022/0017/F）：services / auto_standby / strategy 解析。
+	services, port, err := resolveServices(body.Services, body.Port)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	autoStandbyJSON, err := marshalAutoStandby(body.AutoStandby)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	strategy, err := resolveStrategy(body.Strategy)
+	if err != nil {
+		writeErr(w, 400, err.Error())
 		return
 	}
 
@@ -282,7 +364,8 @@ func (a *API) deployApp(w http.ResponseWriter, r *http.Request) {
 	// 双重保证。
 	if err := a.store.DeployApp(r.Context(), store.Deployment{
 		ID: depID, AppID: appID, Generation: newGen,
-		ImageRef: body.Image, VCPU: body.VCPU, MemMIB: body.MemMIB, Port: body.Port,
+		ImageRef: body.Image, VCPU: body.VCPU, MemMIB: body.MemMIB, Port: port,
+		Services: services, AutoStandby: autoStandbyJSON, Strategy: strategy,
 		Env: body.Env, SecretRefs: body.SecretRefs,
 		Placement: placeJSON, HealthCheck: hcJSON, Status: "PREPARING",
 	}, store.Rollout{
@@ -459,7 +542,7 @@ func (a *API) validateSecretRefs(r *http.Request, refs map[string]store.SecretRe
 			return nil, fmt.Errorf("secret ref %q: secret name is required", varName)
 		}
 		ver := ref.Version
-		if _, err := a.store.GetSecretMeta(r.Context(), projectOr(r, "dev"), ref.Secret, ver); err != nil {
+		if _, err := a.store.GetSecretMeta(r.Context(), effectiveProjectID(r, "dev"), ref.Secret, ver); err != nil {
 			return nil, fmt.Errorf("secret %q (ref %q) not found", ref.Secret, varName)
 		}
 		out[varName] = ref
@@ -502,9 +585,23 @@ func (a *API) setAppSecretRefs(w http.ResponseWriter, r *http.Request) {
 	}
 	db := deployBody{
 		Image: active.ImageRef, VCPU: active.VCPU, MemMIB: active.MemMIB,
-		Port: active.Port, Env: active.Env,
+		Port: active.Port, Env: active.Env, Strategy: active.EffectiveStrategy(),
 		NodePool: place.NodePool, Labels: place.Labels, AntiAffinity: place.AntiAffinity,
 		HealthCheck: &hc, SecretRefs: body.SecretRefs,
+	}
+	if len(active.Services) > 0 {
+		db.Services = make([]serviceBody, 0, len(active.Services))
+		for _, svc := range active.Services {
+			db.Services = append(db.Services, serviceBody{Name: svc.Name, InternalPort: svc.InternalPort})
+		}
+	}
+	if len(active.AutoStandby) > 0 && string(active.AutoStandby) != "null" {
+		var policy autoStandbyBody
+		if err := json.Unmarshal(active.AutoStandby, &policy); err != nil {
+			writeErr(w, 500, "decode active auto_standby: "+err.Error())
+			return
+		}
+		db.AutoStandby = &policy
 	}
 	raw, err := json.Marshal(db)
 	if err != nil {
@@ -513,4 +610,86 @@ func (a *API) setAppSecretRefs(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = io.NopCloser(bytes.NewReader(raw))
 	a.deployApp(w, r)
+}
+
+// ---------------------------------------------------------------------------
+// v1.1：services / auto_standby / strategy 解析与校验
+// ---------------------------------------------------------------------------
+
+// resolveServices 归一 services 声明：返回 (store services, 主端口)。
+//   - services 与 port 同时声明：port 必须等于 services[0].internal_port；
+//   - 只声明 services（1..8 条）：主 service = 第一条（继承单端口语义）；
+//   - 只声明 port（或均缺省，port 已由调用方归一）：单端口，services = nil。
+func resolveServices(services []serviceBody, port int) ([]store.ServiceSpec, int, error) {
+	if len(services) == 0 {
+		if port != 0 && (port < 1 || port > 65535) {
+			return nil, 0, fmt.Errorf("port must be in [1,65535]")
+		}
+		return nil, port, nil
+	}
+	if len(services) > 8 {
+		return nil, 0, fmt.Errorf("services supports at most 8 entries in v1.1")
+	}
+	if port != 0 && port != services[0].InternalPort {
+		return nil, 0, fmt.Errorf("port conflicts with services[0].internal_port (%d)", services[0].InternalPort)
+	}
+	out := make([]store.ServiceSpec, 0, len(services))
+	seenPort := map[int]bool{}
+	seenName := map[string]bool{}
+	for i, svc := range services {
+		if svc.InternalPort < 1 || svc.InternalPort > 65535 {
+			return nil, 0, fmt.Errorf("services[%d].internal_port must be in [1,65535]", i)
+		}
+		if seenPort[svc.InternalPort] {
+			return nil, 0, fmt.Errorf("services[%d].internal_port %d duplicated", i, svc.InternalPort)
+		}
+		name := svc.Name
+		if name == "" {
+			name = fmt.Sprintf("svc-%d", svc.InternalPort)
+		}
+		if seenName[name] {
+			return nil, 0, fmt.Errorf("services[%d].name %q duplicated", i, name)
+		}
+		seenPort[svc.InternalPort] = true
+		seenName[name] = true
+		out = append(out, store.ServiceSpec{Name: name, InternalPort: svc.InternalPort})
+	}
+	return out, out[0].InternalPort, nil
+}
+
+// marshalAutoStandby 校验并序列化 auto_standby 策略（protojson）。
+// nil / 未启用 → nil（未声明，行为与 M5 完全一致）。
+func marshalAutoStandby(b *autoStandbyBody) (json.RawMessage, error) {
+	if b == nil || !b.Enabled {
+		return nil, nil
+	}
+	if b.IdleTimeoutSeconds < 5 {
+		return nil, fmt.Errorf("auto_standby.idle_timeout_seconds must be >= 5 when enabled")
+	}
+	for _, p := range b.IgnoreDestinationPorts {
+		if p == 0 || p > 65535 {
+			return nil, fmt.Errorf("auto_standby.ignore_destination_ports entry %d out of range", p)
+		}
+	}
+	raw, err := protojson.Marshal(&pb.AutoStandbyPolicy{
+		Enabled:                true,
+		IdleTimeoutSeconds:     b.IdleTimeoutSeconds,
+		IgnoreDestinationPorts: b.IgnoreDestinationPorts,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(raw), nil
+}
+
+// resolveStrategy 校验发布策略（v1.1-F）：空/bluegreen/rolling。
+func resolveStrategy(strategy string) (string, error) {
+	switch strategy {
+	case "", "bluegreen":
+		return "bluegreen", nil
+	case "rolling":
+		return "rolling", nil
+	default:
+		return "", fmt.Errorf("strategy must be bluegreen or rolling")
+	}
 }

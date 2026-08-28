@@ -48,6 +48,41 @@ func ValidateMachineSpecForCreate(spec *pb.MachineSpec) error {
 	case spec.MemMib == 0:
 		return errors.New("spec.mem_mib must be > 0")
 	}
+	// v1.1（ADR-0017）：auto_standby 策略校验（enabled 时 idle_timeout 必须 > 0）。
+	if as := spec.GetAutoStandby(); as != nil && as.GetEnabled() && as.GetIdleTimeoutSeconds() == 0 {
+		return errors.New("spec.auto_standby.idle_timeout_seconds must be > 0 when enabled")
+	}
+	// v1.1（ADR-0022）：services 校验（端口合法、deployment 内端口唯一；
+	// 主 service 端口与 network.ingress_port 对齐）。
+	if svcs := spec.GetServices(); len(svcs) > 0 {
+		if len(svcs) > 8 {
+			return errors.New("spec.services supports at most 8 entries in v1.1")
+		}
+		if spec.GetNetwork() == nil {
+			return errors.New("spec.network is required when services are declared")
+		}
+		if svcs[0].GetInternalPort() != uint32(spec.GetNetwork().GetIngressPort()) {
+			return errors.New("spec.services[0].internal_port must equal spec.network.ingress_port")
+		}
+		seenPort := map[uint32]bool{}
+		seenName := map[string]bool{}
+		for i, s := range svcs {
+			if s.GetName() == "" {
+				return fmt.Errorf("spec.services[%d].name is required", i)
+			}
+			if seenName[s.GetName()] {
+				return fmt.Errorf("spec.services[%d].name %q duplicated", i, s.GetName())
+			}
+			if s.GetInternalPort() == 0 || s.GetInternalPort() > 65535 {
+				return errors.New("spec.services[].internal_port must be in [1,65535]")
+			}
+			if seenPort[s.GetInternalPort()] {
+				return fmt.Errorf("spec.services[%d].internal_port %d duplicated", i, s.GetInternalPort())
+			}
+			seenPort[s.GetInternalPort()] = true
+			seenName[s.GetName()] = true
+		}
+	}
 	return nil
 }
 

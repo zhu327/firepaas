@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/example/firepaas/internal/controlplane/agentclient"
@@ -31,22 +32,30 @@ import (
 
 // Config 是 controller 运行参数。
 type Config struct {
-	DefaultAppPort       int
-	LegacyAgentProxyAddr string           // 节点视图缺失时的兜底（M1 单节点兼容）
-	OpPollInterval       time.Duration    // 默认 1s
-	SyncInterval         time.Duration    // 默认 5s
-	RebuildInterval      time.Duration    // 预约/投影重建，默认 30s
-	ReconcileGrace       time.Duration    // ACK 丢失判定宽限，默认 30s
-	MaxPlacementAttempts int              // ResourceExhausted 换节点上限，默认 3
-	AgentRPCTimeout      time.Duration    // 默认 2m（未缓存镜像 pull 可达 60s）
-	CreateRetryBase      time.Duration    // create FAILED 首次重派退避（P1-3），默认 10s
-	CreateRetryMax       time.Duration    // create FAILED 退避封顶，默认 5m
-	ClaimStaleAfter      time.Duration    // CLAIMED 滞留回收阈值（P1-1），默认 2×AgentRPCTimeout+60s
-	NodeMissingThreshold int              // 节点连续 List 失败次数才摘路由（P3-9），默认 3
-	RolloutTimeout       time.Duration    // M3 PREPARING 超时→自动回滚（S3），默认 300s
-	RolloutDrainGrace    time.Duration    // M3 CUTOVER 后旧代 drain 期限，默认 30s
-	Secrets              *secrets.Manager // M4：信封加密（nil = secret 引用不可用）
-	Traffic              *traffic.Signer  // M4：execution-bound proxy credential（nil = 不下发）
+	DefaultAppPort         int
+	LegacyAgentProxyAddr   string           // 节点视图缺失时的兜底（M1 单节点兼容）
+	OpPollInterval         time.Duration    // 默认 1s
+	SyncInterval           time.Duration    // 默认 5s
+	RebuildInterval        time.Duration    // 预约/投影重建，默认 30s
+	ReconcileGrace         time.Duration    // ACK 丢失判定宽限，默认 30s
+	MaxPlacementAttempts   int              // ResourceExhausted 换节点上限，默认 3
+	AgentRPCTimeout        time.Duration    // 默认 2m（未缓存镜像 pull 可达 60s）
+	CreateRetryBase        time.Duration    // create FAILED 首次重派退避（P1-3），默认 10s
+	CreateRetryMax         time.Duration    // create FAILED 退避封顶，默认 5m
+	MaxCreateRetryAttempts int              // 同 machine 连续 create FAILED 上限，默认 8；0 取默认
+	ClaimStaleAfter        time.Duration    // CLAIMED 滞留回收阈值（P1-1），默认 2×AgentRPCTimeout+60s
+	NodeMissingThreshold   int              // 节点连续 List 失败次数才摘路由（P3-9），默认 3
+	NodeLossRecreateAfter  time.Duration    // 节点持续失联后换代重建，默认 60s
+	RolloutTimeout         time.Duration    // M3 PREPARING 超时→自动回滚（S3），默认 300s
+	RolloutDrainGrace      time.Duration    // M3 CUTOVER 后旧代 drain 期限，默认 30s
+	Secrets                *secrets.Manager // M4：信封加密（nil = secret 引用不可用）
+	Traffic                *traffic.Signer  // M4：execution-bound proxy credential（nil = 不下发）
+	// PrefetchTopK（v1.1，ADR-0018）：部署预取向 top-K 候选节点异步 PullImage。
+	// 默认 3；0 取默认。失败/超时不阻塞 rollout（尽力而为）。
+	PrefetchTopK int
+	// EvacuateStepTimeout（v1.1，ADR-0021）：drain+evacuate 单个 machine 迁移的
+	// 等待上限（新代 READY 且切流）；超时记事件继续下一个。默认 5m。
+	EvacuateStepTimeout time.Duration
 }
 
 // Controller 执行 reconcile。
@@ -61,6 +70,14 @@ type Controller struct {
 
 	// nodeListFailures 记录节点连续 List 失败次数（P3-9：单次抖动不摘路由）。
 	nodeListFailures map[string]int
+
+	// prefetchedRollouts（v1.1，ADR-0018）：本轮 leader 任期内已下发过预取的
+	// rollout（尽力而为的去重；leader 切换后重发一次无害——镜像拉取幂等）。
+	prefetchedRollouts map[string]bool
+
+	// evacuatedNodes（v1.1，ADR-0021）：已记过“驱离完成”事件的节点，避免
+	// 每 5s 重复记事件。驱离进度不持久化（由剩余 machine 数自然推导）。
+	evacuatedNodes map[string]bool
 }
 
 // New 构造 Controller。
@@ -90,14 +107,31 @@ func New(st *store.Store, cat *catalog.Catalog, nm *nodemanager.Manager,
 	if cfg.CreateRetryMax == 0 {
 		cfg.CreateRetryMax = 5 * time.Minute
 	}
+	if cfg.MaxCreateRetryAttempts == 0 {
+		// M5 评审（e2e-m5 实测暴露）：永久性失败镜像会让同 execution 重派
+		// 无限循环（InvalidArgument 虽是终态，但 R3 尾部决策只看 create FAILED
+		// 的退避窗口）。上限后停手等人工/rollout 干预，事件流可见。
+		cfg.MaxCreateRetryAttempts = 8
+	}
 	if cfg.ClaimStaleAfter == 0 {
 		cfg.ClaimStaleAfter = 2*cfg.AgentRPCTimeout + time.Minute
 	}
 	if cfg.NodeMissingThreshold == 0 {
 		cfg.NodeMissingThreshold = 3
 	}
+	if cfg.NodeLossRecreateAfter == 0 {
+		// 与节点故障检测 <60s 的目标配套：超过一个检测窗口即允许无状态
+		// 副本换代重建；origin 在此后恢复会因 execution fencing 被回收。
+		cfg.NodeLossRecreateAfter = time.Minute
+	}
+	if cfg.PrefetchTopK == 0 {
+		cfg.PrefetchTopK = 3
+	}
+	if cfg.EvacuateStepTimeout == 0 {
+		cfg.EvacuateStepTimeout = 5 * time.Minute
+	}
 	return &Controller{store: st, catalog: cat, nodes: nm, resv: resv, placer: placer, metrics: reg, cfg: cfg,
-		nodeListFailures: map[string]int{}}
+		nodeListFailures: map[string]int{}, prefetchedRollouts: map[string]bool{}, evacuatedNodes: map[string]bool{}}
 }
 
 // Run 启动三个循环：操作 reconcile、observed 同步/决策表、预约与投影重建。
@@ -113,6 +147,12 @@ func (c *Controller) Run(ctx context.Context) error {
 
 	if c.nodeListFailures == nil { // 防御：New 已初始化，测试可直接构造
 		c.nodeListFailures = map[string]int{}
+	}
+	if c.prefetchedRollouts == nil {
+		c.prefetchedRollouts = map[string]bool{}
+	}
+	if c.evacuatedNodes == nil {
+		c.evacuatedNodes = map[string]bool{}
 	}
 
 	// P1-1（启动回收）：单写者不变量——刚获得 leader 锁时，任何 CLAIMED
@@ -144,6 +184,11 @@ func (c *Controller) Run(ctx context.Context) error {
 			}
 			if err := c.reconcileApps(ctx); err != nil {
 				slog.Error("reconcile apps", "error", err)
+			}
+			// v1.1（ADR-0021）：drain+evacuate 驱离编排（幂等，每拍每节点
+			// 至多推进一个 machine）。
+			if err := c.reconcileEvacuations(ctx); err != nil {
+				slog.Error("reconcile evacuations", "error", err)
 			}
 		case <-rebuildTicker.C:
 			if err := c.rebuildLeases(ctx); err != nil {
@@ -299,6 +344,19 @@ func (c *Controller) processLifecycle(ctx context.Context, op store.Operation) e
 }
 
 func (c *Controller) processOperation(ctx context.Context, op store.Operation) error {
+	// M5 评审（e2e 实测暴露）：机器已进入 DELETED 后，在途 create 不再重派。
+	// 否则「删 app + 节点排水/无候选」组合下 create 会永远 PENDING↔CLAIMED
+	// 自旋（无候选 → requeue → 再 claim），既耗调度周期又污染 PENDING 积压指标。
+	if op.Kind == "create" {
+		if m, err := c.store.GetMachine(ctx, op.MachineID); err == nil && m != nil &&
+			m.DesiredState == "DELETED" {
+			_ = c.store.CompleteOperation(ctx, op.ID, "FAILED", nil, "machine deleted; create cancelled")
+			_ = c.resv.Release(ctx, op.ID)
+			c.metrics.Inc("firepaas_reconcile_actions_total",
+				map[string]string{"kind": "cancel_create_for_deleted"}, 1)
+			return nil
+		}
+	}
 	switch op.Kind {
 	case "create":
 		return c.processCreate(ctx, op)
@@ -469,7 +527,6 @@ func (c *Controller) processDelete(ctx context.Context, op store.Operation, mark
 			return err
 		}
 	}
-	_ = c.catalog.RemoveLocation(ctx, del.MachineId, del.ExecutionId)
 	c.metrics.Inc("firepaas_operations_total", map[string]string{"kind": "delete", "result": "succeeded"}, 1)
 	return c.store.CompleteOperation(ctx, op.ID, "SUCCEEDED", []byte(`{}`), "")
 }
@@ -508,42 +565,30 @@ func (c *Controller) clientForNodeID(agentID string) *agentclient.Client {
 	return nil
 }
 
-// placeFor 执行一次完整放置（过滤+打分+预约），成功返回节点视图。
-func (c *Controller) placeFor(ctx context.Context, op store.Operation, req *pb.CreateMachineRequest, excluded map[string]bool) (*nodeView, error) {
-	views := c.nodeViews()
-	allocated, err := c.store.AllocatedByNode(ctx)
-	if err != nil {
-		return nil, err
-	}
-	pending, err := c.store.PendingUsageByNode(ctx)
-	if err != nil {
-		return nil, err
-	}
-	pendingByNode := map[string]store.PendingUsage{}
-	for _, p := range pending {
-		pendingByNode[p.NodeID] = p
-	}
-	// M5.5：排水节点不进放置候选（scheduler filter "draining"）。
-	storedNodes, err := c.store.ListNodes(ctx)
-	if err != nil {
-		return nil, err
-	}
+// assembleSchedulerNodes 把节点视图 + PG 记账组装为 scheduler.Node 列表
+// （v1.1：注入 nodes 表的 draining 标记与 image_cache 集合，ADR-0018）。
+func (c *Controller) assembleSchedulerNodes(views []nodeView, allocated map[string]store.Allocated,
+	pendingByNode map[string]store.PendingUsage, storedNodes []store.Node) []scheduler.Node {
 	drainingByID := map[string]bool{}
+	imageCacheByID := map[string]map[string]bool{}
 	for _, sn := range storedNodes {
 		if sn.Draining {
 			drainingByID[sn.ID] = true
+			drainingByID[sn.NomadNodeID] = true
+		}
+		if len(sn.ImageCache) > 0 {
+			set := make(map[string]bool, len(sn.ImageCache))
+			for _, d := range sn.ImageCache {
+				set[d] = true
+			}
+			imageCacheByID[sn.ID] = set
 		}
 	}
-	deployNodes, err := c.store.MachineNodesByDeployment(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	spec := req.GetSpec()
 	nodes := make([]scheduler.Node, 0, len(views))
 	for _, v := range views {
 		n := scheduler.Node{ID: v.agentID, Status: v.status, Pool: v.n.NodePool,
-			Draining: drainingByID[v.agentID] || drainingByID[v.nomadID]}
+			Draining:           drainingByID[v.agentID] || drainingByID[v.nomadID],
+			CachedImageDigests: imageCacheByID[v.agentID]}
 		if v.n.Info != nil {
 			info := v.n.Info
 			n.Labels = info.Labels
@@ -572,6 +617,67 @@ func (c *Controller) placeFor(ctx context.Context, op store.Operation, req *pb.C
 		}
 		nodes = append(nodes, n)
 	}
+	return nodes
+}
+
+// schedulerNodes 返回预取候选的全量调度节点视图（v1.1，ADR-0018）。
+func (c *Controller) schedulerNodes(ctx context.Context) []scheduler.Node {
+	views := c.nodeViews()
+	allocated, err := c.store.AllocatedByNode(ctx)
+	if err != nil {
+		return nil
+	}
+	pending, err := c.store.PendingUsageByNode(ctx)
+	if err != nil {
+		return nil
+	}
+	pendingByNode := map[string]store.PendingUsage{}
+	for _, p := range pending {
+		pendingByNode[p.NodeID] = p
+	}
+	storedNodes, err := c.store.ListNodes(ctx)
+	if err != nil {
+		return nil
+	}
+	return c.assembleSchedulerNodes(views, allocated, pendingByNode, storedNodes)
+}
+
+// imageDigestOf 提取 image_ref 的 digest 后缀（非 digest-pinned 返回空）。
+func imageDigestOf(imageRef string) string {
+	if i := strings.LastIndex(imageRef, "@"); i >= 0 && i < len(imageRef)-1 {
+		return imageRef[i+1:]
+	}
+	return ""
+}
+
+// placeFor 执行一次完整放置（过滤+打分+预约），成功返回节点视图。
+func (c *Controller) placeFor(ctx context.Context, op store.Operation, req *pb.CreateMachineRequest, excluded map[string]bool) (*nodeView, error) {
+	views := c.nodeViews()
+	allocated, err := c.store.AllocatedByNode(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pending, err := c.store.PendingUsageByNode(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pendingByNode := map[string]store.PendingUsage{}
+	for _, p := range pending {
+		pendingByNode[p.NodeID] = p
+	}
+	// M5.5：排水节点不进放置候选（scheduler filter "draining"；v1.1 起在
+	// assembleSchedulerNodes 内统一注入 draining 与 image_cache）。
+	storedNodes, err := c.store.ListNodes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	deployNodes, err := c.store.MachineNodesByDeployment(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	spec := req.GetSpec()
+	nodes := c.assembleSchedulerNodes(views, allocated, pendingByNode, storedNodes)
 
 	var wantPool string
 	var wantLabels map[string]string
@@ -597,6 +703,7 @@ func (c *Controller) placeFor(ctx context.Context, op store.Operation, req *pb.C
 		AntiAffinity:            antiAffinity,
 		ExistingDeploymentNodes: deployNodes[spec.GetDeploymentId()],
 		ExcludedNodes:           excluded,
+		ImageDigest:             imageDigestOf(spec.GetImageRef()),
 	}
 	pl, err := c.placer.Place(req2, nodes, nil)
 	if err != nil {
@@ -632,6 +739,15 @@ func (c *Controller) placeFor(ctx context.Context, op store.Operation, req *pb.C
 	vCPUQuota, memQuota, err := c.store.ProjectQuota(ctx, op.ProjectID)
 	if err != nil {
 		return nil, err
+	}
+	// 配额权威检查包含已经落地的 allocated 与全部在途 create（含本 op）。
+	// Redis reservation 仅防并发窗口，不能单独代表长期 allocated 用量。
+	usedVCPU, usedMem, err := c.store.ProjectUsage(ctx, op.ProjectID)
+	if err != nil {
+		return nil, err
+	}
+	if usedVCPU > vCPUQuota || usedMem > memQuota {
+		return nil, reservations.ErrProjectQuota
 	}
 	err = c.resv.Acquire(ctx, op.ID, chosen.agentID, op.ProjectID,
 		vcpu, memMib, chosen.n.Info.Capacity.VcpuTotal, chosen.n.Info.Capacity.MemTotalMib,
@@ -718,6 +834,18 @@ func (c *Controller) syncObserved(ctx context.Context) error {
 	return nil
 }
 
+// KickRouteRebuild 立即执行一次路由重建（P3-13，M5 评审）：显式重投影端点
+// 调用它抢占 5s syncTicker，而不只是 wipe 后等待。用后台 context（不占
+// leader 循环的取消窗口），重建完成即返回耗时。
+func (c *Controller) KickRouteRebuild() (time.Duration, error) {
+	start := time.Now()
+	ctx := context.Background()
+	if err := c.buildRoutes(ctx); err != nil {
+		return time.Since(start), err
+	}
+	return time.Since(start), nil
+}
+
 // publishGauges：M5.2/M5.3 观测 gauge 快照（每 sync 周期刷新，供 /metrics + 告警规则）。
 func (c *Controller) publishGauges(ctx context.Context, views []nodeView, machines []store.Machine) {
 	unhealthy := 0
@@ -729,6 +857,8 @@ func (c *Controller) publishGauges(ctx context.Context, views []nodeView, machin
 	c.metrics.Set("firepaas_nodes_unhealthy", nil, uint64(unhealthy))
 	c.metrics.Set("firepaas_nodes_total", nil, uint64(len(views)))
 
+	// P2-8：先清 family 再 Set——机器状态消失后旧 {state=...} 序列不得残留。
+	c.metrics.ResetFamily("firepaas_machines_observed")
 	byState := map[string]uint64{}
 	for _, m := range machines {
 		if m.DesiredState == "DELETED" {
@@ -770,7 +900,13 @@ func (c *Controller) processAgentMachine(ctx context.Context, m *pb.Machine, v n
 		return
 	}
 
-	// R1：正常观测。
+	// R1：正常观测。v1.1（ADR-0017）：RUNNING→PAUSED 迁移即 auto-standby
+	// 生效事件（agent 侧 conntrack 驱动，无 operation），metrics+审计留痕。
+	if pg.ObservedState == "RUNNING" && m.State == pb.MachineState_PAUSED {
+		c.metrics.Inc("firepaas_machine_standby_total", nil, 1)
+		c.recordEvent(ctx, "autostandby", m.MachineId, "", v.agentID,
+			"machine entered standby (idle); readiness frozen, wake on next request", nil)
+	}
 	_ = c.store.UpdateMachineObserved(ctx, m.MachineId, m.ExecutionId,
 		m.State.String(), m.SlotIp, m.Readiness.String())
 }
@@ -843,13 +979,23 @@ func (c *Controller) processPGMachine(ctx context.Context, m store.Machine,
 		return // 当前 execution 存活：R1 已处理 observed
 	}
 
-	// R4：节点失联/不可用 → 保守 UNKNOWN，不重建。
+	// R4：节点失联时立即摘路由；持续超过有界窗口才换代重建。旧节点恢复
+	// 后会因 execution 不匹配走 R2 清理，避免无限期 hold 影响可用性。
 	if nodeID != "" {
 		v := c.viewForAgent(nodeID)
 		if v == nil || v.status != "HEALTHY" {
 			_ = c.store.MarkMachineObservedMissing(ctx, m.ID)
+			if m.LastObservedAt != nil && time.Since(*m.LastObservedAt) >= c.cfg.NodeLossRecreateAfter {
+				hasPending, err := c.store.HasPendingOperationForMachine(ctx, m.ID)
+				if err == nil && !hasPending && !c.rolloutHoldsRecreate(ctx, m) {
+					c.recordEvent(ctx, "reconcile", m.ID, "", nodeID,
+						"node loss timeout elapsed, recreate on a new execution", nil)
+					c.recreateMachine(ctx, m, true)
+					return
+				}
+			}
 			c.recordEvent(ctx, "reconcile", m.ID, "", nodeID,
-				"node unhealthy, hold recreate until recovery", nil)
+				"node unhealthy, holding recreate within node-loss window", nil)
 			return
 		}
 	}
@@ -880,6 +1026,17 @@ func (c *Controller) processPGMachine(ctx context.Context, m store.Machine,
 		if n, err := c.store.FailedCreateAttempts(ctx, m.ID); err == nil {
 			attempts = n
 		}
+	}
+	// 重试上限（M5 评审）：同 machine 连续 create FAILED 达上限后停止重派，
+	// 记事件等人工/rollout 干预；否则坏镜像 → 永久 5 分钟节奏的无限循环。
+	if last.Kind == "create" && last.Status == "FAILED" && attempts >= c.cfg.MaxCreateRetryAttempts {
+		slog.Error("create retry budget exhausted; giving up until operator/rollout intervention",
+			"machine_id", m.ID, "attempts", attempts)
+		c.recordEvent(ctx, "reconcile", m.ID, last.ID, m.NodeID,
+			"create retry budget exhausted", []byte(`{"attempts":`+fmt.Sprint(attempts)+`}`))
+		c.metrics.Inc("firepaas_reconcile_actions_total",
+			map[string]string{"kind": "create_retry_exhausted"}, 1)
+		return
 	}
 	switch recreateAction(last.Kind, last.Status, time.Since(last.UpdatedAt),
 		c.cfg.ReconcileGrace, c.createRetryDelay(attempts)) {
@@ -1051,6 +1208,11 @@ func (c *Controller) recreateMachine(ctx context.Context, m store.Machine, bump 
 			req.Spec.Placement = &pl
 		}
 	}
+	// v1.1（ADR-0017/0022）：还原 deployment 固化的 auto_standby/services
+	//（R3/evacuate 重建与首次 create 共用同一请求体派生路径，幂等链路一致）。
+	if dep, derr := c.store.GetDeployment(ctx, m.DeploymentID); derr == nil && dep != nil {
+		applyDeploymentSpecExtras(dep, req.Spec)
+	}
 	project, err := c.store.ProjectForApp(ctx, m.AppID)
 	if err != nil || project == "" {
 		project = "dev"
@@ -1217,6 +1379,8 @@ func (c *Controller) buildRoutes(ctx context.Context) error {
 	// R3 换代重建时 +1，与发布代无关）。发布轴是 deployment.generation。
 	rolloutByApp := map[string]*store.Rollout{}
 	depGen := map[string]int64{}
+	depServices := map[string][]store.ServiceSpec{} // v1.1（ADR-0022）：deployment → services
+	depStrategy := map[string]string{}              // v1.1-F：deployment → 发布策略
 	{
 		active, err := c.store.ListActiveRollouts(ctx)
 		if err != nil {
@@ -1236,7 +1400,41 @@ func (c *Controller) buildRoutes(ctx context.Context) error {
 			}
 			for i := range deps {
 				depGen[deps[i].ID] = deps[i].Generation
+				depServices[deps[i].ID] = deps[i].EffectiveServices()
+				depStrategy[deps[i].ID] = deps[i].EffectiveStrategy()
 			}
+		}
+	}
+
+	// v1.1-F（rolling）：同 ordinal 的新代 machine 可服务 → 该 ordinal 已切流
+	//（旧代 draining、新代服务；未切流 ordinal 旧代继续服务）。
+	type appOrdinal struct {
+		app     string
+		ordinal int
+	}
+	// Resolve the rollout target from the active rollout, never from whichever
+	// backend happened to be observed. Empty/unknown readiness is not cut-ready.
+	toDepByApp := map[string]string{}
+	for appID, rl := range rolloutByApp {
+		deps, err := c.store.ListDeployments(ctx, appID)
+		if err != nil {
+			return err
+		}
+		for i := range deps {
+			if deps[i].Generation == rl.ToGeneration {
+				toDepByApp[appID] = deps[i].ID
+				break
+			}
+		}
+	}
+	rollingTargetApp := map[string]bool{}
+	for appID, targetID := range toDepByApp {
+		rollingTargetApp[appID] = depStrategy[targetID] == "rolling"
+	}
+	cutOrdinals := map[appOrdinal]bool{}
+	for _, m := range machines {
+		if toDepByApp[m.AppID] == m.DeploymentID && machineServing(m) {
+			cutOrdinals[appOrdinal{app: m.AppID, ordinal: m.ReplicaOrdinal}] = true
 		}
 	}
 
@@ -1245,55 +1443,86 @@ func (c *Controller) buildRoutes(ctx context.Context) error {
 		port     int
 	}
 	grouped := map[routeKey]*store.RouteRow{}
+	// primaryPort（v1.1，ADR-0022）：hostname → 主 service 端口（hostidx）。
+	primaryPort := map[string]int{}
 	for _, m := range machines {
 		port := m.IngressPort
 		if port == 0 {
 			port = c.cfg.DefaultAppPort
 		}
-		key := routeKey{hostname: m.Hostname, port: port}
-		route := grouped[key]
-		if route == nil {
-			route = &store.RouteRow{Hostname: m.Hostname, Port: port, AppID: m.AppID}
-			grouped[key] = route
+		// v1.1（ADR-0022）：每 machine 按 deployment 的 services 展开——
+		// 每条 service 一条 route:{hostname}:{public_port}，backend AppPort =
+		// 该 service 的 internal_port；public_port = internal_port（v1.1 不做
+		// 端口映射改写）。主 service（第一条）继承单端口语义。
+		services := depServices[m.DeploymentID]
+		if len(services) == 0 {
+			services = []store.ServiceSpec{{Name: "default", InternalPort: port}}
 		}
-
 		proxy := proxyByNode[m.NodeID]
 		if proxy == "" {
 			proxy = c.cfg.LegacyAgentProxyAddr
 		}
-		if proxy == "" {
-			// 节点视图缺失：该 backend 暂时不可达，不写入投影（受控收敛）。
-			continue
-		}
 
-		// 发布状态机：PREPARING 新代不可服务；CUTOVER 旧代 draining、
-		// 新代服务；ROLLING_BACK 新代摘除、旧代恢复。
-		draining := false
-		publishGen := depGen[m.DeploymentID]
-		if rl := rolloutByApp[m.AppID]; rl != nil {
-			switch rl.Status {
-			case "PREPARING":
-				draining = publishGen != rl.FromGeneration
-			case "CUTOVER":
-				draining = publishGen != rl.ToGeneration
-			case "ROLLING_BACK":
-				draining = publishGen != rl.FromGeneration
+		for si, svc := range services {
+			key := routeKey{hostname: m.Hostname, port: svc.InternalPort}
+			route := grouped[key]
+			if route == nil {
+				route = &store.RouteRow{Hostname: m.Hostname, Port: svc.InternalPort, AppID: m.AppID}
+				grouped[key] = route
 			}
-		}
+			if si == 0 {
+				if _, ok := primaryPort[m.Hostname]; !ok || svc.InternalPort < primaryPort[m.Hostname] {
+					primaryPort[m.Hostname] = svc.InternalPort
+				}
+			}
+			if proxy == "" {
+				// 节点视图缺失：该 backend 暂时不可达，不写入投影（受控收敛）。
+				continue
+			}
 
-		route.Backends = append(route.Backends, store.RouteBackendRow{
-			MachineID:         m.ID,
-			ExecutionID:       m.CurrentExecutionID,
-			NodeProxyEndpoint: proxy,
-			AppPort:           port,
-			Weight:            100,
-			Readiness:         m.ObservedReadiness,
-			Draining:          draining,
-		})
-		// 活跃 generation = 可服务代（PREPARING/ROLLING_BACK 用旧代，
-		// CUTOVER 用新代；无 rollout 时取可服务 backend 的发布代最大值）。
-		if !draining && publishGen > route.Generation {
-			route.Generation = publishGen
+			// 发布状态机：PREPARING 新代不可服务；CUTOVER 旧代 draining、
+			// 新代服务；ROLLING_BACK 新代摘除、旧代恢复。
+			// v1.1-F（rolling）：PREPARING 期间按 ordinal 逐批切流——新代
+			// 机器可服务才服务（未 READY = draining）；旧代机器在已切流
+			// ordinal 上 draining（traffic 自然偏移到新代）。
+			draining := false
+			publishGen := depGen[m.DeploymentID]
+			if rl := rolloutByApp[m.AppID]; rl != nil {
+				// Strategy belongs to the active rollout target, not whichever
+				// old/new backend is currently being projected.
+				rolling := rollingTargetApp[m.AppID] && rl.Status == "PREPARING"
+				switch rl.Status {
+				case "PREPARING":
+					if rolling {
+						if publishGen == rl.ToGeneration {
+							draining = !cutOrdinals[appOrdinal{app: m.AppID, ordinal: m.ReplicaOrdinal}]
+						} else {
+							draining = cutOrdinals[appOrdinal{app: m.AppID, ordinal: m.ReplicaOrdinal}]
+						}
+					} else {
+						draining = publishGen != rl.FromGeneration
+					}
+				case "CUTOVER":
+					draining = publishGen != rl.ToGeneration
+				case "ROLLING_BACK":
+					draining = publishGen != rl.FromGeneration
+				}
+			}
+
+			route.Backends = append(route.Backends, store.RouteBackendRow{
+				MachineID:         m.ID,
+				ExecutionID:       m.CurrentExecutionID,
+				NodeProxyEndpoint: proxy,
+				AppPort:           svc.InternalPort,
+				Weight:            100,
+				Readiness:         m.ObservedReadiness,
+				Draining:          draining,
+			})
+			// 活跃 generation = 可服务代（PREPARING/ROLLING_BACK 用旧代，
+			// CUTOVER 用新代；无 rollout 时取可服务 backend 的发布代最大值）。
+			if !draining && publishGen > route.Generation {
+				route.Generation = publishGen
+			}
 		}
 	}
 
@@ -1307,6 +1536,7 @@ func (c *Controller) buildRoutes(ctx context.Context) error {
 
 	keepRoutes := make(map[string]bool, len(active))
 	keepHosts := make(map[string]bool, len(active))
+	hostRoutes := make(map[string][]catalog.HostRoute)
 	for _, r := range active {
 		keepRoutes[fmt.Sprintf("route:%s:%d", r.Hostname, r.Port)] = true
 		keepHosts[r.Hostname] = true
@@ -1325,7 +1555,12 @@ func (c *Controller) buildRoutes(ctx context.Context) error {
 				Draining:          b.Draining,
 			})
 		}
-		if err := c.catalog.PublishRoute(ctx, r.Hostname, r.Port, catalogRoute); err != nil {
+		hostRoutes[r.Hostname] = append(hostRoutes[r.Hostname], catalog.HostRoute{Port: r.Port, Route: catalogRoute})
+	}
+	// 每 hostname 只作一次完整、原子的替换；不能逐端口 RMW hostidx，否则
+	// 并发 rebuild 会丢端口且 service 删除会遗留 route/索引项。
+	for hostname, routes := range hostRoutes {
+		if err := c.catalog.ReplaceHostRoutes(ctx, hostname, routes, primaryPort[hostname]); err != nil {
 			return err
 		}
 	}

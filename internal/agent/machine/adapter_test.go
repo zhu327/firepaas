@@ -15,6 +15,7 @@ import (
 
 type fakeInstances struct {
 	created *instances.Instance
+	got     *instances.Instance // GetInstance 固定返回（endpoint 测试用）
 	listed  []instances.Instance
 	deleted string
 	err     error
@@ -35,6 +36,7 @@ func (f *fakeInstances) CreateInstance(_ context.Context, req instances.CreateIn
 			Env:         req.Env,
 			Tags:        req.Tags,
 			IP:          "10.100.0.2",
+			AutoStandby: req.AutoStandby, // v1.1：透传策略供断言
 			CreatedAt:   time.Now(),
 		},
 		State: instances.StateInitializing,
@@ -59,6 +61,9 @@ func (f *fakeInstances) ListInstances(_ context.Context, _ *instances.ListInstan
 func (f *fakeInstances) GetInstance(_ context.Context, idOrName string) (*instances.Instance, error) {
 	if f.err != nil {
 		return nil, f.err
+	}
+	if f.got != nil {
+		return f.got, nil
 	}
 	if f.created != nil && (f.created.Id == idOrName || f.created.Name == idOrName) {
 		return f.created, nil
@@ -94,7 +99,10 @@ func (f *fakeInstances) RestoreInstance(_ context.Context, id string) (*instance
 	return f.created, nil
 }
 
-type fakeImages struct{ err error }
+type fakeImages struct {
+	err  error
+	list []images.Image
+}
 
 func (f *fakeImages) CreateImage(context.Context, images.CreateImageRequest) (*images.Image, error) {
 	return nil, f.err
@@ -113,6 +121,9 @@ func (f *fakeImages) ListImages(context.Context) ([]images.Image, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
+	if f.list != nil {
+		return f.list, nil
+	}
 	sz := int64(50 << 20)
 	return []images.Image{
 		{Name: "docker.io/library/nginx:alpine@sha256:" + strings.Repeat("a", 64),
@@ -125,7 +136,6 @@ func validCreateRequest() *pb.CreateMachineRequest {
 		MachineId:   "m1-test",
 		Generation:  1,
 		OperationId: "op-1",
-		SecretEnv:   map[string]string{"SECRET_TOKEN": "s3cr3t"},
 		Spec: &pb.MachineSpec{
 			ProjectId:    "p1",
 			AppId:        "a1",
@@ -136,6 +146,18 @@ func validCreateRequest() *pb.CreateMachineRequest {
 			MemMib:       512,
 			Env:          map[string]string{"PORT": "8080"},
 		},
+	}
+}
+
+func TestCachedImageDigestsNewestFirst(t *testing.T) {
+	old, newest := time.Now().Add(-time.Hour), time.Now()
+	img := &fakeImages{list: []images.Image{
+		{Name: "repo/old@sha256:old", Status: images.StatusReady, CreatedAt: old},
+		{Name: "repo/new@sha256:new", Status: images.StatusReady, CreatedAt: newest},
+	}}
+	got := New(&fakeInstances{}, img, nil, nil).CachedImageDigests(context.Background(), 1)
+	if len(got) != 1 || got[0] != "sha256:new" {
+		t.Fatalf("cache truncation = %v, want newest digest", got)
 	}
 }
 
@@ -152,21 +174,25 @@ func TestAdapterCreateMapping(t *testing.T) {
 	if m.Spec.ExecutionId != "e1" || m.Readiness != pb.MachineReadiness_UNCONFIGURED {
 		t.Fatalf("unexpected machine: %+v", m)
 	}
-	// secret 值必须进入 hypeman 请求（VM 启动配置），但不得出现在回显 Machine。
-	if got := im.created.Env["SECRET_TOKEN"]; got != "s3cr3t" {
-		t.Fatalf("secret env not merged into hypeman request: %q", got)
-	}
-	if _, ok := m.Spec.Env["SECRET_TOKEN"]; ok {
-		t.Fatal("secret env leaked into response Machine.Spec.Env (ADR-0013 invariant 3)")
-	}
 	if got := m.Spec.Env["PORT"]; got != "8080" {
-		t.Fatalf("non-secret env lost in echo: PORT=%q", got)
-	}
-	if im.created.Tags[tagSecretKeys] != "SECRET_TOKEN" {
-		t.Fatalf("secret keys tag = %q, want SECRET_TOKEN", im.created.Tags[tagSecretKeys])
+		t.Fatalf("env mapping: PORT=%q", got)
 	}
 	if im.created.Name != "m1-test" || im.created.Vcpus != 1 || im.created.Size != 512*1024*1024 {
 		t.Fatalf("unexpected hypeman request mapping: %+v", im.created)
+	}
+}
+
+func TestAdapterCreateRejectsSecretEnvWithoutPersistingIt(t *testing.T) {
+	im := &fakeInstances{}
+	a := New(im, &fakeImages{}, nil, nil)
+	req := validCreateRequest()
+	req.SecretEnv = map[string]string{"SECRET_TOKEN": "s3cr3t"}
+	_, err := a.Create(context.Background(), req)
+	if !errors.Is(err, ErrSecretEnvInjectionUnsupported) {
+		t.Fatalf("Create error = %v, want ErrSecretEnvInjectionUnsupported", err)
+	}
+	if im.created != nil {
+		t.Fatal("CreateInstance must not be called with secret_env")
 	}
 }
 
@@ -250,11 +276,25 @@ func TestAdapterDeleteResolvesNameToInternalID(t *testing.T) {
 	if _, err := a.Create(context.Background(), validCreateRequest()); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.Delete(context.Background(), "m1-test"); err != nil {
+	if err := a.Delete(context.Background(), "m1-test", "e1"); err != nil {
 		t.Fatal(err)
 	}
 	if im.deleted != "internal-1" {
 		t.Fatalf("deleted %q, want internal-1", im.deleted)
+	}
+}
+
+func TestAdapterDeleteRequiresMatchingExecution(t *testing.T) {
+	im := &fakeInstances{}
+	a := New(im, &fakeImages{}, nil, nil)
+	if _, err := a.Create(context.Background(), validCreateRequest()); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Delete(context.Background(), "m1-test", "stale-execution"); err == nil {
+		t.Fatal("delete with stale execution must fail")
+	}
+	if im.deleted != "" {
+		t.Fatal("delete with stale execution must not call hypeman")
 	}
 }
 
@@ -362,4 +402,141 @@ func TestEnsureImageReadySizeLimit(t *testing.T) {
 	if err := a.ensureImageReady(context.Background(), "docker.io/library/nginx:alpine"); err != nil {
 		t.Fatalf("within limit must pass: %v", err)
 	}
+}
+
+// M5 评审决策：secret_env 默认 fail-closed；opt-in（unsafe-persisted-env）
+// 恢复 M4 注入语义。
+func TestSecretEnvInjectionPolicy(t *testing.T) {
+	im := &fakeInstances{}
+	img := &fakeImages{}
+	req := validCreateRequest()
+	req.SecretEnv = map[string]string{"TOKEN": "v"}
+
+	// 默认拒绝。
+	a := New(im, img, nil, nil)
+	if _, err := a.Create(context.Background(), req); !errors.Is(err, ErrSecretEnvInjectionUnsupported) {
+		t.Fatalf("default must fail closed, got %v", err)
+	}
+	// opt-in 放行（值进入 hypeman Env）。
+	a.SetSecretInjection(SecretInjectionUnsafePersistedEnv)
+	if _, err := a.Create(context.Background(), req); err != nil {
+		t.Fatalf("opt-in injection must pass: %v", err)
+	}
+	if v, ok := im.created.Env["TOKEN"]; !ok || v != "v" {
+		t.Fatalf("secret not injected into env: %+v", im.created.Env)
+	}
+}
+
+// v1.1（ADR-0017）：auto_standby 策略翻译——enabled 时下发 hypeman Policy，
+// 未声明/关闭时不下发（行为与 M5 完全一致）。
+func TestAdapterCreateTranslatesAutoStandby(t *testing.T) {
+	im := &fakeInstances{}
+	a := New(im, &fakeImages{}, nil, nil)
+	req := validCreateRequest()
+	req.Spec.AutoStandby = &pb.AutoStandbyPolicy{Enabled: true, IdleTimeoutSeconds: 120}
+	if _, err := a.Create(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if im.created.AutoStandby == nil || !im.created.AutoStandby.Enabled ||
+		im.created.AutoStandby.IdleTimeout != "2m0s" {
+		t.Fatalf("auto_standby translation: %+v", im.created.AutoStandby)
+	}
+
+	// 未声明 → 不下发。
+	im2 := &fakeInstances{}
+	a2 := New(im2, &fakeImages{}, nil, nil)
+	if _, err := a2.Create(context.Background(), validCreateRequest()); err != nil {
+		t.Fatal(err)
+	}
+	if im2.created.AutoStandby != nil {
+		t.Fatalf("unset policy must not be sent, got %+v", im2.created.AutoStandby)
+	}
+
+	// 显式关闭 → 不下发。
+	im3 := &fakeInstances{}
+	a3 := New(im3, &fakeImages{}, nil, nil)
+	req3 := validCreateRequest()
+	req3.Spec.AutoStandby = &pb.AutoStandbyPolicy{Enabled: false}
+	if _, err := a3.Create(context.Background(), req3); err != nil {
+		t.Fatal(err)
+	}
+	if im3.created.AutoStandby != nil {
+		t.Fatalf("disabled policy must not be sent, got %+v", im3.created.AutoStandby)
+	}
+}
+
+// v1.1（ADR-0017）：非法策略（idle_timeout < 5s）拒绝。
+func TestAdapterCreateRejectsInvalidAutoStandby(t *testing.T) {
+	a := New(&fakeInstances{}, &fakeImages{}, nil, nil)
+	req := validCreateRequest()
+	req.Spec.AutoStandby = &pb.AutoStandbyPolicy{Enabled: true, IdleTimeoutSeconds: 2}
+	if _, err := a.Create(context.Background(), req); !errors.Is(err, ErrInvalidAutoStandby) {
+		t.Fatalf("error = %v, want ErrInvalidAutoStandby", err)
+	}
+}
+
+// v1.1（ADR-0022）：services tag 编解码 + GetEndpointForPort 白名单。
+func TestAdapterServicesTagRoundTrip(t *testing.T) {
+	spec := &pb.MachineSpec{
+		Network:  &pb.NetworkSpec{IngressPort: 80},
+		Services: []*pb.ServiceSpec{{Name: "http", InternalPort: 80}, {Name: "grpc", InternalPort: 8081}},
+	}
+	tag, err := encodeServicesTag(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tag == "" {
+		t.Fatal("multi-service spec must encode a tag")
+	}
+	decoded := decodeServicesTag(tag)
+	if len(decoded) != 1 || decoded[0].Name != "grpc" || decoded[0].Port != 8081 {
+		t.Fatalf("decoded = %+v (primary must stay in tagPort)", decoded)
+	}
+
+	// 单端口 spec：无附加 service → 空 tag。
+	single := &pb.MachineSpec{Network: &pb.NetworkSpec{IngressPort: 8080}}
+	if tag, err := encodeServicesTag(single); err != nil || tag != "" {
+		t.Fatalf("single-port spec must produce empty tag, got %q err=%v", tag, err)
+	}
+}
+
+func TestGetEndpointForPortWhitelist(t *testing.T) {
+	running := instances.Instance{
+		StoredMetadata: instances.StoredMetadata{
+			Id: "i1", Name: "m1", IP: "10.100.0.5",
+			Tags: map[string]string{
+				tagExecution: "e1",
+				tagPort:      "80",
+				tagServices:  encode(t, []svcJSON{{Name: "grpc", Port: 8081}}),
+			},
+		},
+		State: instances.StateRunning,
+	}
+	im := &fakeInstances{got: &running}
+	a := New(im, &fakeImages{}, nil, nil)
+
+	// 主端口（wantPort=0 = 旧行为）。
+	if _, port, err := a.GetEndpointForPort(context.Background(), "m1", "e1", 0); err != nil || port != 80 {
+		t.Fatalf("primary endpoint: port=%d err=%v", port, err)
+	}
+	// 附加端口命中。
+	if _, port, err := a.GetEndpointForPort(context.Background(), "m1", "e1", 8081); err != nil || port != 8081 {
+		t.Fatalf("declared service port: port=%d err=%v", port, err)
+	}
+	// 未声明端口拒绝。
+	if _, _, err := a.GetEndpointForPort(context.Background(), "m1", "e1", 9999); !errors.Is(err, ErrPortNotAllowed) {
+		t.Fatalf("undeclared port error = %v, want ErrPortNotAllowed", err)
+	}
+}
+
+func encode(t *testing.T, list []svcJSON) string {
+	t.Helper()
+	tag, err := encodeServicesTag(&pb.MachineSpec{
+		Network:  &pb.NetworkSpec{IngressPort: 80},
+		Services: []*pb.ServiceSpec{{Name: "http", InternalPort: 80}, {Name: list[0].Name, InternalPort: uint32(list[0].Port)}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tag
 }

@@ -36,10 +36,13 @@ type Provider struct {
 	dataDir         string
 	memAllocatedMib func() uint64 // 已承诺给 machine 的内存（M1：实例 Size 之和）
 	vcpuAllocated   func() int    // 已承诺给 machine 的 vcpu（实例 Vcpus 之和）
-	startedAt       time.Time
-	serviceInstance string
-	status          pb.ServiceInfoResponse_Status
-	statusChangedAt time.Time
+	// cachedImageDigests（v1.1，ADR-0018）：节点本地镜像缓存 digest 列表
+	//（LRU/创建序，截断上限 512）；nil = 未装配（不上报）。
+	cachedImageDigests func() []string
+	startedAt          time.Time
+	serviceInstance    string
+	status             pb.ServiceInfoResponse_Status
+	statusChangedAt    time.Time
 }
 
 // New 构造 Provider。dataDir 用于磁盘容量/用量统计（评审 P3：不得用 / 代替
@@ -62,6 +65,13 @@ func New(nodeID, version, commit, nodePool, fcVersion, networkCIDR, dataDir stri
 		statusChangedAt: now,
 	}
 }
+
+// DataDir 返回数据目录（PullImage 磁盘水位检查用）。
+func (p *Provider) DataDir() string { return p.dataDir }
+
+// SetImageDigestsFunc 注入镜像缓存 digest 采集函数（v1.1，ADR-0018）。
+// 由 agentd 装配：从 hypeman ListImages 派生 ready 镜像的 digest 集合。
+func (p *Provider) SetImageDigestsFunc(f func() []string) { p.cachedImageDigests = f }
 
 // AdmissionSnapshot 返回本机硬准入所需的容量/已承诺量（M2.2）。
 // 调度器是软决策，这里是与真实 cgroup/进程状态对齐的硬校验双保险（ADR-0002）。
@@ -113,8 +123,17 @@ func (p *Provider) Response() *pb.ServiceInfoResponse {
 			"firecracker_version": p.FirecrackerVer,
 			"kernel_version":      kernelRelease(),
 		},
-		NetworkCidr: p.NetworkCIDR,
+		NetworkCidr:        p.NetworkCIDR,
+		CachedImageDigests: p.cachedImageDigestsList(),
 	}
+}
+
+// cachedImageDigestsList 返回镜像缓存 digest（nil func = 不上报）。
+func (p *Provider) cachedImageDigestsList() []string {
+	if p.cachedImageDigests == nil {
+		return nil
+	}
+	return p.cachedImageDigests()
 }
 
 func memTotal() uint64 {

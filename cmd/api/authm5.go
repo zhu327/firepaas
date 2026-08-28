@@ -12,8 +12,8 @@ import (
 	"context"
 	"crypto/subtle"
 	"net/http"
-	"slices"
 	"strings"
+	"time"
 
 	"github.com/example/firepaas/internal/controlplane/apikeys"
 )
@@ -37,6 +37,11 @@ func identFrom(r *http.Request) identity {
 	return identity{Kind: "anon", Scopes: nil}
 }
 
+// withIdentity 注入身份（auth wrapper 与测试用；请求路径唯一写点是 auth）。
+func withIdentity(ctx context.Context, id identity) context.Context {
+	return context.WithValue(ctx, identCtxKey{}, id)
+}
+
 var scopeRank = map[string]int{"read": 1, "write": 2, "admin": 3}
 
 func maxRank(scopes []string) int {
@@ -49,10 +54,22 @@ func maxRank(scopes []string) int {
 	return r
 }
 
-// routeScope：r.Pattern → 最小 scope。缺席 = only-authenticated。
-// 新端点必须在这里登记（M5.1 起 auth wrapper 统一走授权表）。
+// routeScope：r.Pattern → 最小 scope。auth wrapper 对未登记路由默认拒绝，
+// 因而每个经 auth 包装的端点必须在这里显式登记。
 var routeScope = map[string]string{
-	"POST /v1/machines":              "write",
+	"POST /v1/machines":     "write",
+	"GET /v1/machines":      "read",
+	"GET /v1/machines/{id}": "read",
+	// 节点拓扑及无法可靠归属 project 的系统事件属于平台运维信息；
+	// 项目级 read key 不可枚举。
+	"GET /v1/nodes":                  "admin",
+	"GET /v1/events":                 "read",
+	"GET /v1/secrets":                "read",
+	"GET /v1/secrets/{name}":         "read",
+	"GET /v1/apps":                   "read",
+	"GET /v1/apps/{id}":              "read",
+	"GET /v1/operations":             "read",
+	"GET /v1/operations/{id}":        "read",
 	"DELETE /v1/machines/{id}":       "write",
 	"POST /v1/machines/{id}/pause":   "write",
 	"POST /v1/machines/{id}/resume":  "write",
@@ -67,10 +84,12 @@ var routeScope = map[string]string{
 	"POST /v1/apikeys":               "admin",
 	"GET /v1/apikeys":                "admin",
 	"DELETE /v1/apikeys/{id}":        "admin",
-	// M5.4/M5.5 预留（本里程碑后续切片注册路由时生效）。
-	"POST /v1/system/reprojections": "admin",
-	"POST /v1/nodes/{id}/drain":     "admin",
-	"POST /v1/nodes/{id}/ready":     "admin",
+	"POST /v1/system/reprojections":  "admin",
+	"POST /v1/nodes/{id}/drain":      "admin",
+	"POST /v1/nodes/{id}/ready":      "admin",
+	// P1-4（M5 评审）：traffic-token 铸造数据面凭证，按 write 收口
+	// （此前不在表内，read key 也能拿 token 直连 workload）。
+	"GET /v1/machines/{id}/traffic-token": "write",
 }
 
 // projectGated：受限 key 的跨 project 防线覆盖所有 by-id 资源路径。
@@ -88,10 +107,13 @@ var projectGated = map[string]bool{
 	"PUT /v1/apps/{id}/secret-refs":       true,
 	"GET /v1/secrets/{name}":              true,
 	"DELETE /v1/secrets/{name}":           true,
+	"GET /v1/operations/{id}":             true,
 }
 
-// effectiveProjectID：受限 key 的 project 优先；否则由 handler 自行解析
-// query 参数/默认值。
+// effectiveProjectID：project 解析的唯一入口（P1-2/P1-3，M5 评审）。
+// 优先级：受限 key 的 identity project > query project_id >
+// X-Firepaas-Project 头 > fallback。受限 key 永远解析到自己的 project——
+// query/body/header 都无法越权指定。
 func effectiveProjectID(r *http.Request, fallback string) string {
 	if id := identFrom(r); id.ProjectID != "" {
 		return id.ProjectID
@@ -99,7 +121,23 @@ func effectiveProjectID(r *http.Request, fallback string) string {
 	if v := r.URL.Query().Get("project_id"); v != "" {
 		return v
 	}
+	if v := r.Header.Get("X-Firepaas-Project"); v != "" {
+		return v
+	}
 	return fallback
+}
+
+// clampBodyProject 校验请求体里的 project_id（P1-2）：受限 key 显式指定
+// 他 project → 拒绝；留空 → 归一到 identity project。ok=false 表示 403。
+func clampBodyProject(r *http.Request, requested string) (string, bool) {
+	id := identFrom(r)
+	if id.ProjectID == "" {
+		return requested, true // 不受限调用方：显式指定优先
+	}
+	if requested == "" {
+		return id.ProjectID, true
+	}
+	return requested, requested == id.ProjectID
 }
 
 // resourceProject 求 by-id 资源的归属 project（gate 路径专用）。
@@ -123,7 +161,19 @@ func (a *API) resourceProject(ctx context.Context, r *http.Request) (string, boo
 		}
 		return app.ProjectID, true
 	case strings.Contains(p, "/secrets/"):
-		return a.store.AnySecretProject(ctx, r.PathValue("name"))
+		// P1-3：gate 与 handler 同源——都按 effectiveProjectID（受限 key =
+		// 自己的 project）查存在性；不再用同名任取的启发式。
+		project := effectiveProjectID(r, "dev")
+		if _, err := a.store.GetSecretMeta(ctx, project, r.PathValue("name"), nil); err != nil {
+			return "", false
+		}
+		return project, true
+	case strings.Contains(p, "/operations/"):
+		op, err := a.store.GetOperation(ctx, effectiveProjectID(r, "dev"), r.PathValue("id"))
+		if err != nil || op == nil {
+			return "", false
+		}
+		return op.ProjectID, true
 	default:
 		return "", false
 	}
@@ -133,6 +183,9 @@ func (a *API) resourceProject(ctx context.Context, r *http.Request) (string, boo
 func (a *API) auth(next http.HandlerFunc) http.HandlerFunc {
 	if a.authDisabled {
 		return func(w http.ResponseWriter, r *http.Request) {
+			// P1-1：调用方标识经响应头递给外层审计中间件（context 不可变，
+			// 外层读不到内层 WithValue 的结果）。
+			w.Header().Set("X-Firepaas-Caller", "root")
 			next(w, r.WithContext(context.WithValue(r.Context(), identCtxKey{},
 				identity{Kind: "root", Scopes: []string{"admin"}})))
 		}
@@ -151,15 +204,25 @@ func (a *API) auth(next http.HandlerFunc) http.HandlerFunc {
 			if err == nil {
 				id = identity{Kind: "key", KeyID: k.ID, KeyName: k.Name,
 					ProjectID: k.ProjectID, Scopes: k.Scopes}
-				_ = a.apiKeys.Touch(r.Context(), apikeys.Hash(got))
+				// P3-16：last_used_at 节流写（≥1min 一次），避免每请求一行 UPDATE。
+				if k.LastUsedAt == nil || time.Since(*k.LastUsedAt) > time.Minute {
+					_ = a.apiKeys.Touch(r.Context(), apikeys.Hash(got))
+				}
 			}
 		}
 		if id.Kind == "" {
 			writeErr(w, 401, "unauthorized")
 			return
 		}
-		// 授权：routeScope 登记的最小 scope。
-		if need := routeScope[r.Pattern]; need != "" && maxRank(id.Scopes) < scopeRank[need] {
+		// 以下 project gate 必须看到刚认证出的 identity，而不是原始请求。
+		r = r.WithContext(withIdentity(r.Context(), id))
+		// 默认拒绝：未知（或漏登记）路由不因“已认证”而自动获得权限。
+		need, registered := routeScope[r.Pattern]
+		if !registered {
+			writeErr(w, 403, "route is not authorized")
+			return
+		}
+		if maxRank(id.Scopes) < scopeRank[need] {
 			writeErr(w, 403, "insufficient scope: require "+need)
 			return
 		}
@@ -171,13 +234,17 @@ func (a *API) auth(next http.HandlerFunc) http.HandlerFunc {
 				return
 			}
 		}
-		next(w, r.WithContext(context.WithValue(r.Context(), identCtxKey{}, id)))
+		// P1-1：审计 caller 经响应头传出（见 auditMiddleware；header 在
+		// handler 写 body 前设置，外层中间件在 next 返回后可读）。
+		if name := callerName(id); name != "" {
+			w.Header().Set("X-Firepaas-Caller", name)
+		}
+		next(w, r)
 	}
 }
 
-// keyNameForAudit：审计日志里带上调用方（root/key 名），不落凭证明文。
-func keyNameForAudit(r *http.Request) string {
-	id := identFrom(r)
+// callerName：审计里展示的调用方标识（root/key 名），无凭证明文。
+func callerName(id identity) string {
 	switch id.Kind {
 	case "root":
 		return "root"
@@ -189,12 +256,4 @@ func keyNameForAudit(r *http.Request) string {
 	default:
 		return ""
 	}
-}
-
-// hasScope 供 handler 内精细校验（如 traffic-token 仍要求 write）。
-func hasScope(id identity, want string) bool {
-	if id.Kind == "root" {
-		return true
-	}
-	return slices.Contains(id.Scopes, want)
 }

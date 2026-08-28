@@ -6,14 +6,51 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"testing"
 	"time"
 
 	"github.com/kernel/hypeman/lib/healthcheck"
+
+	"github.com/example/firepaas/internal/agent/probeflow"
 	"github.com/kernel/hypeman/lib/instances"
 
 	pb "github.com/example/firepaas/shared/gen/agent/v1"
 )
+
+func TestRecordingDialReleasesOnClose(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	accepted := make(chan struct{})
+	go func() {
+		conn, err := listener.Accept()
+		if err == nil {
+			close(accepted)
+			_ = conn.Close()
+		}
+	}()
+	r := &RecordingRunner{}
+	reg := probeflow.NewRegistry(time.Nanosecond)
+	conn, err := r.recordingDialContext(reg)(context.Background(), "tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-accepted
+	local := conn.LocalAddr().(*net.TCPAddr)
+	dst := listener.Addr().(*net.TCPAddr)
+	if !reg.Match(uint16(local.Port), netip.AddrPortFrom(netip.MustParseAddr(dst.IP.String()), uint16(dst.Port))) {
+		t.Fatal("open probe connection must remain registered beyond legacy TTL")
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if reg.Size() != 0 {
+		t.Fatal("closing probe connection must release its registry entry")
+	}
+}
 
 func TestEncodeParsePolicy(t *testing.T) {
 	// HTTP 探针。

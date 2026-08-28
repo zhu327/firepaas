@@ -5,7 +5,7 @@
 //   - 暴露 gRPC InfoService / MachineService（protos/agent/v1）
 //   - operation ledger 提供 request hash/result 的原子幂等与重启重放
 //
-// M1 身份降级（ADR-0006）：先明文 + 主机端口 ACL；mTLS 在 M1.3 补上。
+// mTLS 是生产默认；仅显式 FIREPAAS_ALLOW_INSECURE_DEV=true 可用于本地明文开发。
 package main
 
 import (
@@ -24,16 +24,29 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kernel/hypeman/lib/autostandby"
+	"github.com/kernel/hypeman/lib/healthcheck"
 	"github.com/kernel/hypeman/lib/instances"
 	"github.com/kernel/hypeman/lib/network"
+	"github.com/kernel/hypeman/lib/vm_metrics"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	otelprometheus "go.opentelemetry.io/otel/exporters/prometheus"
+	otelmetric "go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/noop"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 
 	"github.com/example/firepaas/internal/agent/health"
 	"github.com/example/firepaas/internal/agent/info"
 	"github.com/example/firepaas/internal/agent/machine"
 	"github.com/example/firepaas/internal/agent/network/slot"
+	"github.com/example/firepaas/internal/agent/probeflow"
 	"github.com/example/firepaas/internal/agent/proxy"
 	"github.com/example/firepaas/internal/agent/runtime"
 	"github.com/example/firepaas/internal/agent/server"
+	"github.com/example/firepaas/internal/agent/standby"
 	"github.com/example/firepaas/internal/agent/state"
 	"github.com/example/firepaas/internal/security/mtls"
 	pb "github.com/example/firepaas/shared/gen/agent/v1"
@@ -63,6 +76,13 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// v1.1（F-2/A）：agent 侧 Prometheus 端点。默认只绑定 loopback；跨主机
+	// 抓取必须由部署显式设置 FIREPAAS_AGENT_METRICS_BIND，并以网络 ACL 限制
+	// Prometheus 所在可信网段。必须在 runtime.Assemble 之前设置全局 meter
+	// provider——hypeman 各管理器在构造时从全局 provider 取 meter。
+	meter := initAgentMetrics(ctx, envOr("FIREPAAS_AGENT_METRICS_PORT", ""),
+		envOr("FIREPAAS_AGENT_METRICS_BIND", "127.0.0.1"))
 
 	cfg, err := runtime.LoadConfig()
 	if err != nil {
@@ -165,15 +185,54 @@ func run() error {
 	}
 
 	tracker := health.New()
+	// v1.1（ADR-0017）：探针连接登记 runner——dial 前 bind 固定本地端口并把
+	// 四元组登记进 probeflow registry，供 auto-standby conntrack 过滤器精确
+	// 剔除探针流量（不清闲判定，同时不影响真实流量的活跃计数）。
+	probeReg := probeflow.NewRegistry(0)
+	tracker.SetRunner(health.NewRecordingRunner(
+		healthcheck.DefaultProbeRunner{HTTPClient: health.ProbeHTTPClient()}, probeReg))
 	adapter := machine.New(set.Instances, set.Images, slotManager, tracker)
 	// M5.1：镜像解包大小准入（默认 4096MiB；0 = 不限）。
 	if v, err := strconv.ParseInt(envOr("FIREPAAS_IMAGE_MAX_UNPACK_MIB", "4096"), 10, 64); err == nil && v >= 0 {
 		adapter.SetMaxUnpackMib(v)
 	}
+	// M5 评审决策：secret_env 默认 fail-closed（hypeman Env 明文落盘）；
+	// 受信环境显式 opt-in 恢复 M4 注入语义。
+	adapter.SetSecretInjection(envOr("FIREPAAS_SECRET_INJECTION", ""))
 	// M4.5：standby 实例的首流量同步唤醑（autoresume）。
 	if strings.EqualFold(envOr("FIREPAAS_AGENT_AUTORESUME", "true"), "false") {
 		adapter.SetAutoResume(false)
 		slog.Info("agent autoresume disabled")
+	}
+	// v1.1（ADR-0017）：auto-standby 空闲检测控制器（conntrack 驱动，默认开；
+	// 策略 per-app 默认关闭）。非 Linux/无 runtime 持久化能力时降级关闭。
+	wakes, wakeSeconds := agentWakeMetrics(meter)
+	adapter.SetWakeObserver(func(machineID string, took time.Duration) {
+		wakes.Add(context.Background(), 1,
+			otelmetric.WithAttributes(attribute.String("machine_id", machineID)))
+		wakeSeconds.Record(context.Background(), took.Seconds(),
+			otelmetric.WithAttributes(attribute.String("machine_id", machineID)))
+		slog.Info("autoresume wake", "machine_id", machineID, "took", took.Round(time.Millisecond))
+	})
+	if strings.EqualFold(envOr("FIREPAAS_AGENT_AUTOSTANDBY", "true"), "true") {
+		if err := startAutoStandby(ctx, set.Instances, probeReg, meter); err != nil {
+			slog.Warn("auto-standby controller disabled", "error", err)
+		}
+	} else {
+		slog.Info("auto-standby controller disabled by env")
+	}
+	// v1.1（F-2）：per-VM CPU/RSS 指标（Prometheus 直抓，节点 relabel）。
+	// slot netns 下 TAP 网络统计尚无正确采集实现，故不把网络维度作为已交付
+	// 指标承诺；详见 v1.1 implementation notes 的 DEFERRED 项。
+	if meter != nil {
+		vmMgr := vm_metrics.NewManager()
+		vmMgr.SetInstanceSource(vm_metrics.NewInstanceManagerAdapter(set.Instances))
+		vmMgr.SetLogger(slog.Default().With("component", "vm_metrics"))
+		if err := vmMgr.InitializeOTel(meter); err != nil {
+			slog.Warn("per-VM metrics disabled", "error", err)
+		} else {
+			slog.Info("per-VM metrics enabled (direct scrape)")
+		}
 	}
 	// P1-1：探针 worker 独立于 ListMachines gRPC 路径执行（预算内串行，
 	// 不再共享 gRPC deadline）；controller 每 5s 的 List 只读缓存。
@@ -207,6 +266,12 @@ func run() error {
 	memAllocated := func() uint64 { m, _ := listedResources(); return m }
 	vcpuAllocated := func() int { _, v := listedResources(); return v }
 	infoProvider := info.New(nodeID, serviceVersion, serviceCommit, nodePool, fcVersion, cfg.Network.SubnetCIDR, cfg.DataDir, memAllocated, vcpuAllocated)
+	// v1.1（ADR-0018）：镜像缓存 digest 上报（scheduler 镜像亲和输入）。
+	infoProvider.SetImageDigestsFunc(func() []string {
+		listCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return adapter.CachedImageDigests(listCtx, 512)
+	})
 
 	// M4（ADR-0006 收口）：proxy credential 验证材料（仅 SHA-256 摘要落盘）。
 	credsPath := envOr("FIREPAAS_AGENT_CREDS_PATH", filepath.Join(cfg.DataDir, "agent", "credentials.json"))
@@ -216,8 +281,14 @@ func run() error {
 	}
 	// 兼容开关：默认强制 create 携带 execution-bound credential。
 	requireCred := strings.ToLower(envOr("FIREPAAS_PROXY_CREDENTIAL_REQUIRED", "true")) != "false"
+	// v1.1（ADR-0018）：PullImage（部署预取）磁盘水位守护（已用比例 ≥ 阈值拒绝）。
+	diskWatermark := 0.9
+	if v, err := strconv.ParseFloat(envOr("FIREPAAS_PREFETCH_DISK_WATERMARK", "0.9"), 64); err == nil && v > 0 && v <= 1 {
+		diskWatermark = v
+	}
 	srv := server.New(adapter, ledger, fences, infoProvider,
-		server.WithCreds(creds), server.WithCredentialRequired(requireCred))
+		server.WithCreds(creds), server.WithCredentialRequired(requireCred),
+		server.WithDiskWatermark(diskWatermark))
 
 	lis, err := net.Listen("tcp", net.JoinHostPort(bind, port))
 	if err != nil {
@@ -249,6 +320,7 @@ func run() error {
 	grpcServer := grpc.NewServer(grpcOpts...)
 	pb.RegisterInfoServiceServer(grpcServer, srv)
 	pb.RegisterMachineServiceServer(grpcServer, srv)
+	pb.RegisterImageServiceServer(grpcServer, srv) // v1.1（ADR-0018）：部署预取
 
 	errCh := make(chan error, 2)
 	go func() {
@@ -295,13 +367,18 @@ func envOr(key, def string) string {
 	return def
 }
 
-// agentServerTLS 当三个证书路径都提供时构造服务端 mTLS 配置，否则返回 nil（明文降级）。
+// agentServerTLS requires mTLS in production. Local plaintext operation is deliberately
+// opt-in so an omitted certificate cannot silently expose control/data-plane RPCs.
 func agentServerTLS() (*tls.Config, error) {
 	certFile := os.Getenv("FIREPAAS_AGENT_TLS_CERT")
 	keyFile := os.Getenv("FIREPAAS_AGENT_TLS_KEY")
 	caFile := os.Getenv("FIREPAAS_AGENT_TLS_CA")
 	if certFile == "" && keyFile == "" && caFile == "" {
-		return nil, nil
+		if strings.EqualFold(os.Getenv("FIREPAAS_ALLOW_INSECURE_DEV"), "true") {
+			slog.Warn("agentd running without TLS because FIREPAAS_ALLOW_INSECURE_DEV=true")
+			return nil, nil
+		}
+		return nil, fmt.Errorf("agent mTLS required: set FIREPAAS_AGENT_TLS_CERT/KEY/CA (or FIREPAAS_ALLOW_INSECURE_DEV=true for local development only)")
 	}
 	if certFile == "" || keyFile == "" || caFile == "" {
 		return nil, fmt.Errorf("FIREPAAS_AGENT_TLS_CERT/KEY/CA must be set together")
@@ -315,4 +392,113 @@ func hostnameOr(def string) string {
 		return def
 	}
 	return h
+}
+
+// ---------------------------------------------------------------------------
+// v1.1：auto-standby 装配（ADR-0017）与 agent 指标端点（F-2/A）
+// ---------------------------------------------------------------------------
+
+// startAutoStandby 装配 hypeman autostandby Controller：
+//   - InstanceStore 适配 instances.Manager（含 runtime 持久化能力断言）；
+//   - ConnectionSource 用 probeflow registry 过滤探针连接（slot 后端下探针
+//     与代理回流同源段，源段忽略会误伤真实流量——改为精确按连接剔除）。
+//
+// 策略 per-app 默认关闭；controller 对无策略实例零动作。
+func startAutoStandby(ctx context.Context, mgr instances.Manager, probeReg *probeflow.Registry, meter otelmetric.Meter) error {
+	store := standby.NewInstanceStore(mgr)
+	if store == nil {
+		return fmt.Errorf("instance manager lacks auto-standby runtime persistence")
+	}
+	maxConcurrent := 4
+	if v, err := strconv.Atoi(envOr("FIREPAAS_AUTOSTANDBY_MAX_CONCURRENT", "4")); err == nil && v > 0 {
+		maxConcurrent = v
+	}
+	// 快照同步间隔：hypeman 默认 5min——实例 Created→Running 的转变没有
+	// lifecycle 事件（create 事件携带 Created 态，eligible 要求 Running），
+	// 控制器只能靠快照发现新就绪实例。缩短到 30s：每次同步 = 一次
+	// ListInstances + 一次 conntrack dump + 全实例刷新（廉价）。
+	syncInterval := 30 * time.Second
+	if v, err := time.ParseDuration(envOr("FIREPAAS_AUTOSTANDBY_SYNC_INTERVAL", "30s")); err == nil && v > 0 {
+		syncInterval = v
+	}
+	opts := autostandby.ControllerOptions{
+		Log:                   slog.Default().With("controller", "auto_standby"),
+		MaxConcurrentStandbys: maxConcurrent,
+		SnapshotSyncInterval:  syncInterval,
+	}
+	if meter != nil {
+		opts.Meter = meter
+	}
+	ctrl := autostandby.NewController(store,
+		standby.NewFilteredSource(autostandby.NewConntrackSource(), probeReg), opts)
+	go func() {
+		if err := ctrl.Run(ctx); err != nil && ctx.Err() == nil {
+			slog.Error("auto-standby controller stopped", "error", err)
+		}
+	}()
+	slog.Info("auto-standby controller enabled (conntrack-driven, per-app policy default off)",
+		"max_concurrent_standbys", maxConcurrent, "snapshot_sync_interval", syncInterval)
+	return nil
+}
+
+// mustNoopHistogram 返回 noop 直方图（meter 构造失败的兜底）。
+func mustNoopHistogram() otelmetric.Float64Histogram {
+	h, _ := noop.Meter{}.Float64Histogram("firepaas_agent_autostandby_wake_seconds")
+	return h
+}
+
+// agentWakeMetrics 构造 autoresume 唤醒计数/耗时（v1.1，ADR-0017 metrics）。
+// meter 为 nil 时退化为 noop meter（接口含未导出方法，不能自造实现）。
+func agentWakeMetrics(meter otelmetric.Meter) (otelmetric.Int64Counter, otelmetric.Float64Histogram) {
+	if meter == nil {
+		meter = noop.Meter{}
+	}
+	wakes, err := meter.Int64Counter("firepaas_agent_autostandby_wakes_total",
+		otelmetric.WithDescription("autoresume wakeups triggered by first traffic"))
+	if err != nil {
+		var c otelmetric.Int64Counter
+		c, _ = noop.Meter{}.Int64Counter("firepaas_agent_autostandby_wakes_total")
+		return c, mustNoopHistogram()
+	}
+	seconds, err := meter.Float64Histogram("firepaas_agent_autostandby_wake_seconds",
+		otelmetric.WithDescription("autoresume wake duration (restore + slot re-attach)"))
+	if err != nil {
+		return wakes, mustNoopHistogram()
+	}
+	return wakes, seconds
+}
+
+// initAgentMetrics 设置 Prometheus exporter + 全局 meter provider，并在
+// metricsBind:metricsPort 上暴露 /metrics。port 为空 = 关闭（返回 nil meter）。
+// 调用方必须显式选择非 loopback bind；该端点没有 HTTP 鉴权。
+func initAgentMetrics(ctx context.Context, metricsPort, metricsBind string) otelmetric.Meter {
+	if metricsPort == "" {
+		return nil
+	}
+	promReg := prometheus.NewRegistry()
+	exporter, err := otelprometheus.New(otelprometheus.WithRegisterer(promReg))
+	if err != nil {
+		slog.Warn("agent metrics disabled: prometheus exporter", "error", err)
+		return nil
+	}
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(exporter))
+	otel.SetMeterProvider(mp)
+	go func() {
+		<-ctx.Done()
+		_ = mp.Shutdown(context.Background())
+	}()
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.HandlerFor(promReg, promhttp.HandlerOpts{}))
+	lis, err := net.Listen("tcp", net.JoinHostPort(metricsBind, metricsPort))
+	if err != nil {
+		slog.Warn("agent metrics disabled: listen", "bind", metricsBind, "port", metricsPort, "error", err)
+		return nil
+	}
+	go func() {
+		slog.Info("agent metrics listening", "bind", metricsBind, "port", metricsPort)
+		if err := http.Serve(lis, mux); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("agent metrics serve", "error", err)
+		}
+	}()
+	return mp.Meter("firepaas-agent")
 }

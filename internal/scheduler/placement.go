@@ -33,11 +33,14 @@ type BestOfKConfig struct {
 	Alpha     float64 // 实时用量的权重，默认 0.5
 	WeightCPU float64 // 打分权重，默认 0.5
 	WeightMem float64 // 打分权重，默认 0.5
+	// WeightImage（v1.1，ADR-0018）：镜像缓存亲和罚项权重，默认 0.5。
+	// 只在打分层生效（任何节点都不因镜像未缓存被过滤）。
+	WeightImage float64
 }
 
 // DefaultBestOfKConfig 返回默认参数（对齐 e2b）。
 func DefaultBestOfKConfig() BestOfKConfig {
-	return BestOfKConfig{R: 4, MemR: 1.0, K: 3, Alpha: 0.5, WeightCPU: 0.5, WeightMem: 0.5}
+	return BestOfKConfig{R: 4, MemR: 1.0, K: 3, Alpha: 0.5, WeightCPU: 0.5, WeightMem: 0.5, WeightImage: 0.5}
 }
 
 // Options 是 Place 的可观测/可注入选项。
@@ -65,6 +68,10 @@ type Node struct {
 	MemPending   uint64  // 在途 create 的 MiB 承诺
 	CPUPercent   float64 // 实时用量（0-100）
 	MemUsedMib   uint64  // 实时用量
+
+	// CachedImageDigests（v1.1，ADR-0018）：节点本地镜像缓存 digest 集合
+	//（内含 name-digest 与 manifest digest 两种形态）。nil = 未知（不罚）。
+	CachedImageDigests map[string]bool
 }
 
 // Request 是一次放置请求（来自 MachineSpec.placement + 资源需求）。
@@ -82,6 +89,9 @@ type Request struct {
 	ExistingDeploymentNodes map[string]bool
 	// ExcludedNodes 是本次放置不可选节点（如 ResourceExhausted 换节点重试）。
 	ExcludedNodes map[string]bool
+	// ImageDigest（v1.1，ADR-0018）：目标镜像 digest（image_ref 的 @ 后缀）。
+	// 空 = 不启用镜像亲和罚项。
+	ImageDigest string
 }
 
 // Event 是调度事件（写 scheduler_events，审计可解释）。
@@ -122,7 +132,61 @@ func New(cfg BestOfKConfig, opts Options) *Placer {
 		cfg.WeightCPU = 0.5
 		cfg.WeightMem = 0.5
 	}
+	if cfg.WeightImage == 0 && cfg.WeightCPU == 0 && cfg.WeightMem == 0 {
+		cfg.WeightImage = 0.5
+	}
 	return &Placer{cfg: cfg, opts: opts}
+}
+
+// PrefetchTopK 按真实 deployment 放置的硬候选过滤后，按同一评分升序返回前 k
+// 个节点。预取不做 reservation，但绝不向 pool/labels/资源/反亲和不合格的节点
+// 发 PullImage；否则预热结果不能代表实际 create 的候选集。
+func (p *Placer) PrefetchTopK(req Request, nodes []Node, k int) []Node {
+	if k <= 0 {
+		k = 3
+	}
+	candidates := p.hardCandidates(req, nodes)
+	sort.SliceStable(candidates, func(i, j int) bool {
+		si, sj := p.score(candidates[i], req), p.score(candidates[j], req)
+		if si != sj {
+			return si < sj
+		}
+		return candidates[i].ID < candidates[j].ID
+	})
+	if len(candidates) > k {
+		candidates = candidates[:k]
+	}
+	return candidates
+}
+
+// hardCandidates implements Place's hard candidate pipeline. It intentionally
+// omits retry exclusions: a prefetch is for the deployment, not one retry.
+func (p *Placer) hardCandidates(req Request, nodes []Node) []Node {
+	pool := req.Pool
+	if pool == "" {
+		pool = "compute"
+	}
+	resourcePass := make([]Node, 0, len(nodes))
+	for _, n := range nodes {
+		if n.Status != StatusHealthy || n.Draining || n.Pool != pool ||
+			!labelsMatch(n.Labels, req.Labels) || !canFit(n, req, p.cfg) {
+			continue
+		}
+		resourcePass = append(resourcePass, n)
+	}
+	if !req.AntiAffinity || req.DeploymentID == "" || len(req.ExistingDeploymentNodes) == 0 {
+		return resourcePass
+	}
+	spread := make([]Node, 0, len(resourcePass))
+	for _, n := range resourcePass {
+		if !req.ExistingDeploymentNodes[n.ID] {
+			spread = append(spread, n)
+		}
+	}
+	if len(spread) == 0 { // same availability-preserving anti-affinity degradation as Place
+		return resourcePass
+	}
+	return spread
 }
 
 // ErrNoCandidates 表示过滤后无可用节点。
@@ -241,13 +305,27 @@ func (p *Placer) Place(req Request, nodes []Node, rnd *rand.Rand) (Placement, er
 }
 
 // score 计算单节点放置分（Best-of-K，ADR-0002）。
+// v1.1（ADR-0018）：增加镜像缓存亲和软罚项 WeightImage·imageMiss——目标镜像
+// digest 在节点缓存内 = 0，不在 = 1；节点缓存未知（nil）不罚。亲和只出现在
+// 打分层，任何节点都不因镜像未缓存被过滤（否则新镜像永远无候选）。
 func (p *Placer) score(n Node, req Request) float64 {
 	cpuCap := float64(n.CPUTotal) * p.cfg.R
 	memCap := float64(n.MemTotalMib) * p.cfg.MemR
 	usageCPU := n.CPUPercent / 100 * float64(n.CPUTotal) // 折算为“占用 vcpu 数”
 	cpu := (float64(req.VCPU+uint64(n.CPUAllocated)+uint64(n.CPUPending)) + p.cfg.Alpha*usageCPU) / cpuCap
 	mem := (float64(req.MemMib+n.MemAllocated+n.MemPending) + p.cfg.Alpha*float64(n.MemUsedMib)) / memCap
-	return p.cfg.WeightCPU*cpu + p.cfg.WeightMem*mem
+	base := p.cfg.WeightCPU*cpu + p.cfg.WeightMem*mem
+	if req.ImageDigest == "" || p.cfg.WeightImage == 0 {
+		return base
+	}
+	// 注：nil（未上报）与空集合同罚——proto3 repeated 无法区分“未知”与
+	// “空”，且节点视图均来自已上报 ServiceInfo 的 agent（20s 内必有缓存
+	// 视图）；不罚会让未上报者永远战胜已缓存节点，亲和失效。
+	miss := 1.0
+	if n.CachedImageDigests[req.ImageDigest] {
+		miss = 0
+	}
+	return base + p.cfg.WeightImage*miss
 }
 
 // canFit 硬准入：allocated+pending+req ≤ R·capacity（内存 R=MemR）。

@@ -401,6 +401,12 @@ func (m *Manager) upsertPG(ctx context.Context, n *Node) error {
 			row.MemAllocatedMib = int64(info.Usage.MemAllocatedMib)
 			row.DiskUsedMib = int64(info.Usage.DiskUsedMib)
 		}
+		// v1.1（ADR-0018）：仅以非空 agent 快照更新 PG cache。agent 的
+		// ServiceInfo 无法区分“缓存确实为空”和 ListImages 失败后的空列表；
+		// 保留旧值优先保证短暂 ListImages 失败不会抹掉亲和信息。
+		if len(info.CachedImageDigests) > 0 {
+			row.ImageCache = info.CachedImageDigests
+		}
 	}
 	return m.cfg.Store.UpsertNode(ctx, row)
 }

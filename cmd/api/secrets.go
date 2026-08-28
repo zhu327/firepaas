@@ -35,8 +35,9 @@ func auditMiddleware(next http.Handler) http.Handler {
 			"path":        r.URL.Path,
 			"status":      rec.status,
 			"duration_ms": time.Since(start).Milliseconds(),
-			// M5.1：调用方标识（root/key 名），无凭证明文。
-			"caller": keyNameForAudit(r),
+			// P1-1：调用方标识由 auth wrapper 经响应头传出（context 不可变，
+			// 外层中间件读不到内层注入的 identity）。
+			"caller": rec.Header().Get("X-Firepaas-Caller"),
 			// 显式约定：query/body/authorization 永不入审计。
 		})
 		if v, ok := fields["caller"]; ok && v == "" {
@@ -81,16 +82,6 @@ func (a *API) secretsEnabled(w http.ResponseWriter) bool {
 	return true
 }
 
-func projectOr(r *http.Request, def string) string {
-	if v := r.URL.Query().Get("project_id"); v != "" {
-		return v
-	}
-	if v := r.Header.Get("X-Firepaas-Project"); v != "" {
-		return v
-	}
-	return def
-}
-
 func parseVersionQuery(r *http.Request) (*int64, error) {
 	v := r.URL.Query().Get("version")
 	if v == "" {
@@ -112,6 +103,13 @@ func (a *API) putSecret(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "bad request: "+err.Error())
 		return
 	}
+	// P1-2：受限 key 只能写自己 project（body.project_id 不可越权指定）。
+	project, ok := clampBodyProject(r, body.ProjectID)
+	if !ok {
+		writeErr(w, 403, "cross-project access denied")
+		return
+	}
+	body.ProjectID = project
 	if body.ProjectID == "" || body.Name == "" || body.Value == "" {
 		writeErr(w, 400, "project_id, name and value are required")
 		return
@@ -172,7 +170,7 @@ func (a *API) getSecretMeta(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	meta, err := a.store.GetSecretMeta(r.Context(), projectOr(r, "dev"), r.PathValue("name"), ver)
+	meta, err := a.store.GetSecretMeta(r.Context(), effectiveProjectID(r, "dev"), r.PathValue("name"), ver)
 	if err != nil {
 		writeErr(w, 404, err.Error())
 		return
@@ -185,7 +183,7 @@ func (a *API) deleteSecret(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := r.PathValue("name")
-	n, err := a.store.DeleteSecret(r.Context(), projectOr(r, "dev"), name)
+	n, err := a.store.DeleteSecret(r.Context(), effectiveProjectID(r, "dev"), name)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return

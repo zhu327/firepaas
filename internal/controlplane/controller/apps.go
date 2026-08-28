@@ -18,9 +18,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
+	"sync"
 	"time"
 
+	"github.com/example/firepaas/internal/controlplane/agentclient"
 	"github.com/example/firepaas/internal/controlplane/store"
+	"github.com/example/firepaas/internal/scheduler"
 	pb "github.com/example/firepaas/shared/gen/agent/v1"
 	"github.com/example/firepaas/shared/pkg/id"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -110,6 +114,13 @@ func (c *Controller) reconcileRollout(ctx context.Context, app *store.App, r *st
 				return c.startRollback(ctx, r)
 			}
 		}
+		// v1.1（ADR-0018）：部署预取——PREPARING 派发 create 前，向 top-K
+		// 候选节点异步 PullImage（尽力而为，失败/超时不阻塞 rollout）。
+		c.maybePrefetchRolloutImage(ctx, r, toDep)
+		// v1.1-F：rolling 按 ordinal 把 route 切到新代，但不能在此回收旧代。
+		// buildRoutes 已将旧代标为 draining；edge 仍可能在 fresh cache 窗口内
+		// 使用旧 route/token。旧代必须保留至全部新代已 READY、CUTOVER 的
+		// drain grace 到期后再删除，避免 route/token 的短暂空窗。
 		if allReady(toMachines, app.DesiredReplicas) {
 			deadline := time.Now().Add(c.rolloutDrainGrace()).UTC().Format(time.RFC3339Nano)
 			if err := c.store.RolloutToCutover(ctx, app.ID, deadline); err != nil {
@@ -127,6 +138,12 @@ func (c *Controller) reconcileRollout(ctx context.Context, app *store.App, r *st
 		}
 		deadline := parsePGTime(*r.DrainDeadline)
 		if deadline.IsZero() || time.Now().Before(deadline) {
+			return nil
+		}
+		// 防御性重检：即使 rollout 已进入 CUTOVER，也不能因新代随后掉出
+		// route-serving 就删除旧代。这样 edge 只能在新代已可用、且 drain
+		// grace 已覆盖 route/token cache 后失去旧 execution。
+		if !rollingOldGenerationDeleteAllowed(r.Status, toMachines, app.DesiredReplicas) {
 			return nil
 		}
 		// 回收旧代机器（用户 delete 语义：成功即 desired=DELETED）。
@@ -149,18 +166,29 @@ func (c *Controller) reconcileRollout(ctx context.Context, app *store.App, r *st
 		c.metrics.Inc("firepaas_rollout_transitions_total", map[string]string{"from": "CUTOVER", "to": "COMPLETE"}, 1)
 
 	case "ROLLING_BACK":
-		// S6：删除 to 代机器；全部清完 → COMPLETE(failed=true)。
+		// S6：先确认旧代已可立即服务，再删除 to 代。rolling 可能已回收
+		// 已切 ordinal 的旧代；targetDeployment 会持久地补建它们，因此不能
+		// 在此抢先 COMPLETE 或造成旧代全部不可服务。
+		fromDep, err := c.deploymentForGeneration(ctx, app.ID, r.FromGeneration)
+		if err != nil || fromDep == nil {
+			return fmt.Errorf("rollback source deployment missing: %w", err)
+		}
+		fromMachines := filterMachines(machines, func(m store.Machine) bool { return m.DeploymentID == fromDep.ID })
+		if !allReady(fromMachines, app.DesiredReplicas) {
+			return nil
+		}
 		remaining := 0
 		for _, m := range toMachines {
-			_ = c.enqueueUserDelete(ctx, m, "rollback: remove new generation")
-			remaining++
+			if m.DesiredState != "DELETED" {
+				_ = c.enqueueUserDelete(ctx, m, "rollback: remove new generation")
+				remaining++
+			}
 		}
 		if remaining == 0 {
-			// P2-3：rollout 完成 + deployment FAILED 同事务。
-			if err := c.store.CompleteRolloutWithStatus(ctx, app.ID, true, toDep.ID, "FAILED", "", ""); err != nil {
+			if err := c.store.CompleteRolloutWithStatus(ctx, app.ID, true, toDep.ID, "FAILED", fromDep.ID, "ACTIVE"); err != nil {
 				return err
 			}
-			c.recordEvent(ctx, "rollout", "", r.ID, "", "rollback complete", nil)
+			c.recordEvent(ctx, "rollout", "", r.ID, "", "rollback complete; previous generation retained", nil)
 			c.metrics.Inc("firepaas_rollout_transitions_total", map[string]string{"from": "ROLLING_BACK", "to": "COMPLETE_FAILED"}, 1)
 		}
 	}
@@ -221,10 +249,34 @@ func (c *Controller) reconcileApp(ctx context.Context, app *store.App) error {
 		}
 	}
 
+	// rolling 发布的建新节奏以 active rollout 的 target deployment 为准，
+	// 不可从 backend 的 deployment 推断。查询失败必须 fail closed，避免在
+	// rollout 存在但读取故障时越过 batch 门控。
+	rollingLimit := -1
+	rl, err := c.store.ActiveRolloutForApp(ctx, app.ID)
+	if err != nil {
+		return fmt.Errorf("get active rollout for rolling scale: %w", err)
+	}
+	if rl != nil && rl.Status == "PREPARING" && rl.ToGeneration == target.Generation &&
+		target.EffectiveStrategy() == "rolling" {
+		// A recreate/retry can temporarily leave more than one row for an
+		// ordinal. Batch exposure is defined by distinct ordinals, not rows.
+		cutOrdinals := map[int]bool{}
+		for _, m := range machines {
+			if m.DeploymentID == target.ID && machineServing(m) {
+				cutOrdinals[m.ReplicaOrdinal] = true
+			}
+		}
+		rollingLimit = len(cutOrdinals) + rollingBatchSize(app.DesiredReplicas)
+	}
+
 	// 缺失 ordinal（目标代）→ 建。
 	for ordinal := 0; ordinal < app.DesiredReplicas; ordinal++ {
 		if have[ordinal] {
 			continue
+		}
+		if rollingLimit >= 0 && ordinal >= rollingLimit {
+			continue // 当前批次未切流，不建下一批
 		}
 		if err := c.enqueueAppMachineCreate(ctx, app, target, ordinal); err != nil {
 			slog.Error("enqueue app machine create", "app_id", app.ID, "ordinal", ordinal, "error", err)
@@ -300,6 +352,8 @@ func (c *Controller) enqueueAppMachineCreate(ctx context.Context, app *store.App
 		Env:            dep.Env,
 		Network:        &pb.NetworkSpec{IngressPort: uint64(dep.Port)},
 	}
+	// v1.1（ADR-0017/0022）：auto_standby / services 策略随 deployment 固化。
+	applyDeploymentSpecExtras(dep, spec)
 	if len(dep.Placement) > 0 && string(dep.Placement) != "null" {
 		var p pb.PlacementConstraints
 		if err := protojson.Unmarshal(dep.Placement, &p); err == nil {
@@ -382,10 +436,15 @@ func userDeleteOpID(machineID, executionID string) string {
 
 // allReady 判定目标代全部 ordinal 就绪（S3 切流条件）：
 // observed RUNNING 且 readiness ∈ {READY, UNCONFIGURED}（ADR-0008）。
+// v1.1（ADR-0017）：PAUSED（standby）同样计入——standby 是可服务态，
+// readiness 冻结在入睡前值，首请求经 autoresume 唤醒（<5s SLO）；
+// PREPARING 期间新代副本无真实流量，idle 到点 standby 不阻塞切流。
 func allReady(machines []store.Machine, replicas int) bool {
 	ready := map[int]bool{}
 	for _, m := range machines {
-		if m.ObservedState != "RUNNING" {
+		switch m.ObservedState {
+		case "RUNNING", "PAUSED":
+		default:
 			continue
 		}
 		switch m.ObservedReadiness {
@@ -399,6 +458,54 @@ func allReady(machines []store.Machine, replicas int) bool {
 		}
 	}
 	return true
+}
+
+// machineServing 判定单台 machine 是否可服务（route/滚动切流的口径）。
+func machineServing(m store.Machine) bool {
+	switch m.ObservedState {
+	case "RUNNING", "PAUSED":
+	default:
+		return false
+	}
+	switch m.ObservedReadiness {
+	case "READY", "UNCONFIGURED":
+		return true
+	}
+	return false
+}
+
+// applyDeploymentSpecExtras 把 deployment 的 v1.1 扩展字段（auto_standby、
+// services）翻译进 MachineSpec。单端口 deployment 不动 spec（请求体字节级
+// 不变，存量幂等链路零回归）；多 services 时主 service 端口写入
+// network.ingress_port，全部 services 写入 spec.services。
+func applyDeploymentSpecExtras(dep *store.Deployment, spec *pb.MachineSpec) {
+	if dep == nil || spec == nil {
+		return
+	}
+	if len(dep.AutoStandby) > 0 && string(dep.AutoStandby) != "null" {
+		var as pb.AutoStandbyPolicy
+		if err := protojson.Unmarshal(dep.AutoStandby, &as); err == nil {
+			spec.AutoStandby = &as
+		}
+	}
+	if len(dep.Services) > 1 {
+		spec.Services = make([]*pb.ServiceSpec, 0, len(dep.Services))
+		for _, s := range dep.Services {
+			name := s.Name
+			if name == "" {
+				name = fmt.Sprintf("port-%d", s.InternalPort)
+			}
+			spec.Services = append(spec.Services, &pb.ServiceSpec{Name: name, InternalPort: uint32(s.InternalPort)})
+		}
+		if spec.Network == nil {
+			spec.Network = &pb.NetworkSpec{IngressPort: uint64(dep.Services[0].InternalPort)}
+		} else {
+			spec.Network.IngressPort = uint64(dep.Services[0].InternalPort)
+		}
+	} else if len(dep.Services) == 1 && spec.Network != nil && spec.Network.IngressPort == 0 {
+		// 单 service 声明（新 API）：主端口即该 service 端口。
+		spec.Network.IngressPort = uint64(dep.Services[0].InternalPort)
+	}
 }
 
 func filterMachines(ms []store.Machine, keep func(store.Machine) bool) []store.Machine {
@@ -438,4 +545,113 @@ func placementJSONFor(p *pb.PlacementConstraints) []byte {
 		return nil
 	}
 	return raw
+}
+
+// ---------------------------------------------------------------------------
+// v1.1-F：rolling batch 发布策略（ADR-0015 状态机扩展，不新增状态）
+// ---------------------------------------------------------------------------
+
+// rollingBatchSize 计算滚动批次大小：max(1, 25%·目标副本)。
+func rollingBatchSize(replicas int) int {
+	b := replicas / 4
+	if b < 1 {
+		b = 1
+	}
+	return b
+}
+
+// rollingOldGenerationDeleteAllowed keeps the per-ordinal route cut separate
+// from lifecycle deletion. CUTOVER's elapsed drain deadline supplies the
+// edge-cache propagation grace; this predicate additionally requires every
+// target ordinal to remain route-serving at the moment old executions are
+// deleted. It is strategy-neutral so blue/green receives the same protection.
+func rollingOldGenerationDeleteAllowed(rolloutStatus string, target []store.Machine, replicas int) bool {
+	return rolloutStatus == "CUTOVER" && allReady(target, replicas)
+}
+
+// ---------------------------------------------------------------------------
+// v1.1-B：部署预取（ADR-0018）
+// ---------------------------------------------------------------------------
+
+// maybePrefetchRolloutImage 在 rollout PREPARING 首次对账时向 top-K 候选节点
+// 异步下发 PullImage。尽力而为：失败/超时只记调度事件（prefetch_failed），
+// 不阻塞 rollout、不计入重试预算；镜像拉取幂等（leader 切换重发无害）。
+func (c *Controller) maybePrefetchRolloutImage(ctx context.Context, r *store.Rollout, toDep *store.Deployment) {
+	if c.prefetchedRollouts[r.ID] {
+		return
+	}
+	c.prefetchedRollouts[r.ID] = true
+	// 镜像 digest（准入已保证 digest-pinned；无 @ 后缀时不预取）。
+	ref := toDep.ImageRef
+	i := strings.LastIndex(ref, "@")
+	if i < 0 || i == len(ref)-1 {
+		return
+	}
+	digest := ref[i+1:]
+	go c.prefetchImage(ctx, r.ID, ref, digest, toDep)
+}
+
+// prefetchImage runs under the current leader reconcile context. It may outlive
+// one loop iteration, but leader loss cancels every RPC and event write; no
+// Background context may let a former leader keep prefetching.
+func (c *Controller) prefetchImage(ctx context.Context, rolloutID, imageRef, digest string, toDep *store.Deployment) {
+	nodes, req, err := c.prefetchCandidates(ctx, toDep)
+	if err != nil {
+		c.recordEvent(ctx, "prefetch_failed", "", rolloutID, "", "prefetch candidates: "+err.Error(), nil)
+		return
+	}
+	top := c.placer.PrefetchTopK(req, nodes, c.cfg.PrefetchTopK)
+	if len(top) == 0 {
+		c.recordEvent(ctx, "prefetch", "", rolloutID, "", "prefetch skipped: no hard placement candidates", nil)
+		return
+	}
+	var wg sync.WaitGroup
+	for _, n := range top {
+		v := c.viewForAgent(n.ID)
+		if v == nil {
+			continue
+		}
+		client := c.nodes.ClientFor(v.nomadID)
+		if client == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(n scheduler.Node, client *agentclient.Client) {
+			defer wg.Done()
+			pctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+			defer cancel()
+			if _, err := client.PullImage(pctx, imageRef); err != nil {
+				c.recordEvent(ctx, "prefetch_failed", "", rolloutID, n.ID, "prefetch failed: "+err.Error(), nil)
+				c.metrics.Inc("firepaas_prefetch_total", map[string]string{"result": "failed"}, 1)
+				return
+			}
+			c.recordEvent(ctx, "prefetch", "", rolloutID, n.ID, "prefetch succeeded: image cached for placement affinity", nil)
+			c.metrics.Inc("firepaas_prefetch_total", map[string]string{"result": "succeeded"}, 1)
+		}(n, client)
+	}
+	wg.Wait()
+	c.recordEvent(ctx, "prefetch", "", rolloutID, "",
+		fmt.Sprintf("prefetch dispatched to top-%d hard placement candidates (digest %s)", len(top), digest), nil)
+}
+
+// prefetchCandidates builds the exact hard-candidate request used for create
+// placement: pool/labels/resources/deployment anti-affinity and image digest.
+func (c *Controller) prefetchCandidates(ctx context.Context, dep *store.Deployment) ([]scheduler.Node, scheduler.Request, error) {
+	nodes := c.schedulerNodes(ctx)
+	var placement pb.PlacementConstraints
+	if len(dep.Placement) > 0 && string(dep.Placement) != "null" {
+		if err := protojson.Unmarshal(dep.Placement, &placement); err != nil {
+			return nil, scheduler.Request{}, fmt.Errorf("decode deployment placement: %w", err)
+		}
+	}
+	deployNodes, err := c.store.MachineNodesByDeployment(ctx)
+	if err != nil {
+		return nil, scheduler.Request{}, err
+	}
+	return nodes, scheduler.Request{
+		VCPU: uint64(dep.VCPU), MemMib: uint64(dep.MemMIB), DeploymentID: dep.ID,
+		Pool: placement.NodePool, Labels: placement.Labels,
+		AntiAffinity:            placement.AntiAffinity == pb.PlacementConstraints_DEPLOYMENT,
+		ExistingDeploymentNodes: deployNodes[dep.ID], ImageDigest: imageDigestOf(dep.ImageRef),
+	}, nil
 }

@@ -6,6 +6,8 @@ package machine
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -13,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kernel/hypeman/lib/autostandby"
 	"github.com/kernel/hypeman/lib/images"
 	"github.com/kernel/hypeman/lib/instances"
 	"github.com/kernel/hypeman/lib/network"
@@ -33,9 +36,12 @@ const (
 	tagHostname   = "firepaas/hostname"
 	tagPort       = "firepaas/port"
 	tagGeneration = "firepaas/generation"
-	// tagSecretKeys 记录经 secret_env 注入的键名（逗号分隔）。值本体留在
-	// hypeman Env（VM 启动配置需要）；回显路径（mapMachine）据此剔除。
+	// tagSecretKeys 是回显剔除用的键名列表（仅 opt-in 注入模式写入；值永不入 tag）。
 	tagSecretKeys = "firepaas/secret_keys"
+	// tagServices（v1.1，ADR-0022）：多端口 services 的紧凑 JSON
+	//（[{"n":"http","p":80}]），base64url 编码（tag 值字符集限制，同 tagHealth）。
+	// 只存主 service 之外的附加 service；主端口沿用 tagPort。
+	tagServices = "firepaas/services"
 )
 
 // InstanceManager 是 Adapter 需要的 hypeman instance 能力子集。
@@ -66,8 +72,75 @@ type ImageManager interface {
 	ListImages(ctx context.Context) ([]images.Image, error)
 }
 
+// CachedImageDigests 返回节点本地镜像缓存的 digest 列表（v1.1，ADR-0018）。
+// 每个镜像贡献两个形态：name 里的 digest 引用（与控制面 image_ref 对齐）
+// 与解析后的 manifest digest（M5 遗留：OCI index 引用两者不同，都入集合）。
+// 排序：CreatedAt 降序（最新创建优先；hypeman 未暴露 last-used，因此不是 LRU），截断上限 cap。
+func (a *Adapter) CachedImageDigests(ctx context.Context, cap int) []string {
+	if cap <= 0 {
+		cap = 512
+	}
+	ims, err := a.images.ListImages(ctx)
+	if err != nil {
+		return nil
+	}
+	type entry struct {
+		name    string
+		digest  string
+		created time.Time
+	}
+	list := make([]entry, 0, len(ims))
+	for _, img := range ims {
+		if img.Status != images.StatusReady {
+			continue
+		}
+		name := img.Name
+		digest := img.Digest
+		if i := strings.LastIndex(name, "@"); i >= 0 {
+			if d := name[i+1:]; d != "" {
+				list = append(list, entry{name: d, created: img.CreatedAt})
+			}
+		}
+		if digest != "" {
+			list = append(list, entry{name: digest, created: img.CreatedAt})
+		}
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].created.After(list[j].created) })
+	seen := make(map[string]bool, len(list))
+	out := make([]string, 0, len(list))
+	for _, e := range list {
+		if seen[e.name] {
+			continue
+		}
+		seen[e.name] = true
+		out = append(out, e.name)
+		if len(out) >= cap {
+			break
+		}
+	}
+	return out
+}
+
 // ErrImageTooBig：镜像解包大小超 FIREPAAS_IMAGE_MAX_UNPACK_MIB（永久错误）。
 var ErrImageTooBig = errors.New("image unpack size exceeds limit")
+
+// ErrSecretEnvInjectionUnsupported 表示 secret_env 注入被拒绝：默认 fail
+// closed，因为 hypeman 的 Env 会明文持久化到节点 metadata.json，没有可
+// 验证的 one-shot 注入 API（M5 评审决策：安全默认 + 受控 opt-in）。
+// 受信/实验室环境可显式 FIREPAAS_SECRET_INJECTION=unsafe-persisted-env
+// 恢复 M4 注入语义（明知 secret 会落盘）；v1.1 交付真 one-shot 通道后移除。
+var ErrSecretEnvInjectionUnsupported = errors.New(
+	"secret_env injection is unsupported: no safe one-shot injection API " +
+		"(opt-in via FIREPAAS_SECRET_INJECTION=unsafe-persisted-env on trusted nodes)")
+
+// SecretInjectionMode：secret_env 注入策略。
+const (
+	// SecretInjectionOff：拒绝携带 secret_env 的 create（默认，安全）。
+	SecretInjectionOff = ""
+	// SecretInjectionUnsafePersistedEnv：M4 语义——合并进 hypeman Env。
+	// 明知 hypeman 会把 Env 明文持久化到 metadata.json，仅限受信环境。
+	SecretInjectionUnsafePersistedEnv = "unsafe-persisted-env"
+)
 
 // Adapter 包装 hypeman 的 instance/image manager。slots 非空时启用 slot
 // 网络后端（ADR-0004）：create 后把 hypeman TAP 移入 slot netns，delete 后回收。
@@ -81,6 +154,11 @@ type Adapter struct {
 	autoResume bool
 	// maxUnpackMib：镜像解包大小上限 MiB（0 = 不限制）。M5.1。
 	maxUnpackMib int64
+	// secretInjection：secret_env 注入策略（默认拒绝，见 ErrSecretEnvInjectionUnsupported）。
+	secretInjection string
+	// wakeObserver（v1.1，ADR-0017）：autoresume 唤醒观测（发生 standby
+	// restore 时回调；nil = 不观测）。
+	wakeObserver func(machineID string, took time.Duration)
 }
 
 // New 构造 Adapter。slotManager 为 nil 时保持 M1 bridge 行为；
@@ -96,12 +174,145 @@ func (a *Adapter) SetAutoResume(v bool) { a.autoResume = v }
 // SetMaxUnpackMib 配置镜像解包大小上限（FIREPAAS_IMAGE_MAX_UNPACK_MIB）。
 func (a *Adapter) SetMaxUnpackMib(mib int64) { a.maxUnpackMib = mib }
 
+// SetSecretInjection 配置 secret_env 注入策略（见 SecretInjectionMode*）。
+func (a *Adapter) SetSecretInjection(mode string) { a.secretInjection = mode }
+
+// SetWakeObserver 注入 autoresume 唤醒观测回调（v1.1，ADR-0017 metrics）。
+func (a *Adapter) SetWakeObserver(fn func(machineID string, took time.Duration)) { a.wakeObserver = fn }
+
+// EnsureImage 确保 image_ref 就绪（v1.1，ADR-0018 部署预取的 agent 侧入口）。
+// 复用 create 路径的拉取与准入逻辑（digest 解析、LRU、解包上限）；
+// 幂等（已在队列/已就绪直接等待 ready）。磁盘水位检查由调用方（server
+// 的 PullImage）先行执行。
+func (a *Adapter) EnsureImage(ctx context.Context, imageRef string) error {
+	return a.ensureImageReady(ctx, imageRef)
+}
+
+// ImageInfo 返回已就绪镜像的 digest 与解包大小（MiB；未知为 0）。
+func (a *Adapter) ImageInfo(ctx context.Context, imageRef string) (digest string, sizeMib uint64) {
+	ims, err := a.images.ListImages(ctx)
+	if err != nil {
+		return "", 0
+	}
+	prefix := imageRef
+	if i := strings.Index(prefix, "@"); i >= 0 {
+		prefix = prefix[:i]
+	}
+	for _, img := range ims {
+		if img.Name != imageRef && !strings.HasPrefix(img.Name, prefix+"@") {
+			continue
+		}
+		if img.Status != images.StatusReady {
+			continue
+		}
+		if img.SizeBytes != nil {
+			sizeMib = uint64(*img.SizeBytes) >> 20
+		}
+		if img.Digest != "" {
+			return img.Digest, sizeMib
+		}
+		if i := strings.LastIndex(img.Name, "@"); i >= 0 {
+			return img.Name[i+1:], sizeMib
+		}
+	}
+	return "", 0
+}
+
 // ErrImageNotFound 表示镜像引用无法解析/拉取（永久性业务错误：重试不会
 // 改变结果）。controller 据此把 create 置为终态 FAILED，避免无限重派。
 var ErrImageNotFound = errors.New("image not found")
 
+// svcJSON 是 tagServices 的紧凑形态（控制 tag 长度）。
+type svcJSON struct {
+	Name string `json:"n,omitempty"`
+	Port int    `json:"p"`
+}
+
+// ErrInvalidAutoStandby 表示 auto_standby 策略非法（永久错误）。
+var ErrInvalidAutoStandby = errors.New("invalid auto_standby policy")
+
+// ErrPortNotAllowed 表示请求端口不在 services 白名单内（ADR-0022）。
+var ErrPortNotAllowed = errors.New("requested port is not declared by services")
+
+// translateAutoStandby 把 proto AutoStandbyPolicy 翻译为 hypeman 策略。
+// 探针排除不经由 IgnoreSourceCIDRs（slot 后端下与代理回流同源段，会误伤
+// 真实流量）；agentd 用 probeflow registry 在 conntrack 源头精确剔除。
+func translateAutoStandby(as *pb.AutoStandbyPolicy) (*autostandby.Policy, error) {
+	if as == nil || !as.GetEnabled() {
+		return nil, nil
+	}
+	if as.GetIdleTimeoutSeconds() < 5 {
+		return nil, fmt.Errorf("%w: idle_timeout_seconds must be >= 5", ErrInvalidAutoStandby)
+	}
+	policy := &autostandby.Policy{
+		Enabled:     true,
+		IdleTimeout: fmt.Sprintf("%ds", as.GetIdleTimeoutSeconds()),
+	}
+	for _, cidr := range as.GetIgnoreSourceCidrs() {
+		policy.IgnoreSourceCIDRs = append(policy.IgnoreSourceCIDRs, cidr)
+	}
+	for _, p := range as.GetIgnoreDestinationPorts() {
+		if p == 0 || p > 65535 {
+			return nil, fmt.Errorf("%w: ignore_destination_ports entry %d out of range", ErrInvalidAutoStandby, p)
+		}
+		policy.IgnoreDestinationPorts = append(policy.IgnoreDestinationPorts, uint16(p))
+	}
+	return autostandby.NormalizePolicy(policy)
+}
+
+// encodeServicesTag 把附加 services（除主端口外）编码为 base64url tag。
+// 主 service 端口沿用 tagPort（单端口兼容）；空列表返回空串。
+func encodeServicesTag(spec *pb.MachineSpec) (string, error) {
+	if spec == nil {
+		return "", nil
+	}
+	primary := ingressPortInt(spec.Network)
+	var list []svcJSON
+	for _, s := range spec.GetServices() {
+		if s.GetInternalPort() == 0 {
+			return "", fmt.Errorf("%w: service %q has no internal_port", ErrInvalidAutoStandby, s.GetName())
+		}
+		if int(s.GetInternalPort()) == primary {
+			continue // 主端口在 tagPort
+		}
+		list = append(list, svcJSON{Name: s.GetName(), Port: int(s.GetInternalPort())})
+	}
+	if len(list) == 0 {
+		return "", nil
+	}
+	raw, err := json.Marshal(list)
+	if err != nil {
+		return "", err
+	}
+	encoded := base64.RawURLEncoding.EncodeToString(raw)
+	if len(encoded) > 200 {
+		return "", fmt.Errorf("%w: services too large for tag", ErrInvalidAutoStandby)
+	}
+	return encoded, nil
+}
+
+// decodeServicesTag 解析 tagServices（附加 service）；容错返回 nil。
+func decodeServicesTag(tag string) []svcJSON {
+	if tag == "" {
+		return nil
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(tag)
+	if err != nil {
+		return nil
+	}
+	var list []svcJSON
+	if err := json.Unmarshal(raw, &list); err != nil {
+		return nil
+	}
+	return list
+}
+
 // Create 确保镜像就绪后创建 VM。返回的 Machine 只含回显安全字段。
 func (a *Adapter) Create(ctx context.Context, req *pb.CreateMachineRequest) (*pb.Machine, error) {
+	// 默认 fail closed（hypeman Env 明文落盘）；受信环境 opt-in 恢复 M4 语义。
+	if len(req.GetSecretEnv()) != 0 && a.secretInjection != SecretInjectionUnsafePersistedEnv {
+		return nil, ErrSecretEnvInjectionUnsupported
+	}
 	spec := req.Spec
 	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
@@ -116,15 +327,14 @@ func (a *Adapter) Create(ctx context.Context, req *pb.CreateMachineRequest) (*pb
 	for k, v := range spec.Env {
 		env[k] = v
 	}
-	// secret_env 单向注入：值进入 VM 启动配置（hypeman Env），但键名记录在
-	// tags，供回显路径剔除（ADR-0013 不变量 3）。排序保证确定性。
+	// secret_env 单向注入（opt-in 模式）：值进入 VM 启动配置（hypeman Env，
+	// 明知会明文持久化到节点 metadata.json），键名记录在 tags 供回显剔除。
 	secretKeys := make([]string, 0, len(req.SecretEnv))
 	for k, v := range req.SecretEnv {
 		env[k] = v
 		secretKeys = append(secretKeys, k)
 	}
 	sort.Strings(secretKeys)
-
 	// 完整探针策略 JSON 入 tag（ADR-0008）；EXEC 或非法 target 降级为
 	// 未声明（UNCONFIGURED = RUNNING 即 READY）。
 	healthTag := "0"
@@ -136,6 +346,16 @@ func (a *Adapter) Create(ctx context.Context, req *pb.CreateMachineRequest) (*pb
 
 	sizeBytes := int64(spec.MemMib) * 1024 * 1024
 	overlayBytes := int64(spec.DiskMib) * 1024 * 1024
+	// v1.1（ADR-0017）：auto-standby 策略翻译（默认关闭 = nil）。
+	standbyPolicy, err := translateAutoStandby(spec.GetAutoStandby())
+	if err != nil {
+		return nil, err
+	}
+	// v1.1（ADR-0022）：附加 services 入 tag（主端口沿用 tagPort）。
+	servicesTag, err := encodeServicesTag(spec)
+	if err != nil {
+		return nil, err
+	}
 	hreq := instances.CreateInstanceRequest{
 		Name:           req.MachineId,
 		Image:          spec.ImageRef,
@@ -144,6 +364,7 @@ func (a *Adapter) Create(ctx context.Context, req *pb.CreateMachineRequest) (*pb
 		Vcpus:          int(spec.Vcpu),
 		Env:            env,
 		NetworkEnabled: true,
+		AutoStandby:    standbyPolicy,
 		Tags: tags.Tags{
 			tagProject:    spec.ProjectId,
 			tagApp:        spec.AppId,
@@ -154,6 +375,7 @@ func (a *Adapter) Create(ctx context.Context, req *pb.CreateMachineRequest) (*pb
 			tagPort:       ingressPort(spec.Network),
 			tagGeneration: strconv.FormatUint(req.Generation, 10),
 			tagSecretKeys: strings.Join(secretKeys, ","),
+			tagServices:   servicesTag,
 		},
 	}
 
@@ -204,11 +426,17 @@ func (a *Adapter) List(ctx context.Context, projectID string) ([]*pb.Machine, er
 }
 
 // Delete 停止并删除 machine。machineID 是 firepaas 稳定 ID（hypeman Name）；
-// hypeman DeleteInstance 只接受其内部 ID，因此先 GetInstance 解析。
-func (a *Adapter) Delete(ctx context.Context, machineID string) error {
+// hypeman DeleteInstance 只接受其内部 ID，因此先 GetInstance 解析。expectedExecution
+// 非空时必须在删除前验证当前实例 tag；调用方须以 machine fence 串行这段
+// 读取、验证、删除，避免旧 execution 删除新 execution。
+func (a *Adapter) Delete(ctx context.Context, machineID, expectedExecution string) error {
 	inst, err := a.instances.GetInstance(ctx, machineID)
 	if err != nil {
 		return fmt.Errorf("hypeman get for delete: %w", err)
+	}
+	if expectedExecution != "" && inst.Tags[tagExecution] != expectedExecution {
+		return fmt.Errorf("execution mismatch for %s: want %s got %s",
+			machineID, expectedExecution, inst.Tags[tagExecution])
 	}
 	if err := a.instances.DeleteInstance(ctx, inst.Id); err != nil {
 		return fmt.Errorf("hypeman delete: %w", err)
@@ -227,6 +455,15 @@ func (a *Adapter) Delete(ctx context.Context, machineID string) error {
 // GetEndpoint 解析 proxy 需要的 workload endpoint（M1 bridge guest IP）。
 // 校验 execution_id 与 tags 一致，防止 edge 向 stale execution 转发。
 func (a *Adapter) GetEndpoint(ctx context.Context, machineID, executionID string) (ip string, port int, err error) {
+	return a.GetEndpointForPort(ctx, machineID, executionID, 0)
+}
+
+// GetEndpointForPort 是 GetEndpoint 的多端口形态（v1.1，ADR-0022）。
+// wantPort == 0 → 主 service 端口（旧行为，向后兼容：edge 未带
+// X-Firepaas-App-Port 头时走此分支）；wantPort > 0 → 必须在 services
+// 白名单内（主端口 + tagServices 附加端口），否则 ErrPortNotAllowed
+// （proxy 拒绝未声明端口）。
+func (a *Adapter) GetEndpointForPort(ctx context.Context, machineID, executionID string, wantPort int) (ip string, port int, err error) {
 	inst, err := a.instances.GetInstance(ctx, machineID)
 	if err != nil {
 		return "", 0, fmt.Errorf("get instance %s: %w", machineID, err)
@@ -244,6 +481,7 @@ func (a *Adapter) GetEndpoint(ctx context.Context, machineID, executionID string
 		if !a.autoResume {
 			return "", 0, fmt.Errorf("instance %s is standby and autoresume is disabled", machineID)
 		}
+		wakeStart := time.Now()
 		wakeCtx, wakeCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer wakeCancel()
 		restored, rerr := a.instances.RestoreInstance(wakeCtx, inst.Id)
@@ -253,6 +491,9 @@ func (a *Adapter) GetEndpoint(ctx context.Context, machineID, executionID string
 		// restore 在 root ns 重建 TAP：重挂 slot 后才有数据面。
 		if aerr := a.reattachSlot(wakeCtx, machineID, restored); aerr != nil {
 			return "", 0, fmt.Errorf("autoresume %s: %w", machineID, aerr)
+		}
+		if a.wakeObserver != nil {
+			a.wakeObserver(machineID, time.Since(wakeStart))
 		}
 		inst = restored
 	}
@@ -265,7 +506,23 @@ func (a *Adapter) GetEndpoint(ctx context.Context, machineID, executionID string
 			port = p
 		}
 	}
+	if wantPort > 0 {
+		if wantPort != port && !servicePortAllowed(inst.Tags[tagServices], wantPort) {
+			return "", 0, fmt.Errorf("%w: %d (machine %s)", ErrPortNotAllowed, wantPort, machineID)
+		}
+		port = wantPort
+	}
 	return inst.IP, port, nil
+}
+
+// servicePortAllowed 判断 wantPort 是否在附加 services 白名单内。
+func servicePortAllowed(servicesTag string, wantPort int) bool {
+	for _, s := range decodeServicesTag(servicesTag) {
+		if s.Port == wantPort {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *Adapter) ensureImageReady(ctx context.Context, imageRef string) error {
@@ -343,6 +600,13 @@ func ingressPort(n *pb.NetworkSpec) string {
 		return "8080"
 	}
 	return strconv.FormatUint(n.IngressPort, 10)
+}
+
+func ingressPortInt(n *pb.NetworkSpec) int {
+	if n == nil || n.IngressPort == 0 {
+		return 8080
+	}
+	return int(n.IngressPort)
 }
 
 func mapMachine(inst *instances.Instance) *pb.Machine {

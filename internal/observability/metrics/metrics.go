@@ -41,6 +41,19 @@ func (r *Registry) Set(name string, labels map[string]string, v uint64) {
 	r.add(name, labels, v, true)
 }
 
+// ResetFamily 删除某指标名的全部序列（P2-8，M5 评审）：label 集合随时间
+// 收缩的 gauge（如 machines_observed{state=...}）必须每轮先清再 Set，
+// 否则消失的 label 组合永远残留旧值（幽灵机器/告警噪声）。
+func (r *Registry) ResetFamily(name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for k, e := range r.entries {
+		if e.name == sanitizeName(name) {
+			delete(r.entries, k)
+		}
+	}
+}
+
 func (r *Registry) add(name string, labels map[string]string, n uint64, absolute bool) {
 	if n == 0 && !absolute {
 		return

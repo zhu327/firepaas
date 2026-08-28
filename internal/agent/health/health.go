@@ -19,15 +19,19 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/kernel/hypeman/lib/healthcheck"
 	"github.com/kernel/hypeman/lib/instances"
 
+	"github.com/example/firepaas/internal/agent/probeflow"
 	pb "github.com/example/firepaas/shared/gen/agent/v1"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -420,6 +424,9 @@ func policyTimeout(p *healthcheck.Policy) time.Duration {
 	return d
 }
 
+// ProbeHTTPClient 是探针共享 HTTP 客户端（agentd 装配 RecordingRunner 用）。
+func ProbeHTTPClient() *http.Client { return probeHTTPClient() }
+
 // probeHTTPClient 是探针共享 HTTP 客户端。Timeout 是硬上限（防 SSRF 型
 // 慢响应卡死 worker）；单探针实际超时由 policyTimeout（截断到剩余预算）
 // 的 per-request ctx 控制（P3：此前硬编码 2s 截断用户配置）。
@@ -432,4 +439,161 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// ---------------------------------------------------------------------------
+// v1.1（ADR-0017）：探针连接登记 runner
+// ---------------------------------------------------------------------------
+
+// RecordingRunner 包装默认探针执行器：dial 前显式 bind 固定本地端口，并把
+// 四元组登记进 probeflow registry（在 SYN 发出之前），使 agentd 的
+// auto-standby conntrack 过滤器能精确剔除探针连接（不清闲判定）。
+type RecordingRunner struct {
+	inner  healthcheck.ProbeRunner
+	reg    *probeflow.Registry
+	client *http.Client // 登记型 HTTP 客户端（连接复用，避免每次探针新建池）
+}
+
+// NewRecordingRunner 构造登记 runner。reg 为 nil 时直接透传 inner。
+func NewRecordingRunner(inner healthcheck.ProbeRunner, reg *probeflow.Registry) healthcheck.ProbeRunner {
+	if reg == nil || inner == nil {
+		return inner
+	}
+	r := &RecordingRunner{inner: inner, reg: reg}
+	r.client = &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			DialContext:         r.recordingDialContext(reg),
+			DisableKeepAlives:   true,
+			MaxIdleConnsPerHost: 0,
+		},
+	}
+	return r
+}
+
+// SetRunner 替换 Tracker 的探针执行器（agentd 装配 RecordingRunner 用）。
+func (t *Tracker) SetRunner(r healthcheck.ProbeRunner) { t.runner = r }
+
+// recordingDialContext returns a DialContext that records before SYN and
+// releases exactly when the resulting socket closes. No timer is involved:
+// keepalive probes stay filtered while alive, and a later port reuse is clean.
+func (r *RecordingRunner) recordingDialContext(reg *probeflow.Registry) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dstHost, dstPortStr, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		dstIP, err := netip.ParseAddr(dstHost)
+		if err != nil {
+			return nil, err
+		}
+		dstPort, err := strconv.Atoi(dstPortStr)
+		if err != nil || dstPort <= 0 || dstPort > 65535 {
+			return nil, fmt.Errorf("invalid probe destination %q", addr)
+		}
+		dst := netip.AddrPortFrom(dstIP.Unmap(), uint16(dstPort))
+		var srcPort uint16
+		dialer := &net.Dialer{
+			Timeout: 30 * time.Second,
+			Control: func(network, address string, c syscall.RawConn) error {
+				var opErr error
+				err := c.Control(func(fd uintptr) {
+					if e := syscall.Bind(int(fd), &syscall.SockaddrInet4{Port: 0}); e != nil {
+						opErr = e
+						return
+					}
+					sa, e := syscall.Getsockname(int(fd))
+					if e != nil {
+						opErr = e
+						return
+					}
+					local, ok := sa.(*syscall.SockaddrInet4)
+					if !ok {
+						opErr = fmt.Errorf("probe dial only supports IPv4 local sockets")
+						return
+					}
+					srcPort = uint16(local.Port)
+					reg.Record(srcPort, dst)
+				})
+				if err != nil {
+					return err
+				}
+				return opErr
+			},
+		}
+		conn, err := dialer.DialContext(ctx, network, addr)
+		if err != nil {
+			reg.Release(srcPort, dst)
+			return nil, err
+		}
+		return &recordedConn{Conn: conn, release: func() { reg.Release(srcPort, dst) }}, nil
+	}
+}
+
+type recordedConn struct {
+	net.Conn
+	once    sync.Once
+	release func()
+}
+
+func (c *recordedConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(c.release)
+	return err
+}
+
+// Check 实现 ProbeRunner：HTTP/TCP 走登记型 dialer；EXEC 透传 inner。
+func (r *RecordingRunner) Check(ctx context.Context, inst healthcheck.Instance, policy *healthcheck.Policy) healthcheck.ProbeResult {
+	if policy != nil {
+		switch policy.Type {
+		case healthcheck.TypeHTTP:
+			return r.checkHTTP(ctx, inst, *policy.HTTP)
+		case healthcheck.TypeTCP:
+			return r.checkTCP(ctx, inst, *policy.TCP)
+		}
+	}
+	return r.inner.Check(ctx, inst, policy)
+}
+
+func (r *RecordingRunner) checkHTTP(ctx context.Context, inst healthcheck.Instance, check healthcheck.HTTPCheck) healthcheck.ProbeResult {
+	if !inst.NetworkEnabled || inst.IP == "" {
+		return healthcheck.ProbeResult{Success: false, Error: "instance has no network address"}
+	}
+	u := url.URL{
+		Scheme: check.Scheme,
+		Host:   net.JoinHostPort(inst.IP, strconv.Itoa(int(check.Port))),
+		Path:   check.Path,
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return healthcheck.ProbeResult{Success: false, Error: err.Error()}
+	}
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return healthcheck.ProbeResult{Success: false, Error: err.Error()}
+	}
+	// Close rather than drain/reuse: the registry is socket-lifecycle based, and
+	// one short-lived connection per readiness probe prevents both stale flow
+	// records and an unrelated long-lived conntrack activity signal.
+	resp.Body.Close()
+	if resp.StatusCode != check.ExpectedStatus {
+		return healthcheck.ProbeResult{
+			Success: false,
+			Error:   fmt.Sprintf("expected HTTP status %d, got %d", check.ExpectedStatus, resp.StatusCode),
+		}
+	}
+	return healthcheck.ProbeResult{Success: true}
+}
+
+func (r *RecordingRunner) checkTCP(ctx context.Context, inst healthcheck.Instance, check healthcheck.TCPCheck) healthcheck.ProbeResult {
+	if !inst.NetworkEnabled || inst.IP == "" {
+		return healthcheck.ProbeResult{Success: false, Error: "instance has no network address"}
+	}
+	conn, err := r.recordingDialContext(r.reg)(ctx, "tcp",
+		net.JoinHostPort(inst.IP, strconv.Itoa(int(check.Port))))
+	if err != nil {
+		return healthcheck.ProbeResult{Success: false, Error: err.Error()}
+	}
+	_ = conn.Close()
+	return healthcheck.ProbeResult{Success: true}
 }

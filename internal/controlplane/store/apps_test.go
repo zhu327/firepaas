@@ -7,6 +7,28 @@ import (
 )
 
 // M3.3：app/deployment/rollout 基础 CRUD + 单 rollout 互斥（ADR-0015）。
+func TestCreateAppAndDeploymentAtomic(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	project := "test-m3-app-atomic"
+	cleanupProject(t, s, project)
+	if err := s.EnsureProject(ctx, project, "t"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cleanupProject(t, s, project) })
+
+	// Invalid deployment FK forces the transaction to fail; the app must not remain.
+	err := s.CreateAppAndDeployment(ctx, project,
+		App{ID: "app-atomic", Hostname: "atomic.local", ImageRef: "img:v1", VCPU: 1, MemMIB: 512, DesiredReplicas: 1},
+		Deployment{ID: "dep-atomic", AppID: "wrong-app", Generation: 1, ImageRef: "img:v1", VCPU: 1, MemMIB: 512, Port: 80, Status: "ACTIVE"})
+	if err == nil {
+		t.Fatal("expected transaction failure")
+	}
+	if app, err := s.GetApp(ctx, "app-atomic"); err != nil || app != nil {
+		t.Fatalf("app persisted after failed transaction: app=%+v err=%v", app, err)
+	}
+}
+
 func TestAppDeploymentRolloutLifecycle(t *testing.T) {
 	s := testStore(t)
 	ctx := context.Background()

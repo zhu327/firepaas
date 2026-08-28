@@ -6,8 +6,8 @@
 //   - Advance：仅在变更成功后推进高水位（失败/重试不推进）；
 //   - machine 删除后保留高水位：更旧的 re-create 仍被拒绝，直到 GC 窗口过期。
 //
-// 并发说明：Check 与 Advance 各自原子，但"检查→执行→推进"之间存在窗口。
-// M1 单写者（ADR-0007 count=1）下安全；M2 引入 per-machine 操作队列收口。
+// 并发说明：Check 与 Advance 各自原子。WithMachine 将同一 machine 的
+// "检查→执行→推进"临界区串行化，供会触及实际实例的 RPC 使用。
 package state
 
 import (
@@ -35,11 +35,14 @@ type Fences struct {
 	mu      sync.Mutex
 	path    string
 	entries map[string]FenceEntry
+	// machineLocks 只在进程内保护同一 machine 的复合操作；fence 本身仍由
+	// mu 保护并持久化。锁不落盘，进程重启后没有遗留持锁状态。
+	machineLocks map[string]*sync.Mutex
 }
 
 // OpenFences 加载 fences；文件不存在时从空状态开始。
 func OpenFences(path string) (*Fences, error) {
-	f := &Fences{path: path, entries: map[string]FenceEntry{}}
+	f := &Fences{path: path, entries: map[string]FenceEntry{}, machineLocks: map[string]*sync.Mutex{}}
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return f, nil
@@ -54,6 +57,21 @@ func OpenFences(path string) (*Fences, error) {
 		return nil, fmt.Errorf("parse fences %s: %w", path, err)
 	}
 	return f, nil
+}
+
+// WithMachine 串行化 machineID 的复合生命周期操作。回调不得长期阻塞或
+// 递归对同一 machine 调用 WithMachine。
+func (f *Fences) WithMachine(machineID string, fn func() error) error {
+	f.mu.Lock()
+	lock := f.machineLocks[machineID]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		f.machineLocks[machineID] = lock
+	}
+	f.mu.Unlock()
+	lock.Lock()
+	defer lock.Unlock()
+	return fn()
 }
 
 // Check 校验 generation 不早于该 machine 的已知高水位；未知 machine 任何

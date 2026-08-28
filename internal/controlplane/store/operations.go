@@ -4,6 +4,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -20,13 +21,17 @@ const operationTraceColumns = `id, project_id, machine_id, execution_id, generat
 	coalesce(dispatch_node_id,''), request, result, coalesce(error,''), created_at, updated_at,
 	attempts, claimed_at, completed_at`
 
-// ListOperations 按条件查操作（mapper 参数为空即不加条件）。limit<=0 默认 100。
-func (s *Store) ListOperations(ctx context.Context, machineID, kind, status string, limit int) ([]OperationTrace, error) {
+// ListOperations 按项目及条件查操作。projectID 是强制租户边界，不能为空。
+// limit<=0 默认 100。
+func (s *Store) ListOperations(ctx context.Context, projectID, machineID, kind, status string, limit int) ([]OperationTrace, error) {
+	if projectID == "" {
+		return nil, errors.New("project_id is required")
+	}
 	if limit <= 0 {
 		limit = 100
 	}
-	q := `SELECT ` + operationTraceColumns + ` FROM operations WHERE true`
-	args := []any{}
+	q := `SELECT ` + operationTraceColumns + ` FROM operations WHERE project_id=$1`
+	args := []any{projectID}
 	// 只用白名单列 + 占位参数（无拼接注入面）。
 	if machineID != "" {
 		args = append(args, machineID)
@@ -59,11 +64,14 @@ func (s *Store) ListOperations(ctx context.Context, machineID, kind, status stri
 	return out, rows.Err()
 }
 
-// GetOperation 返回单条操作。
-func (s *Store) GetOperation(ctx context.Context, id string) (*OperationTrace, error) {
+// GetOperation 返回项目内单条操作。projectID 是强制租户边界，不能为空。
+func (s *Store) GetOperation(ctx context.Context, projectID, id string) (*OperationTrace, error) {
+	if projectID == "" {
+		return nil, errors.New("project_id is required")
+	}
 	var op OperationTrace
 	row := s.pool.QueryRow(ctx,
-		`SELECT `+operationTraceColumns+` FROM operations WHERE id=$1`, id)
+		`SELECT `+operationTraceColumns+` FROM operations WHERE project_id=$1 AND id=$2`, projectID, id)
 	got, err := scanOperationTraceRow(row)
 	if err != nil {
 		return nil, err

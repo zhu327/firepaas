@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -107,15 +108,26 @@ type Node struct {
 	GRPCAddr        string
 	ProxyAddr       string
 	Draining        bool // M5.5：手动排水标记（调度不再放置）
-	LastSeenAt      time.Time
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
+	// Evacuate（v1.1，ADR-0021）：drain 时同步驱离存量 machine 的运维意图。
+	// 仅与 draining=true 组合有效；ready（draining=false）时一并清零。
+	Evacuate bool
+	// EvacuationMachineID/StartedAt 是当前驱离步骤的持久化 fence。它使
+	// leader 切换后仍只等待同一 replacement，绝不提前推进下一个 machine。
+	EvacuationMachineID string
+	EvacuationStartedAt *time.Time
+	// ImageCache（v1.1，ADR-0018）：节点本地镜像缓存 digest 列表
+	//（LRU/创建序，ServiceInfo 20s sync 落库）。
+	ImageCache []string
+	LastSeenAt time.Time
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
 }
 
 // SchedulerEvent 是 scheduler_events 表的行（调度/对账审计，MVP 最低可观测）。
 type SchedulerEvent struct {
 	ID          int64
 	At          time.Time
+	ProjectID   string
 	Kind        string // placement|filter_rejection|reconcile|reservation
 	MachineID   string
 	OperationID string
@@ -152,6 +164,58 @@ func (s *Store) ProjectQuota(ctx context.Context, projectID string) (vcpu, memMi
 		return 0, 0, fmt.Errorf("project quota %s: %w", projectID, err)
 	}
 	return vcpu, memMib, nil
+}
+
+// ProjectUsage 返回项目已分配和在途 create 的资源总量。已分配只计有
+// node_id 的期望存活机器；尚未落到节点的 create 由 operations 计入 pending，
+// 从而避免将同一新机器重复记为 allocated 和 pending。
+func (s *Store) ProjectUsage(ctx context.Context, projectID string) (vcpu, memMib int64, err error) {
+	err = s.pool.QueryRow(ctx, `
+		SELECT
+			coalesce((SELECT sum(m.requested_vcpu) FROM machines m
+				JOIN apps a ON a.id=m.app_id
+				WHERE a.project_id=$1 AND m.desired_state IN ('CREATED','RUNNING') AND m.node_id<>''), 0)
+			+ coalesce((SELECT sum(m.requested_vcpu) FROM operations o
+				JOIN machines m ON m.id=o.machine_id
+				WHERE o.project_id=$1 AND o.kind='create' AND o.status IN ('PENDING','CLAIMED')
+					AND m.node_id='' AND o.id=(SELECT min(i.id) FROM operations i
+						WHERE i.machine_id=o.machine_id AND i.kind='create' AND i.status IN ('PENDING','CLAIMED'))), 0),
+			coalesce((SELECT sum(m.requested_mem_mib) FROM machines m
+				JOIN apps a ON a.id=m.app_id
+				WHERE a.project_id=$1 AND m.desired_state IN ('CREATED','RUNNING') AND m.node_id<>''), 0)
+			+ coalesce((SELECT sum(m.requested_mem_mib) FROM operations o
+				JOIN machines m ON m.id=o.machine_id
+				WHERE o.project_id=$1 AND o.kind='create' AND o.status IN ('PENDING','CLAIMED')
+					AND m.node_id='' AND o.id=(SELECT min(i.id) FROM operations i
+						WHERE i.machine_id=o.machine_id AND i.kind='create' AND i.status IN ('PENDING','CLAIMED'))), 0)`, projectID).Scan(&vcpu, &memMib)
+	if err != nil {
+		return 0, 0, fmt.Errorf("project usage %s: %w", projectID, err)
+	}
+	return vcpu, memMib, nil
+}
+
+// CreateAppAndDeployment 原子创建 app 与初始 ACTIVE deployment。若任一步骤
+// 失败事务回滚，避免留下 controller 会对账但没有 deployment 的 app。
+func (s *Store) CreateAppAndDeployment(ctx context.Context, projectID string, app App, dep Deployment) error {
+	return s.inTx(ctx, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO apps(id, project_id, hostname, image_ref, vcpu, mem_mib, desired_replicas, generation)
+			VALUES($1,$2,$3,$4,$5,$6,$7,1)`,
+			app.ID, projectID, app.Hostname, app.ImageRef, app.VCPU, app.MemMIB, app.DesiredReplicas); err != nil {
+			return fmt.Errorf("create app: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO deployments(id, app_id, generation, image_ref, vcpu, mem_mib, port,
+				env, placement, health_check, status, secret_refs, auto_standby, services, strategy)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10::jsonb,$11,$12::jsonb,$13::jsonb,$14::jsonb,$15)`,
+			dep.ID, dep.AppID, dep.Generation, dep.ImageRef, dep.VCPU, dep.MemMIB, dep.Port,
+			jsonMap(dep.Env), jsonOrNull(dep.Placement), jsonOrNull(dep.HealthCheck), dep.Status,
+			secretRefsJSON(dep.SecretRefs), jsonOrNull(dep.AutoStandby), servicesJSON(dep.Services),
+			effectiveStrategyLiteral(dep.Strategy)); err != nil {
+			return fmt.Errorf("create initial deployment: %w", err)
+		}
+		return nil
+	})
 }
 
 // EnsureAppAndEnqueueCreate 在事务中保证 app + machine 期望行存在，并登记 create 操作。
@@ -511,13 +575,14 @@ func (s *Store) GetMachine(ctx context.Context, id string) (*Machine, error) {
 	return m, nil
 }
 
-// UpdateMachineObserved 写入 agent 观测状态。
+// UpdateMachineObserved 写入 agent 观测状态，仅当 executionID 仍为当前
+// execution 时更新。迟到的旧代观测必须无声丢弃，不能覆盖新代。
 func (s *Store) UpdateMachineObserved(ctx context.Context, id, executionID, state, slotIP, readiness string) error {
 	_, err := s.pool.Exec(ctx, `
 		UPDATE machines SET observed_state=$1, observed_slot_ip=$2, observed_readiness=$3,
 			last_observed_at=now(), updated_at=now()
-		WHERE id=$4`,
-		state, slotIP, readiness, id)
+		WHERE id=$4 AND current_execution_id=$5`,
+		state, slotIP, readiness, id, executionID)
 	if err != nil {
 		return fmt.Errorf("update observed %s: %w", id, err)
 	}
@@ -557,36 +622,87 @@ func (s *Store) UpsertNode(ctx context.Context, n Node) error {
 		}
 		labelsJSON = string(b)
 	}
+	imageCache := "[]"
+	if len(n.ImageCache) > 0 {
+		b, err := json.Marshal(n.ImageCache)
+		if err != nil {
+			return fmt.Errorf("marshal image cache: %w", err)
+		}
+		imageCache = string(b)
+	}
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO nodes(id, nomad_node_id, node_pool, status, labels,
 			vcpu_total, mem_total_mib, disk_total_mib, cpu_percent,
-			mem_used_mib, mem_allocated_mib, disk_used_mib, grpc_addr, proxy_addr, last_seen_at)
-		VALUES($1,$2,$3,$4,$5::jsonb,$6,$7,$8,$9,$10,$11,$12,$13,$14,now())
+			mem_used_mib, mem_allocated_mib, disk_used_mib, grpc_addr, proxy_addr,
+			image_cache, last_seen_at)
+		VALUES($1,$2,$3,$4,$5::jsonb,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb,now())
 		ON CONFLICT (nomad_node_id) DO UPDATE SET id=EXCLUDED.id,
 			node_pool=EXCLUDED.node_pool, status=EXCLUDED.status, labels=EXCLUDED.labels,
 			vcpu_total=EXCLUDED.vcpu_total, mem_total_mib=EXCLUDED.mem_total_mib,
 			disk_total_mib=EXCLUDED.disk_total_mib, cpu_percent=EXCLUDED.cpu_percent,
 			mem_used_mib=EXCLUDED.mem_used_mib, mem_allocated_mib=EXCLUDED.mem_allocated_mib,
 			disk_used_mib=EXCLUDED.disk_used_mib, grpc_addr=EXCLUDED.grpc_addr,
-			proxy_addr=EXCLUDED.proxy_addr, last_seen_at=now(), updated_at=now()`,
+			proxy_addr=EXCLUDED.proxy_addr, image_cache=EXCLUDED.image_cache,
+			last_seen_at=now(), updated_at=now()`,
 		n.ID, n.NomadNodeID, n.NodePool, n.Status, labelsJSON,
 		n.VCPUTotal, n.MemTotalMib, n.DiskTotalMib, n.CPUPercent,
-		n.MemUsedMib, n.MemAllocatedMib, n.DiskUsedMib, n.GRPCAddr, n.ProxyAddr)
+		n.MemUsedMib, n.MemAllocatedMib, n.DiskUsedMib, n.GRPCAddr, n.ProxyAddr,
+		imageCache)
 	if err != nil {
 		return fmt.Errorf("upsert node: %w", err)
 	}
 	return nil
 }
 
+// ErrEvacuationBusy 表示已有另一节点正在 evacuate。数据库部分唯一索引是
+// 此不变量的最终仲裁，应用错误用于 API 返回可操作的冲突。
+var ErrEvacuationBusy = errors.New("another node evacuation is active")
+
 // SetNodeDraining 置/清节点排水标记（M5.5）。nodeID = /v1/nodes 里的 id。
-func (s *Store) SetNodeDraining(ctx context.Context, nodeID string, draining bool) error {
-	ct, err := s.pool.Exec(ctx,
-		`UPDATE nodes SET draining=$2, updated_at=now() WHERE id=$1`, nodeID, draining)
+// evacuate=true 在整个集群最多允许一个节点；ready 同时清除持久步骤。
+func (s *Store) SetNodeDraining(ctx context.Context, nodeID string, draining, evacuate bool) error {
+	if !draining {
+		evacuate = false
+	}
+	ct, err := s.pool.Exec(ctx, `UPDATE nodes
+		SET draining=$2, evacuate=$3,
+			evacuation_machine_id=CASE WHEN $3 THEN evacuation_machine_id ELSE NULL END,
+			evacuation_started_at=CASE WHEN $3 THEN evacuation_started_at ELSE NULL END,
+			updated_at=now() WHERE id=$1`, nodeID, draining, evacuate)
 	if err != nil {
+		if isUniqueViolation(err) {
+			return ErrEvacuationBusy
+		}
 		return fmt.Errorf("set node draining: %w", err)
 	}
 	if ct.RowsAffected() == 0 {
 		return ErrNotFound
+	}
+	return nil
+}
+
+// StartEvacuationStep durably claims the only current machine for node. A
+// duplicate claim is harmless and returns false; the marker survives leader
+// changes and is cleared only after the replacement is route-ready.
+func (s *Store) StartEvacuationStep(ctx context.Context, nodeID, machineID string) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `UPDATE nodes SET evacuation_machine_id=$2,
+		evacuation_started_at=now(), updated_at=now()
+		WHERE id=$1 AND draining=true AND evacuate=true
+		AND evacuation_machine_id IS NULL`, nodeID, machineID)
+	if err != nil {
+		return false, fmt.Errorf("start evacuation step: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// ClearEvacuationStep releases a completed/abandoned step only if it is still
+// the caller's machine, preventing a stale leader from clearing newer work.
+func (s *Store) ClearEvacuationStep(ctx context.Context, nodeID, machineID string) error {
+	_, err := s.pool.Exec(ctx, `UPDATE nodes SET evacuation_machine_id=NULL,
+		evacuation_started_at=NULL, updated_at=now()
+		WHERE id=$1 AND evacuation_machine_id=$2`, nodeID, machineID)
+	if err != nil {
+		return fmt.Errorf("clear evacuation step: %w", err)
 	}
 	return nil
 }
@@ -595,7 +711,9 @@ func (s *Store) ListNodes(ctx context.Context) ([]Node, error) {
 		SELECT id, nomad_node_id, node_pool, status, labels::text,
 			vcpu_total, mem_total_mib, disk_total_mib, cpu_percent,
 			mem_used_mib, mem_allocated_mib, disk_used_mib, grpc_addr, proxy_addr,
-			last_seen_at, created_at, updated_at, draining
+			last_seen_at, created_at, updated_at, draining, evacuate,
+			coalesce(evacuation_machine_id,''), evacuation_started_at,
+			coalesce(image_cache::text,'[]')
 		FROM nodes ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("list nodes: %w", err)
@@ -604,15 +722,19 @@ func (s *Store) ListNodes(ctx context.Context) ([]Node, error) {
 	var out []Node
 	for rows.Next() {
 		var n Node
-		var labels string
+		var labels, imageCache string
 		if err := rows.Scan(&n.ID, &n.NomadNodeID, &n.NodePool, &n.Status, &labels,
 			&n.VCPUTotal, &n.MemTotalMib, &n.DiskTotalMib, &n.CPUPercent,
 			&n.MemUsedMib, &n.MemAllocatedMib, &n.DiskUsedMib, &n.GRPCAddr, &n.ProxyAddr,
-			&n.LastSeenAt, &n.CreatedAt, &n.UpdatedAt, &n.Draining); err != nil {
+			&n.LastSeenAt, &n.CreatedAt, &n.UpdatedAt, &n.Draining, &n.Evacuate,
+			&n.EvacuationMachineID, &n.EvacuationStartedAt, &imageCache); err != nil {
 			return nil, fmt.Errorf("scan node: %w", err)
 		}
 		if labels != "" && labels != "null" {
 			_ = json.Unmarshal([]byte(labels), &n.Labels)
+		}
+		if imageCache != "" && imageCache != "null" && imageCache != "[]" {
+			_ = json.Unmarshal([]byte(imageCache), &n.ImageCache)
 		}
 		out = append(out, n)
 	}
@@ -625,24 +747,38 @@ func (s *Store) RecordSchedulerEvent(ctx context.Context, ev SchedulerEvent) err
 	if len(details) == 0 {
 		details = json.RawMessage(`{}`)
 	}
+	projectID := ev.ProjectID
+	if projectID == "" && ev.MachineID != "" {
+		if err := s.pool.QueryRow(ctx, `SELECT a.project_id FROM machines m JOIN apps a ON a.id=m.app_id WHERE m.id=$1`, ev.MachineID).Scan(&projectID); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("resolve scheduler event project: %w", err)
+		}
+	}
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO scheduler_events(kind, machine_id, operation_id, node_id, reason, details)
-		VALUES($1,$2,$3,$4,$5,$6::jsonb)`,
-		ev.Kind, ev.MachineID, ev.OperationID, ev.NodeID, ev.Reason, string(details))
+		INSERT INTO scheduler_events(project_id, kind, machine_id, operation_id, node_id, reason, details)
+		VALUES($1,$2,$3,$4,$5,$6,$7::jsonb)`,
+		projectID, ev.Kind, ev.MachineID, ev.OperationID, ev.NodeID, ev.Reason, string(details))
 	if err != nil {
 		return fmt.Errorf("record scheduler event: %w", err)
 	}
 	return nil
 }
 
-// ListSchedulerEvents 返回最近 limit 条事件。
-func (s *Store) ListSchedulerEvents(ctx context.Context, limit int) ([]SchedulerEvent, error) {
+// ListSchedulerEvents 返回最近 limit 条事件。projectID 非空时严格只返回该项目
+// 的事件；无项目归属的系统运维事件仅由 admin（传空 projectID）可读取。
+func (s *Store) ListSchedulerEvents(ctx context.Context, projectID string, limit int) ([]SchedulerEvent, error) {
 	if limit <= 0 {
 		limit = 200
 	}
-	rows, err := s.pool.Query(ctx, `
-		SELECT id, at, kind, machine_id, operation_id, node_id, reason, details::text
-		FROM scheduler_events ORDER BY at DESC, id DESC LIMIT $1`, limit)
+	query := `SELECT id, at, project_id, kind, machine_id, operation_id, node_id, reason, details::text
+		FROM scheduler_events`
+	args := []any{}
+	if projectID != "" {
+		query += ` WHERE project_id=$1`
+		args = append(args, projectID)
+	}
+	query += ` ORDER BY at DESC, id DESC LIMIT $` + strconv.Itoa(len(args)+1)
+	args = append(args, limit)
+	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list scheduler events: %w", err)
 	}
@@ -651,7 +787,7 @@ func (s *Store) ListSchedulerEvents(ctx context.Context, limit int) ([]Scheduler
 	for rows.Next() {
 		var ev SchedulerEvent
 		var details string
-		if err := rows.Scan(&ev.ID, &ev.At, &ev.Kind, &ev.MachineID, &ev.OperationID,
+		if err := rows.Scan(&ev.ID, &ev.At, &ev.ProjectID, &ev.Kind, &ev.MachineID, &ev.OperationID,
 			&ev.NodeID, &ev.Reason, &details); err != nil {
 			return nil, fmt.Errorf("scan scheduler event: %w", err)
 		}
@@ -852,12 +988,13 @@ func (s *Store) ListMachinesOnNode(ctx context.Context, nodeID string) ([]Machin
 }
 
 // UpdateMachineNodeAndObserved 创建成功后记录节点与观测（optimistic add）。
+// execution CAS 防止旧 create 的迟到成功覆盖已换代的 machine。
 func (s *Store) UpdateMachineNodeAndObserved(ctx context.Context, id, nodeID, executionID, state, slotIP, readiness string) error {
 	_, err := s.pool.Exec(ctx, `
 		UPDATE machines SET node_id=$1, observed_state=$2, observed_slot_ip=$3,
 			observed_readiness=$4, last_observed_at=now(), updated_at=now()
-		WHERE id=$5`,
-		nodeID, state, slotIP, readiness, id)
+		WHERE id=$5 AND current_execution_id=$6`,
+		nodeID, state, slotIP, readiness, id, executionID)
 	if err != nil {
 		return fmt.Errorf("update machine node+observed %s: %w", id, err)
 	}
@@ -865,10 +1002,12 @@ func (s *Store) UpdateMachineNodeAndObserved(ctx context.Context, id, nodeID, ex
 }
 
 // MarkMachineObservedMissing 标记节点失联/agent 缺失（保守 UNKNOWN，摘路由）。
+// last_observed_at 是最后一次成功从 agent 获得观测的时间；它绝不能在每轮
+// missing 同步时刷新，否则节点丢失重建的超时窗口会被永久重置。
 func (s *Store) MarkMachineObservedMissing(ctx context.Context, id string) error {
 	_, err := s.pool.Exec(ctx, `
 		UPDATE machines SET observed_state='UNKNOWN', observed_readiness='UNKNOWN',
-			last_observed_at=now(), updated_at=now()
+			updated_at=now()
 		WHERE id=$1`, id)
 	if err != nil {
 		return fmt.Errorf("mark machine missing %s: %w", id, err)
@@ -890,6 +1029,9 @@ func (s *Store) ResetMachineForRecreate(ctx context.Context, id, executionID str
 }
 
 // ActiveRouteMachines 返回可用于路由投影的 machines（desired=CREATED 且已观测）。
+// v1.1（ADR-0017）：PAUSED（standby）是可服务态——readiness 冻结在入睡前值，
+// 保留在 route backends，首请求经 proxy autoresume 唤醒（<5s SLO）。
+// NOT_READY 入睡的实例同样保留：edge 按 readiness 过滤，不会路由。
 func (s *Store) ActiveRouteMachines(ctx context.Context) ([]Machine, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT m.id, m.app_id, m.deployment_id, m.replica_ordinal, m.hostname,
@@ -901,7 +1043,8 @@ func (s *Store) ActiveRouteMachines(ctx context.Context) ([]Machine, error) {
 			coalesce(m.observed_readiness,''), m.last_observed_at,
 			m.created_at, m.updated_at
 		FROM machines m
-		WHERE m.desired_state IN ('CREATED','RUNNING') AND m.observed_state='RUNNING'`)
+		WHERE m.desired_state IN ('CREATED','RUNNING')
+		  AND m.observed_state IN ('RUNNING','PAUSED')`)
 	if err != nil {
 		return nil, fmt.Errorf("active route machines: %w", err)
 	}

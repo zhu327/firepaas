@@ -22,6 +22,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -148,7 +149,9 @@ func runApp(args []string) error {
 		fs := flag.NewFlagSet("create", flag.ExitOnError)
 		var hostname, image, appID string
 		var vcpu, mem, port, replicas int64
+		var standbyIdle int64
 		var sf secretFlags
+		var services serviceFlags
 		var secretList *secretFlags
 		fs.StringVar(&hostname, "hostname", "", "hostname (required)")
 		fs.StringVar(&image, "image", "", "image ref (required)")
@@ -157,6 +160,8 @@ func runApp(args []string) error {
 		fs.Int64Var(&mem, "mem", 512, "memory MiB")
 		fs.Int64Var(&port, "port", 8080, "ingress port")
 		fs.Int64Var(&replicas, "replicas", 1, "replicas")
+		fs.Int64Var(&standbyIdle, "auto-standby-idle", 0, "auto-standby idle timeout seconds (0 = disabled)")
+		fs.Var(&services, "service", "service NAME=PORT (repeatable, v1.1 multi-port)")
 		secretList = &sf
 		fs.Var(&sf, "secret", "secret binding VAR=NAME[@VERSION] (repeatable)")
 		_ = fs.Parse(args[1:])
@@ -165,6 +170,16 @@ func runApp(args []string) error {
 		}
 		body := map[string]any{"hostname": hostname, "image": image, "vcpu": vcpu,
 			"mem_mib": mem, "port": port, "replicas": replicas}
+		if len(services) > 0 {
+			if port != 0 && port != 8080 && port != int64(services[0].InternalPort) {
+				return fmt.Errorf("--port conflicts with first --service")
+			}
+			body["services"] = []serviceBody(services)
+			delete(body, "port")
+		}
+		if standbyIdle > 0 {
+			body["auto_standby"] = map[string]any{"enabled": true, "idle_timeout_seconds": standbyIdle}
+		}
 		if appID != "" {
 			body["app_id"] = appID
 		}
@@ -194,13 +209,18 @@ func runApp(args []string) error {
 			return err
 		}
 		fs := flag.NewFlagSet("deploy", flag.ExitOnError)
-		var image, envSpec string
+		var image, envSpec, strategy string
 		var port int64
+		var standbyIdle int64
+		var services serviceFlags
 		fs.StringVar(&image, "image", "", "image ref (default: inherit active deployment)")
 		fs.StringVar(&envSpec, "env", "", "env vars KEY=VAL, comma-separated")
 		var secretSpecs secretFlags
 		fs.Var(&secretSpecs, "secret", "secret binding VAR=NAME[@VERSION] (repeatable)")
 		fs.Int64Var(&port, "port", 0, "ingress port (0 = inherit)")
+		fs.StringVar(&strategy, "strategy", "", "rollout strategy: bluegreen (default) | rolling")
+		fs.Int64Var(&standbyIdle, "auto-standby-idle", -1, "auto-standby idle timeout seconds (-1 = inherit, 0 = disable)")
+		fs.Var(&services, "service", "service NAME=PORT (repeatable, v1.1 multi-port)")
 		_ = fs.Parse(args[2:])
 		body := map[string]any{}
 		if len(secretSpecs) > 0 {
@@ -215,6 +235,19 @@ func runApp(args []string) error {
 		}
 		if port != 0 {
 			body["port"] = port
+		}
+		if len(services) > 0 {
+			body["services"] = []serviceBody(services)
+		}
+		if strategy != "" {
+			body["strategy"] = strategy
+		}
+		if standbyIdle >= 0 {
+			if standbyIdle == 0 {
+				body["auto_standby"] = map[string]any{"enabled": false}
+			} else {
+				body["auto_standby"] = map[string]any{"enabled": true, "idle_timeout_seconds": standbyIdle}
+			}
 		}
 		if envSpec != "" {
 			env := map[string]string{}
@@ -305,5 +338,46 @@ func do(method, path string, body, out any) error {
 		return json.Unmarshal(raw, out)
 	}
 	fmt.Println(string(raw))
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// v1.1：多端口 services 与策略便捷参数
+// ---------------------------------------------------------------------------
+
+// serviceBody 是 deploy/create body 的 services 单条（v1.1，ADR-0022）。
+type serviceBody struct {
+	Name         string `json:"name"`
+	InternalPort int    `json:"internal_port"`
+}
+
+// serviceFlags 实现 flag.Value：--service NAME=PORT（NAME 省略 = svc-<PORT>）。
+type serviceFlags []serviceBody
+
+func (f *serviceFlags) String() string {
+	out := ""
+	for i, s := range *f {
+		if i > 0 {
+			out += ","
+		}
+		out += fmt.Sprintf("%s=%d", s.Name, s.InternalPort)
+	}
+	return out
+}
+
+func (f *serviceFlags) Set(v string) error {
+	parts := strings.SplitN(v, "=", 2)
+	if len(parts) != 2 || parts[1] == "" {
+		return fmt.Errorf("bad --service %q (want NAME=PORT)", v)
+	}
+	port, err := strconv.Atoi(parts[1])
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("bad --service port %q", parts[1])
+	}
+	name := parts[0]
+	if name == "" {
+		name = fmt.Sprintf("svc-%d", port)
+	}
+	*f = append(*f, serviceBody{Name: name, InternalPort: port})
 	return nil
 }

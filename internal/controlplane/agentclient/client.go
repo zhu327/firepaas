@@ -22,6 +22,7 @@ type Client struct {
 	addr     string
 	Machines pb.MachineServiceClient
 	Info     pb.InfoServiceClient
+	Images   pb.ImageServiceClient
 }
 
 // Dial 连接单节点 agent。mTLS 是唯一正式形态（ADR-0006/0014）：必须设置
@@ -52,6 +53,7 @@ func Dial(addr string) (*Client, error) {
 		addr:     addr,
 		Machines: pb.NewMachineServiceClient(conn),
 		Info:     pb.NewInfoServiceClient(conn),
+		Images:   pb.NewImageServiceClient(conn),
 	}, nil
 }
 
@@ -88,6 +90,11 @@ func (c *Client) Delete(ctx context.Context, req *pb.DeleteMachineRequest) error
 // ServiceInfo 调用 InfoService。
 func (c *Client) ServiceInfo(ctx context.Context) (*pb.ServiceInfoResponse, error) {
 	return c.Info.ServiceInfo(ctx, &emptypb.Empty{})
+}
+
+// PullImage 调用 ImageService.PullImage（v1.1，ADR-0018 部署预取：尽力而为）。
+func (c *Client) PullImage(ctx context.Context, imageRef string) (*pb.PullImageResponse, error) {
+	return c.Images.PullImage(ctx, &pb.PullImageRequest{ImageRef: imageRef})
 }
 
 // Pause 调用 PauseMachine（M4.5 scale-to-zero）。

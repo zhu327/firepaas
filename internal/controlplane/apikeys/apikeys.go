@@ -45,6 +45,10 @@ func (m *Manager) Create(ctx context.Context, name string, scopes []string, proj
 	if name == "" {
 		return nil, "", fmt.Errorf("key name is required")
 	}
+	if ttl < 0 {
+		// P3-19：负 TTL 语义不是“已过期”，是输入错误，拒绝。
+		return nil, "", fmt.Errorf("ttl must be >= 0")
+	}
 	if len(scopes) == 0 {
 		scopes = []string{"read"}
 	}

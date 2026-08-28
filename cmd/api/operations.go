@@ -23,7 +23,8 @@ func (a *API) listOperations(w http.ResponseWriter, r *http.Request) {
 			limit = n
 		}
 	}
-	ops, err := a.store.ListOperations(r.Context(), q.Get("machine_id"), q.Get("kind"), q.Get("status"), limit)
+	project := effectiveProjectID(r, "dev")
+	ops, err := a.store.ListOperations(r.Context(), project, q.Get("machine_id"), q.Get("kind"), q.Get("status"), limit)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -36,7 +37,7 @@ func (a *API) listOperations(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) getOperation(w http.ResponseWriter, r *http.Request) {
-	op, err := a.store.GetOperation(r.Context(), r.PathValue("id"))
+	op, err := a.store.GetOperation(r.Context(), effectiveProjectID(r, "dev"), r.PathValue("id"))
 	if err != nil {
 		writeErr(w, 404, "operation not found")
 		return

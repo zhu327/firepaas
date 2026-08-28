@@ -17,6 +17,12 @@ var ErrRolloutBusy = errors.New("rollout already in progress")
 // ErrAppDeleted 表示 app 已被软删（P0-1：墓碑不接受新的对账动作）。
 var ErrAppDeleted = errors.New("app deleted")
 
+// ServiceSpec 是 deployments.services jsonb 的单条（ADR-0022）。
+type ServiceSpec struct {
+	Name         string `json:"name"`
+	InternalPort int    `json:"internal_port"`
+}
+
 // Deployment 是 deployments 表行（不可变发布目标）。
 type Deployment struct {
 	ID         string
@@ -25,7 +31,7 @@ type Deployment struct {
 	ImageRef   string
 	VCPU       int64
 	MemMIB     int64
-	Port       int
+	Port       int // 主 service 端口（services 为空时的单端口语义）
 	Env        map[string]string
 	// SecretRefs（ADR-0010）：{var: {secret, version}}，随 deployment 固化；
 	// controller 在 create 时解析为 secret_env 单向下发。
@@ -33,8 +39,36 @@ type Deployment struct {
 	Placement   json.RawMessage
 	HealthCheck json.RawMessage
 	Status      string
-	CreatedAt   string
-	UpdatedAt   string
+	// AutoStandby（ADR-0017）：protojson(AutoStandbyPolicy)；nil = 未声明。
+	AutoStandby json.RawMessage
+	// Services（ADR-0022）：[{name, internal_port}]，主 service = 第一条；
+	// nil = 单端口（用 Port）。
+	Services []ServiceSpec
+	// Strategy（v1.1-F）：bluegreen（默认）| rolling。
+	Strategy  string
+	CreatedAt string
+	UpdatedAt string
+}
+
+// EffectiveServices 返回 deployment 的 service 列表（nil 时从单端口派生）。
+// 主 service 永远是第一条（继承单端口语义：路由默认端口、探针目标）。
+func (d *Deployment) EffectiveServices() []ServiceSpec {
+	if len(d.Services) > 0 {
+		return d.Services
+	}
+	port := d.Port
+	if port == 0 {
+		port = 8080
+	}
+	return []ServiceSpec{{Name: "default", InternalPort: port}}
+}
+
+// EffectiveStrategy 返回发布策略（空 = bluegreen 默认）。
+func (d *Deployment) EffectiveStrategy() string {
+	if d.Strategy == "rolling" {
+		return "rolling"
+	}
+	return "bluegreen"
 }
 
 // Rollout 是 rollouts 表行。
@@ -168,29 +202,50 @@ func (s *Store) BumpAppGeneration(ctx context.Context, appID string, generation 
 func (s *Store) CreateDeployment(ctx context.Context, d Deployment) error {
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO deployments(id, app_id, generation, image_ref, vcpu, mem_mib, port,
-			env, placement, health_check, status, secret_refs)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10::jsonb,$11,$12::jsonb)`,
+			env, placement, health_check, status, secret_refs, auto_standby, services, strategy)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10::jsonb,$11,$12::jsonb,$13::jsonb,$14::jsonb,$15)`,
 		d.ID, d.AppID, d.Generation, d.ImageRef, d.VCPU, d.MemMIB, d.Port,
 		jsonMap(d.Env), jsonOrNull(d.Placement), jsonOrNull(d.HealthCheck), d.Status,
-		secretRefsJSON(d.SecretRefs))
+		secretRefsJSON(d.SecretRefs), jsonOrNull(d.AutoStandby), servicesJSON(d.Services),
+		effectiveStrategyLiteral(d.Strategy))
 	if err != nil {
 		return fmt.Errorf("create deployment: %w", err)
 	}
 	return nil
 }
 
-// GetDeployment 读 deployment 行。
 // deploymentCols 是 deployments 行的公共投影（secret_refs 在最后）。
 const deploymentCols = `id, app_id, generation, image_ref, vcpu, mem_mib, port,
 		coalesce(env::text,'{}'), coalesce(placement::text,'null'),
 		coalesce(health_check::text,'null'), status, created_at::text, updated_at::text,
-		coalesce(secret_refs::text,'{}')`
+		coalesce(secret_refs::text,'{}'),
+		coalesce(auto_standby::text,'null'), coalesce(services::text,'null'), strategy`
+
+// servicesJSON 序列化 services 列（nil = NULL，保持单端口兼容）。
+func servicesJSON(list []ServiceSpec) any {
+	if len(list) == 0 {
+		return nil
+	}
+	b, err := json.Marshal(list)
+	if err != nil {
+		return nil
+	}
+	return string(b)
+}
+
+func effectiveStrategyLiteral(strategy string) string {
+	if strategy == "rolling" {
+		return "rolling"
+	}
+	return "bluegreen"
+}
 
 func scanDeployment(row pgx.Row) (*Deployment, error) {
 	var d Deployment
-	var envRaw, placeRaw, hcRaw, refsRaw string
+	var envRaw, placeRaw, hcRaw, refsRaw, autoRaw, svcRaw string
 	if err := row.Scan(&d.ID, &d.AppID, &d.Generation, &d.ImageRef, &d.VCPU, &d.MemMIB,
-		&d.Port, &envRaw, &placeRaw, &hcRaw, &d.Status, &d.CreatedAt, &d.UpdatedAt, &refsRaw); err != nil {
+		&d.Port, &envRaw, &placeRaw, &hcRaw, &d.Status, &d.CreatedAt, &d.UpdatedAt, &refsRaw,
+		&autoRaw, &svcRaw, &d.Strategy); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
@@ -201,6 +256,14 @@ func scanDeployment(row pgx.Row) (*Deployment, error) {
 	d.HealthCheck = json.RawMessage(hcRaw)
 	if refsRaw != "" && refsRaw != "{}" {
 		_ = json.Unmarshal([]byte(refsRaw), &d.SecretRefs)
+	}
+	if autoRaw != "" && autoRaw != "null" {
+		d.AutoStandby = json.RawMessage(autoRaw)
+	}
+	if svcRaw != "" && svcRaw != "null" && svcRaw != "[]" {
+		if err := json.Unmarshal([]byte(svcRaw), &d.Services); err != nil {
+			return nil, fmt.Errorf("decode deployment services: %w", err)
+		}
 	}
 	return &d, nil
 }
@@ -449,11 +512,12 @@ func (s *Store) DeployApp(ctx context.Context, d Deployment, r Rollout, appGener
 		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO deployments(id, app_id, generation, image_ref, vcpu, mem_mib, port,
-				env, placement, health_check, status, secret_refs)
-			VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10::jsonb,$11,$12::jsonb)`,
+				env, placement, health_check, status, secret_refs, auto_standby, services, strategy)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10::jsonb,$11,$12::jsonb,$13::jsonb,$14::jsonb,$15)`,
 			d.ID, d.AppID, d.Generation, d.ImageRef, d.VCPU, d.MemMIB, d.Port,
 			jsonMap(d.Env), jsonOrNull(d.Placement), jsonOrNull(d.HealthCheck), d.Status,
-			secretRefsJSON(d.SecretRefs)); err != nil {
+			secretRefsJSON(d.SecretRefs), jsonOrNull(d.AutoStandby), servicesJSON(d.Services),
+			effectiveStrategyLiteral(d.Strategy)); err != nil {
 			return fmt.Errorf("create deployment: %w", err)
 		}
 		if _, err := tx.Exec(ctx, `
