@@ -4,7 +4,7 @@
 
 - 数据面复用 [hypeman](https://github.com/zhu327/hypeman) 的 VM/镜像/快照能力（`firepaas-lib` 分支，tag `v0.4.0-firepaas`，作为 Go module 直接消费）
 - 管控面与调度模式参考 [e2b-dev/infra](https://github.com/e2b-dev/infra)：控制面/数据面分离、Best-of-K 自研调度、Nomad 只编排基础设施作业
-- 当前状态：MVP 主体（M1–M5）与 v1.1–v1.4 增量（自动待机、镜像亲和、drain 驱离、多端口 service、one-shot secret、运行时交互、checkpoint/fork、node-local volume、镜像治理）已实现并通过对应 e2e 验收；v2（durable artifact、microVM build、多集群）规划中
+- 当前状态：MVP 主体（M1–M5）与 v1.1–v1.4 增量（自动待机、镜像亲和、drain 驱离、多端口 service、one-shot secret、运行时交互、checkpoint/fork、node-local volume、镜像治理）已实现并通过对应 e2e 验收
 
 ## 文档
 
@@ -17,7 +17,6 @@
 | [docs/v1.2-plan.md](docs/v1.2-plan.md) | v1.2：one-shot secret、运行时交互、生命周期与资源治理 |
 | [docs/v1.3-plan.md](docs/v1.3-plan.md) | v1.3：域名 egress、checkpoint/fork、node-local volume/dataset |
 | [docs/v1.4-plan.md](docs/v1.4-plan.md) | v1.4：磁盘配额、API 治理与镜像 prewarm |
-| [docs/v2-plan.md](docs/v2-plan.md) | v2：durable artifact、microVM build、可移植 template 与多集群 |
 | [docs/runbook-*.md](docs/runbook-*.md) | 运维流程：soak、备份恢复、容量、HA 验证、节点替换等 |
 
 ## 仓库布局
