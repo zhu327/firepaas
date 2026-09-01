@@ -1,7 +1,8 @@
 # Prometheus 配置（M5.3 可观测栈，observability profile）。
 #
 # 单机实验室：firepaas-api 与 Prometheus 同机；容器内经
-# host.docker.internal 访问宿主 8081 的 /metrics（e2e-m5 端口）。
+# host.docker.internal 访问宿主 /metrics。默认端口 8083 对齐 e2e-m5
+# 常驻 API（e2e-m4 用 8081；默认安装为 8080，按实际改这里）。
 # 告警规则文件 alerts.yml 与 capacity model 阈值同步维护。
 global:
   scrape_interval: 15s
@@ -14,9 +15,51 @@ scrape_configs:
   - job_name: firepaas-api
     metrics_path: /metrics
     static_configs:
-      - targets: ["host.docker.internal:8081"]
+      - targets: ["host.docker.internal:8083"]
+        labels:
+          component: "control-plane"
+    # v1.4 inventory/integrity/orphan/prewarm/GC candidate 指标由 leader API
+    # 暴露；leader 切换时 time series 可重置，72h 权威 age/drift/claim/pin
+    # 仍须由 probe 查询 PG/API，不能只依赖 counter。
     # 宿主服务稳定性优先：抓取失联不阻断 Prometheus 自身。
     scrape_timeout: 10s
   - job_name: prometheus
     static_configs:
       - targets: ["localhost:9090"]
+
+  # v1.1（F-2）：agentd 指标直抓。生产使用 Nomad 服务发现，匹配正式
+  # system job 的 firepaas-agentd-metrics 服务；Prometheus 到 compute 节点
+  # :9464 的流量必须由网络 ACL 仅允许可信 observability 网段。该 HTTP
+  # endpoint 本身没有鉴权，绝不可对公网暴露。
+  - job_name: firepaas-agentd
+    metrics_path: /metrics
+    # Production DNS name for the Nomad API. Render this value through the
+    # deployment configuration when the cluster uses a different trusted API
+    # endpoint; Prometheus YAML does not expand shell-style ${...} variables.
+    nomad_sd_configs:
+      - server: "nomad.service.consul:4646"
+    relabel_configs:
+      - source_labels: [__meta_nomad_service]
+        regex: firepaas-agentd-metrics
+        action: keep
+      - source_labels: [__meta_nomad_node_id]
+        target_label: node
+      - source_labels: [__meta_nomad_node_name]
+        target_label: node_name
+    scrape_timeout: 10s
+
+  # 单机实验室无需 Nomad discovery 时显式启用此目标；生产不应将其替换为
+  # 广播式 static targets。
+  - job_name: firepaas-agentd-lab
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:9464"]
+        labels:
+          node: "lab-single"
+    scrape_timeout: 10s
+  # v1.1（C）：edge 并发控制观测（inflight/hard 拒绝/钉扎）。
+  - job_name: firepaas-edge
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:9465"]
+    scrape_timeout: 10s

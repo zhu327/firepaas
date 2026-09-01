@@ -10,7 +10,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LAB_BIN="/home/zty/.local/firepaas-lab/bin"
+LAB_BIN="$HOME/.local/firepaas-lab/bin"
 CERT_DIR="$HERE/certs"
 RUN_DIR="/var/lib/firepaas-p0/e2e-m3"
 RUN_ID="e2e-m4-$(date +%s)"
@@ -23,7 +23,7 @@ EDGE_HTTP=8082       # edge 明文（308 跳转）
 EDGE_TLS=8443        # edge TLS 客户端入口
 PG="docker exec dev-postgres-1 psql -U firepaas -d firepaas -tAc"
 
-export PATH="$LAB_BIN:/home/zty/.local/firepaas-lab/go/bin:$PATH"
+export PATH="$LAB_BIN:$HOME/.local/firepaas-lab/go/bin:$PATH"
 export NOMAD_ADDR="${NOMAD_ADDR:-http://127.0.0.1:4646}"
 export FIREPAAS_AGENT_TLS_CERT="$CERT_DIR/control-plane.crt"
 export FIREPAAS_AGENT_TLS_KEY="$CERT_DIR/control-plane.key"

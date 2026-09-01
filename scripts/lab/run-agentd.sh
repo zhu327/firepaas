@@ -6,10 +6,10 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$HERE/../.." && pwd)"
 
-export PATH="/home/zty/.local/firepaas-lab/bin:/home/zty/.local/firepaas-lab/go/bin:$PATH"
+export PATH="$HOME/.local/firepaas-lab/bin:$HOME/.local/firepaas-lab/go/bin:$PATH"
 export NOMAD_ADDR="${NOMAD_ADDR:-http://127.0.0.1:4646}"
 
-BIN="/home/zty/.local/firepaas-lab/bin/agentd"
+BIN="$HOME/.local/firepaas-lab/bin/agentd"
 CONFIG="$HERE/agentd.yaml"
 
 [[ -x "$BIN" ]] || { echo "ERROR: $BIN 不存在，先在 firepaas 根目录 make build 并复制产物" >&2; exit 1; }
@@ -18,10 +18,10 @@ curl -fsS "$NOMAD_ADDR/v1/status/leader" >/dev/null || { echo "ERROR: Nomad 不�
 
 cd "$ROOT_DIR"
 echo "==> nomad job plan"
-nomad job plan iac/nomad/agentd-single.hcl || echo "    (plan rc=$?, Nomad 2.x 在有待提交变更时返回 1，继续 run)"
+nomad job plan -var "repo_root='$ROOT_DIR'" -var "lab_bin='$(dirname "$BIN")'" iac/nomad/agentd-single.hcl || echo "    (plan rc=$?, Nomad 2.x 在有待提交变更时返回 1，继续 run)"
 
 echo "==> nomad job run"
-nomad job run iac/nomad/agentd-single.hcl || echo "    (run rc=$?, 继续检查 alloc 就绪；旧 deployment 可能仍标记 failed)"
+nomad job run -var "repo_root='$ROOT_DIR'" -var "lab_bin='$(dirname "$BIN")'" iac/nomad/agentd-single.hcl || echo "    (run rc=$?, 继续检查 alloc 就绪；旧 deployment 可能仍标记 failed)"
 
 echo "==> 等待 agentd gRPC :5108"
 for _ in $(seq 1 60); do

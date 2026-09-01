@@ -1,0 +1,11 @@
+# Non-sensitive syntax-validation fixture. Never submit this file to a cluster.
+api_image           = "registry.example.invalid/firepaas/api@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+postgres_url        = "postgres://fixture:fixture@127.0.0.1:5432/fixture?sslmode=disable"
+redis_addr          = "127.0.0.1:6379"
+nomad_addr          = "http://127.0.0.1:4646"
+api_token           = "ci-validation-placeholder"
+secrets_master_key  = "ci-validation-placeholder"
+traffic_token_key   = "ci-validation-placeholder"
+agent_tls_cert      = "/run/firepaas-ci/control-plane.crt"
+agent_tls_key       = "/run/firepaas-ci/control-plane.key"
+agent_tls_ca        = "/run/firepaas-ci/ca.crt"

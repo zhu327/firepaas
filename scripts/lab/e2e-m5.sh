@@ -11,7 +11,8 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LAB_BIN="/home/zty/.local/firepaas-lab/bin"
+ROOT_DIR="$(cd "$HERE/../.." && pwd)"
+LAB_BIN="$HOME/.local/firepaas-lab/bin"
 CERT_DIR="$HERE/certs"
 RUN_DIR="/var/lib/firepaas-p0/e2e-m5"
 RUN_ID="e2e-m5-$(date +%s)"
@@ -22,7 +23,7 @@ EDGE_HTTP=8084
 EDGE_TLS=8445
 PG="docker exec dev-postgres-1 psql -U firepaas -d firepaas -tAc"
 
-export PATH="$LAB_BIN:/home/zty/.local/firepaas-lab/go/bin:$PATH"
+export PATH="$LAB_BIN:$HOME/.local/firepaas-lab/go/bin:$PATH"
 export NOMAD_ADDR="${NOMAD_ADDR:-http://127.0.0.1:4646}"
 export FIREPAAS_AGENT_TLS_CERT="$CERT_DIR/control-plane.crt"
 export FIREPAAS_AGENT_TLS_KEY="$CERT_DIR/control-plane.key"
@@ -36,17 +37,11 @@ authed_curl() { curl -fsS -m 20 -H "Authorization: Bearer $API_TOKEN" "$@"; }
 pg() { $PG "$1"; }
 cur() { curl -s -m 20 "$@"; }
 
-# ontime 探针镜像的 registry digest（本地 registry，M5.2 guest 时钟）。
-# 运行时向 registry 直接取 tag=2 的 manifest digest（无硬编码过期问题）。
-ONTIME_MANIFEST() {
-  curl -s -m 10 -o /dev/null -D - \
-    -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json" \
-    http://127.0.0.1:5000/v2/firepaas/ontime/manifests/2 |
-    awk 'tolower($1)=="docker-content-digest:" {gsub("\r",""); print $2}'
-}
-ONTIME_DIGEST=$(ONTIME_MANIFEST)
-[[ -n "$ONTIME_DIGEST" ]] || fail "registry 无 ontime:2 manifest digest"
-ONTIME_REF="127.0.0.1:5000/firepaas/ontime@$ONTIME_DIGEST"
+# ontime 探针镜像：自建自推（P1-6 修复：不再依赖手工预推的 tag——旧硬编码
+# digest 曾指向丢失的 manifest blob，e2e 无限 recreate）。
+ONLINE_OUT=$(bash "$HERE/push-ontime.sh") || fail "push-ontime 失败"
+ONTIME_REF=$(echo "$ONLINE_OUT" | grep '^REF=' | cut -d= -f2-)
+[[ -n "$ONTIME_REF" ]] || fail "ontime REF 解析失败"
 
 [[ -f "$LAB_BIN/agentd" && -f "$LAB_BIN/firepaas-api" && -f "$LAB_BIN/edge-proxy" ]] || fail "二进制未构建"
 [[ -f "$CERT_DIR/wildcard-$DOMAIN.crt" ]] || fail "泛域名证书缺失"
@@ -90,6 +85,21 @@ hc=$(curl -sk -m 5 -o /dev/null -w '%{http_code}' --resolve "x.$DOMAIN:$EDGE_TLS
 mark "api/edge up"
 
 log "0.5) 预清理历史验收机"
+# M5 修复（实测踩坑）：上一次运行若在 E 段失败（drain 后未 ready），节点会
+# 永久停在 draining，本轮全部放置被过滤 → B 段卡死。预清理一律复位。
+for _ in $(seq 1 10); do
+  curl -s -m 10 -H "Authorization: Bearer $API_TOKEN" "http://127.0.0.1:$API_PORT/v1/nodes" |
+    python3 -c 'import json,sys
+for n in json.load(sys.stdin).get("nodes",[]):
+    print(n.get("id",n.get("ID","")))' |
+    while read -r nid; do
+      [[ -n "$nid" ]] && curl -s -m 10 -H "Authorization: Bearer $API_TOKEN" -X POST \
+        "http://127.0.0.1:$API_PORT/v1/nodes/$nid/ready" >/dev/null || true
+    done
+  nd=$(pg "SELECT count(*) FROM nodes WHERE draining")
+  [[ "$nd" == "0" ]] && break
+  sleep 3
+done
 pg "UPDATE machines SET desired_state='DELETED', updated_at=now() WHERE desired_state != 'DELETED'" >/dev/null
 pg "UPDATE apps SET desired_replicas=0, updated_at=now()" >/dev/null
 pg "UPDATE deployments SET status='SUPERSEDED', updated_at=now() WHERE status IN ('ACTIVE','PREPARING')" >/dev/null
@@ -120,9 +130,24 @@ c1=$(cur -o /dev/null -w '%{http_code}' -H "Authorization: Bearer fp_deadbeef" "
 c2=$(cur -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $ROKEY" -X POST \
   "http://127.0.0.1:$API_PORT/v1/apps" -H 'Content-Type: application/json' -d '{"app_id":"x"}')
 [[ "$c2" == "403" ]] || fail "read scope can write: $c2"
-# 3) read key 读列表 → 200 且只含 dev 项目行。
-c3=$(cur -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $ROKEY" "http://127.0.0.1:$API_PORT/v1/machines?project_id=dev")
-[[ "$c3" == "200" ]] || fail "read key list: $c3"
+# 3) read key 读列表 → 200 且只含 dev 项目行（M5 补：验内容而非仅状态码）。
+c3=$(cur -H "Authorization: Bearer $ROKEY" "http://127.0.0.1:$API_PORT/v1/machines?project_id=dev")
+echo "$c3" | grep -q '"project_id":"other"' && fail "read key 列表泄漏他 project 行"
+# 3b) read key 铸造 traffic-token → 403（P1-4：routeScope write）。
+c3b=$(cur -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $ROKEY" \
+  "http://127.0.0.1:$API_PORT/v1/machines/any/traffic-token")
+[[ "$c3b" == "403" ]] || fail "read key traffic-token 未拒: $c3b"
+# 3c) 受限 write key 显式建 dev app → 403（P1-2：body.project_id clamp）。
+c3c=$(cur -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $WKEY" -X POST \
+  "http://127.0.0.1:$API_PORT/v1/apps" -H 'Content-Type: application/json' \
+  -d "{\"app_id\":\"clamp-$RUN_ID\",\"project_id\":\"dev\",\"hostname\":\"clamp.$DOMAIN\",
+       \"image\":\"$ONTIME_REF\",\"port\":80,\"replicas\":1}")
+[[ "$c3c" == "403" ]] || fail "跨 project createApp 未拦截: $c3c"
+# 3d) 受限 write key 向 dev project 写 secret → 403（P1-2：putSecret clamp）。
+c3d=$(cur -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $WKEY" -X POST \
+  "http://127.0.0.1:$API_PORT/v1/secrets" -H 'Content-Type: application/json' \
+  -d '{"project_id":"dev","name":"clamptest","value":"x"}')
+[[ "$c3d" == "403" ]] || fail "跨 project putSecret 未拦截: $c3d"
 # 4) 镜像准入：mutable tag / 越界 registry → 400。
 c4=$(cur -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $API_TOKEN" -X POST \
   "http://127.0.0.1:$API_PORT/v1/apps" -H 'Content-Type: application/json' \
@@ -131,20 +156,58 @@ c4=$(cur -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $API_TOKEN" -X
 [[ "$c4" == "400" ]] || fail "require-digest 未生效: $c4"
 log "    错 key/只读 scope/镜像 tag+allowlist 拒绝 全部符合预期 OK"
 
-log "B) 稳定性：ontime 探针 + 20 循环 pause/resume 时钟漂移"
+log "B) 稳定性：secret_env 双策略 + ontime 探针 + 20 循环 pause/resume 时钟漂移"
+# 先植入 secret 标记（后续脱敏断言用；P3-18 修复：不再空转 grep）。
+cur -H "Authorization: Bearer $API_TOKEN" -o /dev/null -X POST \
+  "http://127.0.0.1:$API_PORT/v1/secrets" -H 'Content-Type: application/json' \
+  -d '{"project_id":"dev","name":"e2e-marker","value":"s3cr3t-e2e-marker-value"}'
+
+# B1：默认 fail-closed——带 secret_refs 的 create 必须以 InvalidArgument 终态
+# 失败（agent 无 FIREPAAS_SECRET_INJECTION 时拒绝 one-shot 语义不明的注入）。
 APP5="app-clock-$RUN_ID"
 HN5="$APP5.$DOMAIN"
 create_status=$(cur -H "Authorization: Bearer $API_TOKEN" -o /tmp/m5-app.json -w '%{http_code}' \
   -X POST "http://127.0.0.1:$API_PORT/v1/apps" -H 'Content-Type: application/json' \
   -d "{\"app_id\":\"$APP5\",\"project_id\":\"dev\",\"hostname\":\"$HN5\",
-       \"image\":\"$ONTIME_REF\",\"port\":80,\"replicas\":1}")
-[[ "$create_status" == "201" ]] || fail "ontime app create: $create_status $(cat /tmp/m5-app.json)"
+       \"image\":\"$ONTIME_REF\",\"port\":80,\"replicas\":1,
+       \"secret_refs\":{\"MARKER\":{\"secret\":\"e2e-marker\"}}}")
+[[ "$create_status" == "201" ]] || fail "secret-ref app create request: $create_status $(cat /tmp/m5-app.json)"
+for _ in $(seq 1 90); do
+  failed=$(pg "SELECT count(*) FROM operations o JOIN machines m ON m.id=o.machine_id WHERE m.app_id='$APP5' AND o.kind='create' AND o.status='FAILED'")
+  [[ "$failed" == "1" ]] && break
+  sleep 3
+done
+[[ "$failed" == "1" ]] || fail "secret-ref workload did not fail closed"
+running=$(pg "SELECT count(*) FROM machines WHERE app_id='$APP5' AND observed_state='RUNNING' AND desired_state!='DELETED'")
+[[ "$running" == "0" ]] || fail "secret-ref workload unexpectedly became ready"
+mark "B1 默认 fail-closed OK（带 secret_refs 的 create 终态 FAILED）"
+cur -H "Authorization: Bearer $API_TOKEN" -o /dev/null -X DELETE "http://127.0.0.1:$API_PORT/v1/apps/$APP5" || true
+
+# B2：opt-in 注入——渲染带 FIREPAAS_SECRET_INJECTION 的 job 副本重启 agentd，
+# 同样的 secret_refs 必须 RUNNING（M4 语义在受信环境可用）。
+sed 's|^\(\s*\)# FIREPAAS_SECRET_INJECTION|\1FIREPAAS_SECRET_INJECTION|' \
+  "$ROOT_DIR/iac/nomad/agentd-single.hcl" > "$RUN_DIR/agentd-optin.hcl"
+grep -q '^\s*FIREPAAS_SECRET_INJECTION' "$RUN_DIR/agentd-optin.hcl" || fail "opt-in 渲染失败"
+nomad job run -var "repo_root=$ROOT_DIR" -var "lab_bin=$(dirname \"$BIN\")" "$RUN_DIR/agentd-optin.hcl" >/dev/null || fail "opt-in job run 失败"
+for _ in $(seq 1 40); do (echo > /dev/tcp/127.0.0.1/5108) 2>/dev/null && break; sleep 2; done
+(echo > /dev/tcp/127.0.0.1/5108) 2>/dev/null || fail "opt-in agentd 未就绪"
+mark "B2 opt-in agentd 就绪"
+
+APP5="app-clock-$RUN_ID-inj"
+HN5="$APP5.$DOMAIN"
+create_status=$(cur -H "Authorization: Bearer $API_TOKEN" -o /tmp/m5-app.json -w '%{http_code}' \
+  -X POST "http://127.0.0.1:$API_PORT/v1/apps" -H 'Content-Type: application/json' \
+  -d "{\"app_id\":\"$APP5\",\"project_id\":\"dev\",\"hostname\":\"$HN5\",
+       \"image\":\"$ONTIME_REF\",\"port\":80,\"replicas\":1,
+       \"secret_refs\":{\"MARKER\":{\"secret\":\"e2e-marker\"}}}")
+[[ "$create_status" == "201" ]] || fail "opt-in secret-ref app create: $create_status $(cat /tmp/m5-app.json)"
 for _ in $(seq 1 90); do
   running=$(pg "SELECT count(*) FROM machines WHERE app_id='$APP5' AND observed_state='RUNNING' AND desired_state!='DELETED'")
   [[ "$running" == "1" ]] && break
   sleep 3
 done
-[[ "$running" == "1" ]] || fail "ontime machine 未 RUNNING"
+[[ "$running" == "1" ]] || fail "opt-in 注入机器未 RUNNING"
+mark "B2 opt-in 注入 RUNNING OK"
 M5=$(pg "SELECT id FROM machines WHERE app_id='$APP5' AND desired_state!='DELETED' LIMIT 1")
 
 edge_curl() { local h=$1; shift; curl -s -m 15 --resolve "$h:$EDGE_TLS:127.0.0.1" --cacert "$CERT_DIR/ca.crt" "$@"; }
@@ -204,9 +267,12 @@ log "    PG 备份→scratch 恢复→行数一致 PASS"
 redis-cli_flush() { docker exec dev-redis-1 redis-cli FLUSHALL >/dev/null; }
 redis-cli_flush
 rp=$(cur -H "Authorization: Bearer $API_TOKEN" -X POST "http://127.0.0.1:$API_PORT/v1/system/reprojections")
-echo "$rp" | grep -q 'reprojections' 2>/dev/null || true
-echo "$rp" | python3 -c 'import json,sys; print(json.load(sys.stdin)["duration_ms"])' >/dev/null || fail "reprojections 响应异常: $rp"
-log "    显式重投影响应: $rp"
+echo "$rp" | python3 -c '
+import json,sys
+r=json.load(sys.stdin)
+assert r.get("rebuilt_now") is True, f"kick 未生效: {r}"
+assert isinstance(r.get("duration_ms"), int)' || fail "reprojections 响应异常: $rp"
+log "    显式重投影（同步 kick 重建）: $rp"
 for _ in $(seq 1 25); do
   routes=$(docker exec dev-redis-1 redis-cli --scan --pattern 'route:*' 2>/dev/null | wc -l)
   (( routes > 0 )) && break

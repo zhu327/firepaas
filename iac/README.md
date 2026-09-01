@@ -2,72 +2,66 @@
 
 原则见 [ADR-0001](../docs/adr/0001-nomad-infra-only.md)：Nomad 只编排基础设施；用户 VM 由 control-plane 通过 agent gRPC 创建。
 
-## 作业分层
+## 作业和发现契约
 
-```text
-iac/nomad/
-  pools/               # node pool 定义（control / compute）
-  hypeman-p0.hcl      # M0 专用：原版 hypeman 数据面验证（必须提供真实 artifact/config）
-  agent.hcl           # M1+：带 mTLS 的 agentd system job
-  control-plane.hcl   # API/controller service job（count 受 ADR-0007 约束）
-  edge.hcl            # edge-proxy service job
-```
-
-P0 job 与未来 agentd job **不得共用**：它们的端口、健康检查、状态目录、权限和配置语义不同。
-
-## 节点池（唯一方案）
-
-统一使用**真实 Nomad node pool**，禁止 `-meta` constraint 方案、禁止两者混用：
-
-- `compute`：Firecracker 数据面节点（agentd / hypeman-p0 system job）；
-- `control`：api/edge 等基础设施 service job，由 3 台 Nomad server 兼任 client。
-
-`scripts/bootstrap-lab.sh` 按 role 写入各节点 client 的 `node_pool` 配置；集群就绪后创建池（Nomad 2.x）：
-
-```bash
-nomad node pool apply iac/nomad/pools/control.hcl
-nomad node pool apply iac/nomad/pools/compute.hcl
-```
-
-## 服务发现
-
-两种 provider 并存是**有意的设计**：
-
-- **agent（节点发现）**：Nomad native service registration（`provider = "nomad"`），控制面经 Nomad API 查询（ADR-0001，对应 e2b `nodediscovery`）；
-- **api/edge 互访**：Consul DNS（`*.service.consul`），相关 job 用 `provider = "consul"` 注册。
-
-注意：Nomad native service **不进 Consul DNS**，两者不可混用同一域名。Consul DNS 需主机 resolver 将 `.consul` 域转发到 127.0.0.1:8600（dnsmasq `server=/consul/127.0.0.1#8600`，注意与 systemd-resolved 冲突）；未配置时可在 job env 中临时使用静态地址。
-
-## 状态存储与镜像仓库（M1 起）
-
-PG/Redis/MinIO/registry 不作为 Nomad job 管理（避免在 Nomad 里再编排一套有状态服务），部署形态：
-
-| 组件 | 实验室 | 生产 |
+| 作业 | Nomad job / service | 发现与 health |
 |---|---|---|
-| PostgreSQL | systemd/docker 于 control 节点 | 独立 VM + 备份（M5 演练） |
-| Redis | systemd 单实例（AOF） | 单实例；是否 sentinel 依据 M4 验收决定 |
-| MinIO | docker 于 control 节点 | 独立节点 |
-| registry | docker `registry:2` 于 control 节点 | 独立服务或企业 registry |
+| agentd | `firepaas-agentd` / `firepaas-agentd`, `firepaas-agentd-proxy` | Nomad native；均为 TCP 5108/5107 |
+| API | `firepaas-api` / `firepaas-api` | Consul；HTTP `GET /v1/health` on 8080 |
+| edge | `firepaas-edge` / `firepaas-edge` | Nomad native；HTTP `GET /healthz` on 80 |
 
-地址经 `.env` / Nomad template 注入；本机开发用 `make dev-up`（`iac/dev/docker-compose.yaml`，已含 registry）。
+控制面的节点发现固定查询 `firepaas-agentd` job，因此生产 `agent.hcl` 与实验室
+`agentd-single.hcl` 使用同一个 job/service 名。agent 的 native service 不进入 Consul
+DNS；仅 API 经 Consul DNS 注册。edge 的 `FIREPAAS_API_ADDR` 必须是可实际解析的 URL，
+例如 `http://firepaas-api.service.consul:8080`（需配置 `.consul` DNS 转发）。
 
-## M0 前置验证
+## 生产发布：拒绝占位值与浮动 tag
+
+`agent.hcl`、`control-plane.hcl`、`edge.hcl` 的 artifact、镜像和依赖地址都是**无默认值
+required variable**。这使 `nomad job validate/plan` 在漏传发布输入时失败，而非部署
+`latest`、`REPLACE-ME` 或示例地址。镜像变量必须是 allowlisted registry 的 digest 引用
+（`registry.example/firepaas/api@sha256:<64-hex>`）；agent artifact 必须是版本化 HTTPS URL
+和对应 64-hex SHA-256。不要在 HCL、`-var` 历史或 Nomad job spec 写入密码；敏感连接串、API token、secret/traffic signing keys 与 mTLS cert/key/CA 路径通过受控变量
+文件或 Vault template 注入。生产 HCL 为这些输入声明了 required sensitive variables；漏传会使
+`nomad job validate/plan` 失败。agentd 也会在缺少 TLS 时拒绝启动，除非明确设置仅限本地的
+`FIREPAAS_ALLOW_INSECURE_DEV=true`。
+
+示例（值只作格式说明，不能直接投产）：
+
+```bash
+nomad job validate \
+  -var='agentd_artifact_url=https://artifacts.example/firepaas/agentd-1.2.3-linux-amd64' \
+  -var='agentd_artifact_sha256=<64-hex-sha256>' iac/nomad/agent.hcl
+nomad job plan \
+  -var='api_image=registry.example/firepaas/api@sha256:<64-hex>' \
+  -var='postgres_url=<vault-rendered-url>' -var='api_token=<vault-rendered-token>' \
+  -var='secrets_master_key=<vault-rendered-key>' -var='traffic_token_key=<vault-rendered-key>' \
+  -var='agent_tls_cert=/secure/control-plane.crt' -var='agent_tls_key=/secure/control-plane.key' \
+  -var='agent_tls_ca=/secure/ca.crt' -var='redis_addr=redis.internal:6379' \
+  -var='nomad_addr=https://nomad.internal:4646' iac/nomad/control-plane.hcl
+nomad job plan \
+  -var='edge_image=registry.example/firepaas/edge@sha256:<64-hex>' \
+  -var='api_addr=http://firepaas-api.service.consul:8080' -var='redis_addr=redis.internal:6379' \
+  -var='api_token=<vault-rendered-token>' -var='edge_tls_cert=/secure/edge.crt' \
+  -var='edge_tls_key=/secure/edge.key' -var='edge_tls_ca=/secure/ca.crt' iac/nomad/edge.hcl
+```
+
+Before `run`, use `nomad job plan` with the exact release variables and verify no `:latest`,
+`REPLACE-ME`, or placeholder hostname appears in the rendered plan. The lab-only
+`agentd-single.hcl` remains separate and must never be promoted as production configuration.
+
+## 节点池
+
+统一使用真实 Nomad node pool，禁止 `-meta` constraint 方案和混用：
+
+- `compute`：Firecracker 数据面节点（agentd system job）；
+- `control`：api/edge 基础设施 service job。
 
 ```bash
 nomad node pool apply iac/nomad/pools/control.hcl
 nomad node pool apply iac/nomad/pools/compute.hcl
-nomad fmt -check iac/nomad/hypeman-p0.hcl
-nomad job validate iac/nomad/hypeman-p0.hcl
-nomad job plan iac/nomad/hypeman-p0.hcl
-nomad job run iac/nomad/hypeman-p0.hcl
 ```
 
-M0 job 必须显式提供：真实 artifact checksum、hypeman 配置、持久 host data dir、KVM/Firecracker 前置检查、HTTP health endpoint 和卸载/重启 smoke test。不得把占位 artifact URL 视作可部署配置。hypeman 配置中**不设置任何 ingress**（内嵌 Caddy/DNS 不启动，避免与 Nomad/Consul 及未来 edge 端口冲突）；基准驱动用 hypeman-cli 或 REST+JWT（`cmd/gen-jwt` 生成 token）。
-
-## agentd 安全要求（M1+）
-
-- 5108 gRPC 仅接受 control-plane mTLS identity；
-- 5107 proxy 仅接受 edge mTLS identity，另校验 traffic token；
-- 作业通过安全的 secret/template 机制注入证书和短期凭证；
-- host firewall 限制来源，agent data dir 持久化，升级先 drain/rebuild；
-- 提交前运行 `nomad job validate` 与至少一次真实 alloc smoke test。
+PG/Redis/MinIO/registry 不作为 Nomad job 管理；生产部署于独立受管服务，地址由安全
+变量/template 注入。提交前运行 `nomad fmt -check iac/nomad/*.hcl`、带完整变量的
+`nomad job validate`，并执行至少一次真实 alloc smoke test。

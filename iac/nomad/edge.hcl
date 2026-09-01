@@ -1,67 +1,57 @@
-# firepaas edge-proxy service 作业（M1 起提供最小正式流量路径，M3 完整路由）
+# Production edge job. Required variables deliberately have no defaults.
+variable "edge_image" {
+  type = string
+  validation { condition = can(regex("^[^/]+/.+@sha256:[a-fA-F0-9]{64}$", var.edge_image)); error_message = "edge_image must be an immutable registry digest reference." }
+}
+variable "redis_addr" { type = string }
+variable "api_addr" { type = string }
+variable "api_token" { type = string; sensitive = true }
+variable "edge_tls_cert" { type = string; sensitive = true }
+variable "edge_tls_key" { type = string; sensitive = true }
+variable "edge_tls_ca" { type = string; sensitive = true }
+# Public ingress certificate/key are distinct from the edge mTLS client identity.
+variable "edge_server_cert" { type = string; sensitive = true }
+variable "edge_server_key" { type = string; sensitive = true }
 
 job "firepaas-edge" {
-  type      = "service"
+  type = "service"
   node_pool = "control"
-  priority  = 85
-
+  priority = 85
   group "edge" {
     count = 2
-
-    constraint {
-      operator  = "distinct_hosts"
-      value     = "true"
-    }
-
-    network {
-      port "http" {
-        static = 80
-      }
-      port "https" {
-        static = 443
-      }
-      port "health" {
-        static = 3003
-      }
-    }
-
+    constraint { operator = "distinct_hosts"; value = "true" }
+    network { port "http" { static = 80 }; port "https" { static = 443 } }
     service {
-      name     = "firepaas-edge"
-      port     = "http"
+      name = "firepaas-edge"
+      port = "http"
       provider = "nomad"
-
-      check {
-        type     = "http"
-        path     = "/health"
-        port     = "health"
-        interval = "5s"
-        timeout  = "3s"
-      }
+      # edge exposes /healthz on its HTTP listener; it does not listen on a separate health port.
+      check { type = "http"; path = "/healthz"; interval = "5s"; timeout = "3s" }
     }
-
     task "edge" {
       driver = "docker"
-
       env {
-        FIREPAAS_EDGE_PORT          = "80"
-        FIREPAAS_EDGE_TLS_PORT      = "443"
-        FIREPAAS_EDGE_HEALTH_PORT   = "3003"
-        # api job 以 provider=consul 注册,此地址依赖 Consul DNS(见 iac/README.md 服务发现;
-        # 未配置 .consul 转发时临时替换为静态地址)
-        FIREPAAS_EDGE_API_GRPC_ADDR = "firepaas-api-grpc.service.consul:5009"
-        # route catalog 所需;替换为实验室 Redis 地址(control 节点 systemd/docker)
-        FIREPAAS_REDIS_ADDR         = "10.0.0.11:6379"
+        FIREPAAS_EDGE_PORT = "80"
+        # The binary expects a listen address, not FIREPAAS_EDGE_TLS_PORT.
+        FIREPAAS_EDGE_TLS_LISTEN = ":443"
+        FIREPAAS_API_ADDR = var.api_addr
+        FIREPAAS_REDIS_ADDR = var.redis_addr
+        FIREPAAS_API_TOKEN = var.api_token
+        FIREPAAS_EDGE_TLS_CERT = "secrets/agent-client.crt"
+        FIREPAAS_EDGE_TLS_KEY = "secrets/agent-client.key"
+        FIREPAAS_EDGE_TLS_CA = "secrets/agent-ca.crt"
+        FIREPAAS_EDGE_SERVER_CERT = "secrets/edge-server.crt"
+        FIREPAAS_EDGE_SERVER_KEY = "secrets/edge-server.key"
       }
-
-      config {
-        image       = "registry.internal/firepaas/edge:latest"
-        network_mode = "host"
-      }
-
-      resources {
-        cpu    = 500
-        memory = 512
-      }
+      # Variables carry PEM contents; templates materialize them inside the
+      # allocation with restrictive permissions rather than relying on host paths.
+      template { data = var.edge_tls_cert; destination = "secrets/agent-client.crt"; perms = "0400" }
+      template { data = var.edge_tls_key; destination = "secrets/agent-client.key"; perms = "0400" }
+      template { data = var.edge_tls_ca; destination = "secrets/agent-ca.crt"; perms = "0444" }
+      template { data = var.edge_server_cert; destination = "secrets/edge-server.crt"; perms = "0400" }
+      template { data = var.edge_server_key; destination = "secrets/edge-server.key"; perms = "0400" }
+      config { image = var.edge_image; network_mode = "host" }
+      resources { cpu = 500; memory = 512 }
     }
   }
 }

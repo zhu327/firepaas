@@ -5,7 +5,7 @@
 jwt_secret: "dev-p0-single-node-change-me"
 
 # 由 root（Nomad raw_exec）运行；用户态手工调试可临时改成
-# /home/zty/.local/firepaas-lab/run/hypeman
+# $HOME/.local/firepaas-lab/run/hypeman
 data_dir: /var/lib/firepaas-p0/hypeman
 
 port: 4973

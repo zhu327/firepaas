@@ -9,7 +9,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$HERE/../.." && pwd)"
-LAB_BIN="/home/zty/.local/firepaas-lab/bin"
+LAB_BIN="$HOME/.local/firepaas-lab/bin"
 CERT_DIR="$HERE/certs"
 RUN_DIR="/var/lib/firepaas-p0/e2e"
 RUN_ID="e2e-$(date +%s)"
@@ -22,7 +22,7 @@ TRAFFIC_KEY="$(openssl rand -base64 32)"
 OP_CREATE="op-$RUN_ID-create"
 OP_DELETE="op-$RUN_ID-delete"
 
-export PATH="$LAB_BIN:/home/zty/.local/firepaas-lab/go/bin:$PATH"
+export PATH="$LAB_BIN:$HOME/.local/firepaas-lab/go/bin:$PATH"
 export NOMAD_ADDR="${NOMAD_ADDR:-http://127.0.0.1:4646}"
 export FIREPAAS_AGENT_TLS_CERT="$CERT_DIR/control-plane.crt"
 export FIREPAAS_AGENT_TLS_KEY="$CERT_DIR/control-plane.key"

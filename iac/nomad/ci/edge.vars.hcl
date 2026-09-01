@@ -1,0 +1,10 @@
+# Non-sensitive syntax-validation fixture. PEM-looking placeholders are not credentials.
+edge_image       = "registry.example.invalid/firepaas/edge@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+redis_addr       = "127.0.0.1:6379"
+api_addr         = "http://127.0.0.1:8080"
+api_token        = "ci-validation-placeholder"
+edge_tls_cert    = "-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----"
+edge_tls_key     = "-----BEGIN PRIVATE KEY-----\nfixture\n-----END PRIVATE KEY-----"
+edge_tls_ca      = "-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----"
+edge_server_cert = "-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----"
+edge_server_key  = "-----BEGIN PRIVATE KEY-----\nfixture\n-----END PRIVATE KEY-----"

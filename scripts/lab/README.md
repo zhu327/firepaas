@@ -1,7 +1,7 @@
 # firepaas 单机实验室（M0）
 
 > 状态：M0 单机基线（ADR-0012）。与 `scripts/bootstrap-lab.sh`（3 server + 2 compute
-> 标准实验室）互斥，不得混用。所有工具装在 `/home/zty/.local/firepaas-lab`，
+> 标准实验室）互斥，不得混用。所有工具装在 `$HOME/.local/firepaas-lab`，
 > 不改 `/etc`、不写系统 sysctl、不启巨页，避免影响本机已有 k8s。
 
 ## 目录
@@ -60,8 +60,8 @@ sudo bash scripts/bench-hypeman.sh density 16
   用户仍可用 `NOMAD_ADDR=http://127.0.0.1:4646` 操作集群。
 - hypeman 需要 `/dev/kvm`（root:kvm 660）与 CAP_NET_ADMIN（bridge/TAP/iptables）。
 - root 跑 job 前请确认执行路径与 config 路径对 root 可读：
-  `/home/zty/.local/firepaas-lab/bin/hypeman` 与
-  `/home/zty/Learn/firepaas/scripts/lab/hypeman-p0.yaml`。
+  `$HOME/.local/firepaas-lab/bin/hypeman` 与
+  `~/Learn/firepaas/scripts/lab/hypeman-p0.yaml`。
 - hypeman 的 `data_dir` 是 `/var/lib/firepaas-p0/hypeman`（root 所有）。
 
 ## M3（当前开发）

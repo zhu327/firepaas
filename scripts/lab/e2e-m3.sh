@@ -11,7 +11,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LAB_BIN="/home/zty/.local/firepaas-lab/bin"
+LAB_BIN="$HOME/.local/firepaas-lab/bin"
 CERT_DIR="$HERE/certs"
 RUN_DIR="/var/lib/firepaas-p0/e2e-m3"
 RUN_ID="e2e-m3-$(date +%s)"
@@ -19,7 +19,7 @@ API_TOKEN="e2e-m3-token-$RUN_ID"
 TRAFFIC_KEY="$(openssl rand -base64 32)"   # M4：proxy credential 密钥（与 agent 强制校验配套）
 PG="docker exec dev-postgres-1 psql -U firepaas -d firepaas -tAc"
 
-export PATH="$LAB_BIN:/home/zty/.local/firepaas-lab/go/bin:$PATH"
+export PATH="$LAB_BIN:$HOME/.local/firepaas-lab/go/bin:$PATH"
 export NOMAD_ADDR="${NOMAD_ADDR:-http://127.0.0.1:4646}"
 export FIREPAAS_AGENT_TLS_CERT="$CERT_DIR/control-plane.crt"
 export FIREPAAS_AGENT_TLS_KEY="$CERT_DIR/control-plane.key"
@@ -115,8 +115,8 @@ done
 [[ "$n" -ge 1 ]] || fail "节点未 HEALTHY"
 
 log "2.5) slot 泄漏：1000 次 attach/release（内核对象级，须在业务机创建前跑）"
-REPO_ROOT="$HERE/../.."
-(cd "$REPO_ROOT" && FIREPAAS_TEST_NETNS=1 /home/zty/.local/firepaas-lab/go/bin/go test ./internal/agent/network/slot/ -run 'TestSlotLifecycle|TestSlotCycleLeak' -count=1 -v > "$RUN_DIR/slot-test.log" 2>&1) \
+REPO_ROOT="$(cd "$HERE/../.." && pwd)"
+(cd "$REPO_ROOT" && FIREPAAS_TEST_NETNS=1 $HOME/.local/firepaas-lab/go/bin/go test ./internal/agent/network/slot/ -run 'TestSlotLifecycle|TestSlotCycleLeak' -count=1 -v > "$RUN_DIR/slot-test.log" 2>&1) \
   || { tail -20 "$RUN_DIR/slot-test.log" >&2; fail "slot 生命周期/泄漏测试失败"; }
 log "    attach/release 无 netns/veth/路由泄漏 OK"
 

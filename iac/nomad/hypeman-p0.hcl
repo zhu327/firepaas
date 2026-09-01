@@ -5,12 +5,12 @@
 
 variable "hypeman_command" {
   type    = string
-  default = "/home/zty/.local/firepaas-lab/bin/hypeman"
+  default = "~/.local/firepaas-lab/bin/hypeman"
 }
 
 variable "hypeman_config" {
   type    = string
-  default = "/home/zty/Learn/firepaas/scripts/lab/hypeman-p0.yaml"
+  default = "~/Learn/firepaas/scripts/lab/hypeman-p0.yaml"
 }
 
 variable "hypeman_data_dir" {

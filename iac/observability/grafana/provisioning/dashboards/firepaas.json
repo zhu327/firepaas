@@ -1,5 +1,7 @@
 {
-  "annotations": { "list": [] },
+  "annotations": {
+    "list": []
+  },
   "editable": true,
   "graphTooltip": 1,
   "panels": [
@@ -7,57 +9,301 @@
       "id": 1,
       "title": "宿主容量（内存/FD/conntrack/entropy/load）",
       "type": "timeseries",
-      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 0 },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
       "targets": [
-        { "refId": "A", "expr": "firepaas_host_mem_available_kb / 1024 / 1024", "legendFormat": "mem_avail_gib" },
-        { "refId": "B", "expr": "firepaas_host_fds_allocated / firepaas_host_fds_max", "legendFormat": "fd_usage" },
-        { "refId": "C", "expr": "firepaas_host_conntrack_count / firepaas_host_conntrack_max", "legendFormat": "conntrack_usage" },
-        { "refId": "D", "expr": "firepaas_host_entropy_avail", "legendFormat": "entropy" },
-        { "refId": "E", "expr": "firepaas_host_load1_x100 / 100", "legendFormat": "load1" }
+        {
+          "refId": "A",
+          "expr": "firepaas_host_mem_available_kb / 1024 / 1024",
+          "legendFormat": "mem_avail_gib"
+        },
+        {
+          "refId": "B",
+          "expr": "firepaas_host_fds_allocated / firepaas_host_fds_max",
+          "legendFormat": "fd_usage"
+        },
+        {
+          "refId": "C",
+          "expr": "firepaas_host_conntrack_count / firepaas_host_conntrack_max",
+          "legendFormat": "conntrack_usage"
+        },
+        {
+          "refId": "D",
+          "expr": "firepaas_host_entropy_avail",
+          "legendFormat": "entropy"
+        },
+        {
+          "refId": "E",
+          "expr": "firepaas_host_load1_x100 / 100",
+          "legendFormat": "load1"
+        }
       ]
     },
     {
       "id": 2,
       "title": "调度与机器状态",
       "type": "timeseries",
-      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 0 },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
       "targets": [
-        { "refId": "A", "expr": "firepaas_machines_observed", "legendFormat": "{{state}}" },
-        { "refId": "B", "expr": "firepaas_operations_pending", "legendFormat": "ops_pending" },
-        { "refId": "C", "expr": "firepaas_nodes_unhealthy", "legendFormat": "nodes_unhealthy" },
-        { "refId": "D", "expr": "firepaas_nodes_total", "legendFormat": "nodes_total" },
-        { "refId": "E", "expr": "sum by (kind) (rate(firepaas_operations_total[5m]))", "legendFormat": "ops_{{kind}}/s" }
+        {
+          "refId": "A",
+          "expr": "firepaas_machines_observed",
+          "legendFormat": "{{state}}"
+        },
+        {
+          "refId": "B",
+          "expr": "firepaas_operations_pending",
+          "legendFormat": "ops_pending"
+        },
+        {
+          "refId": "C",
+          "expr": "firepaas_nodes_unhealthy",
+          "legendFormat": "nodes_unhealthy"
+        },
+        {
+          "refId": "D",
+          "expr": "firepaas_nodes_total",
+          "legendFormat": "nodes_total"
+        },
+        {
+          "refId": "E",
+          "expr": "sum by (kind) (rate(firepaas_operations_total[5m]))",
+          "legendFormat": "ops_{{kind}}/s"
+        }
       ]
     },
     {
       "id": 3,
       "title": "发布状态机转换",
       "type": "timeseries",
-      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 9 },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 9
+      },
       "targets": [
-        { "refId": "A", "expr": "sum by (from,to) (rate(firepaas_rollout_transitions_total[5m]))", "legendFormat": "{{from}}→{{to}}" },
-        { "refId": "B", "expr": "sum by (result) (rate(firepaas_placements_total[5m]))", "legendFormat": "place_{{result}}" },
-        { "refId": "C", "expr": "sum by (reason) (rate(firepaas_filter_rejections_total[5m]))", "legendFormat": "reject_{{reason}}" }
+        {
+          "refId": "A",
+          "expr": "sum by (from,to) (rate(firepaas_rollout_transitions_total[5m]))",
+          "legendFormat": "{{from}}→{{to}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (result) (rate(firepaas_placements_total[5m]))",
+          "legendFormat": "place_{{result}}"
+        },
+        {
+          "refId": "C",
+          "expr": "sum by (reason) (rate(firepaas_filter_rejections_total[5m]))",
+          "legendFormat": "reject_{{reason}}"
+        }
       ]
     },
     {
       "id": 4,
       "title": "对账与 RPC 健康",
       "type": "timeseries",
-      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 9 },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 9
+      },
       "targets": [
-        { "refId": "A", "expr": "sum by (kind) (rate(firepaas_agent_rpc_errors_total[5m]))", "legendFormat": "rpc_err_{{kind}}" },
-        { "refId": "B", "expr": "sum by (action) (rate(firepaas_reconcile_actions_total[5m]))", "legendFormat": "{{action}}" },
-        { "refId": "C", "expr": "rate(firepaas_operation_stale_claims_recovered_total[5m])", "legendFormat": "stale_recovered" },
-        { "refId": "D", "expr": "rate(firepaas_operation_requeues_total[5m])", "legendFormat": "requeues" }
+        {
+          "refId": "A",
+          "expr": "sum by (kind) (rate(firepaas_agent_rpc_errors_total[5m]))",
+          "legendFormat": "rpc_err_{{kind}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (action) (rate(firepaas_reconcile_actions_total[5m]))",
+          "legendFormat": "{{action}}"
+        },
+        {
+          "refId": "C",
+          "expr": "rate(firepaas_operation_stale_claims_recovered_total[5m])",
+          "legendFormat": "stale_recovered"
+        },
+        {
+          "refId": "D",
+          "expr": "rate(firepaas_operation_requeues_total[5m])",
+          "legendFormat": "requeues"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "per-VM CPU（直抓 agentd，machine 维度）",
+      "type": "timeseries",
+      "description": "v1.1-F：hypeman per-VM CPU（节点 relabel 直抓 :9464；instance_name = firepaas machine_id）",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 18
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "label_replace(rate(hypeman_vm_cpu_seconds_total[1m]), \"app\", \"$1\", \"instance_name\", \"(.*)-r[0-9]+-g[0-9]+\")",
+          "legendFormat": "{{instance_name}}"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "per-VM 内存 RSS/已分配",
+      "type": "timeseries",
+      "description": "v1.1-F：per-VM 内存（实际 RSS vs 已分配）",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 18
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "label_replace(hypeman_vm_memory_rss_bytes, \"app\", \"$1\", \"instance_name\", \"(.*)-r[0-9]+-g[0-9]+\")",
+          "legendFormat": "rss {{instance_name}}"
+        },
+        {
+          "refId": "B",
+          "expr": "label_replace(hypeman_vm_allocated_memory_bytes, \"app\", \"$1\", \"instance_name\", \"(.*)-r[0-9]+-g[0-9]+\")",
+          "legendFormat": "alloc {{instance_name}}"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "title": "per-VM 网络 RX/TX",
+      "type": "timeseries",
+      "description": "v1.1-F：per-VM 网络（TAP 在 slot netns 时降级为 0——已知限制，见 v1.1-plan）",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 26
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "label_replace(rate(hypeman_vm_network_rx_bytes_total[1m]), \"app\", \"$1\", \"instance_name\", \"(.*)-r[0-9]+-g[0-9]+\")",
+          "legendFormat": "rx {{instance_name}}"
+        },
+        {
+          "refId": "B",
+          "expr": "label_replace(rate(hypeman_vm_network_tx_bytes_total[1m]), \"app\", \"$1\", \"instance_name\", \"(.*)-r[0-9]+-g[0-9]+\")",
+          "legendFormat": "tx {{instance_name}}"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "title": "auto-standby 唤醒（次数/耗时）",
+      "type": "timeseries",
+      "description": "v1.1（ADR-0017）：autoresume 唤醒计数与耗时分布（SLO <5s）",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 26
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (machine_id) (rate(firepaas_agent_autostandby_wakes_total[5m]))",
+          "legendFormat": "wake {{machine_id}}"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le, machine_id) (rate(firepaas_agent_autostandby_wake_seconds_bucket[5m])))",
+          "legendFormat": "p95 {{machine_id}}"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "title": "edge 并发控制（inflight/hard 拒绝/钉扎）",
+      "type": "timeseries",
+      "description": "v1.1（ADR-0019/0020）：per-machine inflight（per-edge 本地视角）与 hard 拒绝",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 34
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "firepaas_edge_backend_inflight",
+          "legendFormat": "{{machine_id}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(firepaas_edge_hard_rejected_total[5m]))",
+          "legendFormat": "hard_rejected"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(firepaas_edge_pin_hits_total[5m]))",
+          "legendFormat": "pin_hits"
+        },
+        {
+          "refId": "D",
+          "expr": "sum(rate(firepaas_edge_pin_misses_total[5m]))",
+          "legendFormat": "pin_misses"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "title": "v1.4 本地 inventory 与 integrity",
+      "type": "timeseries",
+      "description": "Inventory support、完整性分布与 orphan bytes。支持标志不是 freshness；age/drift/scrub/quarantine/attachment 由 72h PG/API probe 补采。",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 42},
+      "targets": [
+        {"refId": "A", "expr": "firepaas_local_inventory_support", "legendFormat": "support {{node_id}} {{type}}"},
+        {"refId": "B", "expr": "sum by (type, integrity) (firepaas_local_integrity)", "legendFormat": "{{type}} {{integrity}}"},
+        {"refId": "C", "expr": "sum by (type, node_id) (firepaas_local_orphan_bytes)", "legendFormat": "orphan {{node_id}} {{type}}"}
+      ]
+    },
+    {
+      "id": 16,
+      "title": "v1.4 prewarm / pin / local GC",
+      "type": "timeseries",
+      "description": "仅展示累计结果与 dry-run 候选。prewarm/pin 为 operator-only；local GC 默认 off，当前无 quarantine/finalize，候选不代表已删除。",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 42},
+      "targets": [
+        {"refId": "A", "expr": "sum by (result) (rate(firepaas_prewarm_targets_total[5m]))", "legendFormat": "prewarm {{result}}/s"},
+        {"refId": "B", "expr": "rate(firepaas_image_pins_expired_total[5m])", "legendFormat": "pins_expired/s"},
+        {"refId": "C", "expr": "sum by (node) (firepaas_gc_candidates)", "legendFormat": "gc_candidates {{node}}"}
       ]
     }
   ],
   "refresh": "15s",
   "schemaVersion": 39,
-  "tags": ["firepaas"],
-  "templating": { "list": [] },
-  "time": { "from": "now-1h", "to": "now" },
+  "tags": [
+    "firepaas"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
   "timezone": "browser",
   "title": "firepaas 单机总览",
   "uid": "firepaas-single",

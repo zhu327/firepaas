@@ -8,7 +8,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LAB_BIN="/home/zty/.local/firepaas-lab/bin"
+LAB_BIN="$HOME/.local/firepaas-lab/bin"
 CERT_DIR="$HERE/certs"
 RUN_DIR="/var/lib/firepaas-p0/chaos-m2"
 RUN_ID="chaos-$(date +%s)"
@@ -19,7 +19,7 @@ HN="$MID.local"
 PG="docker exec dev-postgres-1 psql -U firepaas -d firepaas -tAc"
 RD="docker exec dev-redis-1 redis-cli"
 
-export PATH="$LAB_BIN:/home/zty/.local/firepaas-lab/go/bin:$PATH"
+export PATH="$LAB_BIN:$HOME/.local/firepaas-lab/go/bin:$PATH"
 export NOMAD_ADDR="${NOMAD_ADDR:-http://127.0.0.1:4646}"
 export FIREPAAS_AGENT_TLS_CERT="$CERT_DIR/control-plane.crt"
 export FIREPAAS_AGENT_TLS_KEY="$CERT_DIR/control-plane.key"
@@ -194,7 +194,7 @@ log "    在途 crash → 启动回收孤儿 CLAIMED → 收敛（$(($T1-$T0))s�
 log "6) 终态检查：无在途操作、事件审计可解释"
 PENDING=$($PG "SELECT count(*) FROM operations WHERE status IN ('PENDING','CLAIMED')")
 [[ "$PENDING" == "0" ]] || fail "存在在途 operation $PENDING"
-EVENTS=$(curl -fsS -H "Authorization: Bearer $API_TOKEN" 'http://127.0.0.1:8080/v1/events?limit=100' \
+EVENTS=$(curl -fsS -H "Authorization: Bearer $API_TOKEN" 'http://127.0.0.1:8080/v1/system/scheduler-events?limit=100' \
   | python3 -c 'import json,sys; evs=json.load(sys.stdin)["events"]; print(sum(1 for e in evs if e["Kind"]=="reconcile"))')
 [[ "$EVENTS" -gt 0 ]] || fail "无 reconcile 审计事件"
 authed_curl -X DELETE "http://127.0.0.1:8080/v1/machines/$MID?operation_id=op-clean-$MID" >/dev/null || true

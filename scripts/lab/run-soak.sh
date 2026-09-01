@@ -2,7 +2,7 @@
 # 启动 soak 专用 API/edge（M5 60min 排练用；与 e2e-m5 同拓扑，token 固定）。
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LAB_BIN="/home/zty/.local/firepaas-lab/bin"
+LAB_BIN="$HOME/.local/firepaas-lab/bin"
 CERT_DIR="$HERE/certs"
 RUN_DIR="/var/lib/firepaas-p0/e2e-m5"
 mkdir -p "$RUN_DIR"

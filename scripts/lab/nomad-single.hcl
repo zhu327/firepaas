@@ -5,7 +5,7 @@
 datacenter = "dc1"
 region     = "global"
 name       = "firepaas-lab-1"
-data_dir   = "/home/zty/.local/firepaas-lab/run/nomad"
+data_dir   = "$HOME/.local/firepaas-lab/run/nomad"
 bind_addr  = "127.0.0.1"
 
 advertise {

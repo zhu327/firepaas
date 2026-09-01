@@ -28,14 +28,22 @@ ROWS=$(docker exec "$CONTAINER" psql -U firepaas -d "$SCRATCH" -tAc \
         ||' secrets='||(SELECT count(*) FROM secrets)
         ||' api_keys='||(SELECT count(*) FROM api_keys)")
 say "scratch $ROWS"
-PROD_ROWS=$(docker exec "$CONTAINER" psql -U firepaas -d firepaas -tAc \
-  "SELECT 'apps='||(SELECT count(*) FROM apps)||' machines='||(SELECT count(*) FROM machines)
-        ||' operations='||(SELECT count(*) FROM operations)
-        ||' secrets='||(SELECT count(*) FROM secrets)
-        ||' api_keys='||(SELECT count(*) FROM api_keys)")
-say "prod    $PROD_ROWS"
-[[ "$ROWS" == "$PROD_ROWS" ]] || { say "FAIL row count mismatch"; docker exec "$CONTAINER" psql -U firepaas -d postgres -c "DROP DATABASE $SCRATCH" >/dev/null; exit 1; }
-say "PASS 备份可恢复且行数一致"
+# P3-17：基线用备份时刻的 sidecar 行数（无 sidecar 的旧备份兑底为活库快照，
+# 兼容过渡）；恢复库与活库持续写入无关联，不再比较两者。
+RCFILE="${DUMP%.sql.gz}.rowcounts"
+if [[ -f "$RCFILE" ]]; then
+  EXPECTED=$(cat "$RCFILE")
+else
+  say "WARN 备份无 .rowcounts sidecar（旧备份）；退化为活库对比（soak 期间可能漂移）"
+  EXPECTED=$(docker exec "$CONTAINER" psql -U firepaas -d firepaas -tAc \
+    "SELECT 'apps='||(SELECT count(*) FROM apps)||' machines='||(SELECT count(*) FROM machines)
+          ||' operations='||(SELECT count(*) FROM operations)
+          ||' secrets='||(SELECT count(*) FROM secrets)
+          ||' api_keys='||(SELECT count(*) FROM api_keys)")
+fi
+say "expect  $EXPECTED"
+[[ "$ROWS" == "$EXPECTED" ]] || { say "FAIL row count mismatch"; docker exec "$CONTAINER" psql -U firepaas -d postgres -c "DROP DATABASE $SCRATCH" >/dev/null; exit 1; }
+say "PASS 备份可恢复且行数与备份时刻一致"
 
 docker exec "$CONTAINER" psql -U firepaas -d postgres -c "DROP DATABASE $SCRATCH" >/dev/null
 say "scratch db dropped"

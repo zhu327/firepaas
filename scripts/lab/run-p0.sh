@@ -6,10 +6,10 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$HERE/../.." && pwd)"
 
-export PATH="/home/zty/.local/firepaas-lab/bin:/home/zty/.local/firepaas-lab/go/bin:$PATH"
+export PATH="$HOME/.local/firepaas-lab/bin:$HOME/.local/firepaas-lab/go/bin:$PATH"
 export NOMAD_ADDR="${NOMAD_ADDR:-http://127.0.0.1:4646}"
 
-BIN="/home/zty/.local/firepaas-lab/bin/hypeman"
+BIN="$HOME/.local/firepaas-lab/bin/hypeman"
 CONFIG="$HERE/hypeman-p0.yaml"
 
 [[ -x "$BIN" ]] || { echo "ERROR: $BIN 不存在，先运行 bash scripts/lab/build-hypeman.sh" >&2; exit 1; }

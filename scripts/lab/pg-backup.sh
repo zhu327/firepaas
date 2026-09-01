@@ -22,9 +22,19 @@ docker exec "$CONTAINER" pg_dump -U firepaas -d firepaas --no-owner --no-privile
 SIZE=$(du -h "$OUT" | cut -f1)
 say "done $OUT ($SIZE)"
 
-# 保留最近 7 份。
+# P3-17（M5 评审）：记录备份时刻的关键表行数 sidecar（.rowcounts）。恢复演练
+# 对比它，而不是活库——活库在 soak/chaos 持续写入下必然漂移，原断言必误报。
+ROWCOUNTS=$(docker exec "$CONTAINER" psql -U firepaas -d firepaas -tAc \
+  "SELECT 'apps='||(SELECT count(*) FROM apps)||' machines='||(SELECT count(*) FROM machines)
+        ||' operations='||(SELECT count(*) FROM operations)
+        ||' secrets='||(SELECT count(*) FROM secrets)
+        ||' api_keys='||(SELECT count(*) FROM api_keys)")
+printf '%s\n' "$ROWCOUNTS" > "${OUT%.sql.gz}.rowcounts"
+say "rowcounts at backup time: $ROWCOUNTS"
+
+# 保留最近 7 份（含 .rowcounts sidecar）。
 ls -1t "$BACKUP_DIR"/pg-*.sql.gz 2>/dev/null | tail -n +8 | while read -r old; do
-  rm -f "$old"
+  rm -f "$old" "${old%.sql.gz}.rowcounts"
   say "pruned $old"
 done
 say "keep latest 7 backups; current list:"
