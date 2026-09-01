@@ -15,7 +15,7 @@ M0 数据面验证以**单机折叠实验室**为基线执行:
            + Docker 承载 PG/Redis/MinIO/registry
 ```
 
-- 工具链全部安装到 `/home/zty/.local/firepaas-lab`,不改 `/etc`、不动系统
+- 工具链全部安装到 `~/.local/firepaas-lab`,不改 `/etc`、不动系统
   sysctl、不启巨页、不装 systemd 系统服务;runtime 数据(root)在
   `/var/lib/firepaas-p0`。
 - `scripts/bootstrap-lab.sh` 保留为**多机标准实验室**入口;新增

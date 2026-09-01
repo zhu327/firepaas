@@ -9,8 +9,9 @@
 ### 1. 实体与状态
 
 - **deployment**：app 的一次不可变发布目标（image_ref/vcpu/mem_mib/port/env/
-  generation）。机器创建后其 `deployment_id/generation` 不再改变；修正只能
-  产生新 deployment。
+  generation/strategy）。机器创建后其 `deployment_id/generation` 不再改变；修正只能
+  产生新 deployment。`rolling` 策略以 active rollout 的 `to_generation` 作为唯一
+  target，绝不由任意已观测 backend 推断。
 - **rollout**：`(app_id, from_generation → to_generation)` 的一次发布过程。
   PG `rollouts` 表唯一活跃约束（`app_id` 上最多一条 status ∈
   PREPARING/CUTOVER/ROLLING_BACK）保证单 rollout 互斥。
@@ -35,8 +36,9 @@
 ### 2. 发布与 route 投影（ADR-0005 顺序落地）
 
 1. controller 每轮 route 重建读 PG `rollouts` 活跃状态：
-   - PREPARING：active generation = from；新 backend 以 readiness 实际值写入
-     `route_backends`（generation=to），但不在 active backend set；edge 不感知。
+   - PREPARING：bluegreen active generation = from；rolling 按 ordinal 切流：仅
+     target-generation 的 RUNNING/PAUSED 且 readiness ∈ {READY, UNCONFIGURED}
+     backend 可服务，同 ordinal 旧 backend draining。空/UNKNOWN readiness 绝不切流。
    - CUTOVER：active generation = to；to-generation 的 READY backend 进 active
      set；from-generation backend 保留但 `draining=true`。
    - ROLLING_BACK：active generation = from；to backend 摘除；from backend
@@ -48,9 +50,11 @@
    任一失败/超时（默认 300s，可配）→ 自动 ROLLING_BACK。
 3. drain：CUTOVER 后旧 backend 只服务已建连请求；`drain_deadline`（默认 30s，
    可配）后 controller 下发旧 execution 的 reap delete 并置 rollout COMPLETE。
-4. edge 契约不变：只读 route projection 的 backend set，按
-   `draining=false && readiness ∈ {READY, UNCONFIGURED}` 选择；edge 永不读
-   slot IP（ADR-0005）。
+4. route publisher 仅将 `readiness ∈ {READY, UNCONFIGURED}` 且
+   `draining=false` 的 execution 写入 PG `route_backends` 和 Redis；完整 machine
+   集仍只在 publisher 内部用于推导 rolling ordinal 的 cut 决策。edge 永不读
+   slot IP（ADR-0005）。这是对早期“发布全部 backend、由 edge 再过滤”实现偏差的
+   不变量 bug 修复，不是 rollout 语义变更。
 
 ### 3. 决策表（组合场景冻结）
 
@@ -61,7 +65,7 @@
 | S3 | PREPARING 超时（300s）未全 READY | ROLLING_BACK |
 | S4 | CUTOVER 中 from 代机器死亡 | 不重建 from 代（已 draining），提前回收 |
 | S5 | CUTOVER 中 to 代机器死亡 | 按 to generation 重建；重建期间该 backend 不进 active set，其余 to backend 继续服务 |
-| S6 | ROLLING_BACK 中 | from generation 机器保持/补建；to 代机器删除；完成后 COMPLETE(failed) |
+| S6 | ROLLING_BACK 中 | 先持久补建并确认 from generation 全部可服务，再删除 to 代；完成时 from=ACTIVE、to=FAILED，避免旧代不可立即服务 |
 | S7 | 发布中再次 deploy | 409（MVP 互斥） |
 | S8 | 发布中 scale | 作用于目标 generation ordinal 集；不重置 rollout 计时 |
 | S9 | 发布中 app 删除 | rollout 级联删除；所有机器按 ordinal 下发 delete |

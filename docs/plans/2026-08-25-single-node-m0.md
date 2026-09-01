@@ -17,9 +17,9 @@ M0 数据面 go/no-go 输入。
 1. 本机只有普通用户 zty 可被本会话直接使用；sudo/root 步骤是 HITL，由操作者执行。
 2. 不得破坏现有 k8s/桌面：不写系统 sysctl（ip_forward 已开启）、不启用巨页、
    不改 systemd-resolved、不用 `/etc` 系统级服务；所有工具装在
-   `/home/zty/.local/firepaas-lab`。
+   `~/.local/firepaas-lab`。
 3. 网络可访问 GitHub、HashiCorp releases、Go 官方下载（已验证连通）。
-4. hypeman 与 firepaas 同级 checkout（`/home/zty/Learn/hypeman`）不变；
+4. hypeman 与 firepaas 同级 checkout（`~/Learn/hypeman`）不变；
    M0 数据面用**原版 hypeman 二进制**，不接 agentd。
 5. M0 基准以 Firecracker 为默认 hypervisor；Cloud Hypervisor 仅作为对照采样。
 6. 单机意味着双节点/三节点行为（quorum、跨节点放置、跨节点快照兼容）无法在本机
@@ -29,7 +29,7 @@ M0 数据面 go/no-go 输入。
 
 ```text
 本机 (Ubuntu 24.04, KVM)
-├── /home/zty/.local/firepaas-lab/
+├── ~/.local/firepaas-lab/
 │   ├── go/                # Go 1.25.4（用户态）
 │   ├── bin/{nomad,consul} # Nomad 2.0.x / Consul 2.0.x
 │   ├── bin/hypeman        # 构建产物（嵌入 Firecracker v1.14.2）
@@ -46,7 +46,7 @@ M0 数据面 go/no-go 输入。
 - M0 阶段只创建 `compute` 节点池；`control` 池在 M1 需要跑 control-plane/edge
   service job 时再处理（单机方案：control 组件直接以 systemd/docker/进程运行，
   或临时放宽 job 到 compute 池，见 M1 计划）。
-- 所有写盘路径：工具链与代码在 `/home/zty/Learn`，运行时数据在
+- 所有写盘路径：工具链与代码在 `~/Learn`，运行时数据在
   `/var/lib/firepaas-p0`（root）与 Docker volume（user 加入 docker 组后由
   compose 管理）。
 
@@ -103,7 +103,7 @@ bash scripts/bench-hypeman.sh
 
 ### T4 hypeman 构建
 
-- 在 `/home/zty/Learn/hypeman` 执行 `make build-linux`（嵌入式 CH v49/v51.1、
+- 在 `~/Learn/hypeman` 执行 `make build-linux`（嵌入式 CH v49/v51.1、
   Firecracker v1.14.2、Caddy v2.10.2、guest init/agent）。
 - 产物复制到 `~/.local/firepaas-lab/bin/hypeman`，记录 `git rev-parse HEAD` 与
   `go version` 作为 provenance。
@@ -118,7 +118,7 @@ bash scripts/bench-hypeman.sh
 
 ### T6 hypeman-p0 job 与 hypeman 配置
 
-- `iac/nomad/hypeman-p0.hcl`：artifact 改为 `file:///home/zty/.local/firepaas-lab/bin/hypeman`，
+- `iac/nomad/hypeman-p0.hcl`：artifact 改为 `file://~/.local/firepaas-lab/bin/hypeman`，
   `HYPEMAN_PORT`、`CONFIG_PATH` 指向 `scripts/lab/hypeman-p0.yaml`；health 保持 `/health`；
   资源 memory 降到 768MB（微 VM 基准专用）；job 注释写明单机版，多机版由变量覆盖。
 - `scripts/lab/hypeman-p0.yaml`：`hypervisor.default: firecracker`、无 ingress、

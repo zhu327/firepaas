@@ -143,3 +143,28 @@ DEFERRED-MULTI-NODE 项继续累积到双机清单。
    image 要求：必须有基础发行版 init（文档化于 runbook-capacity）。
 3. 自动 idle 检测（per-VM usage 管道）v1.1（同 M4 记录）。
 4. 多 edge/双节点项 DEFERRED-MULTI-NODE（不变）。
+
+### 评审修复轮（2026-08-27 第二轮，最终全绿）
+
+独立代码评审（P0×0 / P1×6 / P2×5 / P3×8）全部修复后重跑验收：
+
+- **P1 安全**：审计 caller（响应头通道）、body.project_id clamp（防跨
+  project 建机器/app/secret 投毒）、secrets 读删统一 effectiveProjectID、
+  traffic-token routeScope=write。
+- **P1 验收链**：e2e D 段重投影断言竞态（改同步 kick + rebuilt_now 断言）、
+  B 段 ontime 镜像不可复现（push-ontime.sh 自建自推：真 gzip 层 + busybox
+  /bin/sh——hypeman-init 经 sh -c 启 entrypoint，scratch 无 sh 即 panic）。
+- **P2**：gauge family 清理、prometheus 端口对齐 8083 + observability README、
+  soak 改 digest-pinned 本地镜像、capacity-model 阈值回填（drift ≤6ms /
+  entropy 256 / conntrack 基线 576）、redact+auth 纯函数单测。
+- **P3**：/metrics 可选 token、Touch 节流、负 TTL 拒绝、catalog location 死
+  代码删除、pg 备份 .rowcounts sidecar。
+- **产品裁决**：secret_env 默认 fail-closed + `FIREPAAS_SECRET_INJECTION=
+  unsafe-persisted-env` opt-in（hypeman Env 明文持久化实测确认；e2e B 段
+  双断言；one-shot 通道 v1.1 列 DEFERRED-hypeman-upstream）。
+- **正确性加固**：create 重试上限 8 次（封坏镜像无限 recreate）+ 已删机器
+  在途 create 取消（封 no-candidates 自旋）；升级脚本 HEALTHY 状态机修正 +
+  失败 trap 自动 ready + 对账 90s 窗；hardening S() 点号路径 bug；e2e 预清理
+  复位 draining；go.mod replace 恢复（v0.3.0 缺 lib/config）。
+- **最终验收**：单测+PG-gated+sim 10 万次全绿；e2e-m5 六段全绿（约 4.5min）；
+  soak 10 轮排练 PASS、终态 fc/netns/machines 归零。

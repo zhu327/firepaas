@@ -1,0 +1,36 @@
+schema_version: '1.0'
+# Targets apply only to the workload conditions documented in architecture.md.
+# Evaluator requires explicitly captured samples; this file does not certify a system.
+objectives:
+  - name: node-failure-detect-p95
+    metric: node_failure_detect_seconds
+    percentile: 95
+    max_seconds: 60
+    minimum_samples: 20
+  - name: node-failover-ready-p95
+    metric: node_failover_seconds
+    percentile: 95
+    max_seconds: 120
+    minimum_samples: 20
+  - name: vip-failover-p95
+    metric: vip_failover_seconds
+    percentile: 95
+    max_seconds: 60
+    minimum_samples: 20
+  - name: control-quorum-write-p95
+    metric: control_quorum_recovery_seconds
+    percentile: 95
+    max_seconds: 60
+    minimum_samples: 20
+  - name: availability-probe-p95
+    metric: availability_probe_seconds
+    percentile: 95
+    max_seconds: 15
+    minimum_samples: 100
+  # Age is based on control-plane received_at, never agent wall clock. The probe
+  # must fail if any expected healthy node/type has no accepted observation.
+  - name: local-inventory-age-p95
+    metric: inventory_age_seconds
+    percentile: 95
+    max_seconds: 60
+    minimum_samples: 100

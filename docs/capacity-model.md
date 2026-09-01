@@ -47,15 +47,18 @@ agentd 依赖 firecracker 二进制、内核与 guest rootfs 基件;分发与版
 | snapshot compatibility key | Firecracker v1.14.2 + ch-6.12.8-kernel-3.0-202605291 + hypeman 默认 snapshot 格式 + CPU vendor AuthenticAMD/model 25/SVM + host KVM 特性;不兼容时 cold-start 降级 |
 | 不兼容降级 | 禁止 restore，回退到 digest-pinned image cold-start |
 
-## Host/runtime 容量与稳定性边界（M0 采样，M5 soak 冻结）
+## Host/runtime 容量与稳定性边界（M0 采样，M5 实测回填 2026-08-27）
 
 | 项 | 基线/上限 | 告警与降级 |
 |---|---|---|
-| host NTP / guest resume clock drift | (待填) | 超阈值禁用 snapshot resume |
-| entropy | (待填) | guest 启动超时并告警 |
-| host OOM / cgroup memory.events | (待填) | 节点停止准入并 drain |
-| inode / file descriptor | (待填) | 高水位停止拉取/创建 |
-| conntrack / TAP / netns 数量 | (待填) | 高水位停止准入并回收 |
+| host NTP / guest resume clock drift | 实测 20 次 pause/resume 后 guest-host 偏差 -4~-6ms（远低于 10min 闸门）；FC snapshot 不保存 wall clock，长时间 standby 后偏差 ≈ 暂停时长，恢复后由 guest 内 NTP/chrony 补救 | > 10min 禁用 snapshot resume（e2e-m5 B 段断言）；runbook 建议 guest 内 chrony |
+| entropy | 实测 256（满档，现代内核 getrandom 不阻塞） | < 128 告警（prometheus-alerts FirePaasEntropyLow） |
+| host OOM / cgroup memory.events | agentd cgroup 16GiB；宿主可用内存告警阈 4GiB | < 4GiB 持续 5min 告警（FirePaasHostMemLow）；节点 drain |
+| inode / file descriptor | 实验室 fs.file-max 巨大（不被约束）；采样基线 FD 10432，20 次 pause/resume 后无增长（零 FD 泄漏） | FD > max×80% 持续 5min 告警（FirePaasFDPressure）；高水位停止拉取/创建 |
+| conntrack / TAP / netns 数量 | 实测基线 576，20 次 pause/resume 后 519（波动无增长）；上限 nf_conntrack_max=524288；每 VM 净占 ≈ 3-5 conntrack + 1 netns + 1 TAP + 2 veth | > max×70% 告警（FirePaasConntrackPressure critical）；高水位停止准入 |
+
+实测样本：e2e-m5 B 段（20 循环 pause/resume + FD/conntrack/entropy 采样）
+与 soak-m5 10 轮排练（fc/netns/machines 终态归零）；72h 正式浸泡待用户后台执行。
 
 ## OCI 镜像边界（M0 冻结中）
 
@@ -73,9 +76,18 @@ agentd 依赖 firecracker 二进制、内核与 guest rootfs 基件;分发与版
 | micro | 1 | 512MiB | 5GiB(默认 10GiB) | 32(网络带宽准入上限) |
 | small | 2 | 2GiB | 10GiB | (待填) |
 
+## 生产发布与 Nomad 资源边界
+
+生产 Nomad spec 不得使用 `latest`、`REPLACE-ME`、示例 registry 或无校验 artifact。
+`iac/nomad/*.hcl` 要求调用方提供 digest-pinned 镜像、版本化 agent artifact 和 SHA-256；
+漏传变量必须令 `nomad job validate/plan` 失败。API 的实际 health endpoint 是
+`/v1/health`，edge 是其 HTTP 监听器上的 `/healthz`；不能按过期 `/health` 或不存在的
+独立 health port 配置健康检查。
+
 ## 变更记录
 
-- (冻结日期 + 依据)
+- 2026-08-27：Task 3 统一 production agent job/service 名为 `firepaas-agentd`，并记录
+  必填、digest/checksum 发布输入和真实 health/env 契约。
 
 ## M5 实测校准（2026-08-27，results/m5/）
 

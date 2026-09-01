@@ -1,14 +1,18 @@
 # Runbook：host hardening（实验室/生产）
 
 审计入口：`sudo bash scripts/lab/host-hardening-check.sh`（**只读**，绝不写
-系统配置）。输出 PASS/WARN/FAIL + 本次结论。
+系统配置）。输出 PASS/WARN/FAIL + 本次结论；WARN 不会覆盖之前的 FAIL。sshd 检查
+使用 `sshd -T` 的生效配置（含 Include/Match），无法取得生效配置时只 WARN，不以
+原始 `sshd_config` 产生错误结论。凭证扫描仅计数、不输出匹配内容，且不再截断候选
+文件列表。
 
 ## 实验室形态（当前执行结果）
 
 - 内核随机化/链接保护/ip_forward=1（slot 数据面必需）/dev/kvm 权限通过。
 - WARN 项（实验室可接受，迁移生产前关闭）：sshd PermitRootLogin、
   docker.sock 归 docker 组、SUID 面大小。
-- 任何 FAIL（如 `/dev/kvm` 缺失）必须当日解决——firepaas 不可运行。
+- 任何 FAIL（如 `/dev/kvm` 缺失）必须当日解决——firepaas 不可运行。审计脚本的
+  退出码仅代表 FAIL；WARN 须记录风险接受或修复计划。
 
 ## 生产实施清单（每次装机）
 

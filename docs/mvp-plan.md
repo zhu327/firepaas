@@ -37,6 +37,8 @@ OCI image → app/deployment → 多副本 Firecracker VM
 - UFFD/NBD 极致冷启动优化；
 - 支持 node-local snapshot 的跨节点恢复。
 
+（以上 v1.1 候选项的范围裁决与排期见 [v1.1-plan.md](v1.1-plan.md)；IPv6/6PN、WireGuard mesh 方向经评审拒绝，见 ADR-0016。）
+
 scale-to-zero 是**条件特性**：只有 P0 证明 standby 稳定且恢复达标后才进入 MVP；否则以 stop+cold-start 降级，不阻塞发布主线。
 
 ### 1.4 SLO 与适用范围
@@ -465,6 +467,39 @@ M3 全量代码评审发现两类 P0 与若干 P1/P2/P3，已全部修复并重�
   基础镜像要求（runbook-capacity）；4) 72h soak 以 `scripts/lab/soak-m5.sh`
   交付并后台运行（结果 results/soak-m5/summary.csv），本里程碑记录 60min 排练。
 - **多 edge/双机项**继续累积 DEFERRED-MULTI-NODE。
+
+### M5 评审修复记录（2026-08-27 第二轮，全量重跑 PASS）
+
+独立代码评审发现 P0/P1 若干并全部修复（详见上方第一轮记录的补充）：
+
+- **安全（P1）**：①审计 caller 字段此前因 context 不可变从未生效→改响应头
+  通道；②受限 key 可经 body.project_id 越权建机器/app/写 secret（同名 secret
+  版本轮换可投毒他 project）→ clampBodyProject 单一入口收口；③secrets
+  读/删的 project 取 query 且 gate 用同名任取启发式→统一 effectiveProjectID；
+  ④traffic-token 无 scope 校验（hasScope 死代码）→ routeScope 表登记 write；
+  ⑤/metrics 可选 token（FIREPAAS_METRICS_TOKEN）；Touch 节流 1min；负 TTL 拒绝。
+- **正确性（P1/P2）**：gauge label 序列残留（ResetFamily）；重投影仅 wipe 等
+  ticker→同步 kick（KickRouteRebuild + routeKicker，响应带 rebuilt_now/耗时）；
+  catalog location 死代码族删除；**create 重试上限 8 次**（坏镜像实测无限
+  recreate ~90s 节奏永续）+ 已删除机器在途 create 取消（no-candidates 下
+  PENDING↔CLAIMED 自旋实测复现）。
+- **secret_env 冲突裁决（P0 级产品决策）**：第一轮的 fail-closed 拒绝推翻了
+  M4 已验收注入能力（e2e-m4 不可重跑）。实测确认 hypeman `Env` 在
+  `StoredMetadata` 内→secret 明文持久化到 metadata.json，fail-closed 依据
+  成立；裁决为**默认拒绝 + 受信环境 opt-in**
+  （`FIREPAAS_SECRET_INJECTION=unsafe-persisted-env`，开关名自带风险声明）；
+  e2e B 段双断言（默认终态 FAILED + opt-in RUNNING）；真 one-shot 通道 v1.1
+  （需 hypeman 提供不落盘注入 API，DEFERRED-hypeman-upstream）。
+- **验收链修复**：ontime 镜像自建自推（push-ontime.sh：旧硬编码 digest 指向
+  丢失 blob；需真 gzip 层；scratch 镜像必须带 /bin/sh——hypeman-init 经
+  sh -c 启 entrypoint，实测无 sh 即 kernel panic 卡 INITIALIZING）；升级脚本
+  READY/HEALTHY 状态机错配（永远不匹配）+ 对账 90s 窗；hardening S() 点号
+  路径 bug（所有 /proc/sys 检查读空值）；e2e 预清理复位 draining；soak 改
+  digest-pinned 本地镜像；pg 备份 .rowcounts sidecar（演练对比备份时刻）；
+  prometheus 抓取端口对齐 8083 + observability README。
+- **工程**：go.mod replace 恢复（v0.3.0 tag 缺 lib/config，agent 不可编译；
+  待 hypeman 发新 tag 后移除）；redact/auth 纯函数单测补齐；全部单测+sim
+  10 万次全绿；e2e-m5 六段全绿（run12）；soak 10 轮排练 PASS 终态归零。
 
 ## 10. 依赖与分工
 

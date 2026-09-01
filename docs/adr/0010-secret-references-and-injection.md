@@ -52,3 +52,24 @@
   secret_env`(请求向,响应不回填);`env` 注释改为"仅非敏感值"。
 - architecture.md §4.2 模型增加 secrets 表;mvp-plan §11 风险表增加降级条目。
 - 审计/日志中间件需实现字段黑名单,列入 M1 工程基线或 M4 工作项。
+
+## 增补：注入通道降级为 opt-in（2026-08-27，M5 评审）
+
+**背景**：M5 评审实测确认 hypeman 的 `CreateInstanceRequest.Env` 位于
+`StoredMetadata` ——secret 值会**明文持久化到节点 `metadata.json`**，
+与"一次性下发、不落盘"的本 ADR 语义冲突。M4 交付的注入路径事实上一直
+违反该不变量（M4 验收只检查了 firepaas 自身状态文件，未覆盖 hypeman 落盘）。
+
+**决策**：
+
+1. agent 默认 **fail-closed**：携带 `secret_env` 的 create 以
+   `InvalidArgument`（终态）拒绝，错误信息指明开关。
+2. 受信节点可显式 `FIREPAAS_SECRET_INJECTION=unsafe-persisted-env`
+   opt-in 恢复 M4 注入语义（开关名自带风险声明）。
+3. e2e-m5 B 段对两种策略分别断言（默认拒绝 / opt-in RUNNING）。
+4. 真 one-shot 注入通道（不落盘：vsock setenv 或一次性 config-disk
+   明文销毁）列 v1.1，依赖 hypeman 上游 API（DEFERRED-hypeman-upstream）。
+
+**后果**：ADR 原文的"值经 mTLS+fencing 通道一次性下发"在 v1 仅对
+**默认配置**成立；opt-in 环境的操作者需自行接受节点盘明文风险
+（生产建议文件盘加密 + 节点访问控制补偿）。
