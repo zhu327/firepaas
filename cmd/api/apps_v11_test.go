@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/example/firepaas/internal/controlplane/store"
+	"github.com/zhu327/firepaas/internal/controlplane/store"
 )
 
 // v1.1（ADR-0022）：services 声明归一与校验。

@@ -29,7 +29,22 @@ func Open(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 
 // Migrate 按文件名顺序执行未应用的迁移，每个迁移一个事务。
 func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
-	if _, err := pool.Exec(ctx, `
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire migration connection: %w", err)
+	}
+	defer conn.Release()
+	// Test packages and HA processes may start together. Serialize the complete
+	// read/apply/record sequence on one session so two migrators cannot both
+	// observe a version as absent and race its DDL/ledger insert.
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock(hashtext('firepaas-schema-migrations'))`); err != nil {
+		return fmt.Errorf("lock migrations: %w", err)
+	}
+	defer func() {
+		_, _ = conn.Exec(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock(hashtext('firepaas-schema-migrations'))`)
+	}()
+
+	if _, err := conn.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			version    text PRIMARY KEY,
 			applied_at timestamptz NOT NULL DEFAULT now()
@@ -51,7 +66,7 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 
 	for _, version := range versions {
 		var exists bool
-		if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=$1)`, version).Scan(&exists); err != nil {
+		if err := conn.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=$1)`, version).Scan(&exists); err != nil {
 			return fmt.Errorf("check migration %s: %w", version, err)
 		}
 		if exists {
@@ -63,7 +78,7 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 			return fmt.Errorf("read migration %s: %w", version, err)
 		}
 
-		tx, err := pool.Begin(ctx)
+		tx, err := conn.Begin(ctx)
 		if err != nil {
 			return fmt.Errorf("begin migration %s: %w", version, err)
 		}

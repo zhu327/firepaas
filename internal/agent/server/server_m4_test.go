@@ -6,10 +6,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/example/firepaas/internal/security/redact"
-	pb "github.com/example/firepaas/shared/gen/agent/v1"
+	"github.com/zhu327/firepaas/internal/security/redact"
+	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 // M4.5：Pause/Resume 的服务端纪律——幂等重放、fencing、execution 绑定。
@@ -85,6 +86,19 @@ func TestCreateRequiresProxyCredential(t *testing.T) {
 
 // M4：secret_env / proxy_credential 不参与 request hash —— 控制面重派时
 // 重新解析引用值、现算凭证，同一 operation_id 的幂等重放不能被破坏。
+func TestSnapshotRequestHashIgnoresProxyCredential(t *testing.T) {
+	for _, pair := range [][2]proto.Message{
+		{&pb.ForkSnapshotRequest{MachineId: "m", ExecutionId: "e", Generation: 1, OperationId: "o", SnapshotId: "s", ProxyCredential: "old"},
+			&pb.ForkSnapshotRequest{MachineId: "m", ExecutionId: "e", Generation: 1, OperationId: "o", SnapshotId: "s", ProxyCredential: "new"}},
+		{&pb.RestoreSnapshotRequest{MachineId: "m", ExecutionId: "e", Generation: 1, OperationId: "o", SnapshotId: "s", ProxyCredential: "old"},
+			&pb.RestoreSnapshotRequest{MachineId: "m", ExecutionId: "e", Generation: 1, OperationId: "o", SnapshotId: "s", ProxyCredential: "new"}},
+	} {
+		if hashRequest(pair[0]) != hashRequest(pair[1]) {
+			t.Fatal("one-way snapshot credential changed idempotency hash")
+		}
+	}
+}
+
 func TestRequestHashIgnoresOneWayFields(t *testing.T) {
 	base := createReq("m-hash-1", 1, "op-hash-1")
 	a := hashRequest(base)

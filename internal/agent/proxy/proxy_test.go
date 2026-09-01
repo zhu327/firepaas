@@ -8,7 +8,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/example/firepaas/internal/agent/machine"
+	"github.com/zhu327/firepaas/internal/agent/machine"
 	"github.com/kernel/hypeman/lib/images"
 	"github.com/kernel/hypeman/lib/instances"
 )
@@ -49,6 +49,7 @@ func (*testImages) CreateImage(context.Context, images.CreateImageRequest) (*ima
 }
 func (*testImages) WaitForReady(context.Context, string) error         { return nil }
 func (*testImages) ListImages(context.Context) ([]images.Image, error) { return nil, nil }
+func (*testImages) DeleteImage(context.Context, string) error          { return nil }
 
 func proxyRequest() *http.Request {
 	r := httptest.NewRequest(http.MethodGet, "http://agent/", nil)

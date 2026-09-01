@@ -5,7 +5,7 @@ import (
 	"encoding/base64"
 	"testing"
 
-	"github.com/example/firepaas/internal/controlplane/secrets"
+	"github.com/zhu327/firepaas/internal/controlplane/secrets"
 )
 
 func mustBase64(t *testing.T) string {

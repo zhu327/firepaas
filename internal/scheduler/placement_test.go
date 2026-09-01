@@ -3,6 +3,7 @@ package scheduler
 import (
 	"errors"
 	"math/rand"
+	"strings"
 	"testing"
 )
 
@@ -45,6 +46,84 @@ func TestFilterBeforeScore(t *testing.T) {
 	}
 	if len(scored) == 0 {
 		t.Fatal("score hook never called")
+	}
+}
+
+// TestCapabilityHardFilter 覆盖 v1.2-A（ADR-0023）：启动必需能力在资源
+// 打分前硬过滤；缺能力的节点即使资源更空闲也不能被选中，且产生可解释的
+// filter_rejection 事件。
+func TestCapabilityHardFilter(t *testing.T) {
+	nodes := []Node{
+		healthyNode("no-cap", "compute", 64, 65536),
+		func() Node {
+			n := healthyNode("has-cap", "compute", 64, 65536)
+			n.FeatureIDs = map[string]bool{"secret.oneshot.v1": true}
+			return n
+		}(),
+	}
+	p := New(DefaultBestOfKConfig(), Options{})
+	pl, err := p.Place(Request{VCPU: 1, MemMib: 512, RequiredFeatures: []string{"secret.oneshot.v1"}},
+		nodes, rand.New(rand.NewSource(1)))
+	if err != nil {
+		t.Fatalf("want placement on capable node, got %v", err)
+	}
+	if pl.NodeID != "has-cap" {
+		t.Fatalf("want has-cap, got %s", pl.NodeID)
+	}
+	var sawCapReject bool
+	for _, ev := range pl.Events {
+		if ev.Kind == "filter_rejection" && ev.NodeID == "no-cap" &&
+			strings.Contains(ev.Reason, "secret.oneshot.v1") {
+			sawCapReject = true
+		}
+	}
+	if !sawCapReject {
+		t.Fatalf("want capability filter rejection event, got %+v", pl.Events)
+	}
+}
+
+// TestCapabilityNoSupportNodeFailsClosed 覆盖验收：无支持节点时返回可解释的
+// terminal reason（ErrNoCandidates + capability 事件），不静默降级。
+func TestCapabilityNoSupportNodeFailsClosed(t *testing.T) {
+	nodes := []Node{healthyNode("only", "compute", 64, 65536)}
+	p := New(DefaultBestOfKConfig(), Options{})
+	pl, err := p.Place(Request{VCPU: 1, MemMib: 512, RequiredFeatures: []string{"secret.oneshot.v1"}},
+		nodes, rand.New(rand.NewSource(1)))
+	if err == nil {
+		t.Fatal("want no candidates")
+	}
+	var nce ErrNoCandidates
+	if !errors.As(err, &nce) {
+		t.Fatalf("want ErrNoCandidates, got %T", err)
+	}
+	found := false
+	for _, ev := range pl.Events {
+		if ev.Kind == "filter_rejection" && strings.Contains(ev.Reason, "capability missing") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("want capability rejection event, got %+v", pl.Events)
+	}
+}
+
+// TestUnknownFeatureIgnored：未知 feature 不破坏旧客户端/节点（只按集合成员
+// 匹配，required 为空时完全不影响放置）。
+func TestUnknownFeatureIgnored(t *testing.T) {
+	nodes := []Node{
+		func() Node {
+			n := healthyNode("n1", "compute", 64, 65536)
+			n.FeatureIDs = map[string]bool{"future.gpu.v9": true}
+			return n
+		}(),
+	}
+	p := New(DefaultBestOfKConfig(), Options{})
+	pl, err := p.Place(Request{VCPU: 1, MemMib: 512}, nodes, rand.New(rand.NewSource(1)))
+	if err != nil {
+		t.Fatalf("unknown feature must be ignored: %v", err)
+	}
+	if pl.NodeID != "n1" {
+		t.Fatalf("want n1, got %s", pl.NodeID)
 	}
 }
 
@@ -305,6 +384,59 @@ func TestImageAffinityNilCacheTreatedAsMiss(t *testing.T) {
 	}
 }
 
+func TestPlacementAndPrefetchShareHardCandidatePolicy(t *testing.T) {
+	base := healthyNode("eligible", "compute", 8, 8192)
+	base.FeatureIDs = map[string]bool{"required": true}
+	base.DiskTotalMib = 4096
+
+	tests := []struct {
+		name string
+		node Node
+	}{
+		{name: "unhealthy", node: func() Node { n := base; n.ID = "unhealthy"; n.Status = StatusUnhealthy; return n }()},
+		{name: "draining", node: func() Node { n := base; n.ID = "draining"; n.Draining = true; return n }()},
+		{name: "pool", node: func() Node { n := base; n.ID = "pool"; n.Pool = "other"; return n }()},
+		{name: "labels", node: func() Node { n := base; n.ID = "labels"; n.Labels = map[string]string{"arch": "arm64"}; return n }()},
+		{name: "capability", node: func() Node { n := base; n.ID = "capability"; n.FeatureIDs = nil; return n }()},
+		{name: "resources", node: func() Node { n := base; n.ID = "resources"; n.MemAllocated = n.MemTotalMib; return n }()},
+		{name: "disk", node: func() Node { n := base; n.ID = "disk"; n.DiskAllocated = n.DiskTotalMib; return n }()},
+		{name: "locality", node: func() Node { n := base; n.ID = "locality"; return n }()},
+	}
+
+	p := New(DefaultBestOfKConfig(), Options{})
+	req := Request{VCPU: 1, MemMib: 512, DiskMib: 512, Pool: "compute",
+		Labels: map[string]string{"arch": "x86_64"}, RequiredFeatures: []string{"required"},
+		RequiredNodeID: "eligible"}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			nodes := []Node{tt.node, base}
+			prefetch := p.PrefetchTopK(req, nodes, len(nodes))
+			if len(prefetch) != 1 || prefetch[0].ID != "eligible" {
+				t.Fatalf("prefetch candidates = %+v, want only eligible", prefetch)
+			}
+			placement, err := p.Place(req, nodes, rand.New(rand.NewSource(1)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if placement.NodeID != "eligible" {
+				t.Fatalf("placement = %q, want eligible", placement.NodeID)
+			}
+		})
+	}
+}
+
+func TestPrefetchIgnoresPerAttemptRetryExclusions(t *testing.T) {
+	p := New(DefaultBestOfKConfig(), Options{})
+	node := healthyNode("only", "compute", 8, 8192)
+	req := Request{VCPU: 1, MemMib: 512, ExcludedNodes: map[string]bool{"only": true}}
+	if got := p.PrefetchTopK(req, []Node{node}, 1); len(got) != 1 || got[0].ID != "only" {
+		t.Fatalf("prefetch must ignore retry exclusions, got %+v", got)
+	}
+	if _, err := p.Place(req, []Node{node}, rand.New(rand.NewSource(1))); err == nil {
+		t.Fatal("placement must apply retry exclusions")
+	}
+}
+
 func TestPrefetchTopKUsesDeploymentHardCandidates(t *testing.T) {
 	busy := healthyNode("busy", "compute", 64, 65536)
 	busy.CPUAllocated = 60
@@ -323,5 +455,60 @@ func TestPrefetchTopKUsesDeploymentHardCandidates(t *testing.T) {
 	}, []Node{busy, idle, wrongPool, wrongLabel, full, occupied}, 2)
 	if len(top) != 2 || top[0].ID != "idle" || top[1].ID != "busy" {
 		t.Fatalf("prefetch candidates = %+v, want idle,busy", top)
+	}
+}
+
+func TestLocalRWLocalityWinsOverAntiAffinity(t *testing.T) {
+	p := New(DefaultBestOfKConfig(), Options{})
+	nodes := []Node{
+		{ID: "origin", Pool: "compute", Status: StatusHealthy, CPUTotal: 4, MemTotalMib: 4096, FeatureIDs: map[string]bool{"volume.local_rw.v1": true}},
+		{ID: "spread", Pool: "compute", Status: StatusHealthy, CPUTotal: 4, MemTotalMib: 4096, FeatureIDs: map[string]bool{"volume.local_rw.v1": true}},
+	}
+	pl, err := p.Place(Request{VCPU: 1, MemMib: 512, DeploymentID: "dep", AntiAffinity: true,
+		ExistingDeploymentNodes: map[string]bool{"origin": true}, RequiredNodeID: "origin",
+		RequiredFeatures: []string{"volume.local_rw.v1"}}, nodes, rand.New(rand.NewSource(1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pl.NodeID != "origin" {
+		t.Fatalf("placed on %q, want LOCAL_RW origin", pl.NodeID)
+	}
+}
+
+// v1.2-E（ADR-0035）：磁盘维度硬过滤——requested 承诺不超售；旧 agent
+// 未上报容量（DiskTotalMib==0）时跳过磁盘过滤。
+func TestDiskHardFilter(t *testing.T) {
+	nodes := []Node{
+		func() Node {
+			n := healthyNode("disk-full", "compute", 64, 65536)
+			n.DiskTotalMib = 1024
+			n.DiskAllocated = 500
+			n.DiskPending = 500
+			return n
+		}(),
+		func() Node {
+			n := healthyNode("disk-ok", "compute", 64, 65536)
+			n.DiskTotalMib = 2048
+			n.DiskAllocated = 500
+			return n
+		}(),
+		func() Node {
+			// 未上报磁盘容量的旧节点：不能因磁盘被全拒（升级期安全）。
+			n := healthyNode("disk-legacy", "compute", 64, 65536)
+			return n
+		}(),
+	}
+	p := New(DefaultBestOfKConfig(), Options{})
+	pl, err := p.Place(Request{VCPU: 1, MemMib: 512, DiskMib: 512}, nodes, rand.New(rand.NewSource(1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pl.NodeID == "disk-full" {
+		t.Fatal("disk-full (allocated+pending+req > total) must be filtered")
+	}
+	// 全部节点磁盘满 → ErrNoCandidates。
+	full := []Node{nodes[0]}
+	if _, err := p.Place(Request{VCPU: 1, MemMib: 512, DiskMib: 1000}, full, rand.New(rand.NewSource(1))); err == nil {
+		t.Fatal("disk-exceeded single node must yield ErrNoCandidates")
 	}
 }

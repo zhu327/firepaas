@@ -9,7 +9,8 @@ internal/agent/network/slot/# M3 slot 管理器：netns/veth/TAP/nftables 原子
 internal/agent/health/      # M3 host 侧 readiness 探针(ADR-0008)
 internal/agent/proxy/       # M1 起唯一流量入口，edge mTLS + execution/credential 校验
 internal/agent/info/        # 容量/用量采集(基于 hypeman lib/resources + lib/vm_metrics)
-internal/agent/state/       # agent operation ledger + 崩溃恢复缓存(非业务源真相)
+internal/agent/state/       # ledger/fence/credential 的兼容持久化机制
+internal/agent/mutation/    # typed fenced-mutation protocol（post-effect/recoverable/tombstone）
 ```
 
 设计红线:
@@ -20,6 +21,7 @@ internal/agent/state/       # agent operation ledger + 崩溃恢复缓存(非业
   hypeman pin 到具体 commit/tag(定期、有意识地升级并跑 agent 回归),go.work/replace 仅用于
   本地开发联调;CI 增加一条“禁止 replace 指向 ../ 进入发布构建”的检查,防止上游漂移打穿。
 - agent 本地 runtime metadata 只是 observed 恢复缓存，业务权威状态在 PG；Redis 仅为投影。operation ledger 是节点侧幂等权威，必须原子持久化 request hash/result 并可在重启后重放。
+- `internal/agent/mutation` 明确区分三种协议族：无 pre-effect claim 的 post-effect 操作、可从 inventory 恢复的 durable-claim 操作，以及 Exec 的 non-reattachable tombstone。它只编排 ledger/fence/serialization 原语，不用 flags 或通用 effect callback 隐藏 runtime、credential 与 recovery 的顺序。create/delete、pause/resume、snapshot create/delete/fork/restore、volume create/import/attach/detach/delete、Exec claim 与 CopyTo 均由 typed family 方法编排；server 只保留验证、gRPC error mapping、adapter effect/recovery 和 credential hook。
 - edge/catalog 不得感知 slot IP；proxy 通过内部 workload endpoint 接口解析 bridge/slot 地址。
 - proxy credential 仅由 Create 请求单向接收并保存验证材料/摘要，不进入 Machine/ListMachines/日志/operation result。
 - gRPC 端口 5108、proxy 端口 5107(与 e2b 的 5008/5007 区分,避免混部冲突)。

@@ -132,26 +132,60 @@ func tokenServer(t *testing.T, token string, fail *atomic.Bool) *httptest.Server
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"token":%q,"execution_id":"e1"}`, token)
+		fmt.Fprintf(w, `{"token":%q,"execution_id":"exec-1"}`, token)
 	}))
 	t.Cleanup(srv.Close)
 	return srv
 }
 
-// P1-2：缓存按 (machine, execution) 命中——换代后旧 execution 不命中，
-// 必须回源拿新 token；旧 execution 的条目不受影响。
-func TestTokenClientExecutionBinding(t *testing.T) {
-	srv := tokenServer(t, "tok-1", nil)
+func TestTokenClientRejectsExecutionMismatchAndRetriesFetch(t *testing.T) {
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n := hits.Add(1)
+		execution := "wrong-execution"
+		if n > 1 {
+			execution = "exec-1"
+		}
+		fmt.Fprintf(w, `{"token":"tok-%d","execution_id":%q}`, n, execution)
+	}))
+	defer srv.Close()
 	tc := NewTokenClient(srv.URL, "bearer", 30*time.Second)
 	ctx := context.Background()
 
-	tok, err := tc.Get(ctx, "m1", "exec-1")
-	if err != nil || tok != "tok-1" {
-		t.Fatalf("get: %v %q", err, tok)
+	if tok, err := tc.Get(ctx, "m1", "exec-1"); !errors.Is(err, errTokenExecutionMismatch) || tok != "" {
+		t.Fatalf("mismatch: token=%q err=%v", tok, err)
 	}
-	// 不同 execution（新代）必须回源（不命中 exec-1 的缓存）。
-	if _, err := tc.Get(ctx, "m1", "exec-2"); err != nil {
-		t.Fatalf("exec-2 get: %v", err)
+	if tok, err := tc.Get(ctx, "m1", "exec-1"); err != nil || tok != "tok-2" {
+		t.Fatalf("retry: token=%q err=%v", tok, err)
+	}
+	if tok, err := tc.Get(ctx, "m1", "exec-1"); err != nil || tok != "tok-2" {
+		t.Fatalf("cache: token=%q err=%v", tok, err)
+	}
+	if got := hits.Load(); got != 2 {
+		t.Fatalf("mismatch was cached or valid token was not cached: hits=%d", got)
+	}
+}
+
+func TestTokenClientMismatchDoesNotServeStale(t *testing.T) {
+	var mismatch atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		execution := "exec-1"
+		if mismatch.Load() {
+			execution = "exec-2"
+		}
+		fmt.Fprintf(w, `{"token":"tok","execution_id":%q}`, execution)
+	}))
+	defer srv.Close()
+	tc := NewTokenClient(srv.URL, "bearer", 30*time.Second)
+	now := time.Now()
+	tc.nowFn = func() time.Time { return now }
+	if _, err := tc.Get(context.Background(), "m1", "exec-1"); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(31 * time.Second)
+	mismatch.Store(true)
+	if tok, err := tc.Get(context.Background(), "m1", "exec-1"); !errors.Is(err, errTokenExecutionMismatch) || tok != "" {
+		t.Fatalf("mismatch served stale token: token=%q err=%v", tok, err)
 	}
 }
 
@@ -194,7 +228,7 @@ func TestTokenClientInvalidate(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"token":"tok","execution_id":"e1"}`)
+		fmt.Fprintf(w, `{"token":"tok","execution_id":"exec-1"}`)
 	}))
 	defer srv.Close()
 	tc := NewTokenClient(srv.URL, "bearer", 30*time.Second)
@@ -232,7 +266,7 @@ func TestTokenClientConcurrentSingleFlight(t *testing.T) {
 		default:
 		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"token":"tok","execution_id":"e1"}`)
+		fmt.Fprintf(w, `{"token":"tok","execution_id":"exec-1"}`)
 	}))
 	defer srv.Close()
 	close(release)

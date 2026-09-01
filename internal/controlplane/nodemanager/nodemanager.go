@@ -17,9 +17,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/example/firepaas/internal/controlplane/agentclient"
-	"github.com/example/firepaas/internal/controlplane/store"
-	pb "github.com/example/firepaas/shared/gen/agent/v1"
+	"github.com/zhu327/firepaas/internal/capabilities"
+	"github.com/zhu327/firepaas/internal/controlplane/agentclient"
+	"github.com/zhu327/firepaas/internal/controlplane/store"
+	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 )
 
 // Node 是 nodemanager 维护的节点视图（含最近一次 ServiceInfo）。
@@ -35,6 +36,9 @@ type Node struct {
 	ProxyAddr   string
 	Info        *pb.ServiceInfoResponse // 可为 nil（从未成功）
 	LastSeen    time.Time
+	// capabilitySig（v1.2-A，ADR-0023）：上一次已记录日志的能力签名
+	//（protocol|features|snapshot key）；变化时记一条可审计日志。
+	capabilitySig string
 }
 
 // NomadNodeStub 是 /v1/nodes 返回条目的最小字段集。
@@ -46,6 +50,7 @@ type NomadNodeStub struct {
 	SchedulingEligibility string `json:"SchedulingEligibility"`
 	Drain                 bool   `json:"Drain"`
 	HTTPAddr              string `json:"HTTPAddr"`
+	Address               string `json:"Address"` // Nomad 2.x /v1/nodes advertises the client IP here.
 }
 
 // NomadAllocStub 是 /v1/job/{job}/allocations 返回条目的最小字段集。
@@ -107,26 +112,45 @@ func New(cfg Config) (*Manager, error) {
 	return m, nil
 }
 
-// Run 周期执行发现与 ServiceInfo 同步，直到 ctx 取消。
+// Run 周期执行发现与 ServiceInfo 同步，直到 ctx 取消。保留给单写者调用；
+// 多 API 副本应分别使用 RunDiscovery（每副本）和 RunServiceInfo（仅 leader）。
 func (m *Manager) Run(ctx context.Context) error {
-	discover := time.NewTicker(m.cfg.DiscoverEvery)
-	info := time.NewTicker(m.cfg.InfoEvery)
-	defer discover.Stop()
-	defer info.Stop()
+	errCh := make(chan error, 2)
+	go func() { errCh <- m.RunDiscovery(ctx) }()
+	go func() { errCh <- m.RunServiceInfo(ctx) }()
+	return <-errCh
+}
 
-	// 启动即同步一次，缩短冷启动窗口。
+// RunDiscovery 只维护 Nomad 节点快照与 agent 连接池，不调用 ServiceInfo，
+// 也不写 PG。它可安全地在每个 API 副本运行，为 runtime logs/exec/cp 提供
+// 本地 agent client；controller 是否为 leader 与该只读发现生命周期无关。
+func (m *Manager) RunDiscovery(ctx context.Context) error {
+	ticker := time.NewTicker(m.cfg.DiscoverEvery)
+	defer ticker.Stop()
 	_ = m.Discover(ctx)
-	_ = m.SyncServiceInfo(ctx)
-
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-discover.C:
+		case <-ticker.C:
 			if err := m.Discover(ctx); err != nil {
 				slog.Error("nodemanager discover", "error", err)
 			}
-		case <-info.C:
+		}
+	}
+}
+
+// RunServiceInfo 拉取 agent observed 信息并写 PG nodes 投影。该循环必须只由
+// 当前 leader 运行，避免多个 nodemanager 并发覆盖 observed projection。
+func (m *Manager) RunServiceInfo(ctx context.Context) error {
+	ticker := time.NewTicker(m.cfg.InfoEvery)
+	defer ticker.Stop()
+	_ = m.SyncServiceInfo(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
 			if err := m.SyncServiceInfo(ctx); err != nil {
 				slog.Error("nodemanager service info sync", "error", err)
 			}
@@ -187,11 +211,11 @@ func (m *Manager) Discover(ctx context.Context) error {
 		alloc := bestAlloc[nomadID]
 		if alloc != nil {
 			grpcPort, proxyPort := allocPorts(alloc)
-			host := hostOf(stub.HTTPAddr)
-			if grpcPort > 0 {
+			host, ok := nodeHost(stub)
+			if ok && grpcPort > 0 {
 				n.GRPCAddr = net.JoinHostPort(host, fmt.Sprintf("%d", grpcPort))
 			}
-			if proxyPort > 0 {
+			if ok && proxyPort > 0 {
 				n.ProxyAddr = net.JoinHostPort(host, fmt.Sprintf("%d", proxyPort))
 			}
 		}
@@ -259,6 +283,15 @@ func (m *Manager) SyncServiceInfo(ctx context.Context) error {
 			cur.Info = info
 			cur.LastSeen = time.Now()
 			cur.Status = combinedStatus(cur, info)
+			// v1.2-A（ADR-0023）：能力变化（含 agent 重启后的恢复）记审计日志。
+			if sig := capabilitySignature(info); sig != cur.capabilitySig {
+				slog.Info("node capability projection changed",
+					"node", cur.NomadNodeID, "agent_node_id", info.NodeId,
+					"protocol_version", info.ProtocolVersion,
+					"snapshot_compatibility_key", info.SnapshotCompatibilityKey,
+					"feature_ids", info.FeatureIds, "previous", cur.capabilitySig)
+				cur.capabilitySig = sig
+			}
 		} else {
 			cur.Status = unknownStatus(cur)
 		}
@@ -289,6 +322,57 @@ func (m *Manager) ClientFor(nomadNodeID string) *agentclient.Client {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.conns[nomadNodeID]
+}
+
+// ClientForNodeID 同时接受 agent node ID 和 Nomad node ID。它只读本副本的
+// discovery 快照，不访问或写入 PG。
+func (m *Manager) ClientForNodeID(nodeID string) *agentclient.Client {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for nomadID, n := range m.nodes {
+		if nomadID == nodeID || agentNodeID(n) == nodeID {
+			return m.conns[nomadID]
+		}
+	}
+	return nil
+}
+
+// AgentRuntimeForMachine 为 API runtime 通道解析 machine 所在 agent 与能力。
+// machine/node projection 仅从 PG 读取，连接来自本副本的只读 discovery；因此
+// follower 可直接服务请求，且不会参与 leader-only observed 同步。
+func (m *Manager) AgentRuntimeForMachine(ctx context.Context, machineID string) (*agentclient.Client, map[string]bool, error) {
+	if m.cfg.Store == nil {
+		return nil, nil, fmt.Errorf("node resolver store not configured")
+	}
+	machine, err := m.cfg.Store.GetMachine(ctx, machineID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if machine == nil {
+		return nil, nil, fmt.Errorf("machine %s not found", machineID)
+	}
+	nodes, err := m.cfg.Store.ListNodes(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	// machines.node_id 通常保存 agent node ID，而 follower 不调用 ServiceInfo，
+	// 因此用 leader 写入的 PG node projection 映射回 Nomad ID，再查本地连接池。
+	lookupID := machine.NodeID
+	var features map[string]bool
+	for i := range nodes {
+		if nodes[i].ID == machine.NodeID || nodes[i].NomadNodeID == machine.NodeID {
+			if nodes[i].NomadNodeID != "" {
+				lookupID = nodes[i].NomadNodeID
+			}
+			features = capabilities.SetOf(nodes[i].FeatureIDs)
+			break
+		}
+	}
+	client := m.ClientForNodeID(lookupID)
+	if client == nil {
+		return nil, nil, fmt.Errorf("no agent client for machine %s (node %s)", machineID, machine.NodeID)
+	}
+	return client, features, nil
 }
 
 // Close 关闭全部连接。
@@ -407,6 +491,11 @@ func (m *Manager) upsertPG(ctx context.Context, n *Node) error {
 		if len(info.CachedImageDigests) > 0 {
 			row.ImageCache = info.CachedImageDigests
 		}
+		// v1.2-A（ADR-0023）：能力投影随 ServiceInfo 同步落库。未知 feature
+		// 原样保留（审计可解释），调度过滤只看集合成员关系。
+		row.ProtocolVersion = info.ProtocolVersion
+		row.FeatureIDs = info.FeatureIds
+		row.SnapshotCompatibilityKey = info.SnapshotCompatibilityKey
 	}
 	return m.cfg.Store.UpsertNode(ctx, row)
 }
@@ -416,6 +505,14 @@ func agentNodeID(n *Node) string {
 		return n.Info.NodeId
 	}
 	return n.NomadNodeID
+}
+
+// capabilitySignature 是能力投影的紧凑签名（变化检测/审计日志用）。
+func capabilitySignature(info *pb.ServiceInfoResponse) string {
+	if info == nil {
+		return ""
+	}
+	return fmt.Sprintf("%s|%s|%v", info.ProtocolVersion, info.SnapshotCompatibilityKey, info.FeatureIds)
 }
 
 // nomadStatus 根据 Nomad 节点状态计算状态机初值。
@@ -475,13 +572,20 @@ func allocPorts(a *NomadAllocStub) (grpc, proxy int) {
 	return grpc, proxy
 }
 
-func hostOf(addr string) string {
-	if u, err := url.Parse("//" + addr); err == nil && u.Hostname() != "" {
-		return u.Hostname()
+func nodeHost(stub *NomadNodeStub) (string, bool) {
+	// Nomad's node list exposes the advertised client IP in Address. Prefer it
+	// over HTTPAddr so a server-local HTTP endpoint cannot misroute agent RPCs.
+	if ip := net.ParseIP(stub.Address); ip != nil && !ip.IsLoopback() && !ip.IsUnspecified() {
+		return ip.String(), true
 	}
-	host, _, err := net.SplitHostPort(addr)
-	if err == nil {
-		return host
+	if u, err := url.Parse("//" + stub.HTTPAddr); err == nil {
+		host := u.Hostname()
+		if ip := net.ParseIP(host); ip != nil && !ip.IsLoopback() && !ip.IsUnspecified() {
+			return ip.String(), true
+		}
+		if host != "" && host != "localhost" {
+			return host, true
+		}
 	}
-	return "127.0.0.1"
+	return "", false
 }

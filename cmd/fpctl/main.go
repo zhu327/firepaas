@@ -28,6 +28,10 @@ import (
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
+		var ex exitError
+		if errors.As(err, &ex) {
+			os.Exit(ex.code)
+		}
 		fmt.Fprintln(os.Stderr, "fpctl:", err)
 		os.Exit(1)
 	}
@@ -35,7 +39,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) < 1 {
-		return errors.New("usage: fpctl app <create|list|status|deploy|scale|rollback|delete> ...")
+		return errors.New("usage: fpctl app/secrets/apikey/ops/images/logs/exec/cp <...>")
 	}
 	switch args[0] {
 	case "app":
@@ -46,6 +50,10 @@ func run(args []string) error {
 		return runAPIKey(args[1:])
 	case "ops":
 		return runOps(args[1:])
+	case "images":
+		return runImages(args[1:])
+	case "logs", "exec", "cp":
+		return runRuntime(args)
 	default:
 		return fmt.Errorf("unknown command %q (see fpctl secrets / fpctl app)", args[0])
 	}

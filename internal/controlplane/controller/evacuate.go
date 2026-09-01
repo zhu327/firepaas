@@ -12,8 +12,8 @@ import (
 	"sort"
 	"time"
 
-	"github.com/example/firepaas/internal/controlplane/store"
-	"github.com/example/firepaas/shared/pkg/id"
+	"github.com/zhu327/firepaas/internal/controlplane/store"
+	"github.com/zhu327/firepaas/shared/pkg/id"
 )
 
 func (c *Controller) reconcileEvacuations(ctx context.Context) error {
@@ -63,6 +63,13 @@ func (c *Controller) reconcileEvacuateNode(ctx context.Context, node *store.Node
 	})
 	for i := range machines {
 		m := machines[i]
+		if attached, err := c.store.MachineHasLocalRWAttachment(ctx, m.ID); err != nil {
+			return err
+		} else if attached {
+			c.recordEvent(ctx, "evacuate_skip", m.ID, "", node.ID,
+				"LOCAL_RW attachment pins machine to origin node; explicit detach required", nil)
+			continue
+		}
 		rl, err := c.store.ActiveRolloutForApp(ctx, m.AppID)
 		if err != nil {
 			// A failed active-rollout lookup must never race a rollout.
@@ -95,6 +102,13 @@ func (c *Controller) reconcileEvacuationStep(ctx context.Context, node *store.No
 	// The source row may have disappeared through an unrelated app delete.
 	if m == nil || m.DesiredState == "DELETED" {
 		return c.store.ClearEvacuationStep(ctx, node.ID, node.EvacuationMachineID)
+	}
+	if attached, err := c.store.MachineHasLocalRWAttachment(ctx, m.ID); err != nil {
+		return err
+	} else if attached {
+		c.recordEvent(ctx, "evacuate_skip", m.ID, "", node.ID,
+			"LOCAL_RW attachment appeared during evacuation; holding step", nil)
+		return nil
 	}
 	if m.NodeID != node.ID && c.evacuationReplacementRouteReady(*m) {
 		// buildRoutes runs before evacuation on each sync and derives eligibility
@@ -129,6 +143,14 @@ func (c *Controller) reconcileEvacuationStep(ctx context.Context, node *store.No
 	exec := m.CurrentExecutionID
 	if exec == "" {
 		return nil
+	}
+	if m.ObservedState == "STOPPED" {
+		// A stopped source still occupies the agent identity. Persist a fenced
+		// reap first; the next evacuation pass advances the execution only after
+		// that operation has completed.
+		return c.enqueueDelete(ctx, m.ID, exec, m.Generation,
+			evacuationDeleteOperationID(m.ID, exec), node.ID,
+			"evacuation source stopped; reap before replacement")
 	}
 	if err := c.store.ResetMachineForRecreate(ctx, m.ID, "exec-evac-"+id.New(), m.Generation+1); err != nil {
 		return fmt.Errorf("fence evacuation replacement: %w", err)

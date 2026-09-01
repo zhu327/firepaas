@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/firepaas/internal/controlplane/db"
+	"github.com/zhu327/firepaas/internal/controlplane/db"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 

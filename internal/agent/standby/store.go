@@ -23,7 +23,7 @@ import (
 	"github.com/kernel/hypeman/lib/autostandby"
 	"github.com/kernel/hypeman/lib/instances"
 
-	"github.com/example/firepaas/internal/agent/probeflow"
+	"github.com/zhu327/firepaas/internal/agent/probeflow"
 )
 
 // runtimeManager 是 hypeman 实例管理器上 auto-standby runtime 持久化的能力

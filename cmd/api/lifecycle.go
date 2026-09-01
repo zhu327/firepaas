@@ -33,6 +33,16 @@ func (a *API) enqueueLifecycle(w http.ResponseWriter, r *http.Request, kind stri
 		writeErr(w, 409, "machine has no active execution")
 		return
 	}
+	// v1.2-B（ADR-0024 §9）：接收过 secret 的 execution 禁止 memory snapshot
+	//（standby/pause 会快照 guest RAM，含 secret tmpfs）。agent 侧同样拒绝
+	//（双保险，防 PG 滞后）。
+	if kind == "pause" {
+		if hasSecret, err := a.store.MachineHasActiveSecretDelivery(r.Context(),
+			m.ID, m.CurrentExecutionID); err == nil && hasSecret {
+			writeErr(w, 409, "machine received one-shot secrets; pause/standby forbidden for this execution (ADR-0024)")
+			return
+		}
+	}
 	project, err := a.store.ProjectForApp(r.Context(), m.AppID)
 	if err != nil || project == "" {
 		project = "dev"

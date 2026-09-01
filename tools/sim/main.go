@@ -17,18 +17,21 @@ import (
 	"log"
 	"math/rand"
 
-	"github.com/example/firepaas/internal/scheduler"
+	agentv1 "github.com/zhu327/firepaas/internal/contracts/agentv1"
+	"github.com/zhu327/firepaas/internal/scheduler"
 )
 
 type simNode struct {
 	node       scheduler.Node
 	allocVCPU  uint64
 	allocMem   uint64
-	lostUntil  int64 // 失联到该迭代为止（0 = 未失联）
+	allocDisk  uint64 // v1.2-E：磁盘承诺记账（与调度器硬过滤同语义）
+	lostUntil  int64  // 失联到该迭代为止（0 = 未失联）
 	placements int
 }
 
 type placedMachine struct {
+	disk            uint64 // v1.2-E
 	id, nodeID, dep string
 	vcpu, mem       uint64
 }
@@ -96,10 +99,11 @@ func run(n int, seed int64) error {
 		}
 
 		req := scheduler.Request{
-			VCPU:   uint64(1 + rnd.Intn(4)),
-			MemMib: uint64(512 * (1 + rnd.Intn(8))),
-			Pool:   "compute",
-			Labels: map[string]string{"arch": "x86_64"},
+			VCPU:    uint64(1 + rnd.Intn(4)),
+			MemMib:  uint64(512 * (1 + rnd.Intn(8))),
+			DiskMib: uint64(agentv1.DefaultDiskMib + 1024*rnd.Intn(16)), // v1.2-E：磁盘维度
+			Pool:    "compute",
+			Labels:  map[string]string{"arch": "x86_64"},
 		}
 		if rnd.Intn(10) < 8 {
 			req.DeploymentID = fmt.Sprintf("dep-%02d", rnd.Intn(30))
@@ -116,6 +120,7 @@ func run(n int, seed int64) error {
 			n := sn.node
 			n.CPUAllocated = sn.allocVCPU
 			n.MemAllocated = sn.allocMem
+			n.DiskAllocated = sn.allocDisk
 			if sn.lostUntil > 0 && int64(i) < sn.lostUntil {
 				n.Status = scheduler.StatusUnhealthy
 				excludedByLoss[n.ID] = true
@@ -147,7 +152,7 @@ func run(n int, seed int64) error {
 						v.Pool == req.Pool &&
 						labelsMatch(v.Labels, req.Labels) &&
 						!req.ExistingDeploymentNodes[v.ID] &&
-						canFitNode(v, req.VCPU, req.MemMib) {
+						canFitNode(v, req.VCPU, req.MemMib, req.DiskMib) {
 						outside++
 					}
 				}
@@ -178,6 +183,7 @@ func run(n int, seed int64) error {
 		chosen := findByID(nodes, pl.NodeID)
 		chosen.allocVCPU += req.VCPU
 		chosen.allocMem += req.MemMib
+		chosen.allocDisk += req.DiskMib
 		chosen.placements++
 		if float64(chosen.allocVCPU) > float64(chosen.node.CPUTotal)*4 {
 			return fmt.Errorf("iter %d: node %s cpu overcommit %d > 4x%d", i, chosen.node.ID, chosen.allocVCPU, chosen.node.CPUTotal)
@@ -185,10 +191,13 @@ func run(n int, seed int64) error {
 		if chosen.allocMem > chosen.node.MemTotalMib {
 			return fmt.Errorf("iter %d: node %s mem overcommit %d > %d", i, chosen.node.ID, chosen.allocMem, chosen.node.MemTotalMib)
 		}
+		if chosen.allocDisk > chosen.node.DiskTotalMib {
+			return fmt.Errorf("iter %d: node %s disk overcommit %d > %d", i, chosen.node.ID, chosen.allocDisk, chosen.node.DiskTotalMib)
+		}
 		if _, dup := live[machineID]; dup {
 			return fmt.Errorf("iter %d: duplicate machine id %s", i, machineID)
 		}
-		live[machineID] = placedMachine{id: machineID, nodeID: chosen.node.ID, dep: req.DeploymentID, vcpu: req.VCPU, mem: req.MemMib}
+		live[machineID] = placedMachine{id: machineID, nodeID: chosen.node.ID, dep: req.DeploymentID, vcpu: req.VCPU, mem: req.MemMib, disk: req.DiskMib}
 		if req.DeploymentID != "" {
 			deployments[req.DeploymentID][chosen.node.ID]++
 		}
@@ -212,6 +221,7 @@ func releaseNode(nodes []*simNode, m placedMachine) {
 			}
 			if sn.allocMem >= m.mem {
 				sn.allocMem -= m.mem
+				sn.allocDisk -= m.disk
 			}
 			return
 		}
@@ -231,11 +241,14 @@ func mk(id, pool string, cpu, memMiB uint64) *simNode {
 	return &simNode{node: scheduler.Node{
 		ID: id, Pool: pool, Labels: map[string]string{"arch": "x86_64"},
 		Status: scheduler.StatusHealthy, CPUTotal: cpu, MemTotalMib: memMiB,
+		DiskTotalMib: 1024 * 1024, // v1.2-E：1TiB/节点（磁盘维度进硬过滤）
 	}}
 }
 
-func canFitNode(n scheduler.Node, vcpu, mem uint64) bool {
-	return float64(n.CPUAllocated+vcpu) <= float64(n.CPUTotal)*4 && n.MemAllocated+mem <= n.MemTotalMib
+func canFitNode(n scheduler.Node, vcpu, mem, disk uint64) bool {
+	return float64(n.CPUAllocated+vcpu) <= float64(n.CPUTotal)*4 &&
+		n.MemAllocated+mem <= n.MemTotalMib &&
+		(n.DiskTotalMib == 0 || n.DiskAllocated+disk <= n.DiskTotalMib)
 }
 
 func labelsMatch(nodeLabels, want map[string]string) bool {
@@ -263,7 +276,7 @@ func checkPassed(n scheduler.Node, req scheduler.Request, lost map[string]bool) 
 			return fmt.Errorf("label %s=%s mismatch", k, v)
 		}
 	}
-	if !canFitNode(n, req.VCPU, req.MemMib) {
+	if !canFitNode(n, req.VCPU, req.MemMib, req.DiskMib) {
 		return fmt.Errorf("resource filter violated")
 	}
 	return nil

@@ -3,10 +3,22 @@ package agentv1
 import (
 	"testing"
 
-	pb "github.com/example/firepaas/shared/gen/agent/v1"
+	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
 )
+
+func TestValidateEgressPolicyRejectsIPv6(t *testing.T) {
+	for _, spec := range []*pb.EgressPolicySpec{
+		{Mode: pb.EgressPolicySpec_ALLOWLIST, PolicyGeneration: 1, AllowedCidrs: []string{"2001:db8::/32"}},
+		{Mode: pb.EgressPolicySpec_UNRESTRICTED, PolicyGeneration: 1, DeniedCidrs: []string{"::1/128"}},
+		{Mode: pb.EgressPolicySpec_ALLOWLIST, PolicyGeneration: 1, AllowedDomains: []string{"2001:db8::1"}},
+	} {
+		if err := ValidateEgressPolicy(spec); err == nil {
+			t.Fatalf("IPv6 policy must be rejected: %+v", spec)
+		}
+	}
+}
 
 func descriptor(t *testing.T, name protoreflect.FullName) protoreflect.MessageDescriptor {
 	t.Helper()
@@ -112,6 +124,11 @@ func TestNoSensitiveFieldsOnEchoMessages(t *testing.T) {
 			t.Errorf("CreateMachineRequest must keep one-way field %q", name)
 		}
 	}
+	for _, message := range []string{"firepaas.agent.v1.ForkSnapshotRequest", "firepaas.agent.v1.RestoreSnapshotRequest"} {
+		if _, ok := fieldNames(descriptor(t, protoreflect.FullName(message)))["proxy_credential"]; !ok {
+			t.Errorf("%s must keep one-way field proxy_credential", message)
+		}
+	}
 }
 
 // TestMachineReadinessFrozen 校验 readiness 四值语义（ADR-0008/ADR-0013）。
@@ -205,6 +222,24 @@ func TestValidateMachineSpecForCreate(t *testing.T) {
 	}
 	if err := ValidateMachineSpecForCreate(&pb.MachineSpec{ProjectId: "p"}); err == nil {
 		t.Fatal("expected error for incomplete spec")
+	}
+}
+
+func TestLocalIntegrityContractsFailClosed(t *testing.T) {
+	if err := ValidateScrubSnapshotRequest(&pb.ScrubSnapshotRequest{SnapshotId: "s", ExpectedRevision: "sha256:x"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateScrubSnapshotRequest(&pb.ScrubSnapshotRequest{SnapshotId: "s"}); err == nil {
+		t.Fatal("scrub without revision must fail")
+	}
+	if err := ValidateQuarantineImageRequest(&pb.QuarantineImageRequest{ImageRef: "repo@sha256:x", ClaimId: "c", OperationId: "op", ExpectedRevision: "sha256:x"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateQuarantineVolumeRequest(&pb.QuarantineVolumeRequest{VolumeId: "v", ClaimId: "c", OperationId: "op", ExpectedRevision: "r", Mode: "LOCAL_RW", Rebuildable: true}); err == nil {
+		t.Fatal("LOCAL_RW quarantine must fail")
+	}
+	if err := ValidateQuarantineVolumeRequest(&pb.QuarantineVolumeRequest{VolumeId: "v", ClaimId: "c", OperationId: "op", ExpectedRevision: "r", Mode: "DATASET_RO", Rebuildable: false}); err == nil {
+		t.Fatal("non-rebuildable dataset quarantine must fail")
 	}
 }
 

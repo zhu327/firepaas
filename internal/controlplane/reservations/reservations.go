@@ -3,9 +3,12 @@
 //
 // 键布局：
 //
-//	resv:node:{node_id}    hash{pending_vcpu, pending_mem_mib} 在途承诺
-//	resv:project:{project} hash{pending_vcpu, pending_mem_mib} 项目在途承诺
-//	resv:op:{operation_id} 预约记录（TTL，含 node/project/vcpu/mem）
+//	resv:node:{node_id}    hash{pending_vcpu, pending_mem_mib, pending_disk_mib} 在途承诺
+//	resv:project:{project} hash{pending_vcpu, pending_mem_mib, pending_disk_mib} 项目在途承诺
+//	resv:op:{operation_id} 预约记录（TTL，含 node/project/vcpu/mem/disk）
+//
+// v1.2-E（ADR-0035）：磁盘维度进预约（不超售）。旧记录（无 disk_mib 字段）
+// 按 0 重放/释放，升级期安全。
 //
 // 生命周期：Acquire（原子 Lua，幂等）→ 派发 agent → Commit/Fail（释放
 // pending）。TTL 过期由 rebuildLeases 兜底：PruneStaleOps 清非活跃 op 键，
@@ -36,6 +39,8 @@ type Record struct {
 	ProjectID string `json:"project_id"`
 	VCPU      int64  `json:"vcpu"`
 	MemMib    int64  `json:"mem_mib"`
+	DiskMib   int64  `json:"disk_mib"` // v1.2-E；旧记录缺省 0
+	Machines  int64  `json:"machines"` // project machine-concurrency 在途承诺
 }
 
 // Manager 封装预约脚本。
@@ -68,6 +73,12 @@ local project_mem_quota = tonumber(ARGV[6])
 local ttl = tonumber(ARGV[7])
 local node_id = ARGV[8]
 local project_id = ARGV[9]
+-- v1.2-E（ADR-0035）：磁盘维度（ARGV 10-12 追加，兼容旧调用方省略）。
+local disk = tonumber(ARGV[10] or '0')
+local node_disk_total = tonumber(ARGV[11] or '0')
+local project_disk_quota = tonumber(ARGV[12] or '0')
+local machines = tonumber(ARGV[13] or '0')
+local project_machine_quota = tonumber(ARGV[14] or '0')
 
 -- 幂等（P3-1）：同 opID 同参数的重复 Acquire 直接成功，不双计 pending。
 -- 若重试换了节点（旧 Release 失败的残留），先从旧 hash 扣回再走全流程。
@@ -75,34 +86,52 @@ local raw = redis.call('GET', op_key)
 if raw then
   local ok, prev = pcall(cjson.decode, raw)
   if ok and prev.node_id == node_id and prev.project_id == project_id
-      and tonumber(prev.vcpu) == vcpu and tonumber(prev.mem_mib) == mem then
+      and tonumber(prev.vcpu) == vcpu and tonumber(prev.mem_mib) == mem
+      and tonumber(prev.disk_mib or 0) == disk
+      and tonumber(prev.machines or 0) == machines then
     return 1
   end
   if ok then
-    redis.call('HINCRBY', 'resv:node:' .. prev.node_id, 'pending_vcpu', -tonumber(prev.vcpu))
-    redis.call('HINCRBY', 'resv:node:' .. prev.node_id, 'pending_mem_mib', -tonumber(prev.mem_mib))
-    redis.call('HINCRBY', 'resv:project:' .. prev.project_id, 'pending_vcpu', -tonumber(prev.vcpu))
-    redis.call('HINCRBY', 'resv:project:' .. prev.project_id, 'pending_mem_mib', -tonumber(prev.mem_mib))
+    local pv = tonumber(prev.vcpu)
+    local pm = tonumber(prev.mem_mib)
+    local pd = tonumber(prev.disk_mib or 0)
+    local pc = tonumber(prev.machines or 0)
+    redis.call('HINCRBY', 'resv:node:' .. prev.node_id, 'pending_vcpu', -pv)
+    redis.call('HINCRBY', 'resv:node:' .. prev.node_id, 'pending_mem_mib', -pm)
+    redis.call('HINCRBY', 'resv:node:' .. prev.node_id, 'pending_disk_mib', -pd)
+    redis.call('HINCRBY', 'resv:project:' .. prev.project_id, 'pending_vcpu', -pv)
+    redis.call('HINCRBY', 'resv:project:' .. prev.project_id, 'pending_mem_mib', -pm)
+    redis.call('HINCRBY', 'resv:project:' .. prev.project_id, 'pending_disk_mib', -pd)
+    redis.call('HINCRBY', 'resv:project:' .. prev.project_id, 'pending_machines', -pc)
     redis.call('DEL', op_key)
   end
 end
 
 local pending_vcpu = tonumber(redis.call('HGET', node_key, 'pending_vcpu') or '0')
 local pending_mem = tonumber(redis.call('HGET', node_key, 'pending_mem_mib') or '0')
--- 节点侧硬上限（与 scheduler 同一语义的保守双保险；CPU 超售 R=4，内存不超售）。
+local pending_disk = tonumber(redis.call('HGET', node_key, 'pending_disk_mib') or '0')
+-- 节点侧硬上限（与 scheduler 同一语义的保守双保险；CPU 超售 R=4，内存/磁盘不超售）。
 if pending_vcpu + vcpu > node_vcpu_total * 4 then return -3 end
 if pending_mem + mem > node_mem_total then return -4 end
+if node_disk_total > 0 and pending_disk + disk > node_disk_total then return -5 end
 
 local proj_vcpu = tonumber(redis.call('HGET', project_key, 'pending_vcpu') or '0')
 local proj_mem = tonumber(redis.call('HGET', project_key, 'pending_mem_mib') or '0')
+local proj_disk = tonumber(redis.call('HGET', project_key, 'pending_disk_mib') or '0')
+local proj_machines = tonumber(redis.call('HGET', project_key, 'pending_machines') or '0')
 if proj_vcpu + vcpu > project_vcpu_quota then return -1 end
 if proj_mem + mem > project_mem_quota then return -2 end
+if project_disk_quota > 0 and proj_disk + disk > project_disk_quota then return -6 end
+if project_machine_quota > 0 and proj_machines + machines > project_machine_quota then return -7 end
 
-local data = {node_id=node_id, project_id=project_id, vcpu=vcpu, mem_mib=mem}
+local data = {node_id=node_id, project_id=project_id, vcpu=vcpu, mem_mib=mem, disk_mib=disk, machines=machines}
 redis.call('HINCRBY', node_key, 'pending_vcpu', vcpu)
 redis.call('HINCRBY', node_key, 'pending_mem_mib', mem)
+redis.call('HINCRBY', node_key, 'pending_disk_mib', disk)
 redis.call('HINCRBY', project_key, 'pending_vcpu', vcpu)
 redis.call('HINCRBY', project_key, 'pending_mem_mib', mem)
+redis.call('HINCRBY', project_key, 'pending_disk_mib', disk)
+redis.call('HINCRBY', project_key, 'pending_machines', machines)
 redis.call('SET', op_key, cjson.encode(data), 'EX', ttl)
 return 1`),
 		release: redis.NewScript(`
@@ -115,8 +144,11 @@ local ok, data = pcall(cjson.decode, raw)
 if not ok then redis.call('DEL', op_key) return 1 end
 redis.call('HINCRBY', node_key, 'pending_vcpu', -data.vcpu)
 redis.call('HINCRBY', node_key, 'pending_mem_mib', -data.mem_mib)
+redis.call('HINCRBY', node_key, 'pending_disk_mib', -(tonumber(data.disk_mib or 0)))
 redis.call('HINCRBY', project_key, 'pending_vcpu', -data.vcpu)
 redis.call('HINCRBY', project_key, 'pending_mem_mib', -data.mem_mib)
+redis.call('HINCRBY', project_key, 'pending_disk_mib', -(tonumber(data.disk_mib or 0)))
+redis.call('HINCRBY', project_key, 'pending_machines', -(tonumber(data.machines or 0)))
 redis.call('DEL', op_key)
 return 1`),
 		reset: redis.NewScript(`
@@ -135,10 +167,15 @@ for i, k in ipairs(ops) do
   if raw then
     local ok, d = pcall(cjson.decode, raw)
     if ok and d.node_id and d.vcpu then
+      local dd = tonumber(d.disk_mib or 0)
+      local dc = tonumber(d.machines or 0)
       redis.call('HINCRBY', 'resv:node:' .. d.node_id, 'pending_vcpu', tonumber(d.vcpu))
       redis.call('HINCRBY', 'resv:node:' .. d.node_id, 'pending_mem_mib', tonumber(d.mem_mib))
+      redis.call('HINCRBY', 'resv:node:' .. d.node_id, 'pending_disk_mib', dd)
       redis.call('HINCRBY', 'resv:project:' .. d.project_id, 'pending_vcpu', tonumber(d.vcpu))
       redis.call('HINCRBY', 'resv:project:' .. d.project_id, 'pending_mem_mib', tonumber(d.mem_mib))
+      redis.call('HINCRBY', 'resv:project:' .. d.project_id, 'pending_disk_mib', dd)
+      redis.call('HINCRBY', 'resv:project:' .. d.project_id, 'pending_machines', dc)
     end
   end
 end
@@ -151,26 +188,35 @@ func projectKey(projectID string) string { return "resv:project:" + projectID }
 func opKey(opID string) string           { return "resv:op:" + opID }
 
 // Acquire 原子预约：检查节点硬上限与项目配额后记账并写 TTL 记录。
-// 幂等（P3-1）：同 opID、同参数的重复调用直接成功；换节点的重试会先把
-// 旧预约从原节点/项目 hash 扣回。
+// v1.2-E（ADR-0035）：diskMib 为有效磁盘承诺；nodeDiskTotal/projectQuotaDisk
+// 为 0 表示该维度不限（旧节点/未配置配额的兼容语义）。
 func (m *Manager) Acquire(ctx context.Context, opID, nodeID, projectID string,
-	vcpu, memMib uint64, nodeVCPUTotal, nodeMemTotal uint64,
-	projectQuotaVCPU, projectQuotaMem uint64) error {
+	vcpu, memMib, diskMib uint64, nodeVCPUTotal, nodeMemTotal, nodeDiskTotal uint64,
+	projectQuotaVCPU, projectQuotaMem, projectQuotaDisk uint64, projectMachineQuotaOpt ...uint64) error {
 
+	var projectMachineQuota uint64
+	machines := uint64(1)
+	if len(projectMachineQuotaOpt) > 0 {
+		projectMachineQuota = projectMachineQuotaOpt[0]
+	}
+	if len(projectMachineQuotaOpt) > 1 {
+		machines = projectMachineQuotaOpt[1]
+	}
 	res, err := m.acquire.Run(ctx, m.rdb,
 		[]string{nodeKey(nodeID), projectKey(projectID), opKey(opID)},
 		vcpu, memMib, nodeVCPUTotal, nodeMemTotal,
 		projectQuotaVCPU, projectQuotaMem,
-		int64(m.ttl.Seconds()), nodeID, projectID).Int()
+		int64(m.ttl.Seconds()), nodeID, projectID,
+		diskMib, nodeDiskTotal, projectQuotaDisk, machines, projectMachineQuota).Int()
 	if err != nil {
 		return fmt.Errorf("reservation acquire %s: %w", opID, err)
 	}
 	switch res {
 	case 1:
 		return nil
-	case -1, -2:
+	case -1, -2, -6, -7:
 		return ErrProjectQuota
-	case -3, -4:
+	case -3, -4, -5:
 		return ErrNodeCapacity
 	default:
 		return fmt.Errorf("reservation acquire %s: unexpected script result %d", opID, res)

@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/example/firepaas/internal/controlplane/secrets"
+	"github.com/zhu327/firepaas/internal/controlplane/secrets"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"

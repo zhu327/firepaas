@@ -6,8 +6,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
-	pb "github.com/example/firepaas/shared/gen/agent/v1"
+	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 )
 
 func fakeNomad(t *testing.T, nodes []NomadNodeStub, allocs []NomadAllocStub, details map[string]NomadAllocStub) *httptest.Server {
@@ -92,6 +93,44 @@ func TestDiscoverBuildsNodeViews(t *testing.T) {
 	}
 }
 
+func TestDiscoverSelectsRoutableNomadNodeAddress(t *testing.T) {
+	tests := []struct {
+		name, address, httpAddr, grpcAddr, proxyAddr string
+	}{
+		{name: "IPv4 Address", address: "10.0.0.1", grpcAddr: "10.0.0.1:5108", proxyAddr: "10.0.0.1:5107"},
+		{name: "IPv6 Address", address: "2001:db8::1", grpcAddr: "[2001:db8::1]:5108", proxyAddr: "[2001:db8::1]:5107"},
+		{name: "Address preferred", address: "10.0.0.2", httpAddr: "10.0.0.1:4646", grpcAddr: "10.0.0.2:5108", proxyAddr: "10.0.0.2:5107"},
+		{name: "legacy HTTPAddr", httpAddr: "10.0.0.1:4646", grpcAddr: "10.0.0.1:5108", proxyAddr: "10.0.0.1:5107"},
+		{name: "legacy hostname", httpAddr: "compute-1.internal:4646", grpcAddr: "compute-1.internal:5108", proxyAddr: "compute-1.internal:5107"},
+		{name: "empty", grpcAddr: "", proxyAddr: ""},
+		{name: "invalid", address: "not an IP", httpAddr: "://bad", grpcAddr: "", proxyAddr: ""},
+		{name: "IPv4 loopback", address: "127.0.0.1", grpcAddr: "", proxyAddr: ""},
+		{name: "IPv6 loopback", address: "::1", grpcAddr: "", proxyAddr: ""},
+		{name: "localhost", httpAddr: "localhost:4646", grpcAddr: "", proxyAddr: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			nodes := []NomadNodeStub{{
+				ID: "n1", Name: "node-1", NodePool: "compute", Status: "ready",
+				SchedulingEligibility: "eligible", Address: tt.address, HTTPAddr: tt.httpAddr,
+			}}
+			srv := fakeNomad(t, nodes, []NomadAllocStub{alloc("n1", 3, true, 5108, 5107)}, nil)
+			m, err := New(Config{NomadAddr: srv.URL, JobName: "firepaas-agentd"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer m.Close()
+			if err := m.Discover(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			got := m.Nodes()
+			if len(got) != 1 || got[0].GRPCAddr != tt.grpcAddr || got[0].ProxyAddr != tt.proxyAddr {
+				t.Fatalf("unexpected addresses: %+v", got)
+			}
+		})
+	}
+}
+
 func TestDiscoverFillsPortsFromAllocDetail(t *testing.T) {
 	nodes := []NomadNodeStub{
 		{ID: "n1", Name: "node-1", NodePool: "compute", Status: "ready",
@@ -114,6 +153,55 @@ func TestDiscoverFillsPortsFromAllocDetail(t *testing.T) {
 	got := m.Nodes()
 	if len(got) != 1 || got[0].GRPCAddr != "10.0.0.1:5108" || got[0].ProxyAddr != "10.0.0.1:5107" {
 		t.Fatalf("ports not filled from alloc detail: %+v", got)
+	}
+}
+
+func TestFollowerDiscoveryResolvesAgentClient(t *testing.T) {
+	nodes := []NomadNodeStub{{ID: "nomad-1", Name: "node-1", Status: "ready",
+		SchedulingEligibility: "eligible", HTTPAddr: "10.0.0.1:4646"}}
+	srv := fakeNomad(t, nodes, []NomadAllocStub{alloc("nomad-1", 1, true, 5108, 5107)}, nil)
+	m, err := New(Config{NomadAddr: srv.URL, JobName: "firepaas-agentd"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if err := m.Discover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := m.ClientForNodeID("nomad-1"); got == nil {
+		t.Fatal("follower discovery should resolve a client without ServiceInfo or PG sync")
+	}
+}
+
+func TestLeaderHandoverDoesNotClearDiscoveryClients(t *testing.T) {
+	nodes := []NomadNodeStub{{ID: "n1", Name: "node-1", Status: "ready",
+		SchedulingEligibility: "eligible", HTTPAddr: "10.0.0.1:4646"}}
+	srv := fakeNomad(t, nodes, []NomadAllocStub{alloc("n1", 1, true, 5108, 5107)}, nil)
+	m, err := New(Config{NomadAddr: srv.URL, JobName: "firepaas-agentd", InfoEvery: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if err := m.Discover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	before := m.ClientForNodeID("n1")
+	if before == nil {
+		t.Fatal("missing discovery client before handover")
+	}
+
+	// Losing leadership cancels only the PG-writing ServiceInfo loop. A new leader
+	// term may start it again; neither transition owns or closes discovery clients.
+	for i := 0; i < 2; i++ {
+		term, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err := m.RunServiceInfo(term); err == nil {
+			t.Fatal("cancelled leader term should return an error")
+		}
+		if got := m.ClientForNodeID("n1"); got != before {
+			t.Fatalf("handover %d replaced or cleared the follower discovery client", i+1)
+		}
 	}
 }
 

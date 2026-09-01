@@ -24,20 +24,24 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/example/firepaas/internal/controlplane/apikeys"
-	"github.com/example/firepaas/internal/controlplane/catalog"
-	"github.com/example/firepaas/internal/controlplane/controller"
-	"github.com/example/firepaas/internal/controlplane/db"
-	"github.com/example/firepaas/internal/controlplane/imagepolicy"
-	"github.com/example/firepaas/internal/controlplane/leader"
-	"github.com/example/firepaas/internal/controlplane/nodemanager"
-	"github.com/example/firepaas/internal/controlplane/reservations"
-	"github.com/example/firepaas/internal/controlplane/secrets"
-	"github.com/example/firepaas/internal/controlplane/store"
-	"github.com/example/firepaas/internal/controlplane/traffic"
-	"github.com/example/firepaas/internal/observability/metrics"
-	"github.com/example/firepaas/internal/scheduler"
-	pb "github.com/example/firepaas/shared/gen/agent/v1"
+	agentv1 "github.com/zhu327/firepaas/internal/contracts/agentv1"
+	"github.com/zhu327/firepaas/internal/controlplane/agentclient"
+	"github.com/zhu327/firepaas/internal/controlplane/apikeys"
+	"github.com/zhu327/firepaas/internal/controlplane/appcommand"
+	"github.com/zhu327/firepaas/internal/controlplane/catalog"
+	"github.com/zhu327/firepaas/internal/controlplane/controller"
+	"github.com/zhu327/firepaas/internal/controlplane/db"
+	"github.com/zhu327/firepaas/internal/controlplane/imagepolicy"
+	"github.com/zhu327/firepaas/internal/controlplane/leader"
+	"github.com/zhu327/firepaas/internal/controlplane/nodemanager"
+	"github.com/zhu327/firepaas/internal/controlplane/ratelimit"
+	"github.com/zhu327/firepaas/internal/controlplane/reservations"
+	"github.com/zhu327/firepaas/internal/controlplane/secrets"
+	"github.com/zhu327/firepaas/internal/controlplane/store"
+	"github.com/zhu327/firepaas/internal/controlplane/traffic"
+	"github.com/zhu327/firepaas/internal/observability/metrics"
+	"github.com/zhu327/firepaas/internal/scheduler"
+	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/protobuf/encoding/protojson"
 )
@@ -127,27 +131,36 @@ func run() error {
 	}
 	placer := scheduler.New(placerCfg, scheduler.Options{})
 
+	// 每个 API 副本都维护只读 Nomad discovery + agent 连接池，使 follower 可
+	// 直接服务 logs/exec/cp。ServiceInfo→PG 同步和 mutation controller 仍严格
+	// 只在 leader 任期内运行，避免多个 nodemanager 并发写 observed projection。
+	nm, err := nodemanager.New(nodemanager.Config{
+		NomadAddr:     nomadAddr,
+		JobName:       "firepaas-agentd",
+		DiscoverEvery: 10 * time.Second,
+		InfoEvery:     20 * time.Second,
+		Store:         st,
+	})
+	if err != nil {
+		return fmt.Errorf("nodemanager: %w", err)
+	}
+	defer nm.Close()
+	go func() {
+		if err := nm.RunDiscovery(ctx); err != nil && ctx.Err() == nil {
+			slog.Error("node discovery exited", "error", err)
+		}
+	}()
+
 	// M2a leader：controller（reconcile+放置）只在持锁实例运行；备实例只读待命。
-	// P3-13：routeKicker 把 leader 内 controller 的即时重建能力暴露给重投影
-	// 端点（幂等：buildRoutes 只读 PG 写投影，非 leader 调用也无害）。
+	// P3-13：routeKicker 把 leader 内 controller 的即时重建能力暴露给重投影。
 	kicker := &routeKicker{}
+	rgw := &runtimeGW{}
+	rgw.Set(nm.AgentRuntimeForMachine)
 	go func() {
 		err := leader.Elect(ctx, pool, leader.Key, func(lctx context.Context) error {
-			nm, err := nodemanager.New(nodemanager.Config{
-				NomadAddr:     nomadAddr,
-				JobName:       "firepaas-agentd",
-				DiscoverEvery: 10 * time.Second,
-				InfoEvery:     20 * time.Second,
-				Store:         st,
-			})
-			if err != nil {
-				slog.Error("nodemanager", "error", err)
-				return err
-			}
-			defer nm.Close()
 			go func() {
-				if err := nm.Run(lctx); err != nil && lctx.Err() == nil {
-					slog.Error("nodemanager exited", "error", err)
+				if err := nm.RunServiceInfo(lctx); err != nil && lctx.Err() == nil {
+					slog.Error("node service info sync exited", "error", err)
 				}
 			}()
 
@@ -167,6 +180,22 @@ func run() error {
 				// v1.1（ADR-0018/0021）：部署预取 top-K 与 evacuate 步超时。
 				PrefetchTopK:        envInt("FIREPAAS_PREFETCH_TOPK", 3),
 				EvacuateStepTimeout: envDur("FIREPAAS_EVACUATE_STEP_TIMEOUT", 5*time.Minute),
+				// v1.4（ADR-0036）：本地 GC 默认 off。delete 仅在 agent
+				// 广告 lock-aware quarantine capability 后执行。
+				UserEventsRetention: envDur("FIREPAAS_USER_EVENTS_RETENTION", 168*time.Hour),
+				GC: controller.GCConfig{
+					Mode:      envOr("FIREPAAS_LOCAL_GC_MODE", "off"),
+					MinAge:    envDur("FIREPAAS_GC_MIN_AGE", time.Hour),
+					HighWater: envFloat("FIREPAAS_GC_HIGH_WATERMARK", 0.85),
+					LowWater:  envFloat("FIREPAAS_GC_LOW_WATERMARK", 0.70),
+					Interval:  envDur("FIREPAAS_GC_INTERVAL", 5*time.Minute),
+					Grace:     envDur("FIREPAAS_LOCAL_GC_GRACE", 10*time.Minute),
+				},
+				Scrub: controller.ScrubConfig{
+					Enabled:  envBool("FIREPAAS_SCRUB_ENABLED", false),
+					Interval: envDur("FIREPAAS_SCRUB_INTERVAL", time.Hour),
+					Budget:   envInt("FIREPAAS_SCRUB_BUDGET", 1),
+				},
 			})
 			slog.Info("running control loop as leader")
 			kicker.Set(ctrl.KickRouteRebuild)
@@ -178,11 +207,28 @@ func run() error {
 		}
 	}()
 
+	// v1.2-E（ADR-0035）：API 限流（Redis 令牌桶；配置 PG + 10s 缓存）。
+	var apiLimiter *ratelimit.Limiter
+	if rdb != nil {
+		apiLimiter = ratelimit.New(rdb, func(ctx context.Context, project string) (ratelimit.Config, error) {
+			c, _, err := st.GetRateLimitConfig(ctx, project)
+			if err != nil {
+				return ratelimit.Config{}, err
+			}
+			return ratelimit.Config{
+				Read:     ratelimit.Limits{Rate: c.ReadRate, Burst: c.ReadBurst},
+				Mutation: ratelimit.Limits{Rate: c.MutationRate, Burst: c.MutationBurst},
+				Stream:   ratelimit.Limits{Rate: c.StreamRate, Burst: c.StreamBurst},
+			}, nil
+		}, 10*time.Second)
+	}
+	images := imagepolicy.NewWithOptions(envOr("FIREPAAS_REGISTRY_ALLOWLIST", ""),
+		isTruthy(envOr("FIREPAAS_IMAGE_REQUIRE_DIGEST", "false")))
 	api := &API{store: st, apiToken: apiToken, authDisabled: authDisabled,
-		images: imagepolicy.NewWithOptions(envOr("FIREPAAS_REGISTRY_ALLOWLIST", ""),
-			isTruthy(envOr("FIREPAAS_IMAGE_REQUIRE_DIGEST", "false"))),
+		images: images, appCommands: appcommand.New(st, images),
 		secrets: secretsMgr, traffic: trafficSigner, apiKeys: apiKeyMgr,
-		cat: cat, metrics: reg, kicker: kicker}
+		cat: cat, metrics: reg, kicker: kicker, rgw: rgw,
+		limiter: apiLimiter, sessions: newSessionCounter()}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) })
 	mux.HandleFunc("POST /v1/machines", api.auth(api.createMachine))
@@ -194,7 +240,9 @@ func run() error {
 	mux.HandleFunc("POST /v1/machines/{id}/pause", api.auth(api.pauseMachine))
 	mux.HandleFunc("POST /v1/machines/{id}/resume", api.auth(api.resumeMachine))
 	mux.HandleFunc("GET /v1/nodes", api.auth(api.listNodes))
+	mux.HandleFunc("GET /v1/capabilities", api.auth(api.listCapabilities))
 	mux.HandleFunc("GET /v1/events", api.auth(api.listEvents))
+	mux.HandleFunc("GET /v1/system/scheduler-events", api.auth(api.listSchedulerEvents))
 	// M4：secrets v1（ADR-0010，值只进不出——无 reveal 端点）。
 	mux.HandleFunc("POST /v1/secrets", api.auth(api.putSecret))
 	mux.HandleFunc("GET /v1/secrets", api.auth(api.listSecrets))
@@ -211,6 +259,50 @@ func run() error {
 	mux.HandleFunc("POST /v1/apps/{id}/scale", api.auth(api.scaleApp))
 	mux.HandleFunc("POST /v1/apps/{id}/rollback", api.auth(api.rollbackApp))
 	mux.HandleFunc("DELETE /v1/apps/{id}", api.auth(api.deleteApp))
+	// v1.3-A（ADR-0027）：egress 拒绝摘要与策略变更审计（project 隔离）。
+	mux.HandleFunc("GET /v1/apps/{id}/egress-audit", api.auth(api.getAppEgressAudit))
+	// v1.3-B（ADR-0028）：node-local snapshot 资源 + checkpoint + schedule。
+	mux.HandleFunc("POST /v1/machines/{id}/snapshots", api.auth(api.createSnapshot))
+	mux.HandleFunc("GET /v1/snapshots", api.auth(api.listSnapshots))
+	mux.HandleFunc("GET /v1/snapshots/{id}", api.auth(api.getSnapshot))
+	mux.HandleFunc("DELETE /v1/snapshots/{id}", api.auth(api.deleteSnapshot))
+	mux.HandleFunc("POST /v1/machines/{id}/snapshot-schedules", api.auth(api.upsertSnapshotSchedule))
+	mux.HandleFunc("GET /v1/machines/{id}/snapshot-schedules", api.auth(api.listSnapshotSchedules))
+	mux.HandleFunc("DELETE /v1/machines/{id}/snapshot-schedules/{schedule}", api.auth(api.deleteSnapshotSchedule))
+	// v1.3-C（ADR-0028）：受限 fork + filesystem rescue。
+	mux.HandleFunc("POST /v1/snapshots/{id}/fork", api.auth(api.forkSnapshot))
+	mux.HandleFunc("POST /v1/machines/{id}/rescue", api.auth(api.rescueMachine))
+	// v1.4-D：只读 restore preflight（不改变 restore/fork 状态机）。
+	mux.HandleFunc("POST /v1/snapshots/{id}/preflight", api.auth(api.snapshotPreflight))
+	// v1.3-D（ADR-0029）：LOCAL_RW volume。
+	mux.HandleFunc("POST /v1/volumes", api.auth(api.createVolume))
+	mux.HandleFunc("GET /v1/volumes", api.auth(api.listVolumes))
+	mux.HandleFunc("GET /v1/volumes/{id}", api.auth(api.getVolume))
+	mux.HandleFunc("DELETE /v1/volumes/{id}", api.auth(api.deleteVolume))
+	mux.HandleFunc("POST /v1/machines/{id}/volume-attach", api.auth(api.attachVolume))
+	mux.HandleFunc("POST /v1/machines/{id}/volume-detach", api.auth(api.detachVolume))
+	// v1.4-C（docs/v1.4-plan.md §7）：镜像预热/覆盖率/cache pin。
+	mux.HandleFunc("POST /v1/images/prewarm", api.auth(api.prewarmImage))
+	mux.HandleFunc("GET /v1/images/coverage", api.auth(api.imageCoverage))
+	mux.HandleFunc("POST /v1/images/pins", api.auth(api.createImagePin))
+	mux.HandleFunc("GET /v1/images/pins", api.auth(api.listImagePins))
+	mux.HandleFunc("DELETE /v1/images/pins/{id}", api.auth(api.deleteImagePin))
+	// v1.2-C（ADR-0025）：受控运行时通道（logs/exec/cp；debug scope）。
+	mux.HandleFunc("GET /v1/machines/{id}/logs", api.auth(api.machineLogs))
+	mux.HandleFunc("POST /v1/machines/{id}/exec", api.auth(api.machineExec))
+	mux.HandleFunc("PUT /v1/machines/{id}/files", api.auth(api.machineFilesPut))
+	mux.HandleFunc("GET /v1/machines/{id}/files", api.auth(api.machineFilesGet))
+	// v1.2-D（ADR-0026）：wait / TTL / restart 治理。
+	mux.HandleFunc("GET /v1/machines/{id}/wait", api.auth(api.waitMachine))
+	mux.HandleFunc("GET /v1/operations/{id}/wait", api.auth(api.waitOperation))
+	mux.HandleFunc("GET /v1/rollouts/{id}/wait", api.auth(api.waitRollout))
+	mux.HandleFunc("PUT /v1/machines/{id}/ttl", api.auth(api.updateMachineTTL))
+	mux.HandleFunc("POST /v1/machines/{id}/restart-reset", api.auth(api.resetRestart))
+	// v1.2-E（ADR-0035）：项目配额与限流配置（配额写 = admin；读 = read）。
+	mux.HandleFunc("GET /v1/projects/{id}/quota", api.auth(api.getProjectQuota))
+	mux.HandleFunc("PUT /v1/projects/{id}/quota", api.auth(api.putProjectQuota))
+	mux.HandleFunc("GET /v1/projects/{id}/rate-limits", api.auth(api.getRateLimits))
+	mux.HandleFunc("PUT /v1/projects/{id}/rate-limits", api.auth(api.putRateLimits))
 	// M5.1（mvp-plan §9.1）：API key 管理（admin scope，routeScope 表收口）。
 	mux.HandleFunc("POST /v1/apikeys", api.auth(api.createAPIKey))
 	mux.HandleFunc("GET /v1/apikeys", api.auth(api.listAPIKeys))
@@ -262,12 +354,17 @@ type API struct {
 	apiToken     string
 	authDisabled bool
 	images       *imagepolicy.Policy // 镜像引用策略（P1-2：digest/allowlist）
+	appCommands  *appcommand.Command // transport-independent deploy use case
 	secrets      *secrets.Manager    // M4：信封加密（nil = /v1/secrets 返回 503）
 	traffic      *traffic.Signer     // M4：execution-bound credential 现算
 	apiKeys      *apikeys.Manager    // M5.1：API key 哈希库（nil = 只认 root token）
 	cat          *catalog.Catalog    // M5.4：显式重投影（Redis 投影句柄）
 	metrics      *metrics.Registry   // M5.4：重投影计数等系统指标
 	kicker       *routeKicker        // P3-13：leader controller 的即时重建句柄
+	rgw          *runtimeGW          // v1.2-C：每副本只读 agent 客户端网关
+	// v1.2-E（ADR-0035）
+	limiter  *ratelimit.Limiter // API 限流（nil = 未装配，仅开发模式）
+	sessions *sessionCounter    // runtime 会话并发计数
 }
 
 // routeKicker 把 leader 实例 controller 的 KickRouteRebuild 递给 API 层
@@ -303,6 +400,36 @@ func (k *routeKicker) Kick() (time.Duration, error, bool) {
 	return d, err, true
 }
 
+// runtimeGW 把本 API 副本的只读 agent 客户端解析递给 HTTP 层。
+// resolver 生命周期独立于 leader 任期，handover 时不会出现 follower 503 窗口。
+type runtimeGW struct {
+	mu sync.Mutex
+	fn func(ctx context.Context, machineID string) (*agentclient.Client, map[string]bool, error)
+}
+
+func (g *runtimeGW) Set(fn func(ctx context.Context, machineID string) (*agentclient.Client, map[string]bool, error)) {
+	g.mu.Lock()
+	g.fn = fn
+	g.mu.Unlock()
+}
+
+func (g *runtimeGW) Clear() {
+	g.mu.Lock()
+	g.fn = nil
+	g.mu.Unlock()
+}
+
+// Get 解析 machine 的 agent 客户端与节点能力；resolver 未就绪返回 503 语义错误。
+func (g *runtimeGW) Get(ctx context.Context, machineID string) (*agentclient.Client, map[string]bool, error) {
+	g.mu.Lock()
+	fn := g.fn
+	g.mu.Unlock()
+	if fn == nil {
+		return nil, nil, fmt.Errorf("runtime resolver not ready")
+	}
+	return fn(ctx, machineID)
+}
+
 type createMachineBody struct {
 	MachineID      string            `json:"machine_id"`
 	Hostname       string            `json:"hostname"`
@@ -322,6 +449,17 @@ type createMachineBody struct {
 	Labels         map[string]string `json:"labels"`
 	AntiAffinity   string            `json:"anti_affinity"`
 	HealthCheck    *healthCheckBody  `json:"health_check"`
+	// v1.2-D（ADR-0026）：TTL（秒，0=关闭）与 restart policy。
+	TTLSeconds    int64              `json:"ttl_seconds"`
+	RestartPolicy *restartPolicyBody `json:"restart_policy"`
+}
+
+// restartPolicyBody 是 createMachine 的 restart policy 声明（v1.2-D）。
+type restartPolicyBody struct {
+	Mode                string `json:"mode"` // NEVER|ON_FAILURE|ALWAYS
+	MaxAttempts         int    `json:"max_attempts"`
+	BackoffSeconds      int    `json:"backoff_seconds"`
+	StableWindowSeconds int    `json:"stable_window_seconds"`
 }
 
 type healthCheckBody struct {
@@ -410,6 +548,12 @@ func (a *API) createMachine(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// v1.2-D（ADR-0026）：restart policy 解析（默认 NEVER；控制面唯一权威）。
+	restartPolicy, err := marshalRestartPolicy(body.RestartPolicy)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
 
 	req := &pb.CreateMachineRequest{
 		MachineId:   body.MachineID,
@@ -428,6 +572,7 @@ func (a *API) createMachine(w http.ResponseWriter, r *http.Request) {
 			Env:            body.Env,
 			Network:        &pb.NetworkSpec{IngressPort: uint64(body.Port)},
 			HealthCheck:    healthCheck,
+			RestartPolicy:  restartPolicy,
 			Placement: &pb.PlacementConstraints{
 				NodePool:     body.NodePool,
 				Labels:       body.Labels,
@@ -441,10 +586,30 @@ func (a *API) createMachine(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	op, err := a.store.EnsureAppAndEnqueueCreate(r.Context(),
+	var expiresAt *time.Time
+	if body.TTLSeconds > 0 {
+		t := time.Now().Add(time.Duration(body.TTLSeconds) * time.Second)
+		expiresAt = &t
+	}
+	mode, maxAttempts, backoff, stable := "NEVER", 3, 10, 300
+	if body.RestartPolicy != nil && body.RestartPolicy.Mode != "" {
+		mode = strings.ToUpper(body.RestartPolicy.Mode)
+		if body.RestartPolicy.MaxAttempts > 0 {
+			maxAttempts = body.RestartPolicy.MaxAttempts
+		}
+		if body.RestartPolicy.BackoffSeconds > 0 {
+			backoff = body.RestartPolicy.BackoffSeconds
+		}
+		if body.RestartPolicy.StableWindowSeconds > 0 {
+			stable = body.RestartPolicy.StableWindowSeconds
+		}
+	}
+	op, err := a.store.EnsureAppAndEnqueueCreateWithLifecycle(r.Context(),
 		body.ProjectID, body.AppID, body.Hostname, body.Image, body.VCPU, body.MemMIB,
+		int64(agentv1.EffectiveDiskMib(req.Spec.GetDiskMib())),
 		body.Port, body.MachineID, body.DeploymentID, body.ExecutionID, body.OperationID,
-		body.Generation, int(body.ReplicaOrdinal), raw, placementJSON(req.Spec.Placement))
+		body.Generation, int(body.ReplicaOrdinal), raw, placementJSON(req.Spec.Placement),
+		expiresAt, mode, maxAttempts, backoff, stable)
 	if err != nil {
 		if errors.Is(err, store.ErrRequestConflict) {
 			writeErr(w, 409, err.Error())
@@ -545,8 +710,52 @@ func (a *API) listNodes(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"nodes": nodes})
 }
 
-// listEvents 输出最近调度/对账事件。
+// listEvents（v1.2-F）：租户事件流（user_events，append-only）。
+// 过滤：project/app/machine/type/since/before（keyset 游标）；受限 key 只能
+// 看自己的 project（effectiveProjectID 收口），root 必须显式带 project_id。
 func (a *API) listEvents(w http.ResponseWriter, r *http.Request) {
+	project := effectiveProjectID(r, "")
+	if project == "" {
+		writeErr(w, 400, "project_id query parameter is required")
+		return
+	}
+	f := store.UserEventFilter{ProjectID: project,
+		AppID: r.URL.Query().Get("app_id"), MachineID: r.URL.Query().Get("machine_id"),
+		Type: r.URL.Query().Get("type")}
+	if v := r.URL.Query().Get("before"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			f.Before = n
+		}
+	}
+	if v := r.URL.Query().Get("since"); v != "" {
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			f.Since = t
+		} else {
+			writeErr(w, 400, "since must be RFC3339")
+			return
+		}
+	}
+	limit := 200
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 1000 {
+			limit = n
+		}
+	}
+	f.Limit = limit
+	events, err := a.store.ListUserEvents(r.Context(), f)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	var next int64
+	if len(events) == limit {
+		next = events[len(events)-1].ID
+	}
+	writeJSON(w, 200, map[string]any{"events": events, "next_before": next})
+}
+
+// listSchedulerEvents（v1.2-F）：内部调度/对账事件（admin；与租户事件分离）。
+func (a *API) listSchedulerEvents(w http.ResponseWriter, r *http.Request) {
 	limit := 200
 	if v := r.URL.Query().Get("limit"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 2000 {
@@ -564,6 +773,35 @@ func (a *API) listEvents(w http.ResponseWriter, r *http.Request) {
 func isTruthy(v string) bool {
 	b, err := strconv.ParseBool(strings.TrimSpace(v))
 	return err == nil && b
+}
+
+// marshalRestartPolicy 解析并归一 restart policy（v1.2-D，ADR-0026）。
+func marshalRestartPolicy(b *restartPolicyBody) (*pb.RestartPolicy, error) {
+	if b == nil {
+		return nil, nil
+	}
+	var mode pb.RestartPolicy_Mode
+	switch strings.ToUpper(b.Mode) {
+	case "", "NEVER":
+		mode = pb.RestartPolicy_NEVER
+	case "ON_FAILURE":
+		mode = pb.RestartPolicy_ON_FAILURE
+	case "ALWAYS":
+		mode = pb.RestartPolicy_ALWAYS
+	default:
+		return nil, fmt.Errorf("restart_policy.mode must be NEVER, ON_FAILURE or ALWAYS")
+	}
+	if b.MaxAttempts < 0 || b.BackoffSeconds < 0 || b.StableWindowSeconds < 0 {
+		return nil, fmt.Errorf("restart_policy counts must be >= 0")
+	}
+	if b.MaxAttempts > 100 {
+		return nil, fmt.Errorf("restart_policy.max_attempts must be <= 100")
+	}
+	return &pb.RestartPolicy{
+		Mode:           mode,
+		MaxAttempts:    uint32(b.MaxAttempts),
+		BackoffSeconds: uint32(b.BackoffSeconds),
+	}, nil
 }
 
 // placementJSON 序列化放置约束（nil 返回空字节，存 NULL/默认）。
@@ -596,6 +834,18 @@ func envOr(key, def string) string {
 }
 
 // envDur 解析时长环境变量（非法值回退默认）。
+func envBool(key string, def bool) bool {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	parsed, err := strconv.ParseBool(v)
+	if err != nil {
+		return def
+	}
+	return parsed
+}
+
 func envDur(key string, def time.Duration) time.Duration {
 	v := os.Getenv(key)
 	if v == "" {
@@ -609,6 +859,13 @@ func envDur(key string, def time.Duration) time.Duration {
 }
 
 // envInt 解析整数环境变量（非法值回退默认）。
+func envFloat(key string, def float64) float64 {
+	if v, err := strconv.ParseFloat(os.Getenv(key), 64); err == nil && v > 0 && v < 1 {
+		return v
+	}
+	return def
+}
+
 func envInt(key string, def int) int {
 	if v := os.Getenv(key); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {

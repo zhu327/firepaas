@@ -45,9 +45,16 @@ type Deployment struct {
 	// nil = 单端口（用 Port）。
 	Services []ServiceSpec
 	// Strategy（v1.1-F）：bluegreen（默认）| rolling。
-	Strategy  string
-	CreatedAt string
-	UpdatedAt string
+	Strategy string
+	// RequiredFeatures（v1.2-A，ADR-0023）：平台从 deployment 语义推导的
+	// 启动正确性能力（如绑定 secret_refs ⇒ secret.oneshot.v1）。客户端不得
+	// 直接声明；调度在资源打分前按此硬过滤。
+	RequiredFeatures []string
+	// EgressPolicy（v1.3-A，ADR-0027）：protojson(EgressPolicySpec)；nil =
+	// 未声明（历史 CIDR-only 语义）。不可变：修改即新 deployment generation。
+	EgressPolicy json.RawMessage
+	CreatedAt    string
+	UpdatedAt    string
 }
 
 // EffectiveServices 返回 deployment 的 service 列表（nil 时从单端口派生）。
@@ -202,12 +209,14 @@ func (s *Store) BumpAppGeneration(ctx context.Context, appID string, generation 
 func (s *Store) CreateDeployment(ctx context.Context, d Deployment) error {
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO deployments(id, app_id, generation, image_ref, vcpu, mem_mib, port,
-			env, placement, health_check, status, secret_refs, auto_standby, services, strategy)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10::jsonb,$11,$12::jsonb,$13::jsonb,$14::jsonb,$15)`,
+			env, placement, health_check, status, secret_refs, auto_standby, services, strategy,
+			required_features, egress_policy)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10::jsonb,$11,$12::jsonb,$13::jsonb,$14::jsonb,$15,$16::jsonb,$17::jsonb)`,
 		d.ID, d.AppID, d.Generation, d.ImageRef, d.VCPU, d.MemMIB, d.Port,
 		jsonMap(d.Env), jsonOrNull(d.Placement), jsonOrNull(d.HealthCheck), d.Status,
 		secretRefsJSON(d.SecretRefs), jsonOrNull(d.AutoStandby), servicesJSON(d.Services),
-		effectiveStrategyLiteral(d.Strategy))
+		effectiveStrategyLiteral(d.Strategy), requiredFeaturesJSON(d.RequiredFeatures),
+		jsonOrNull(d.EgressPolicy))
 	if err != nil {
 		return fmt.Errorf("create deployment: %w", err)
 	}
@@ -219,7 +228,8 @@ const deploymentCols = `id, app_id, generation, image_ref, vcpu, mem_mib, port,
 		coalesce(env::text,'{}'), coalesce(placement::text,'null'),
 		coalesce(health_check::text,'null'), status, created_at::text, updated_at::text,
 		coalesce(secret_refs::text,'{}'),
-		coalesce(auto_standby::text,'null'), coalesce(services::text,'null'), strategy`
+		coalesce(auto_standby::text,'null'), coalesce(services::text,'null'), strategy,
+		coalesce(required_features::text,'[]'), coalesce(egress_policy::text,'null')`
 
 // servicesJSON 序列化 services 列（nil = NULL，保持单端口兼容）。
 func servicesJSON(list []ServiceSpec) any {
@@ -240,12 +250,24 @@ func effectiveStrategyLiteral(strategy string) string {
 	return "bluegreen"
 }
 
+// requiredFeaturesJSON 序列化平台推导的启动必需能力（nil = "[]"，不为 NULL）。
+func requiredFeaturesJSON(features []string) string {
+	if len(features) == 0 {
+		return "[]"
+	}
+	b, err := json.Marshal(features)
+	if err != nil {
+		return "[]"
+	}
+	return string(b)
+}
+
 func scanDeployment(row pgx.Row) (*Deployment, error) {
 	var d Deployment
-	var envRaw, placeRaw, hcRaw, refsRaw, autoRaw, svcRaw string
+	var envRaw, placeRaw, hcRaw, refsRaw, autoRaw, svcRaw, reqFeaturesRaw, egressRaw string
 	if err := row.Scan(&d.ID, &d.AppID, &d.Generation, &d.ImageRef, &d.VCPU, &d.MemMIB,
 		&d.Port, &envRaw, &placeRaw, &hcRaw, &d.Status, &d.CreatedAt, &d.UpdatedAt, &refsRaw,
-		&autoRaw, &svcRaw, &d.Strategy); err != nil {
+		&autoRaw, &svcRaw, &d.Strategy, &reqFeaturesRaw, &egressRaw); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
@@ -264,6 +286,14 @@ func scanDeployment(row pgx.Row) (*Deployment, error) {
 		if err := json.Unmarshal([]byte(svcRaw), &d.Services); err != nil {
 			return nil, fmt.Errorf("decode deployment services: %w", err)
 		}
+	}
+	if reqFeaturesRaw != "" && reqFeaturesRaw != "null" && reqFeaturesRaw != "[]" {
+		if err := json.Unmarshal([]byte(reqFeaturesRaw), &d.RequiredFeatures); err != nil {
+			return nil, fmt.Errorf("decode deployment required_features: %w", err)
+		}
+	}
+	if egressRaw != "" && egressRaw != "null" {
+		d.EgressPolicy = json.RawMessage(egressRaw)
 	}
 	return &d, nil
 }
@@ -331,6 +361,32 @@ func (s *Store) CreateRollout(ctx context.Context, r Rollout) error {
 		return fmt.Errorf("create rollout: %w", err)
 	}
 	return nil
+}
+
+// GetRollout 按 ID 查询 rollout（v1.2-D wait 端点用）。
+func (s *Store) GetRollout(ctx context.Context, id string) (*Rollout, error) {
+	row := s.pool.QueryRow(ctx, `
+		SELECT id, app_id, from_generation, to_generation, status, failed,
+			coalesce(cutover_at::text,''), coalesce(drain_deadline::text,''),
+			started_at::text, coalesce(completed_at::text,'')
+		FROM rollouts WHERE id=$1`, id)
+	var r Rollout
+	var cutover, drain string
+	err := row.Scan(&r.ID, &r.AppID, &r.FromGeneration, &r.ToGeneration, &r.Status,
+		&r.Failed, &cutover, &drain, &r.StartedAt, &r.CompletedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get rollout: %w", err)
+	}
+	if cutover != "" {
+		r.CutoverAt = &cutover
+	}
+	if drain != "" {
+		r.DrainDeadline = &drain
+	}
+	return &r, nil
 }
 
 // ActiveRolloutForApp 返回 app 的活跃 rollout（无则 nil）。
@@ -512,12 +568,14 @@ func (s *Store) DeployApp(ctx context.Context, d Deployment, r Rollout, appGener
 		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO deployments(id, app_id, generation, image_ref, vcpu, mem_mib, port,
-				env, placement, health_check, status, secret_refs, auto_standby, services, strategy)
-			VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10::jsonb,$11,$12::jsonb,$13::jsonb,$14::jsonb,$15)`,
+				env, placement, health_check, status, secret_refs, auto_standby, services, strategy,
+				required_features, egress_policy)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10::jsonb,$11,$12::jsonb,$13::jsonb,$14::jsonb,$15,$16::jsonb,$17::jsonb)`,
 			d.ID, d.AppID, d.Generation, d.ImageRef, d.VCPU, d.MemMIB, d.Port,
 			jsonMap(d.Env), jsonOrNull(d.Placement), jsonOrNull(d.HealthCheck), d.Status,
 			secretRefsJSON(d.SecretRefs), jsonOrNull(d.AutoStandby), servicesJSON(d.Services),
-			effectiveStrategyLiteral(d.Strategy)); err != nil {
+			effectiveStrategyLiteral(d.Strategy), requiredFeaturesJSON(d.RequiredFeatures),
+			jsonOrNull(d.EgressPolicy)); err != nil {
 			return fmt.Errorf("create deployment: %w", err)
 		}
 		if _, err := tx.Exec(ctx, `
@@ -532,6 +590,15 @@ func (s *Store) DeployApp(ctx context.Context, d Deployment, r Rollout, appGener
 		if _, err := tx.Exec(ctx, `UPDATE apps SET generation=$2, updated_at=now()
 			WHERE id=$1`, r.AppID, appGeneration); err != nil {
 			return fmt.Errorf("bump app generation: %w", err)
+		}
+		if len(d.EgressPolicy) > 0 && string(d.EgressPolicy) != "null" {
+			var projectID string
+			if err := tx.QueryRow(ctx, `SELECT project_id FROM apps WHERE id=$1`, r.AppID).Scan(&projectID); err != nil {
+				return fmt.Errorf("load app project for egress audit: %w", err)
+			}
+			if err := recordEgressPolicyChangeTx(ctx, tx, projectID, d); err != nil {
+				return err
+			}
 		}
 		return nil
 	})

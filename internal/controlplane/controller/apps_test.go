@@ -3,7 +3,7 @@ package controller
 import (
 	"testing"
 
-	"github.com/example/firepaas/internal/controlplane/store"
+	"github.com/zhu327/firepaas/internal/controlplane/store"
 )
 
 func TestAllReady(t *testing.T) {

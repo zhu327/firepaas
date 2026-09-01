@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/example/firepaas/internal/observability/metrics"
+	"github.com/zhu327/firepaas/internal/observability/metrics"
 )
 
 const hostSampleInterval = 15 * time.Second

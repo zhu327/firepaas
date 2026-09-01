@@ -8,7 +8,7 @@ import (
 
 	"github.com/kernel/hypeman/lib/autostandby"
 
-	"github.com/example/firepaas/internal/agent/probeflow"
+	"github.com/zhu327/firepaas/internal/agent/probeflow"
 )
 
 type fakeStream struct {

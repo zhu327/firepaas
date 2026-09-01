@@ -4,13 +4,14 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/kernel/hypeman/lib/images"
 	"github.com/kernel/hypeman/lib/instances"
 
-	pb "github.com/example/firepaas/shared/gen/agent/v1"
+	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 )
 
 type fakeInstances struct {
@@ -100,8 +101,9 @@ func (f *fakeInstances) RestoreInstance(_ context.Context, id string) (*instance
 }
 
 type fakeImages struct {
-	err  error
-	list []images.Image
+	err     error
+	list    []images.Image
+	deleted string
 }
 
 func (f *fakeImages) CreateImage(context.Context, images.CreateImageRequest) (*images.Image, error) {
@@ -130,6 +132,13 @@ func (f *fakeImages) ListImages(context.Context) ([]images.Image, error) {
 			Status: images.StatusReady, SizeBytes: &sz},
 	}, nil
 }
+func (f *fakeImages) DeleteImage(_ context.Context, name string) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.deleted = name
+	return nil
+}
 
 func validCreateRequest() *pb.CreateMachineRequest {
 	return &pb.CreateMachineRequest{
@@ -146,6 +155,116 @@ func validCreateRequest() *pb.CreateMachineRequest {
 			MemMib:       512,
 			Env:          map[string]string{"PORT": "8080"},
 		},
+	}
+}
+
+func TestDeleteImageRejectsLiveInstanceReference(t *testing.T) {
+	ref := "repo/app@sha256:live"
+	ims := &fakeImages{list: []images.Image{{Name: ref, Digest: "sha256:live", Status: images.StatusReady}}}
+	inst := &fakeInstances{listed: []instances.Instance{{StoredMetadata: instances.StoredMetadata{Name: "m1", Image: ref}}}}
+	err := New(inst, ims, nil, nil).DeleteImage(context.Background(), "sha256:live")
+	if err == nil || !strings.Contains(err.Error(), "referenced by live instance") {
+		t.Fatalf("DeleteImage error = %v, want live reference rejection", err)
+	}
+	if ims.deleted != "" {
+		t.Fatalf("deleted live image %q", ims.deleted)
+	}
+}
+
+func TestDeleteImageDeletesResolvedDigest(t *testing.T) {
+	ref := "repo/app@sha256:unused"
+	ims := &fakeImages{list: []images.Image{{Name: ref, Digest: "sha256:unused", Status: images.StatusReady}}}
+	if err := New(&fakeInstances{}, ims, nil, nil).DeleteImage(context.Background(), "sha256:unused"); err != nil {
+		t.Fatal(err)
+	}
+	if ims.deleted != ref {
+		t.Fatalf("deleted %q, want %q", ims.deleted, ref)
+	}
+}
+
+type blockingPullImages struct {
+	fakeImages
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (f *blockingPullImages) CreateImage(ctx context.Context, _ images.CreateImageRequest) (*images.Image, error) {
+	f.once.Do(func() { close(f.started) })
+	select {
+	case <-f.release:
+		return nil, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func TestActivePullHoldsImageDeletionLock(t *testing.T) {
+	ref := "repo/app@sha256:" + strings.Repeat("a", 64)
+	ims := &blockingPullImages{
+		fakeImages: fakeImages{list: []images.Image{{Name: ref, Digest: imageDigestFromName(ref), Status: images.StatusReady}}},
+		started:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	a := New(&fakeInstances{}, ims, nil, nil)
+	pullDone := make(chan error, 1)
+	go func() { pullDone <- a.EnsureImage(context.Background(), ref) }()
+	<-ims.started
+	if a.imageUseMu.TryLock() {
+		a.imageUseMu.Unlock()
+		t.Fatal("active pull did not protect image from deletion")
+	}
+	close(ims.release)
+	if err := <-pullDone; err != nil {
+		t.Fatalf("pull: %v", err)
+	}
+	if err := a.DeleteImage(context.Background(), ref); err != nil {
+		t.Fatalf("delete after pull: %v", err)
+	}
+}
+
+type blockingCreateInstances struct {
+	fakeInstances
+	started chan struct{}
+	release chan struct{}
+}
+
+func (f *blockingCreateInstances) CreateInstance(ctx context.Context, req instances.CreateInstanceRequest) (*instances.Instance, error) {
+	close(f.started)
+	select {
+	case <-f.release:
+		return f.fakeInstances.CreateInstance(ctx, req)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func TestCreateHoldsImageDeletionLockUntilReferencePublication(t *testing.T) {
+	ref := "docker.io/library/nginx:alpine@sha256:" + strings.Repeat("a", 64)
+	ims := &fakeImages{}
+	inst := &blockingCreateInstances{started: make(chan struct{}), release: make(chan struct{})}
+	a := New(inst, ims, nil, nil)
+	createDone := make(chan error, 1)
+	go func() {
+		req := validCreateRequest()
+		req.Spec.ImageRef = ref
+		_, err := a.Create(context.Background(), req)
+		createDone <- err
+	}()
+	<-inst.started
+	if a.imageUseMu.TryLock() {
+		a.imageUseMu.Unlock()
+		t.Fatal("create did not protect image before instance reference publication")
+	}
+	close(inst.release)
+	if err := <-createDone; err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := a.DeleteImage(context.Background(), ref); err == nil || !strings.Contains(err.Error(), "referenced by live instance") {
+		t.Fatalf("delete after create = %v, want live reference rejection", err)
+	}
+	if ims.deleted != "" {
+		t.Fatalf("deleted image used by new instance: %q", ims.deleted)
 	}
 }
 

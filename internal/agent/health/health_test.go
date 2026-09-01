@@ -12,10 +12,10 @@ import (
 
 	"github.com/kernel/hypeman/lib/healthcheck"
 
-	"github.com/example/firepaas/internal/agent/probeflow"
+	"github.com/zhu327/firepaas/internal/agent/probeflow"
 	"github.com/kernel/hypeman/lib/instances"
 
-	pb "github.com/example/firepaas/shared/gen/agent/v1"
+	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 )
 
 func TestRecordingDialReleasesOnClose(t *testing.T) {

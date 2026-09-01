@@ -10,7 +10,7 @@ import (
 	"syscall"
 	"time"
 
-	pb "github.com/example/firepaas/shared/gen/agent/v1"
+	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 	"github.com/google/uuid"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -27,22 +27,27 @@ const (
 
 // Provider 实现 InfoService 的 ServiceInfo。
 type Provider struct {
-	NodeID          string
-	ServiceVersion  string
-	ServiceCommit   string
-	NodePool        string
-	FirecrackerVer  string
-	NetworkCIDR     string
-	dataDir         string
-	memAllocatedMib func() uint64 // 已承诺给 machine 的内存（M1：实例 Size 之和）
-	vcpuAllocated   func() int    // 已承诺给 machine 的 vcpu（实例 Vcpus 之和）
+	NodeID           string
+	ServiceVersion   string
+	ServiceCommit    string
+	NodePool         string
+	FirecrackerVer   string
+	NetworkCIDR      string
+	dataDir          string
+	memAllocatedMib  func() uint64 // 已承诺给 machine 的内存（M1：实例 Size 之和）
+	vcpuAllocated    func() int    // 已承诺给 machine 的 vcpu（实例 Vcpus 之和）
+	diskAllocatedMib func() uint64 // 已承诺磁盘（实例 OverlaySize 之和，MiB；v1.2-E）
 	// cachedImageDigests（v1.1，ADR-0018）：节点本地镜像缓存 digest 列表
 	//（LRU/创建序，截断上限 512）；nil = 未装配（不上报）。
 	cachedImageDigests func() []string
-	startedAt          time.Time
-	serviceInstance    string
-	status             pb.ServiceInfoResponse_Status
-	statusChangedAt    time.Time
+	// v1.2-A（ADR-0023）：runtime capability。
+	protocolVersion   string
+	featureIDs        []string
+	snapshotCompatKey string
+	startedAt         time.Time
+	serviceInstance   string
+	status            pb.ServiceInfoResponse_Status
+	statusChangedAt   time.Time
 }
 
 // New 构造 Provider。dataDir 用于磁盘容量/用量统计（评审 P3：不得用 / 代替
@@ -69,6 +74,15 @@ func New(nodeID, version, commit, nodePool, fcVersion, networkCIDR, dataDir stri
 // DataDir 返回数据目录（PullImage 磁盘水位检查用）。
 func (p *Provider) DataDir() string { return p.dataDir }
 
+// SetCapabilities 设置 v1.2-A capability 投影（protocol/features/snapshot
+// compatibility key）。features 只报告本 agent 真实可调用且可兑现的能力；
+// 未配置 = 空（调度器按缺少全部启动能力过滤）。
+func (p *Provider) SetCapabilities(protocolVersion string, featureIDs []string, snapshotCompatKey string) {
+	p.protocolVersion = protocolVersion
+	p.featureIDs = append([]string(nil), featureIDs...)
+	p.snapshotCompatKey = snapshotCompatKey
+}
+
 // SetImageDigestsFunc 注入镜像缓存 digest 采集函数（v1.1，ADR-0018）。
 // 由 agentd 装配：从 hypeman ListImages 派生 ready 镜像的 digest 集合。
 func (p *Provider) SetImageDigestsFunc(f func() []string) { p.cachedImageDigests = f }
@@ -88,6 +102,20 @@ func (p *Provider) AdmissionSnapshot() (vcpuTotal, memTotalMib, vcpuAllocated, m
 	return vcpuTotal, memTotalMib, vcpuAllocated, memAllocatedMib
 }
 
+// DiskAdmissionSnapshot（v1.2-E，ADR-0035）：磁盘维度硬准入输入。
+// diskTotalMib 为 data 盘总量（statfs）；diskAllocatedMib 为已承诺 overlay
+// 之和（注入函数；未注入 = 0，调用方仅做水位检查）。
+func (p *Provider) DiskAdmissionSnapshot() (diskTotalMib, diskAllocatedMib uint64) {
+	diskTotalMib, _ = diskStats(p.dataDir)
+	if p.diskAllocatedMib != nil {
+		diskAllocatedMib = p.diskAllocatedMib()
+	}
+	return diskTotalMib, diskAllocatedMib
+}
+
+// SetDiskAllocatedFunc 注入已承诺磁盘采集（requested overlay 之和，MiB）。
+func (p *Provider) SetDiskAllocatedFunc(f func() uint64) { p.diskAllocatedMib = f }
+
 // Response 构造 ServiceInfoResponse。
 func (p *Provider) Response() *pb.ServiceInfoResponse {
 	totalMem := memTotal()
@@ -96,6 +124,10 @@ func (p *Provider) Response() *pb.ServiceInfoResponse {
 	memAllocated := uint64(0)
 	if p.memAllocatedMib != nil {
 		memAllocated = p.memAllocatedMib()
+	}
+	diskAllocated := uint64(0)
+	if p.diskAllocatedMib != nil {
+		diskAllocated = p.diskAllocatedMib()
 	}
 
 	return &pb.ServiceInfoResponse{
@@ -111,10 +143,11 @@ func (p *Provider) Response() *pb.ServiceInfoResponse {
 			DiskTotalMib: diskTotal,
 		},
 		Usage: &pb.NodeUsage{
-			CpuPercent:      loadAvgCPUPercent(),
-			MemUsedMib:      (totalMem - availMem) / 1024,
-			MemAllocatedMib: memAllocated,
-			DiskUsedMib:     diskUsed,
+			CpuPercent:       loadAvgCPUPercent(),
+			MemUsedMib:       (totalMem - availMem) / 1024,
+			MemAllocatedMib:  memAllocated,
+			DiskUsedMib:      diskUsed,
+			DiskAllocatedMib: diskAllocated, // v1.2-E（ADR-0035）
 		},
 		Labels: map[string]string{
 			"node_pool":           p.NodePool,
@@ -125,6 +158,10 @@ func (p *Provider) Response() *pb.ServiceInfoResponse {
 		},
 		NetworkCidr:        p.NetworkCIDR,
 		CachedImageDigests: p.cachedImageDigestsList(),
+		// v1.2-A（ADR-0023）：runtime capability 投影。
+		ProtocolVersion:          p.protocolVersion,
+		FeatureIds:               p.featureIDs,
+		SnapshotCompatibilityKey: p.snapshotCompatKey,
 	}
 }
 

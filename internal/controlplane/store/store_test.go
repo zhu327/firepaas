@@ -7,7 +7,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/example/firepaas/internal/controlplane/db"
+	"github.com/zhu327/firepaas/internal/controlplane/db"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -22,13 +22,13 @@ func TestProjectUsageIncludesAllocatedAndPending(t *testing.T) {
 
 	machineID := "m-usage-" + fmt.Sprint(os.Getpid())
 	op, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-usage", "usage.local", "img:1",
-		2, 1024, 80, machineID, "dep-usage", "exec-1", "op-usage-"+fmt.Sprint(os.Getpid()),
+		2, 1024, 0, 80, machineID, "dep-usage", "exec-1", "op-usage-"+fmt.Sprint(os.Getpid()),
 		1, 0, []byte(`{}`), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if vcpu, mem, err := s.ProjectUsage(ctx, project); err != nil || vcpu != 2 || mem != 1024 {
-		t.Fatalf("pending usage = (%d,%d), err=%v; want (2,1024)", vcpu, mem, err)
+	if vcpu, mem, disk, err := s.ProjectUsage(ctx, project); err != nil || vcpu != 2 || mem != 1024 || disk != 10240 {
+		t.Fatalf("pending usage = (%d,%d,%d), err=%v; want (2,1024,10240)", vcpu, mem, disk, err)
 	}
 	if err := s.UpdateMachineNodeAndObserved(ctx, machineID, "node-1", "exec-1", "RUNNING", "", "READY"); err != nil {
 		t.Fatal(err)
@@ -36,8 +36,133 @@ func TestProjectUsageIncludesAllocatedAndPending(t *testing.T) {
 	if err := s.CompleteOperation(ctx, op.ID, "SUCCEEDED", []byte(`{}`), ""); err != nil {
 		t.Fatal(err)
 	}
-	if vcpu, mem, err := s.ProjectUsage(ctx, project); err != nil || vcpu != 2 || mem != 1024 {
-		t.Fatalf("allocated usage = (%d,%d), err=%v; want (2,1024)", vcpu, mem, err)
+	if vcpu, mem, disk, err := s.ProjectUsage(ctx, project); err != nil || vcpu != 2 || mem != 1024 || disk != 10240 {
+		t.Fatalf("allocated usage = (%d,%d,%d), err=%v; want (2,1024,10240)", vcpu, mem, disk, err)
+	}
+}
+
+func TestProjectMachineUsageCountsCurrentCreateAndRestartOnce(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	suffix := fmt.Sprint(os.Getpid())
+	project := "p-machine-usage-" + suffix
+	if err := s.EnsureProject(ctx, project, "machine-usage-test"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cleanupProject(t, s, project) })
+
+	machineID := "m-machine-usage-" + suffix
+	op, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-machine-usage", "machine-usage.local", "img:1",
+		1, 512, 1024, 80, machineID, "dep-machine-usage", "exec-1", "op-machine-usage-1-"+suffix,
+		1, 0, []byte(`{"generation":"1"}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.ProjectMachineUsage(ctx, project); err != nil || got != 1 {
+		t.Fatalf("pending create usage = %d, err=%v; want 1", got, err)
+	}
+	if err := s.UpdateMachineNodeAndObserved(ctx, machineID, "node-1", "exec-1", "RUNNING", "", "READY"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CompleteOperation(ctx, op.ID, "SUCCEEDED", []byte(`{}`), ""); err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.EnsureAppAndEnqueueCreate(ctx, project, "app-machine-usage", "machine-usage.local", "img:1",
+		1, 512, 1024, 80, machineID, "dep-machine-usage", "exec-2", "op-machine-usage-2-"+suffix,
+		2, 0, []byte(`{"generation":"2"}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.ProjectMachineUsage(ctx, project); err != nil || got != 1 {
+		t.Fatalf("restart replacement usage = %d, err=%v; want net usage 1", got, err)
+	}
+}
+
+func TestEnsureCreateRejectsImmutableOwnershipConflict(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	sfx := fmt.Sprint(os.Getpid())
+	ownerProject := "p-owner-" + sfx
+	otherProject := "p-other-" + sfx
+	for _, project := range []string{ownerProject, otherProject} {
+		if err := s.EnsureProject(ctx, project, project); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { cleanupProject(t, s, project) })
+	}
+
+	appID := "app-owned-" + sfx
+	machineID := "m-owned-" + sfx
+	deploymentID := "dep-owned-" + sfx
+	firstOp := "op-owned-1-" + sfx
+	if _, err := s.EnsureAppAndEnqueueCreate(ctx, ownerProject, appID, appID+".test", "img:1",
+		1, 512, 0, 80, machineID, deploymentID, "exec-1", firstOp,
+		1, 0, []byte(`{"request":1}`), nil); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name, project, app, deployment, operation string
+	}{
+		{"app project", otherProject, appID, deploymentID, "op-cross-project-" + sfx},
+		{"machine app", ownerProject, "app-other-" + sfx, deploymentID, "op-cross-app-" + sfx},
+		{"machine deployment", ownerProject, appID, "dep-other-" + sfx, "op-cross-dep-" + sfx},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := s.EnsureAppAndEnqueueCreate(ctx, tc.project, tc.app, tc.app+".test", "img:2",
+				2, 1024, 0, 8080, machineID, tc.deployment, "exec-attacker", tc.operation,
+				9, 4, []byte(`{"request":2}`), nil)
+			if !errors.Is(err, ErrOwnershipConflict) || !errors.Is(err, ErrRequestConflict) {
+				t.Fatalf("want typed ownership/request conflict, got %v", err)
+			}
+			var n int
+			if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM operations WHERE id=$1`, tc.operation).Scan(&n); err != nil {
+				t.Fatal(err)
+			}
+			if n != 0 {
+				t.Fatalf("conflict inserted operation %s", tc.operation)
+			}
+			m, err := s.GetMachine(ctx, machineID)
+			if err != nil || m == nil {
+				t.Fatal(err)
+			}
+			if m.AppID != appID || m.DeploymentID != deploymentID || m.CurrentExecutionID != "exec-1" || m.Generation != 1 {
+				t.Fatalf("conflict mutated machine: %+v", m)
+			}
+		})
+	}
+}
+
+func TestEnsureCreateRejectsExistingDeploymentForOtherApp(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	sfx := fmt.Sprint(os.Getpid())
+	project := "p-dep-owner-" + sfx
+	if err := s.EnsureProject(ctx, project, project); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cleanupProject(t, s, project) })
+	if _, err := s.pool.Exec(ctx, `INSERT INTO apps(id, project_id, hostname) VALUES($1,$2,$3),($4,$2,$5)`,
+		"app-dep-owner-"+sfx, project, "dep-owner-"+sfx+".test",
+		"app-dep-other-"+sfx, "dep-other-"+sfx+".test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.pool.Exec(ctx, `INSERT INTO deployments(id, app_id, generation, image_ref) VALUES($1,$2,1,'img')`,
+		"dep-shared-"+sfx, "app-dep-owner-"+sfx); err != nil {
+		t.Fatal(err)
+	}
+
+	opID := "op-dep-conflict-" + sfx
+	_, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-dep-other-"+sfx, "dep-other-"+sfx+".test", "img",
+		1, 512, 0, 80, "m-dep-conflict-"+sfx, "dep-shared-"+sfx, "exec-1", opID,
+		1, 0, []byte(`{}`), nil)
+	if !errors.Is(err, ErrOwnershipConflict) {
+		t.Fatalf("want deployment ownership conflict, got %v", err)
+	}
+	var n int
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM operations WHERE id=$1`, opID).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("conflict operation count=%d err=%v", n, err)
 	}
 }
 
@@ -88,6 +213,10 @@ func cleanupProject(t *testing.T, s *Store, projectID string) {
 	// 否则清理静默失败，残留行会让下一个用例的固定 opID 撞主键。
 	ctx := context.Background()
 	stmts := []string{
+		`DELETE FROM volume_attachments WHERE volume_id IN (SELECT id FROM volumes WHERE project_id=$1)`,
+		`DELETE FROM volumes WHERE project_id=$1`,
+		`DELETE FROM snapshot_references WHERE snapshot_id IN (SELECT id FROM snapshots WHERE project_id=$1)`,
+		`DELETE FROM snapshots WHERE project_id=$1`,
 		`DELETE FROM operations WHERE project_id=$1`,
 		`DELETE FROM machines WHERE app_id IN (SELECT id FROM apps WHERE project_id=$1)`,
 		`DELETE FROM apps WHERE project_id=$1`,
@@ -97,6 +226,35 @@ func cleanupProject(t *testing.T, s *Store, projectID string) {
 		if _, err := s.pool.Exec(ctx, q, projectID); err != nil {
 			t.Logf("cleanup %q: %v", q, err)
 		}
+	}
+}
+
+func TestBeginVolumeDeleteAndEnqueueIsAtomicAndIdempotent(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	sfx := fmt.Sprint(os.Getpid())
+	project := "p-volume-delete-" + sfx
+	if err := s.EnsureProject(ctx, project, project); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cleanupProject(t, s, project) })
+	volumeID, opID := "vol-delete-"+sfx, "op-vol-delete-"+sfx
+	if _, err := s.pool.Exec(ctx, `INSERT INTO volumes(id,project_id,name,mode,node_id,size_bytes,state) VALUES($1,$2,$3,'LOCAL_RW','node-1',1048576,'READY')`, volumeID, project, volumeID); err != nil {
+		t.Fatal(err)
+	}
+	p := EnqueueOperationParams{OperationID: opID, ProjectID: project, Kind: "volume_delete", Request: []byte(`{"volume_id":"` + volumeID + `"}`), DispatchNodeID: "node-1"}
+	for i := 0; i < 2; i++ {
+		if _, err := s.BeginVolumeDeleteAndEnqueue(ctx, volumeID, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var state string
+	var operations int
+	if err := s.pool.QueryRow(ctx, `SELECT state,(SELECT count(*) FROM operations WHERE id=$2) FROM volumes WHERE id=$1`, volumeID, opID).Scan(&state, &operations); err != nil {
+		t.Fatal(err)
+	}
+	if state != "DELETING" || operations != 1 {
+		t.Fatalf("state=%s operations=%d", state, operations)
 	}
 }
 
@@ -164,7 +322,7 @@ func TestFailedCreateAttempts(t *testing.T) {
 	ensure := func(opID, exec string, gen int64) {
 		t.Helper()
 		op, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-a", "h.local", "img:1",
-			1, 512, 80, "m-att-"+sfx, "dep-a", exec, opID+"-"+sfx, gen, 0, []byte(`{}`), nil)
+			1, 512, 0, 80, "m-att-"+sfx, "dep-a", exec, opID+"-"+sfx, gen, 0, []byte(`{}`), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -175,7 +333,7 @@ func TestFailedCreateAttempts(t *testing.T) {
 	succeed := func(opID, exec string, gen int64) {
 		t.Helper()
 		op, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-a", "h.local", "img:1",
-			1, 512, 80, "m-att-"+sfx, "dep-a", exec, opID+"-"+sfx, gen, 0, []byte(`{}`), nil)
+			1, 512, 0, 80, "m-att-"+sfx, "dep-a", exec, opID+"-"+sfx, gen, 0, []byte(`{}`), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -212,7 +370,7 @@ func TestEnsureCreateGenerationMonotonic(t *testing.T) {
 
 	sfx := fmt.Sprintf("%d", os.Getpid())
 	if _, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-m", "m.local", "img:1",
-		1, 512, 80, "m-mono-"+sfx, "dep-m", "exec-1", "op-m1-"+sfx, 1, 0, []byte(`{}`), nil); err != nil {
+		1, 512, 0, 80, "m-mono-"+sfx, "dep-m", "exec-1", "op-m1-"+sfx, 1, 0, []byte(`{}`), nil); err != nil {
 		t.Fatal(err)
 	}
 	// 模拟换代重建已把水位推到 5（recreateMachine bump 路径）。
@@ -222,7 +380,7 @@ func TestEnsureCreateGenerationMonotonic(t *testing.T) {
 	}
 	// 用户/重试用 gen=1 重试：GREATEST 必须保住 5。
 	if _, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-m", "m.local", "img:1",
-		1, 512, 80, "m-mono-"+sfx, "dep-m", "exec-9", "op-m2-"+sfx, 1, 0, []byte(`{}`), nil); err != nil {
+		1, 512, 0, 80, "m-mono-"+sfx, "dep-m", "exec-9", "op-m2-"+sfx, 1, 0, []byte(`{}`), nil); err != nil {
 		t.Fatal(err)
 	}
 	m, err := s.GetMachine(ctx, "m-mono-"+sfx)
@@ -234,7 +392,7 @@ func TestEnsureCreateGenerationMonotonic(t *testing.T) {
 	}
 	// 更高的 generation 正常推进。
 	if _, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-m", "m.local", "img:1",
-		1, 512, 80, "m-mono-"+sfx, "dep-m", "exec-10", "op-m3-"+sfx, 6, 0, []byte(`{}`), nil); err != nil {
+		1, 512, 0, 80, "m-mono-"+sfx, "dep-m", "exec-10", "op-m3-"+sfx, 6, 0, []byte(`{}`), nil); err != nil {
 		t.Fatal(err)
 	}
 	m, _ = s.GetMachine(ctx, "m-mono-"+sfx)
@@ -256,7 +414,7 @@ func TestMarkMachineObservedMissingPreservesLastObservation(t *testing.T) {
 	t.Cleanup(func() { cleanupProject(t, s, project) })
 	machineID := "m-missing-" + fmt.Sprint(os.Getpid())
 	if _, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-missing", "missing.local", "img:1",
-		1, 512, 80, machineID, "dep-missing", "exec-1", "op-missing-"+fmt.Sprint(os.Getpid()),
+		1, 512, 0, 80, machineID, "dep-missing", "exec-1", "op-missing-"+fmt.Sprint(os.Getpid()),
 		1, 0, []byte(`{}`), nil); err != nil {
 		t.Fatal(err)
 	}
@@ -289,7 +447,7 @@ func TestUpdateObservedRejectsStaleExecution(t *testing.T) {
 	t.Cleanup(func() { cleanupProject(t, s, project) })
 	machineID := "m-observed-cas-" + fmt.Sprint(os.Getpid())
 	if _, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-observed-cas", "cas.local", "img:1",
-		1, 512, 80, machineID, "dep-cas", "exec-current", "op-cas-"+fmt.Sprint(os.Getpid()),
+		1, 512, 0, 80, machineID, "dep-cas", "exec-current", "op-cas-"+fmt.Sprint(os.Getpid()),
 		2, 0, []byte(`{}`), nil); err != nil {
 		t.Fatal(err)
 	}
@@ -305,6 +463,68 @@ func TestUpdateObservedRejectsStaleExecution(t *testing.T) {
 	}
 }
 
+func TestEnqueueRescueReplacementAtomic(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	project := fmt.Sprintf("p-rescue-%d", os.Getpid())
+	if err := s.EnsureProject(ctx, project, "rescue-test"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cleanupProject(t, s, project) })
+	machineID := "m-rescue-" + fmt.Sprint(os.Getpid())
+	if _, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-rescue", "rescue.local", "img:1",
+		1, 512, 0, 80, machineID, "dep-rescue", "exec-old", "op-create-rescue-"+fmt.Sprint(os.Getpid()),
+		1, 0, []byte(`{}`), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateMachineNodeAndObserved(ctx, machineID, "node-1", "exec-old", "RUNNING", "10.0.0.2", "READY"); err != nil {
+		t.Fatal(err)
+	}
+	snapID := "snap-rescue-" + fmt.Sprint(os.Getpid())
+	if _, err := s.CreateSnapshot(ctx, Snapshot{ID: snapID, ProjectID: project, SourceMachineID: machineID,
+		SourceExecutionID: "exec-old", SourceGeneration: 1, Kind: "MEMORY", NodeID: "node-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpdateSnapshotArtifact(ctx, snapID, 1, "sha256:test", "none", "none", "", nil, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.pool.Exec(ctx, `INSERT INTO routes(id,app_id,hostname,active_generation) VALUES($1,$2,$3,1)
+		ON CONFLICT (hostname, port) DO NOTHING`, "route-rescue-"+fmt.Sprint(os.Getpid()), "app-rescue", "rescue.local"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.pool.Exec(ctx, `INSERT INTO route_backends(route_id,generation,machine_id,execution_id)
+		SELECT id,1,$2,$3 FROM routes WHERE app_id=$1`, "app-rescue", machineID, "exec-old"); err != nil {
+		t.Fatal(err)
+	}
+	opID := "op-rescue-" + fmt.Sprint(os.Getpid())
+	raw := []byte(fmt.Sprintf(`{"snapshot_id":%q}`, snapID))
+	op, err := s.EnqueueRescueReplacement(ctx, RescueReplacementParams{ProjectID: project, MachineID: machineID,
+		OldExecutionID: "exec-old", OldGeneration: 1, NewExecutionID: "exec-new", OperationID: opID,
+		SnapshotID: snapID, Request: raw, DispatchNodeID: "node-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op.ExecutionID != "exec-new" || op.Generation != 2 || op.Kind != "rescue" {
+		t.Fatalf("unexpected rescue operation: %+v", op)
+	}
+	m, err := s.GetMachine(ctx, machineID)
+	if err != nil || m == nil {
+		t.Fatal(err)
+	}
+	if m.CurrentExecutionID != "exec-new" || m.Generation != 2 || m.ObservedState != "" || m.ObservedReadiness != "UNKNOWN" {
+		t.Fatalf("unexpected replacement machine: %+v", m)
+	}
+	var backends int
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM route_backends WHERE machine_id=$1`, machineID).Scan(&backends); err != nil || backends != 0 {
+		t.Fatalf("route backends after rescue = %d, err=%v", backends, err)
+	}
+	if _, err := s.EnqueueRescueReplacement(ctx, RescueReplacementParams{ProjectID: project, MachineID: machineID,
+		OldExecutionID: "exec-old", OldGeneration: 1, NewExecutionID: "exec-other", OperationID: opID + "-stale",
+		SnapshotID: snapID, Request: raw, DispatchNodeID: "node-1"}); !errors.Is(err, ErrRescueConflict) {
+		t.Fatalf("stale rescue CAS error = %v, want ErrRescueConflict", err)
+	}
+}
+
 func TestEnsureCreateExecutionChangeClearsObserved(t *testing.T) {
 	s := testStore(t)
 	ctx := context.Background()
@@ -316,7 +536,7 @@ func TestEnsureCreateExecutionChangeClearsObserved(t *testing.T) {
 
 	sfx := fmt.Sprintf("%d", os.Getpid())
 	if _, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-c", "c.local", "img:1",
-		1, 512, 80, "m-clr-"+sfx, "dep-c", "exec-1", "op-c1-"+sfx, 1, 0, []byte(`{}`), nil); err != nil {
+		1, 512, 0, 80, "m-clr-"+sfx, "dep-c", "exec-1", "op-c1-"+sfx, 1, 0, []byte(`{}`), nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.UpdateMachineNodeAndObserved(ctx, "m-clr-"+sfx, "n1", "exec-1",
@@ -326,7 +546,7 @@ func TestEnsureCreateExecutionChangeClearsObserved(t *testing.T) {
 
 	// 换代重建：exec-1 → exec-2。旧 RUNNING 观测必须清空，节点回空。
 	if _, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-c", "c.local", "img:1",
-		1, 512, 80, "m-clr-"+sfx, "dep-c", "exec-2", "op-c2-"+sfx, 2, 0, []byte(`{}`), nil); err != nil {
+		1, 512, 0, 80, "m-clr-"+sfx, "dep-c", "exec-2", "op-c2-"+sfx, 2, 0, []byte(`{}`), nil); err != nil {
 		t.Fatal(err)
 	}
 	m, err := s.GetMachine(ctx, "m-clr-"+sfx)
@@ -343,7 +563,7 @@ func TestEnsureCreateExecutionChangeClearsObserved(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-c", "c.local", "img:1",
-		1, 512, 80, "m-clr-"+sfx, "dep-c", "exec-2", "op-c3-"+sfx, 2, 0, []byte(`{}`), nil); err != nil {
+		1, 512, 0, 80, "m-clr-"+sfx, "dep-c", "exec-2", "op-c3-"+sfx, 2, 0, []byte(`{}`), nil); err != nil {
 		t.Fatal(err)
 	}
 	m, _ = s.GetMachine(ctx, "m-clr-"+sfx)

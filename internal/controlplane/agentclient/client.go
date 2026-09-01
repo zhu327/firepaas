@@ -8,8 +8,8 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/example/firepaas/internal/security/mtls"
-	pb "github.com/example/firepaas/shared/gen/agent/v1"
+	"github.com/zhu327/firepaas/internal/security/mtls"
+	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
@@ -60,6 +60,9 @@ func Dial(addr string) (*Client, error) {
 // Addr 返回连接目标地址（nodemanager 判断是否需要重拨）。
 func (c *Client) Addr() string { return c.addr }
 
+// RawConn 返回底层 gRPC 连接（派生 snapshot 等附属服务客户端用）。
+func (c *Client) RawConn() *grpc.ClientConn { return c.conn }
+
 // Close 关闭连接。
 func (c *Client) Close() error { return c.conn.Close() }
 
@@ -97,6 +100,41 @@ func (c *Client) PullImage(ctx context.Context, imageRef string) (*pb.PullImageR
 	return c.Images.PullImage(ctx, &pb.PullImageRequest{ImageRef: imageRef})
 }
 
+// ListImages returns the node's ready local image cache entries.
+func (c *Client) ListImages(ctx context.Context) ([]*pb.PullImageResponse, error) {
+	resp, err := c.Images.ListImages(ctx, &pb.ListImagesRequest{})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Images, nil
+}
+
+// DeleteImage 调用 ImageService.DeleteImage（v1.2-F：引用感知 GC）。agent
+// 在删除前独立检查本机 live instance 引用；not-found 按成功收敛。
+func (c *Client) DeleteImage(ctx context.Context, imageRef string) error {
+	_, err := c.Images.DeleteImage(ctx, &pb.DeleteImageRequest{ImageRef: imageRef})
+	return err
+}
+
+func (c *Client) QuarantineImage(ctx context.Context, req *pb.QuarantineImageRequest) (*pb.ImageQuarantine, error) {
+	return c.Images.QuarantineImage(ctx, req)
+}
+func (c *Client) ListImageQuarantines(ctx context.Context) ([]*pb.ImageQuarantine, error) {
+	resp, err := c.Images.ListImageQuarantines(ctx, &pb.ListImageQuarantinesRequest{})
+	if err != nil {
+		return nil, err
+	}
+	return resp.GetQuarantines(), nil
+}
+func (c *Client) RollbackImageQuarantine(ctx context.Context, req *pb.ImageQuarantineActionRequest) error {
+	_, err := c.Images.RollbackImageQuarantine(ctx, req)
+	return err
+}
+func (c *Client) FinalizeImageQuarantine(ctx context.Context, req *pb.ImageQuarantineActionRequest) error {
+	_, err := c.Images.FinalizeImageQuarantine(ctx, req)
+	return err
+}
+
 // Pause 调用 PauseMachine（M4.5 scale-to-zero）。
 func (c *Client) Pause(ctx context.Context, machineID, executionID string, generation uint64, opID string) (*pb.Machine, error) {
 	return c.Machines.PauseMachine(ctx, &pb.PauseMachineRequest{Operation: &pb.MachineOperationRequest{
@@ -111,4 +149,108 @@ func (c *Client) Resume(ctx context.Context, machineID, executionID string, gene
 		MachineId: machineID, ExecutionId: executionID, Generation: generation,
 		OperationId: opID, ExpectedState: pb.MachineState_PAUSED,
 	}})
+}
+
+// Snapshots 是 agent SnapshotService 客户端（v1.3-B，ADR-0028）。
+type SnapshotClient struct {
+	client pb.SnapshotServiceClient
+}
+
+// NewSnapshotClient 构造 snapshot 客户端。
+func NewSnapshotClient(conn *grpc.ClientConn) *SnapshotClient {
+	return &SnapshotClient{client: pb.NewSnapshotServiceClient(conn)}
+}
+
+// CreateSnapshot 调用 agent 执行 checkpoint。
+func (s *SnapshotClient) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotRequest) (*pb.SnapshotInfo, error) {
+	resp, err := s.client.CreateSnapshot(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	return resp.GetSnapshot(), nil
+}
+
+// DeleteSnapshot 调用 agent 删除本地快照。
+func (s *SnapshotClient) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotRequest) error {
+	_, err := s.client.DeleteSnapshot(ctx, req)
+	return err
+}
+
+// ListSnapshots 调用 agent 列出本地快照。返回完整响应以暴露 v1.4-B
+// inventory 观测元数据（complete/generation/observed_at）。
+func (s *SnapshotClient) ListSnapshots(ctx context.Context, machineID, snapshotID string) (*pb.ListSnapshotsResponse, error) {
+	return s.client.ListSnapshots(ctx, &pb.ListSnapshotsRequest{MachineId: machineID, SnapshotId: snapshotID})
+}
+
+// ForkSnapshot 调用 agent fork 快照（v1.3-C）。
+func (s *SnapshotClient) ForkSnapshot(ctx context.Context, req *pb.ForkSnapshotRequest) (*pb.ForkSnapshotResponse, error) {
+	return s.client.ForkSnapshot(ctx, req)
+}
+
+// RestoreSnapshot 调用 agent restore 快照（v1.3-C rescue）。
+func (s *SnapshotClient) RestoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotRequest) (*pb.RestoreSnapshotResponse, error) {
+	return s.client.RestoreSnapshot(ctx, req)
+}
+func (s *SnapshotClient) ScrubSnapshot(ctx context.Context, req *pb.ScrubSnapshotRequest) (*pb.ScrubSnapshotResponse, error) {
+	return s.client.ScrubSnapshot(ctx, req)
+}
+
+// VolumeClient 是 agent VolumeService 客户端（v1.3-D，ADR-0029）。
+type VolumeClient struct {
+	client pb.VolumeServiceClient
+}
+
+// NewVolumeClient 构造 volume 客户端。
+func NewVolumeClient(conn *grpc.ClientConn) *VolumeClient {
+	return &VolumeClient{client: pb.NewVolumeServiceClient(conn)}
+}
+
+// CreateVolume 创建本地空卷。
+func (v *VolumeClient) CreateVolume(ctx context.Context, req *pb.CreateVolumeRequest) (*pb.CreateVolumeResponse, error) {
+	return v.client.CreateVolume(ctx, req)
+}
+
+// ImportDataset asks the agent to fetch an archive directly from object storage.
+func (v *VolumeClient) ImportDataset(ctx context.Context, req *pb.ImportDatasetRequest) (*pb.CreateVolumeResponse, error) {
+	return v.client.ImportDataset(ctx, req)
+}
+
+// ListVolumes 返回 agent 本地 materialization inventory（含 v1.4-B 观测
+// 元数据）。
+func (v *VolumeClient) ListVolumes(ctx context.Context) (*pb.ListVolumesResponse, error) {
+	return v.client.ListVolumes(ctx, &pb.ListVolumesRequest{})
+}
+
+// DeleteVolume 删除本地卷。
+func (v *VolumeClient) DeleteVolume(ctx context.Context, req *pb.DeleteVolumeRequest) error {
+	_, err := v.client.DeleteVolume(ctx, req)
+	return err
+}
+func (v *VolumeClient) QuarantineVolume(ctx context.Context, req *pb.QuarantineVolumeRequest) (*pb.VolumeQuarantine, error) {
+	return v.client.QuarantineVolume(ctx, req)
+}
+func (v *VolumeClient) ListVolumeQuarantines(ctx context.Context) ([]*pb.VolumeQuarantine, error) {
+	r, e := v.client.ListVolumeQuarantines(ctx, &pb.ListVolumeQuarantinesRequest{})
+	if e != nil {
+		return nil, e
+	}
+	return r.GetQuarantines(), nil
+}
+func (v *VolumeClient) RollbackVolumeQuarantine(ctx context.Context, req *pb.VolumeQuarantineActionRequest) error {
+	_, e := v.client.RollbackVolumeQuarantine(ctx, req)
+	return e
+}
+func (v *VolumeClient) FinalizeVolumeQuarantine(ctx context.Context, req *pb.VolumeQuarantineActionRequest) error {
+	_, e := v.client.FinalizeVolumeQuarantine(ctx, req)
+	return e
+}
+
+// AttachVolume 挂载卷。
+func (v *VolumeClient) AttachVolume(ctx context.Context, req *pb.AttachVolumeRequest) (*pb.Machine, error) {
+	return v.client.AttachVolume(ctx, req)
+}
+
+// DetachVolume 卸载卷。
+func (v *VolumeClient) DetachVolume(ctx context.Context, req *pb.DetachVolumeRequest) (*pb.Machine, error) {
+	return v.client.DetachVolume(ctx, req)
 }

@@ -19,7 +19,7 @@ package firepaas.agent.v1;
 import "google/protobuf/empty.proto";
 import "google/protobuf/timestamp.proto";
 
-option go_package = "github.com/example/firepaas/shared/gen/agent/v1;agentv1";
+option go_package = "github.com/zhu327/firepaas/shared/gen/agent/v1;agentv1";
 
 // ---------------------------------------------------------------------------
 // 节点信息(调度器的输入)
@@ -42,6 +42,9 @@ message NodeUsage {
   uint64 mem_used_mib = 2;
   uint64 mem_allocated_mib = 3; // 已承诺给 machine 的内存
   uint64 disk_used_mib = 4;
+  // v1.2-E（ADR-0035）：已承诺给 machine 的磁盘（requested overlay 之和），
+  // 与 disk_used_mib（真实占用）区分——前者是调度/预约的 accounting 维度。
+  uint64 disk_allocated_mib = 5;
 }
 
 message ServiceInfoResponse {
@@ -62,6 +65,16 @@ message ServiceInfoResponse {
   NodeUsage usage = 8;
   map<string, string> labels = 9; // node_pool、arch、kernel_version、firecracker_version、gpu...
   string network_cidr = 10;       // 节点内 slot 子网
+  // v1.1（ADR-0018）：节点本地镜像缓存摘要（digest 形态，LRU/创建序，截断
+  // 上限 512 条）。scheduler 用于镜像亲和打分；非 ready 镜像不计入。
+  repeated string cached_image_digests = 11;
+  // v1.2-A（ADR-0023）：runtime capability discovery。
+  // protocol_version 只描述 agent 契约版本，不代表任何 feature 可用性；
+  // feature_ids 是稳定小写带版本后缀的能力 ID，未知 ID 必须可忽略；
+  // snapshot_compatibility_key 用于判断 snapshot 产物能否跨节点/版本恢复。
+  string protocol_version = 12;
+  repeated string feature_ids = 13;
+  string snapshot_compatibility_key = 14;
 }
 
 // ---------------------------------------------------------------------------
@@ -85,6 +98,10 @@ service MachineService {
   // exec 为双向流:第一帧必须是 open。operation_id 只保证“创建会话”幂等；
   // MVP 中连接断开即终止会话，不承诺 stdin/stdout 无损续传或重新 attach。
   rpc Exec(stream ExecInput) returns (stream ExecOutput);
+  // v1.2-C（ADR-0025）：单文件 cp。第一帧必须是 open；数据帧按到达顺序
+  // 写入 guest，流结束（CloseSend）触发最终落盘与 bytes_written 响应。
+  rpc CopyTo(stream CopyToInput) returns (CopyToResponse);
+  rpc CopyFrom(CopyFromRequest) returns (stream CopyFromResponse);
 }
 
 enum MachineState {
@@ -121,6 +138,28 @@ message MachineSpec {
   repeated SecretRef secret_refs = 17; // secret 引用,值经 secret_env 一次性下发
   PlacementConstraints placement = 18;  // 放置约束(ADR-0009),agent 不消费决策,仅记录
   string hostname = 19;                 // M1 vertical slice 用;M3 route 冻结时转正(ADR-0005)
+  // v1.1（ADR-0017）：自动 standby 策略。默认关闭（nil/未声明 = 行为与 M5
+  // 完全一致）。agent 翻译为 hypeman autostandby Policy；唤醒走既有
+  // autoresume（proxy GetEndpoint 同步 restore）。
+  AutoStandbyPolicy auto_standby = 20;
+  // v1.1（ADR-0022）：多端口 services。主 service（第一条）继承单端口语义
+  //（路由默认端口、readiness 探针目标）。空 = 单端口（network.ingress_port）。
+  repeated ServiceSpec services = 21;
+}
+
+// AutoStandbyPolicy 是 deployment 级的自动 standby 策略（ADR-0017）。
+// 空闲判定在 agent 侧（conntrack 入站连接视角）；平台注入探针流排除。
+message AutoStandbyPolicy {
+  bool enabled = 1;                 // 默认 false：未声明的 app 行为不变
+  uint32 idle_timeout_seconds = 2;  // 空闲多久后 standby（enabled 时必填，>0）
+  repeated string ignore_source_cidrs = 3;       // 平台保留：入站活动忽略的源段
+  repeated uint32 ignore_destination_ports = 4;  // app 声明：监控拨测等不计数端口
+}
+
+// ServiceSpec 声明 app 暴露的一个服务端口（ADR-0022）。
+message ServiceSpec {
+  string name = 1;          // service 名（deployment 内唯一）
+  uint32 internal_port = 2; // guest 侧监听端口；v1.1 public_port = internal_port
 }
 
 // SecretRef 引用控制面 secrets 表中的一个版本化 secret(ADR-0010)。
@@ -147,6 +186,31 @@ message NetworkSpec {
   repeated string allowed_cidrs = 2;
   repeated string denied_cidrs = 3;
   uint64 ingress_port = 4;        // app 暴露端口(默认 8080)
+  // v1.3-A（ADR-0027）：域名/SNI egress policy。nil = 无域名策略
+  //（历史 CIDR-only 语义不变）。policy_generation 随 deployment generation
+  // 单调递增，agent 只接受不早于已应用 generation 的全量替换。
+  EgressPolicySpec egress = 5;
+}
+
+// EgressPolicySpec 声明一个 execution 的出站网络策略（ADR-0027）。
+// 规则全量替换：允许/拒绝集完整下发，不带 generation fencing 的更新无效。
+message EgressPolicySpec {
+  enum Mode {
+    MODE_UNSPECIFIED = 0;
+    UNRESTRICTED = 1;  // 默认：仅 denied_cidrs 与保留段被拒
+    DENY_ALL = 2;      // 仅 allowed_cidrs 可出站
+    ALLOWLIST = 3;     // CIDR + 域名白名单；其余默认拒绝
+  }
+  Mode mode = 1;
+  repeated string allowed_cidrs = 2;
+  repeated string denied_cidrs = 3;
+  // exact（example.com）或单层 wildcard（*.example.com）；大小写不敏感。
+  // 只保护 TCP/80（HTTP Host）与 TCP/443（TLS ClientHello SNI）；
+  // 无 Host/SNI、ECH、非 80/443 TCP 与 UDP 只按 CIDR 判断。
+  repeated string allowed_domains = 4;
+  uint32 max_tcp_connections = 5; // per-execution 并发 TCP 连接上限；0 = 不限
+  uint64 policy_generation = 6;   // 全量替换 fencing 水位
+  bool audit_all = 7;             // audit_mode：false = 只审计拒绝，true = 全部
 }
 
 message VolumeMount {
@@ -192,6 +256,10 @@ message CreateMachineRequest {
   // execution-bound 的代理凭证，仅用于本次创建请求。不得出现在 Machine/MachineSpec、
   // ListMachines、Redis、日志或持久化 operation result；agent 仅持久化验证材料/摘要。
   string proxy_credential = 6;
+  // v1.2-B（ADR-0024）：本次 execution 的 secret delivery lease ID。
+  // 非空时 agent 走 one-shot 通道（tmpfs + release gate）而非 hypeman Env；
+  // lease 状态推进由控制面基于 observed secret_delivery_state 完成。
+  string secret_lease_id = 7;
 }
 
 message CreateMachineResponse {
@@ -238,6 +306,43 @@ message Machine {
   MachineReadiness readiness = 10;                // ADR-0008
   google.protobuf.Timestamp last_readiness_change = 11;
   uint64 generation = 12;      // 该 execution 的 generation（fence 水位；orphan 清理按它下发 delete）
+  // v1.2-D（ADR-0026）：execution-bound exit 报告（hypeman serial 哨兵）。
+  // 未退出时为空；ON_FAILURE restart 决策以此为准。
+  optional int32 exit_code = 13;
+  // v1.2-B（ADR-0024）：本次 execution 的 secret delivery 观测状态。
+  // NONE 表示无租约（未绑定 secret）；DELIVERED = agent 已写入 guest tmpfs 并释放
+  // gate；ACKED = guest entrypoint 已启动（secret 已被 init 消费）。
+  // 仅状态，不含任何 secret 元数据或键名。
+  SecretDeliveryState secret_delivery_state = 14;
+  // v1.3-A（ADR-0027）：本次 execution 的 egress 审计计数器（拒绝摘要，
+  // 控制面聚合入 PG；明细写 agent 日志 sink）。不含 Host/SNI 之外的任何
+  // URL/header/body 信息。
+  EgressAuditStats egress_audit = 15;
+}
+
+// EgressAuditStats 是 agent 观测的 egress 连接决策聚合（ADR-0027）。
+// 只含计数与当前已应用的 policy_generation；按协议/端口分桶，避免
+// 高基数标签，域名不进入该结构。
+message EgressAuditStats {
+  uint64 policy_generation = 1; // 当前已应用策略代
+  uint64 allowed_connections = 2;
+  uint64 denied_connections = 3;
+  uint64 limit_rejections = 4;  // 因 per-execution 连接限额拒绝
+  repeated EgressDenyBucket deny_buckets = 5; // 按 protocol:port 分桶（上限截断）
+}
+
+message EgressDenyBucket {
+  string protocol = 1; // tcp | udp | http | tls
+  uint32 port = 2;
+  uint64 denied = 3;
+}
+
+// SecretDeliveryState 是 agent 观测的 one-shot secret 投递状态（ADR-0024）。
+enum SecretDeliveryState {
+  SECRET_DELIVERY_STATE_UNSPECIFIED = 0; // 未知（agent 重建 observed state 后）
+  SECRET_DELIVERY_NONE = 1;              // 本 execution 无 secret lease
+  SECRET_DELIVERY_DELIVERED = 2;         // 已写入 guest tmpfs，gate 已释放
+  SECRET_DELIVERY_ACKED = 3;             // entrypoint 已启动（secret 已消费）
 }
 
 message DeleteMachineRequest {
@@ -280,14 +385,57 @@ message LogChunk {
   string cursor = 2;       // 下一段起点;follow 模式下可为空
 }
 
+// ---------------------------------------------------------------------------
+// v1.2-C（ADR-0025）：单文件 cp（guest 路径约束与权限由 agent 执行）
+// ---------------------------------------------------------------------------
+
+message CopyToOpen {
+  string machine_id = 1;
+  string execution_id = 2;
+  string path = 3;         // guest 内目标路径（agent 做 path clean + 根目录约束）
+  uint32 mode = 4;         // 可选权限位；0 = 使用 guest 默认 0644
+  uint64 generation = 5;   // 运行态变更 fence
+  string operation_id = 6; // 完整请求（metadata + 内容）的幂等键
+}
+
+message CopyToInput {
+  oneof frame {
+    CopyToOpen open = 1;   // 必须是第一帧
+    bytes data = 2;        // 文件内容分片
+  }
+}
+
+message CopyToResponse {
+  uint64 bytes_written = 1;
+}
+
+message CopyFromRequest {
+  string machine_id = 1;
+  string execution_id = 2;
+  string path = 3;         // guest 内源文件路径（只允许普通文件，不跟随 symlink）
+}
+
+message CopyFromHeader {
+  string path = 1;
+  uint64 size = 2;
+  uint32 mode = 3;
+}
+
+message CopyFromResponse {
+  oneof frame {
+    CopyFromHeader header = 1; // 首帧：文件元数据
+    bytes data = 2;            // 文件内容分片
+  }
+}
+
 message ExecOpen {
   string machine_id = 1;
   string execution_id = 2;
-  string operation_id = 3; // 创建会话的幂等键；MVP 不提供断线续接
+  string operation_id = 3; // 必填；首次创建被持久记录，重复 ID 拒绝（不提供断线续接）
   repeated string command = 4; // argv,如 ["/bin/sh", "-c", "env"]
   map<string, string> env = 5;
   string working_dir = 6;
-  bool tty = 7;
+  bool tty = 7; // guest 支持 PTY；API v1.2 仅支持初始尺寸，不提供交互式后续 resize
 }
 
 message ExecInput {
@@ -295,7 +443,13 @@ message ExecInput {
     ExecOpen open = 1; // 必须是第一帧
     bytes stdin = 2;
     uint32 signal = 3; // POSIX 信号编号
+    ExecResize resize = 4; // v1.2-C（ADR-0025）：TTY 窗口尺寸
   }
+}
+
+message ExecResize {
+  uint32 rows = 1;
+  uint32 cols = 2;
 }
 
 message ExecOutput {
@@ -315,6 +469,12 @@ service ImageService {
   rpc PullImage(PullImageRequest) returns (PullImageResponse);
   rpc ListImages(ListImagesRequest) returns (ListImagesResponse);
   rpc DeleteImage(DeleteImageRequest) returns (google.protobuf.Empty);
+  // v1.4-C: path-free, reversible local cache deletion. Destructive GC must
+  // never substitute DeleteImage for this quarantine protocol.
+  rpc QuarantineImage(QuarantineImageRequest) returns (ImageQuarantine);
+  rpc ListImageQuarantines(ListImageQuarantinesRequest) returns (ListImageQuarantinesResponse);
+  rpc RollbackImageQuarantine(ImageQuarantineActionRequest) returns (google.protobuf.Empty);
+  rpc FinalizeImageQuarantine(ImageQuarantineActionRequest) returns (google.protobuf.Empty);
 }
 
 message PullImageRequest {
@@ -336,3 +496,308 @@ message ListImagesResponse {
 }
 
 message DeleteImageRequest { string image_ref = 1; }
+
+message QuarantineImageRequest {
+  string image_ref = 1;       // digest-pinned repository reference
+  string claim_id = 2;        // stable PG claim ID
+  string operation_id = 3;    // retry idempotency key
+  string expected_revision = 4; // expected sha256 digest
+}
+
+message ImageQuarantineActionRequest {
+  string claim_id = 1;
+  string token = 2;           // capability token returned by quarantine/list
+  string operation_id = 3;
+}
+
+message ImageQuarantine {
+  string claim_id = 1;
+  string token = 2;
+  string repository = 3;
+  string digest = 4;
+  string state = 5;           // active | rolled_back | finalized
+  int64 created_at_unix = 6;
+}
+
+message ListImageQuarantinesRequest {}
+message ListImageQuarantinesResponse { repeated ImageQuarantine quarantines = 1; }
+
+// ---------------------------------------------------------------------------
+// v1.3-B（ADR-0028）：node-local snapshot 资源。
+// firepaas snapshot ID 由控制面生成并写入 hypeman snapshot tags；agent 侧
+// 返回 hypeman 内部 ID（删除时按 tag 解析）。memory 快照 = pause→capture→
+// resume source（源 execution 不变）；filesystem-only = guest sync → stop →
+// capture → start source（一致性字段显式返回）。
+// ---------------------------------------------------------------------------
+
+service SnapshotService {
+  rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
+  rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
+  rpc DeleteSnapshot(DeleteSnapshotRequest) returns (google.protobuf.Empty);
+  // v1.3-C（ADR-0028）：受限 fork（origin node 本地）与 filesystem rescue。
+  rpc ForkSnapshot(ForkSnapshotRequest) returns (ForkSnapshotResponse);
+  rpc RestoreSnapshot(RestoreSnapshotRequest) returns (RestoreSnapshotResponse);
+  // Content verification is path-free and does not mutate runtime state.
+  rpc ScrubSnapshot(ScrubSnapshotRequest) returns (ScrubSnapshotResponse);
+}
+
+enum SnapshotKind {
+  SNAPSHOT_KIND_UNSPECIFIED = 0;
+  SNAPSHOT_MEMORY = 1;       // pause→capture→resume（VMM 内存+磁盘）
+  SNAPSHOT_FILESYSTEM = 2;   // sync → stop → capture → start（磁盘+metadata）
+}
+
+message SnapshotCompressionSpec {
+  enum Algorithm {
+    ALGORITHM_UNSPECIFIED = 0;
+    NONE = 1;
+    ZSTD = 2;
+    LZ4 = 3;
+  }
+  Algorithm algorithm = 1;
+  int32 level = 2; // -1 = 默认等级
+}
+
+message CreateSnapshotRequest {
+  string machine_id = 1;
+  string execution_id = 2;
+  uint64 generation = 3;
+  string operation_id = 4;   // fencing/幂等键
+  string snapshot_id = 5;    // firepaas 稳定 snapshot ID（写入 hypeman tags）
+  SnapshotKind kind = 6;
+  string name = 7;
+  SnapshotCompressionSpec compression = 8;
+}
+
+// SnapshotState 与 PG snapshots.status 对齐（控制面权威转换）。
+message SnapshotInfo {
+  string id = 1;                    // firepaas snapshot ID（tag 内回读）
+  string artifact_id = 2;           // hypeman 内部 ID（agent 本地句柄）
+  string machine_id = 3;
+  string execution_id = 4;
+  SnapshotKind kind = 5;
+  uint64 size_bytes = 6;
+  string compression_state = 7;     // none|compressing|compressed|error
+  string compression_algorithm = 8;
+  string filesystem_consistency = 9; // clean | crash-consistent
+  int64 created_at_unix = 10;
+  string artifact_sha256 = 11;       // sha256:<hex>, verified by hypeman
+  string compatibility_key = 12;     // complete memory restore compatibility key
+}
+
+message CreateSnapshotResponse {
+  SnapshotInfo snapshot = 1;
+}
+
+message ScrubSnapshotRequest {
+  string snapshot_id = 1;       // firepaas stable ID, resolved by tag
+  string expected_revision = 2; // immutable artifact_sha256 observed by PG
+}
+
+message ScrubSnapshotResponse {
+  string snapshot_id = 1;
+  string revision = 2;
+  string integrity = 3; // CONTENT_VERIFIED | UNKNOWN; corruption is an RPC error
+}
+
+message ListSnapshotsRequest {
+  string machine_id = 1; // 空 = 全部
+  string snapshot_id = 2; // 空 = 全部（按 tag 过滤）
+}
+
+message InventoryObservation {
+  // complete is authoritative only when epoch is non-empty, generation > 0 and
+  // observed_at_unix is non-zero. Old agents therefore fail closed.
+  bool complete = 1;
+  string epoch = 2;              // random per agent process start
+  uint64 generation = 3;         // strictly increasing within epoch
+  int64 observed_at_unix = 4;    // diagnostic; received order remains authoritative
+}
+
+message ListSnapshotsResponse {
+  repeated SnapshotInfo snapshots = 1;
+  // v1.4-B：完整列表标志。true = 本响应是节点全量 snapshot inventory
+  //（控制面可据此推导 MISSING）；false/缺省（旧 agent）= 只能产生 UNKNOWN，
+  // 不得推导 MISSING。带过滤参数的查询不得置 true。
+  bool complete = 2;
+  // 观测 generation（agent 进程内单调递增；重启归零，新鲜度以
+  // observed_at_unix 为准）。控制面只把它作为观测序号，不当业务状态。
+  uint64 observation_generation = 3;
+  int64 observed_at_unix = 4;
+  InventoryObservation observation = 5;
+}
+
+message DeleteSnapshotRequest {
+  string snapshot_id = 1;   // firepaas snapshot ID（tag 解析 hypeman ID）
+  string machine_id = 2;
+  string execution_id = 3;
+  uint64 generation = 4;
+  string operation_id = 5;
+}
+
+// ForkSnapshotRequest（v1.3-C）：从 READY snapshot 创建新的 debug/ephemeral
+// machine（origin node 本地）。新 machine 有全新 execution/slot/credential；
+// 不继承 secret 值、不继承 volume；默认无 public route（由控制面决定）。
+message ForkSnapshotRequest {
+  string snapshot_id = 1;    // firepaas snapshot ID（tag 解析）
+  string machine_id = 2;     // 新 machine 稳定 ID
+  string execution_id = 3;   // 新 execution
+  uint64 generation = 4;
+  string operation_id = 5;
+  // 新 machine 的 spec（复用 MachineSpec；image_ref 可留空=快照自带）。
+  // 控制面保证 project 同源、TTL 必填、无 volume、无 public route。
+  string spec_json = 6;      // protojson(MachineSpec)
+  string proxy_credential = 7; // execution-bound 凭证（仅本次请求，不落盘回显）
+  string source_machine_id = 8; // 快照来源 machine（fencing 校验用）
+}
+
+message ForkSnapshotResponse {
+  Machine machine = 1;
+}
+
+// RestoreSnapshotRequest（v1.3-C）：restore_mode=memory|filesystem|auto。
+// memory 必须匹配完整 compatibility key（agent 校验）；filesystem 忽略内存/
+// device 状态冷启动；auto 只在明确兼容性错误上降级。
+message RestoreSnapshotRequest {
+  string snapshot_id = 1;
+  string machine_id = 2;     // 目标 machine（同 machine 或新 execution 由控制面定）
+  string execution_id = 3;
+  uint64 generation = 4;
+  string operation_id = 5;
+  string restore_mode = 6;   // memory | filesystem | auto
+  string compatibility_key = 7; // 目标节点 snapshot compatibility key
+  // 新 execution 的代理凭证，仅单向下发；agent 成功恢复并重挂 slot 后替换摘要。
+  // 不得出现在响应、operation result、日志或 Redis。
+  string proxy_credential = 8;
+}
+
+message RestoreSnapshotResponse {
+  Machine machine = 1;
+  string restore_mode_used = 2;
+  string filesystem_consistency = 3;
+}
+
+// ---------------------------------------------------------------------------
+// v1.3-D（ADR-0029）：node-local volume（LOCAL_RW 单写；DATASET_RO 见 v1.3-E）。
+// ---------------------------------------------------------------------------
+
+service VolumeService {
+  rpc CreateVolume(CreateVolumeRequest) returns (CreateVolumeResponse);
+  // ImportDataset authorizes one short-lived, node-local fetch. Archive bytes flow
+  // directly from the HTTPS object URL to the agent and never through the API.
+  rpc ImportDataset(ImportDatasetRequest) returns (CreateVolumeResponse);
+  rpc AttachVolume(AttachVolumeRequest) returns (Machine);
+  rpc DetachVolume(DetachVolumeRequest) returns (Machine);
+  rpc DeleteVolume(DeleteVolumeRequest) returns (google.protobuf.Empty);
+  rpc ListVolumes(ListVolumesRequest) returns (ListVolumesResponse);
+  rpc QuarantineVolume(QuarantineVolumeRequest) returns (VolumeQuarantine);
+  rpc ListVolumeQuarantines(ListVolumeQuarantinesRequest) returns (ListVolumeQuarantinesResponse);
+  rpc RollbackVolumeQuarantine(VolumeQuarantineActionRequest) returns (google.protobuf.Empty);
+  rpc FinalizeVolumeQuarantine(VolumeQuarantineActionRequest) returns (google.protobuf.Empty);
+}
+
+message CreateVolumeRequest {
+  string volume_id = 1;   // firepaas 稳定 volume ID
+  uint64 size_bytes = 2;
+  string operation_id = 3;
+}
+
+message CreateVolumeResponse {
+  string volume_id = 1;
+  uint64 size_bytes = 2;
+  string content_digest = 3;
+  bool sealed = 4;
+}
+
+message ImportDatasetRequest {
+  string volume_id = 1;
+  string source_url = 2;
+  string expected_digest = 3; // sha256:<lowercase hex> of the compressed archive
+  uint64 max_download_bytes = 4;
+  uint64 max_expanded_bytes = 5;
+  uint32 max_files = 6;
+  int64 expires_at_unix = 7; // no more than 15 minutes in the future
+  string operation_id = 8;
+  // Accepted only when source_url host is an explicit loopback address. This is
+  // for hermetic tests; production callers must never set it.
+  bool allow_http_loopback_for_tests = 9;
+}
+
+message AttachVolumeRequest {
+  string volume_id = 1;
+  string machine_id = 2;
+  string execution_id = 3;
+  uint64 generation = 4;
+  string operation_id = 5;
+  string mount_path = 6;
+  bool readonly = 7;
+  bool overlay = 8;            // DATASET_RO only; base remains readonly
+  uint64 overlay_size_bytes = 9; // required when overlay=true
+}
+
+message DetachVolumeRequest {
+  string volume_id = 1;
+  string machine_id = 2;
+  string execution_id = 3;
+  uint64 generation = 4;
+  string operation_id = 5;
+}
+
+message DeleteVolumeRequest {
+  string volume_id = 1;
+  string operation_id = 2;
+}
+
+message ListVolumesRequest {}
+
+message QuarantineVolumeRequest {
+  string volume_id = 1;
+  string claim_id = 2;
+  string operation_id = 3;
+  string expected_revision = 4;
+  string mode = 5;             // must be DATASET_RO
+  bool rebuildable = 6;        // must be true; source remains PG authority
+}
+message VolumeQuarantineActionRequest {
+  string claim_id = 1;
+  string token = 2;
+  string operation_id = 3;
+}
+message VolumeQuarantine {
+  string claim_id = 1;
+  string token = 2;
+  string volume_id = 3;
+  string state = 4;
+  int64 created_at_unix = 5;
+}
+message ListVolumeQuarantinesRequest {}
+message ListVolumeQuarantinesResponse { repeated VolumeQuarantine quarantines = 1; }
+
+message VolumeAttachmentInfo {
+  string machine_id = 1;
+  string execution_id = 2;
+  string mount_path = 3;
+  bool readonly = 4;
+  bool overlay = 5;
+}
+
+message VolumeInfo {
+  string id = 1;
+  uint64 size_bytes = 2;
+  string content_digest = 3;
+  bool sealed = 4;
+  string mode = 5; // LOCAL_RW | DATASET_RO; empty means unknown/old agent
+  string metadata_health = 6; // UNKNOWN | HEALTHY | DEGRADED
+  string materialization_revision = 7;
+  repeated VolumeAttachmentInfo attachments = 8;
+}
+
+message ListVolumesResponse {
+  repeated VolumeInfo volumes = 1;
+  // v1.4-B：与 ListSnapshotsResponse.complete 同语义；false/缺省（旧
+  // agent）只能产生 UNKNOWN，不能推导 MISSING。
+  bool complete = 2;
+  uint64 observation_generation = 3;
+  int64 observed_at_unix = 4;
+  InventoryObservation observation = 5;
+}

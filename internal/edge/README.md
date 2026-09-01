@@ -1,13 +1,15 @@
-# edge 内部结构（M1.6 最小链路已落地，M3 完整路由）
+# edge 内部结构
 
 ```
-cmd/edge-proxy/          # 入口：Redis catalog → agent proxy（TLS 可选）
-internal/edge/router/    # hostname → route 解析（M1 直接读 catalog）
-internal/edge/catalog/   # Redis routing catalog 客户端（复用 internal/controlplane/catalog）
-internal/edge/autoresume/# paused machine 的自动唤醒（M4 条件特性）
-internal/edge/tls/       # Caddy 集成（复用 hypeman lib/ingress 的证书/ACME 部分，
-                         # ACME directory 指向内部 step-ca，ADR-0011）
+cmd/edge-proxy/          # 进程装配：配置、Redis、TLS、listeners、shutdown
+internal/edge/handler.go # 完整请求生命周期：route/cache、选择/并发、token、转发、一次安全重试
+internal/edge/edge.go    # route/token 本地缓存与 hostname 限流
 ```
+
+`internal/edge.Handler` 是数据面行为所有者。命令包不参与 backend eligibility、
+pinning、least-inflight/hard limit、凭证、header 清理或 retry 状态机；每次转发的
+retry 结果保存在 attempt-local state，不使用 package-global 请求映射。
+`catalog.Catalog` 直接实现 edge 的窄只读接口，Redis JSON/key 格式不经包装或转换。
 
 流量链路：
 

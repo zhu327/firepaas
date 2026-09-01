@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/example/firepaas/internal/security/mtls"
-	pb "github.com/example/firepaas/shared/gen/agent/v1"
+	"github.com/zhu327/firepaas/internal/security/mtls"
+	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"

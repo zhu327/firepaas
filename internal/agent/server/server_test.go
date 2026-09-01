@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/firepaas/internal/agent/info"
-	"github.com/example/firepaas/internal/agent/machine"
-	"github.com/example/firepaas/internal/agent/state"
-	pb "github.com/example/firepaas/shared/gen/agent/v1"
+	"github.com/zhu327/firepaas/internal/agent/info"
+	"github.com/zhu327/firepaas/internal/agent/machine"
+	"github.com/zhu327/firepaas/internal/agent/state"
+	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 	"github.com/kernel/hypeman/lib/images"
 	"github.com/kernel/hypeman/lib/instances"
 	"google.golang.org/grpc/codes"
@@ -119,7 +119,9 @@ func (f *fakeInstances) DeleteInstance(_ context.Context, id string) error {
 	return instances.ErrNotFound
 }
 
-type fakeImages struct{}
+type fakeImages struct {
+	deleteErr error
+}
 
 func (fakeImages) CreateImage(context.Context, images.CreateImageRequest) (*images.Image, error) {
 	return nil, nil
@@ -136,6 +138,7 @@ func (fakeImages) ListImages(context.Context) ([]images.Image, error) {
 		SizeBytes: ptr(int64(1 << 20)),
 	}}, nil
 }
+func (f fakeImages) DeleteImage(context.Context, string) error { return f.deleteErr }
 
 func ptr[T any](v T) *T { return &v }
 
@@ -158,6 +161,31 @@ func newTestServer(t *testing.T) (*Server, *state.Ledger, *state.Fences) {
 	}
 	return New(adapter, ledger, fences, provider,
 		WithCreds(creds), WithCredentialRequired(true)), ledger, fences
+}
+
+func TestDeleteImageNotFoundIsIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	ledger, _ := state.Open(filepath.Join(dir, "ledger.json"))
+	fences, _ := state.OpenFences(filepath.Join(dir, "fences.json"))
+	adapter := machine.New(&fakeInstances{byName: map[string]*instances.Instance{}}, fakeImages{}, nil, nil)
+	srv := New(adapter, ledger, fences, info.New("node", "test", "test", "compute", "v1", "", dir, nil, nil))
+	if _, err := srv.DeleteImage(context.Background(), &pb.DeleteImageRequest{ImageRef: "repo/missing@sha256:" + strings.Repeat("b", 64)}); err != nil {
+		t.Fatalf("DeleteImage missing = %v, want success", err)
+	}
+}
+
+func TestDeleteImageRejectsLiveReference(t *testing.T) {
+	dir := t.TempDir()
+	ledger, _ := state.Open(filepath.Join(dir, "ledger.json"))
+	fences, _ := state.OpenFences(filepath.Join(dir, "fences.json"))
+	ref := "docker.io/library/nginx:alpine@sha256:" + strings.Repeat("a", 64)
+	inst := &fakeInstances{byName: map[string]*instances.Instance{"m1": {StoredMetadata: instances.StoredMetadata{Name: "m1", Image: ref}}}}
+	srv := New(machine.New(inst, fakeImages{}, nil, nil), ledger, fences,
+		info.New("node", "test", "test", "compute", "v1", "", dir, nil, nil))
+	_, err := srv.DeleteImage(context.Background(), &pb.DeleteImageRequest{ImageRef: ref})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("DeleteImage live status = %v, want FailedPrecondition", status.Code(err))
+	}
 }
 
 func createReq(machineID string, generation uint64, opID string) *pb.CreateMachineRequest {

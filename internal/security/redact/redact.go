@@ -17,11 +17,36 @@ var sensitive = []string{
 	"wrapped_dek", "wrappeddek", "wrapped", "proxy_credential",
 	"proxycredential", "traffic_token", "traffictoken", "authorization",
 	"password", "api_key", "bearer",
+	// v1.4（ADR-0030）：dataset 来源 URL 原文不得进入响应/日志/事件；
+	// 摘要（source_url_digest）不受影响。
+	"source_url", "sourceurl",
+}
+
+var (
+	urlPattern = regexp.MustCompile(`(?i)https?://[^\s"'<>]+`)
+	// Error strings commonly flatten structured fields as key=value or key: value.
+	// Keep the key for diagnosis while removing its value.
+	sensitiveAssignmentPattern = regexp.MustCompile(`(?i)(source[_-]?url|authorization|password|api[_-]?key|bearer|token)\s*[:=]\s*[^\s,;]+`)
+)
+
+// RedactText removes URL-bearing and common flattened secret values from
+// unstructured errors before they are returned by operation/wait APIs.
+func RedactText(text string) string {
+	text = urlPattern.ReplaceAllString(text, "[REDACTED_URL]")
+	return sensitiveAssignmentPattern.ReplaceAllStringFunc(text, func(match string) string {
+		if i := strings.IndexAny(match, ":="); i >= 0 {
+			return match[:i+1] + "[REDACTED]"
+		}
+		return "[REDACTED]"
+	})
 }
 
 // IsSensitive 判断字段名是否命中黑名单。
 func IsSensitive(key string) bool {
 	n := normalize(key)
+	if n == "sourceurldigest" {
+		return false
+	}
 	for _, s := range sensitive {
 		if strings.Contains(n, s) {
 			return true

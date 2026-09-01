@@ -31,6 +31,7 @@ package slot
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -47,8 +48,9 @@ const (
 	nsPrefix   = "fp-slot-"
 	vethPrefix = "fp-vp"
 	brPrefix   = "fp-br"
-	// vethRange 是 root↔netns 点对点链路的地址池（10.12.0.0/16）。
-	vethRange = "10.12.0.0/16"
+	// VethRange 是 root↔netns 点对点链路的地址池（10.12.0.0/16）。
+	// 导出：agentd 的 egress 保留段检查需要把它列为平台保留段。
+	VethRange = "10.12.0.0/16"
 	// 私有目标集合：guest 永远不可达（host/私网/组播）。
 	privateDst = "{ 10.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4 }"
 )
@@ -58,6 +60,11 @@ type Config struct {
 	SubnetCIDR string // hypeman 网络子网（guest 侧），如 10.100.0.0/16
 	Gateway    string // 子网网关（slot 内 bridge 地址），如 10.100.0.1
 	StatePath  string // slots.json 状态文件（agent data_dir 下）
+	// EgressProxyPort80/443（v1.3-A，ADR-0027）：root ns 透明 egress 代理的
+	// 监听端口。>0 时 fp-isolation INPUT 放行 slot→代理的新连接（否则 SYN 会被
+	// “非 established 即 drop”截断）。
+	EgressProxyPort80  int
+	EgressProxyPort443 int
 }
 
 // Slot 是一个已分配的 slot。
@@ -66,6 +73,26 @@ type Slot struct {
 	MachineID string `json:"machine_id"`
 	Tap       string `json:"tap"`
 	GuestIP   string `json:"guest_ip"`
+	// Egress（v1.3-A，ADR-0027）：本 slot 当前应用的 egress 规则集
+	//（重启后按此重放；空 Mode = 未声明）。
+	Egress EgressRuleSet `json:"egress,omitempty"`
+}
+
+// EgressRuleSet 描述一个 slot 的 egress 执行规则（nftables 落地）。
+// 由 agent 的 egress 层计算，slot 只负责内核落地：
+//   - 80/443 域名流量 DNAT 到 root ns 透明代理（ProxyPort80/443）；
+//   - 其余流量按 Mode + Allowed/Denied CIDR 在 netns 内过滤；
+//   - Generation 是 fencing 水位（只升不降）。
+type EgressRuleSet struct {
+	Mode         string   `json:"mode"` // unrestricted | deny_all | allowlist
+	AllowedCIDRs []string `json:"allowed_cidrs,omitempty"`
+	DeniedCIDRs  []string `json:"denied_cidrs,omitempty"`
+	Domains      []string `json:"domains,omitempty"`       // 归一化域名（重启重建 proxy 用）
+	ProxyPort80  int      `json:"proxy_port80,omitempty"`  // 0 = 不代理
+	ProxyPort443 int      `json:"proxy_port443,omitempty"` // 0 = 不代理
+	MaxTCPConns  uint32   `json:"max_tcp_conns,omitempty"` // 0 = 不限
+	AuditAll     bool     `json:"audit_all,omitempty"`
+	Generation   uint64   `json:"generation,omitempty"`
 }
 
 // LiveInstance 是 Reconcile 时 agent 提供的存活实例视图。
@@ -97,6 +124,12 @@ func New(cfg Config) (*Manager, error) {
 	}
 	if cfg.StatePath == "" {
 		return nil, fmt.Errorf("slot: StatePath is required")
+	}
+	if cfg.EgressProxyPort80 == 0 {
+		cfg.EgressProxyPort80 = 18080
+	}
+	if cfg.EgressProxyPort443 == 0 {
+		cfg.EgressProxyPort443 = 18443
 	}
 	return &Manager{cfg: cfg, slots: map[string]Slot{}}, nil
 }
@@ -152,7 +185,11 @@ func (m *Manager) Attach(ctx context.Context, machineID, tap, guestIP string) (S
 		if err := m.ensureKernel(ctx, s, tap, guestIP); err != nil {
 			return Slot{}, err
 		}
-		m.slots[machineID] = Slot{Index: s.Index, MachineID: machineID, Tap: tap, GuestIP: guestIP}
+		// Reattach changes execution plumbing, not the deployment policy. Preserve
+		// the persisted rule set so it can be replayed and rebuilt by egress.Manager.
+		s.Tap = tap
+		s.GuestIP = guestIP
+		m.slots[machineID] = s
 		if err := m.persistLocked(); err != nil {
 			return Slot{}, err
 		}
@@ -230,6 +267,14 @@ func (m *Manager) Reconcile(ctx context.Context, live []LiveInstance) error {
 			if err := m.ensureKernel(ctx, s, l.Tap, l.GuestIP); err != nil {
 				logf("slot: re-ensure %s (degraded): %v", id, err)
 			}
+			// v1.3-A（ADR-0027）：重启后重放持久化 egress 规则。
+			if s.Egress.Mode != "" {
+				// Reconcile already owns m.mu; call the lock-free helper to avoid
+				// self-deadlocking through RestoreEgress.
+				if err := ensureSlotEgress(ctx, s.Index, s.Egress); err != nil {
+					logf("slot: restore egress %s (degraded): %v", id, err)
+				}
+			}
 			continue
 		}
 		if err := m.releaseLocked(ctx, s.Index); err != nil {
@@ -278,6 +323,110 @@ func (m *Manager) Reconcile(ctx context.Context, live []LiveInstance) error {
 	return m.persistLocked()
 }
 
+// ApplyEgressPolicy（v1.3-A，ADR-0027）在 slot netns 内落地 egress 规则集。
+// 全量替换 + generation fencing：新 generation 小于已应用值 → 拒绝并保持旧
+// 规则。重复应用同 generation 幂等（flush + rebuild）。
+func (m *Manager) ApplyEgressPolicy(ctx context.Context, machineID string, rs EgressRuleSet) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.slots[machineID]
+	if !ok {
+		return fmt.Errorf("slot: egress apply: machine %s has no slot", machineID)
+	}
+	if rs.Generation < s.Egress.Generation {
+		return fmt.Errorf("slot: egress generation fencing: applied %d > requested %d (keep old policy)",
+			s.Egress.Generation, rs.Generation)
+	}
+	if err := ensureSlotEgress(ctx, s.Index, rs); err != nil {
+		return err
+	}
+	old := s.Egress
+	s.Egress = rs
+	m.slots[machineID] = s
+	if err := m.persistLocked(); err != nil {
+		s.Egress = old
+		m.slots[machineID] = s
+		var rollbackErr error
+		if old.Mode == "" {
+			rollbackErr = clearSlotEgress(ctx, s.Index)
+		} else {
+			rollbackErr = ensureSlotEgress(ctx, s.Index, old)
+		}
+		return errors.Join(err, rollbackErr)
+	}
+	return nil
+}
+
+// CurrentEgressPolicy returns the persisted policy snapshot used by the
+// egress coordinator for rollback.
+func (m *Manager) CurrentEgressPolicy(machineID string) (EgressRuleSet, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.slots[machineID]
+	return s.Egress, ok && s.Egress.Mode != ""
+}
+
+// RollbackEgressPolicy restores a snapshot without generation fencing. It is
+// only exposed to the serialized egress coordinator after a committed nft
+// update could not be published by the proxy.
+func (m *Manager) RollbackEgressPolicy(ctx context.Context, machineID string, rs EgressRuleSet, present bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.slots[machineID]
+	if !ok {
+		return fmt.Errorf("slot: egress rollback: machine %s has no slot", machineID)
+	}
+	if present {
+		if err := ensureSlotEgress(ctx, s.Index, rs); err != nil {
+			return err
+		}
+		s.Egress = rs
+	} else {
+		if err := clearSlotEgress(ctx, s.Index); err != nil {
+			return err
+		}
+		s.Egress = EgressRuleSet{}
+	}
+	m.slots[machineID] = s
+	return m.persistLocked()
+}
+
+// RemoveEgressPolicy 清空 slot 的 egress 规则（恢复 unrestricted 全通）。
+func (m *Manager) RemoveEgressPolicy(ctx context.Context, machineID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.slots[machineID]
+	if !ok {
+		return nil
+	}
+	if s.Egress.Mode == "" {
+		return nil
+	}
+	if err := clearSlotEgress(ctx, s.Index); err != nil {
+		return err
+	}
+	old := s.Egress
+	s.Egress = EgressRuleSet{}
+	m.slots[machineID] = s
+	if err := m.persistLocked(); err != nil {
+		s.Egress = old
+		m.slots[machineID] = s
+		return errors.Join(err, ensureSlotEgress(ctx, s.Index, old))
+	}
+	return nil
+}
+
+// RestoreEgress 重启后按持久化状态重放 slot egress 规则（Reconcile 内用）。
+func (m *Manager) RestoreEgress(ctx context.Context, machineID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.slots[machineID]
+	if !ok || s.Egress.Mode == "" {
+		return nil
+	}
+	return ensureSlotEgress(ctx, s.Index, s.Egress)
+}
+
 // logf 是包内日志出口（避免 slot 包依赖 slog 的全局 handler 配置）。
 func logf(format string, args ...any) {
 	slog.Error(fmt.Sprintf(format, args...))
@@ -288,6 +437,14 @@ func (m *Manager) Count() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.slots)
+}
+
+// SlotFor 返回 machine 当前 slot（不存在时 ok=false）。
+func (m *Manager) SlotFor(machineID string) (Slot, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.slots[machineID]
+	return s, ok
 }
 
 // ---------------------------------------------------------------------------
@@ -419,7 +576,7 @@ func (m *Manager) setupLocked(ctx context.Context, s Slot) error {
 	}
 
 	// root 侧隔离 + guest /32 路由（代理/探针通道）。
-	if err := ensureIsolationTable(ctx, vh); err != nil {
+	if err := m.ensureIsolationTable(ctx, vh); err != nil {
 		return err
 	}
 	if err := execCmd(ctx, "ip", "route", "replace", s.GuestIP+"/32", "via", nsAddr, "dev", vh); err != nil {
@@ -432,12 +589,13 @@ func (m *Manager) setupLocked(ctx context.Context, s Slot) error {
 
 // ensureKernel 幂等补齐已有 slot 的内核状态（Reconcile/重复 Attach 用）。
 func (m *Manager) ensureKernel(ctx context.Context, s Slot, tap, guestIP string) error {
+	var err error
 	_, nsAddr, err := vethAddrs(s.Index)
 	if err != nil {
 		return err
 	}
 	vh, _ := vethNames(s.Index)
-	if err := ensureIsolationTable(ctx, vh); err != nil {
+	if err := m.ensureIsolationTable(ctx, vh); err != nil {
 		return err
 	}
 	if err := execCmd(ctx, "ip", "route", "replace", guestIP+"/32", "via", nsAddr, "dev", vh); err != nil {
@@ -608,7 +766,7 @@ func tapExistsInRoot(tap string) bool {
 }
 
 // ensureIsolationTable 幂等创建 root 侧 nftables 隔离表并把 veth 加入集合。
-func ensureIsolationTable(ctx context.Context, veth string) error {
+func (m *Manager) ensureIsolationTable(ctx context.Context, veth string) error {
 	// 表已存在则跳过（检查 exit code：nft list 不存在时非零）。
 	if err := exec.Command("nft", "list", "table", "ip", "fp-isolation").Run(); err != nil {
 		steps := [][]string{
@@ -618,11 +776,13 @@ func ensureIsolationTable(ctx context.Context, veth string) error {
 			{"nft", "add", "chain", "ip", "fp-isolation", "fwdchain", "{", "type", "filter", "hook", "forward", "priority", "filter;", "}"},
 			{"nft", "add", "chain", "ip", "fp-isolation", "post", "{", "type", "nat", "hook", "postrouting", "priority", "srcnat;", "}"},
 			{"nft", "add", "rule", "ip", "fp-isolation", "in", "iifname", "@slot-veths", "ct", "state", "established,related", "accept"},
+			{"nft", "add", "rule", "ip", "fp-isolation", "in", "iifname", "@slot-veths",
+				"tcp", "dport", "{", fmt.Sprintf("%d,%d", m.cfg.EgressProxyPort80, m.cfg.EgressProxyPort443), "}", "accept"},
 			{"nft", "add", "rule", "ip", "fp-isolation", "in", "iifname", "@slot-veths", "drop"},
 			{"nft", "add", "rule", "ip", "fp-isolation", "fwdchain", "iifname", "@slot-veths", "ct", "state", "established,related", "accept"},
 			{"nft", "add", "rule", "ip", "fp-isolation", "fwdchain", "iifname", "@slot-veths", "ip", "daddr", privateDst, "drop"},
 			{"nft", "add", "rule", "ip", "fp-isolation", "fwdchain", "iifname", "@slot-veths", "accept"},
-			{"nft", "add", "rule", "ip", "fp-isolation", "post", "ip", "saddr", vethRange, "masquerade"},
+			{"nft", "add", "rule", "ip", "fp-isolation", "post", "ip", "saddr", VethRange, "masquerade"},
 		}
 		for _, args := range steps {
 			if err := execCmd(ctx, args[0], args[1:]...); err != nil {
@@ -634,6 +794,48 @@ func ensureIsolationTable(ctx context.Context, veth string) error {
 	out, err := exec.Command("nft", "add", "element", "ip", "fp-isolation", "slot-veths", "{", veth, "}").CombinedOutput()
 	if err != nil && !strings.Contains(string(out), "exists") {
 		return fmt.Errorf("slot: nft add veth %s: %w (%s)", veth, err, strings.TrimSpace(string(out)))
+	}
+	// v1.3-A：升级场景下表已存在但没有 egress 代理 INPUT accept 规则时补齐
+	//（必须插在 drop 之前，否则 SYN 被截断）。
+	if err := m.ensureEgressProxyInputRule(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ensureEgressProxyInputRule 幂等保证 INPUT 链中存在 slot→egress 代理端口的
+// accept 规则（位于 drop 规则之前）。nft 的 position 参数语义是**handle**而非
+// 序号，因此先带 handle 列出链，定位 drop 规则后在其前插入。
+func (m *Manager) ensureEgressProxyInputRule(ctx context.Context) error {
+	marker := fmt.Sprintf("%d", m.cfg.EgressProxyPort80)
+	out, err := exec.Command("nft", "-a", "list", "chain", "ip", "fp-isolation", "in").Output()
+	if err != nil {
+		return fmt.Errorf("slot: list input chain: %w", err)
+	}
+	listing := string(out)
+	if strings.Contains(listing, marker) {
+		return nil
+	}
+	// 解析 drop 规则（@slot-veths 且以 drop 结尾）的 handle。
+	dropHandle := ""
+	for _, line := range strings.Split(listing, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.Contains(line, "@slot-veths") || !strings.HasSuffix(line, "drop") {
+			continue
+		}
+		fields := strings.Fields(line)
+		for i := 0; i+1 < len(fields); i++ {
+			if fields[i] == "handle" {
+				dropHandle = fields[i+1]
+			}
+		}
+	}
+	if dropHandle == "" {
+		return fmt.Errorf("slot: egress input accept: drop rule handle not found in fp-isolation")
+	}
+	if err := execCmd(ctx, "nft", "insert", "rule", "ip", "fp-isolation", "in", "position", dropHandle,
+		"iifname", "@slot-veths", "tcp", "dport", "{", fmt.Sprintf("%d,%d", m.cfg.EgressProxyPort80, m.cfg.EgressProxyPort443), "}", "accept"); err != nil {
+		return fmt.Errorf("slot: insert egress proxy input rule: %w", err)
 	}
 	return nil
 }

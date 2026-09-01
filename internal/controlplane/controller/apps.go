@@ -22,11 +22,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/example/firepaas/internal/controlplane/agentclient"
-	"github.com/example/firepaas/internal/controlplane/store"
-	"github.com/example/firepaas/internal/scheduler"
-	pb "github.com/example/firepaas/shared/gen/agent/v1"
-	"github.com/example/firepaas/shared/pkg/id"
+	agentv1 "github.com/zhu327/firepaas/internal/contracts/agentv1"
+	"github.com/zhu327/firepaas/internal/controlplane/agentclient"
+	"github.com/zhu327/firepaas/internal/controlplane/store"
+	"github.com/zhu327/firepaas/internal/scheduler"
+	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
+	"github.com/zhu327/firepaas/shared/pkg/id"
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
@@ -127,6 +128,7 @@ func (c *Controller) reconcileRollout(ctx context.Context, app *store.App, r *st
 				return err
 			}
 			c.recordEvent(ctx, "rollout", "", r.ID, "", "cutover: new generation ready, old draining", nil)
+			c.rolloutUserEvent(ctx, r, "cutover", nil)
 			c.metrics.Inc("firepaas_rollout_transitions_total", map[string]string{"from": "PREPARING", "to": "CUTOVER"}, 1)
 		}
 
@@ -163,6 +165,7 @@ func (c *Controller) reconcileRollout(ctx context.Context, app *store.App, r *st
 			return err
 		}
 		c.recordEvent(ctx, "rollout", "", r.ID, "", "complete: old generation recycled", nil)
+		c.rolloutUserEvent(ctx, r, "complete", nil)
 		c.metrics.Inc("firepaas_rollout_transitions_total", map[string]string{"from": "CUTOVER", "to": "COMPLETE"}, 1)
 
 	case "ROLLING_BACK":
@@ -200,8 +203,24 @@ func (c *Controller) startRollback(ctx context.Context, r *store.Rollout) error 
 		return err
 	}
 	c.recordEvent(ctx, "rollout", "", r.ID, "", "start rollback to previous generation", nil)
+	c.rolloutUserEvent(ctx, r, "rollback_started", nil)
 	c.metrics.Inc("firepaas_rollout_transitions_total", map[string]string{"from": r.Status, "to": "ROLLING_BACK"}, 1)
 	return nil
+}
+
+// rolloutUserEvent（v1.2-F）：rollout 状态迁移的租户事件。
+func (c *Controller) rolloutUserEvent(ctx context.Context, r *store.Rollout, status string, details map[string]any) {
+	app, err := c.store.GetApp(ctx, r.AppID)
+	if err != nil || app == nil {
+		return
+	}
+	if details == nil {
+		details = map[string]any{}
+	}
+	details["status"] = status
+	details["from_generation"] = r.FromGeneration
+	details["to_generation"] = r.ToGeneration
+	c.userEvent(ctx, app.ProjectID, r.AppID, "", store.UserEventRolloutUpdated, details)
 }
 
 // reconcileAppScale 把 app 的目标 deployment 对账到 desired_replicas。
@@ -366,6 +385,21 @@ func (c *Controller) enqueueAppMachineCreate(ctx context.Context, app *store.App
 			spec.HealthCheck = &h
 		}
 	}
+	// v1.3-A（ADR-0027）：egress policy 随 deployment 固化；nil = 历史
+	// CIDR-only 语义。policy_generation 已等于 deployment generation。
+	if len(dep.EgressPolicy) > 0 && string(dep.EgressPolicy) != "null" {
+		var ep pb.EgressPolicySpec
+		if err := protojson.Unmarshal(dep.EgressPolicy, &ep); err != nil {
+			return fmt.Errorf("decode deployment egress policy: %w", err)
+		}
+		if err := agentv1.ValidateEgressPolicy(&ep); err != nil {
+			return fmt.Errorf("validate deployment egress policy: %w", err)
+		}
+		if spec.Network == nil {
+			spec.Network = &pb.NetworkSpec{}
+		}
+		spec.Network.Egress = &ep
+	}
 
 	req := &pb.CreateMachineRequest{
 		MachineId:  machineID,
@@ -380,7 +414,9 @@ func (c *Controller) enqueueAppMachineCreate(ctx context.Context, app *store.App
 		return err
 	}
 	op, err := c.store.EnsureAppAndEnqueueCreate(ctx, app.ProjectID, app.ID, app.Hostname,
-		dep.ImageRef, dep.VCPU, dep.MemMIB, dep.Port, machineID, dep.ID, executionID,
+		dep.ImageRef, dep.VCPU, dep.MemMIB,
+		int64(agentv1.EffectiveDiskMib(spec.GetDiskMib())), dep.Port,
+		machineID, dep.ID, executionID,
 		req.OperationId, dep.Generation, ordinal, raw, placementJSONFor(spec.Placement))
 	if err != nil {
 		return err

@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sort"
+	"strings"
 )
 
 // 节点状态（与 agent ServiceInfoResponse.Status 对齐，外加 UNKNOWN）。
@@ -29,6 +30,7 @@ const (
 type BestOfKConfig struct {
 	R         float64 // 集群级最大超售比（CPU 维度），默认 4
 	MemR      float64 // 内存超售比，默认 1.0（内存不超售）
+	DiskR     float64 // 磁盘超售比（v1.2-E，ADR-0035），默认 1.0（磁盘不超售）
 	K         int     // 每轮随机采样数，默认 3
 	Alpha     float64 // 实时用量的权重，默认 0.5
 	WeightCPU float64 // 打分权重，默认 0.5
@@ -40,7 +42,7 @@ type BestOfKConfig struct {
 
 // DefaultBestOfKConfig 返回默认参数（对齐 e2b）。
 func DefaultBestOfKConfig() BestOfKConfig {
-	return BestOfKConfig{R: 4, MemR: 1.0, K: 3, Alpha: 0.5, WeightCPU: 0.5, WeightMem: 0.5, WeightImage: 0.5}
+	return BestOfKConfig{R: 4, MemR: 1.0, DiskR: 1.0, K: 3, Alpha: 0.5, WeightCPU: 0.5, WeightMem: 0.5, WeightImage: 0.5}
 }
 
 // Options 是 Place 的可观测/可注入选项。
@@ -69,15 +71,27 @@ type Node struct {
 	CPUPercent   float64 // 实时用量（0-100）
 	MemUsedMib   uint64  // 实时用量
 
+	// Disk（v1.2-E，ADR-0035）：requested overlay 承诺维度。
+	// DiskTotalMib==0（旧 agent 未上报）时磁盘过滤跳过（混合版本安全）。
+	DiskTotalMib  uint64 // 节点 data 盘总量
+	DiskAllocated uint64 // 已承诺 MiB（requested 之和，agent 上报）
+	DiskPending   uint64 // 在途 create 的 MiB 承诺
+
 	// CachedImageDigests（v1.1，ADR-0018）：节点本地镜像缓存 digest 集合
 	//（内含 name-digest 与 manifest digest 两种形态）。nil = 未知（不罚）。
 	CachedImageDigests map[string]bool
+	// FeatureIDs（v1.2-A，ADR-0023）：节点上报的 runtime capability 集合。
+	// nil = 未上报/无能力（任何 required feature 都不满足）。
+	FeatureIDs map[string]bool
 }
 
 // Request 是一次放置请求（来自 MachineSpec.placement + 资源需求）。
 type Request struct {
 	VCPU   uint64
 	MemMib uint64
+	// DiskMib（v1.2-E，ADR-0035）：有效磁盘承诺（MiB）。控制面必须传
+	// EffectiveDiskMib（spec 0 → 默认 10GiB），保证调度/预约/准入同值。
+	DiskMib uint64
 
 	DeploymentID string            // 反亲和范围；空 = 不启用
 	Pool         string            // 空 = compute
@@ -92,6 +106,12 @@ type Request struct {
 	// ImageDigest（v1.1，ADR-0018）：目标镜像 digest（image_ref 的 @ 后缀）。
 	// 空 = 不启用镜像亲和罚项。
 	ImageDigest string
+	// RequiredFeatures（v1.2-A，ADR-0023）：启动正确性能力硬过滤。控制面从
+	// deployment 语义推导（客户端不得直接声明内部 feature）。空 = 无要求。
+	RequiredFeatures []string
+	// RequiredNodeID is a hard locality constraint (LOCAL_RW origin node). It is
+	// evaluated after resource/capability filters and before anti-affinity.
+	RequiredNodeID string
 }
 
 // Event 是调度事件（写 scheduler_events，审计可解释）。
@@ -145,7 +165,7 @@ func (p *Placer) PrefetchTopK(req Request, nodes []Node, k int) []Node {
 	if k <= 0 {
 		k = 3
 	}
-	candidates := p.hardCandidates(req, nodes)
+	candidates, _ := p.evaluateCandidates(req, nodes, candidateEvaluation{})
 	sort.SliceStable(candidates, func(i, j int) bool {
 		si, sj := p.score(candidates[i], req), p.score(candidates[j], req)
 		if si != sj {
@@ -159,34 +179,98 @@ func (p *Placer) PrefetchTopK(req Request, nodes []Node, k int) []Node {
 	return candidates
 }
 
-// hardCandidates implements Place's hard candidate pipeline. It intentionally
-// omits retry exclusions: a prefetch is for the deployment, not one retry.
-func (p *Placer) hardCandidates(req Request, nodes []Node) []Node {
+type candidateEvaluation struct {
+	applyRetryExclusions bool
+	collectEvents        bool
+}
+
+// evaluateCandidates is the single hard-candidate pipeline used by placement
+// and prefetch. Terminal sampling/ranking remains with the caller; prefetch
+// deliberately omits per-attempt retry exclusions.
+func (p *Placer) evaluateCandidates(req Request, nodes []Node, opts candidateEvaluation) ([]Node, []Event) {
+	var events []Event
+	addEvent := func(kind, nodeID, reason string) {
+		if opts.collectEvents {
+			events = append(events, Event{Kind: kind, NodeID: nodeID, Reason: reason})
+		}
+	}
+	filter := func(nodes []Node, reject func(Node) string) []Node {
+		passed := make([]Node, 0, len(nodes))
+		for _, n := range nodes {
+			if reason := reject(n); reason != "" {
+				addEvent("filter_rejection", n.ID, reason)
+				continue
+			}
+			passed = append(passed, n)
+		}
+		return passed
+	}
+
 	pool := req.Pool
 	if pool == "" {
 		pool = "compute"
 	}
-	resourcePass := make([]Node, 0, len(nodes))
-	for _, n := range nodes {
-		if n.Status != StatusHealthy || n.Draining || n.Pool != pool ||
-			!labelsMatch(n.Labels, req.Labels) || !canFit(n, req, p.cfg) {
-			continue
+
+	candidates := filter(nodes, func(n Node) string {
+		if n.Draining {
+			return "draining"
 		}
-		resourcePass = append(resourcePass, n)
+		if n.Status != StatusHealthy {
+			return "status=" + n.Status
+		}
+		return ""
+	})
+	if opts.applyRetryExclusions {
+		candidates = filter(candidates, func(n Node) string {
+			if req.ExcludedNodes[n.ID] {
+				return "excluded by retry policy"
+			}
+			return ""
+		})
 	}
-	if !req.AntiAffinity || req.DeploymentID == "" || len(req.ExistingDeploymentNodes) == 0 {
-		return resourcePass
-	}
-	spread := make([]Node, 0, len(resourcePass))
-	for _, n := range resourcePass {
-		if !req.ExistingDeploymentNodes[n.ID] {
-			spread = append(spread, n)
+	candidates = filter(candidates, func(n Node) string {
+		if n.Pool != pool {
+			return "pool mismatch"
+		}
+		if !labelsMatch(n.Labels, req.Labels) {
+			return "labels mismatch"
+		}
+		return ""
+	})
+	candidates = filter(candidates, func(n Node) string {
+		if missing := missingFeatures(n.FeatureIDs, req.RequiredFeatures); missing != "" {
+			return "capability missing: " + missing
+		}
+		return ""
+	})
+	candidates = filter(candidates, func(n Node) string {
+		if !canFit(n, req, p.cfg) {
+			return fmt.Sprintf("resources: need vcpu=%d mem=%dMiB disk=%dMiB (allocated+pending+req exceeds R*capacity)",
+				req.VCPU, req.MemMib, req.DiskMib)
+		}
+		return ""
+	})
+	candidates = filter(candidates, func(n Node) string {
+		if req.RequiredNodeID != "" && n.ID != req.RequiredNodeID {
+			return "volume locality mismatch"
+		}
+		return ""
+	})
+
+	if req.AntiAffinity && req.DeploymentID != "" && len(req.ExistingDeploymentNodes) > 0 {
+		spread := make([]Node, 0, len(candidates))
+		for _, n := range candidates {
+			if !req.ExistingDeploymentNodes[n.ID] {
+				spread = append(spread, n)
+			}
+		}
+		if len(spread) == 0 {
+			addEvent("placement", "", "anti_affinity degraded: no node outside deployment set")
+		} else {
+			candidates = spread
 		}
 	}
-	if len(spread) == 0 { // same availability-preserving anti-affinity degradation as Place
-		return resourcePass
-	}
-	return spread
+	return candidates, events
 }
 
 // ErrNoCandidates 表示过滤后无可用节点。
@@ -199,80 +283,12 @@ func (p *Placer) Place(req Request, nodes []Node, rnd *rand.Rand) (Placement, er
 	if rnd == nil {
 		rnd = rand.New(rand.NewSource(rand.Int63()))
 	}
-	var events []Event
+	candidates, events := p.evaluateCandidates(req, nodes, candidateEvaluation{
+		applyRetryExclusions: true,
+		collectEvents:        true,
+	})
 	addEvent := func(kind, nodeID, reason string) {
 		events = append(events, Event{Kind: kind, NodeID: nodeID, Reason: reason})
-	}
-
-	pool := req.Pool
-	if pool == "" {
-		pool = "compute"
-	}
-
-	// 1) 状态过滤：只接受 HEALTHY，排除重试黑名单。
-	var statusPass []Node
-	for _, n := range nodes {
-		if n.Status == StatusHealthy && !n.Draining {
-			statusPass = append(statusPass, n)
-		} else if n.Draining {
-			addEvent("filter_rejection", n.ID, "draining")
-		} else {
-			addEvent("filter_rejection", n.ID, "status="+n.Status)
-		}
-	}
-
-	// 1.5) 重试排除（ResourceExhausted 换节点，ADR-0002）。
-	var retryPass []Node
-	for _, n := range statusPass {
-		if req.ExcludedNodes[n.ID] {
-			addEvent("filter_rejection", n.ID, "excluded by retry policy")
-			continue
-		}
-		retryPass = append(retryPass, n)
-	}
-
-	// 2) node_pool + labels 硬过滤。
-	var poolPass []Node
-	for _, n := range retryPass {
-		if n.Pool != pool {
-			addEvent("filter_rejection", n.ID, "pool mismatch")
-			continue
-		}
-		if !labelsMatch(n.Labels, req.Labels) {
-			addEvent("filter_rejection", n.ID, "labels mismatch")
-			continue
-		}
-		poolPass = append(poolPass, n)
-	}
-
-	// 3) 资源硬准入（agent 侧同样有硬校验，双保险，ADR-0002）。
-	var resourcePass []Node
-	for _, n := range poolPass {
-		if !canFit(n, req, p.cfg) {
-			addEvent("filter_rejection", n.ID,
-				fmt.Sprintf("resources: need vcpu=%d mem=%dMiB (allocated+pending+req exceeds R*capacity)",
-					req.VCPU, req.MemMib))
-			continue
-		}
-		resourcePass = append(resourcePass, n)
-	}
-
-	// 4) DEPLOYMENT 反亲和（尽力而为）：排除集内节点先剔除；候选为空则回退
-	//    到资源通过集合，并记录降级事件（ADR-0009 不为反亲和牺牲可用性）。
-	candidates := resourcePass
-	if req.AntiAffinity && req.DeploymentID != "" && len(req.ExistingDeploymentNodes) > 0 {
-		var spread []Node
-		for _, n := range resourcePass {
-			if req.ExistingDeploymentNodes[n.ID] {
-				continue
-			}
-			spread = append(spread, n)
-		}
-		if len(spread) == 0 {
-			addEvent("placement", "", "anti_affinity degraded: no node outside deployment set")
-		} else {
-			candidates = spread
-		}
 	}
 
 	if len(candidates) == 0 {
@@ -341,6 +357,14 @@ func canFit(n Node, req Request, cfg BestOfKConfig) bool {
 	if float64(usedMem) > float64(n.MemTotalMib)*cfg.MemR {
 		return false
 	}
+	// v1.2-E（ADR-0035）：磁盘硬过滤（不超售）。旧 agent 未上报容量
+	//（DiskTotalMib==0）时跳过，避免升级期全部节点不可调度。
+	if n.DiskTotalMib > 0 {
+		usedDisk := n.DiskAllocated + n.DiskPending + req.DiskMib
+		if float64(usedDisk) > float64(n.DiskTotalMib)*cfg.DiskR {
+			return false
+		}
+	}
 	return true
 }
 
@@ -351,6 +375,25 @@ func labelsMatch(nodeLabels, want map[string]string) bool {
 		}
 	}
 	return true
+}
+
+// featuresMatch 判断节点是否具备全部启动必需能力（v1.2-A，ADR-0023）。
+func featuresMatch(nodeFeatures map[string]bool, required []string) bool {
+	return len(missingFeatures(nodeFeatures, required)) == 0
+}
+
+// missingFeatures 返回缺失能力名（逗号连接，事件审计用）。
+func missingFeatures(nodeFeatures map[string]bool, required []string) string {
+	var missing []string
+	for _, id := range required {
+		if !nodeFeatures[id] {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) == 0 {
+		return ""
+	}
+	return strings.Join(missing, ",")
 }
 
 func sampleK(nodes []Node, k int, rnd *rand.Rand) []Node {

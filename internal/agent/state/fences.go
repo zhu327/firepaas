@@ -59,9 +59,12 @@ func OpenFences(path string) (*Fences, error) {
 	return f, nil
 }
 
-// WithMachine 串行化 machineID 的复合生命周期操作。回调不得长期阻塞或
-// 递归对同一 machine 调用 WithMachine。
-func (f *Fences) WithMachine(machineID string, fn func() error) error {
+// LockMachine acquires the process-local lock for one serialization key and
+// returns its unlock function. It lets protocol owners keep the lock across
+// fence checks, runtime effects, and durable completion without hiding those
+// ordered steps in a callback wrapper. The returned function must be called
+// exactly once; callers must not recursively lock the same key.
+func (f *Fences) LockMachine(machineID string) func() {
 	f.mu.Lock()
 	lock := f.machineLocks[machineID]
 	if lock == nil {
@@ -70,7 +73,13 @@ func (f *Fences) WithMachine(machineID string, fn func() error) error {
 	}
 	f.mu.Unlock()
 	lock.Lock()
-	defer lock.Unlock()
+	return lock.Unlock
+}
+
+// WithMachine is retained for existing callers.
+func (f *Fences) WithMachine(machineID string, fn func() error) error {
+	unlock := f.LockMachine(machineID)
+	defer unlock()
 	return fn()
 }
 
@@ -141,12 +150,35 @@ func (f *Fences) persistLocked() error {
 	if err := os.MkdirAll(filepath.Dir(f.path), 0o755); err != nil {
 		return fmt.Errorf("create fences dir: %w", err)
 	}
-	tmp := f.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	dir := filepath.Dir(f.path)
+	tmp, err := os.OpenFile(f.path+".tmp", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("open fences tmp: %w", err)
+	}
+	cleanup := func() { _ = tmp.Close(); _ = os.Remove(tmp.Name()) }
+	if _, err := tmp.Write(data); err != nil {
+		cleanup()
 		return fmt.Errorf("write fences tmp: %w", err)
 	}
-	if err := os.Rename(tmp, f.path); err != nil {
+	if err := tmp.Sync(); err != nil {
+		cleanup()
+		return fmt.Errorf("fsync fences tmp: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmp.Name())
+		return fmt.Errorf("close fences tmp: %w", err)
+	}
+	if err := os.Rename(tmp.Name(), f.path); err != nil {
+		_ = os.Remove(tmp.Name())
 		return fmt.Errorf("rename fences: %w", err)
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open fences dir: %w", err)
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil {
+		return fmt.Errorf("fsync fences dir: %w", err)
 	}
 	return nil
 }

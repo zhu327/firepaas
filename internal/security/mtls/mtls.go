@@ -92,22 +92,46 @@ func PeerCN(ctx context.Context) (string, error) {
 // unary 拦截器。仅在服务端启用 mTLS 时安装；未持证/未验证/CN 不在白名单的
 // 调用分别返回 Unauthenticated/PermissionDenied。
 func UnaryServerIdentityInterceptor(allowedCNs []string) grpc.UnaryServerInterceptor {
+	allowed := allowedIdentities(allowedCNs)
+	return func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		if err := authorizePeer(ctx, allowed); err != nil {
+			return nil, err
+		}
+		return handler(ctx, req)
+	}
+}
+
+// StreamServerIdentityInterceptor applies the same verified-client CN allowlist
+// as UnaryServerIdentityInterceptor to server-, client-, and bidirectional streams.
+func StreamServerIdentityInterceptor(allowedCNs []string) grpc.StreamServerInterceptor {
+	allowed := allowedIdentities(allowedCNs)
+	return func(srv any, stream grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		if err := authorizePeer(stream.Context(), allowed); err != nil {
+			return err
+		}
+		return handler(srv, stream)
+	}
+}
+
+func allowedIdentities(allowedCNs []string) map[string]bool {
 	allowed := make(map[string]bool, len(allowedCNs))
 	for _, cn := range allowedCNs {
 		if cn = strings.TrimSpace(cn); cn != "" {
 			allowed[cn] = true
 		}
 	}
-	return func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-		cn, err := PeerCN(ctx)
-		if err != nil {
-			return nil, status.Error(codes.Unauthenticated, err.Error())
-		}
-		if !allowed[cn] {
-			return nil, status.Errorf(codes.PermissionDenied, "client identity %q is not allowed", cn)
-		}
-		return handler(ctx, req)
+	return allowed
+}
+
+func authorizePeer(ctx context.Context, allowed map[string]bool) error {
+	cn, err := PeerCN(ctx)
+	if err != nil {
+		return status.Error(codes.Unauthenticated, err.Error())
 	}
+	if !allowed[cn] {
+		return status.Errorf(codes.PermissionDenied, "client identity %q is not allowed", cn)
+	}
+	return nil
 }
 
 // RequireClientIdentity 返回限制 HTTP 调用方身份（证书 CN 白名单）的中间件。

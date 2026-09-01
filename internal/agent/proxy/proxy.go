@@ -18,8 +18,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/example/firepaas/internal/agent/machine"
-	"github.com/example/firepaas/internal/controlplane/traffic"
+	"github.com/zhu327/firepaas/internal/agent/machine"
+	"github.com/zhu327/firepaas/internal/controlplane/traffic"
 )
 
 const (

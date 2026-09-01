@@ -146,7 +146,7 @@ func TestMachinesCrossGenerationCoexist(t *testing.T) {
 		{"app-coexist-r0-g2", "d2", "exec-2", 2},
 	} {
 		if _, err := s.EnsureAppAndEnqueueCreate(ctx, project, appID, "co.local",
-			"img:v1", 1, 512, 80, m.machineID, m.depID, m.execID,
+			"img:v1", 1, 512, 0, 80, m.machineID, m.depID, m.execID,
 			"op-"+m.machineID, m.gen, 0, []byte(`{"machine_id":"`+m.machineID+`"}`), nil); err != nil {
 			t.Fatalf("enqueue %s: %v", m.machineID, err)
 		}

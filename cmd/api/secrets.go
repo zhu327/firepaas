@@ -14,8 +14,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/example/firepaas/internal/controlplane/store"
-	"github.com/example/firepaas/internal/security/redact"
+	"github.com/zhu327/firepaas/internal/controlplane/store"
+	"github.com/zhu327/firepaas/internal/security/redact"
 )
 
 // auditMiddleware 为每个请求输出一行结构化审计：时间/方法/路径（无 query/
@@ -63,6 +63,16 @@ func (a *auditRecorder) WriteHeader(code int) {
 		a.wroteHeader = true
 	}
 	a.ResponseWriter.WriteHeader(code)
+}
+
+// Flush preserves streaming semantics through the audit wrapper.
+func (a *auditRecorder) Flush() {
+	if !a.wroteHeader {
+		a.WriteHeader(http.StatusOK)
+	}
+	if f, ok := a.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 // ---- secrets v1 ----

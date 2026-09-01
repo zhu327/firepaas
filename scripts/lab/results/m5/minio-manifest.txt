@@ -1,9 +1,0 @@
-ba7d8c1569af65ebb818638ab521074f  ./.minio.sys/buckets/.bloomcycle.bin/xl.meta
-a48d656369c38553f1996a812069306a  ./.minio.sys/buckets/.usage.json/xl.meta
-b35b5c6652f6d9740fb0f7b0d90cb3f8  ./.minio.sys/config/config.json/xl.meta
-72522e62755617d6e14bef7122e02774  ./.minio.sys/config/iam/format.json/xl.meta
-a5dc0e22e3372319391ea3c50e4b4407  ./.minio.sys/format.json
-c077b85ee8aa6cb5bca8cd04f4704b6a  ./.minio.sys/pool.bin/xl.meta
-fcea66cbf60b342744c3e5d56bb38b5f  ./.minio.sys/tmp/814a6fb7-1a43-4edc-8e01-838403cc7452
-a4a87c623fbe6310e9df5dced7e331c1  ./.minio.sys/tmp/.trash/443c6e5d-c32e-411d-b88e-9d5b470d521a/xl.meta.bkp
-6455043c9ab87a07d17de5af1a0b1c7e  ./.minio.sys/tmp/.trash/463cde64-5a09-455a-a4b1-1720af20d332/xl.meta.bkp

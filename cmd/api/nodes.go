@@ -6,8 +6,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
 
-	"github.com/example/firepaas/internal/controlplane/store"
+	"github.com/zhu327/firepaas/internal/controlplane/store"
 )
 
 // drainNode / readyNode：M5.5（mvp-plan §9.5）节点排水开关。
@@ -57,4 +58,54 @@ func (a *API) drainNode(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) readyNode(w http.ResponseWriter, r *http.Request) {
 	a.setNodeDraining(w, r, false, false)
+}
+
+// listCapabilities 返回集群能力汇总（v1.2-A，ADR-0023）：每项 feature 的
+// 可放置（HEALTHY 且非 draining）节点数与节点 ID 列表；不把节点能力并集
+// 伪装成“整个集群支持”。
+func (a *API) listCapabilities(w http.ResponseWriter, r *http.Request) {
+	nodes, err := a.store.ListNodes(r.Context())
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	type capEntry struct {
+		FeatureID     string   `json:"feature_id"`
+		EligibleNodes int      `json:"eligible_nodes"`
+		NodeIDs       []string `json:"node_ids"`
+	}
+	byFeature := map[string]*capEntry{}
+	eligibleTotal := 0
+	for i := range nodes {
+		n := &nodes[i]
+		eligible := n.Status == "HEALTHY" && !n.Draining
+		if !eligible {
+			continue
+		}
+		eligibleTotal++
+		seen := map[string]bool{}
+		for _, id := range n.FeatureIDs {
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+			e, ok := byFeature[id]
+			if !ok {
+				e = &capEntry{FeatureID: id}
+				byFeature[id] = e
+			}
+			e.EligibleNodes++
+			e.NodeIDs = append(e.NodeIDs, n.ID)
+		}
+	}
+	out := make([]capEntry, 0, len(byFeature))
+	for _, e := range byFeature {
+		out = append(out, *e)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].FeatureID < out[j].FeatureID })
+	writeJSON(w, 200, map[string]any{
+		"capabilities":   out,
+		"eligible_nodes": eligibleTotal,
+		"nodes_total":    len(nodes),
+	})
 }

@@ -46,6 +46,25 @@ func TestRedactJSONBytesNonObjectFallback(t *testing.T) {
 	}
 }
 
+func TestSourceURLDigestIsSafeMetadata(t *testing.T) {
+	if IsSensitive("source_url_digest") {
+		t.Fatal("source_url_digest must remain available for safe correlation")
+	}
+	if !IsSensitive("source_url") {
+		t.Fatal("source_url must remain sensitive")
+	}
+}
+
+func TestRedactTextRemovesURLsAndFlattenedSecrets(t *testing.T) {
+	input := `redirect to https://target.internal/path?sig=secret source_url=https://source.internal/a token=abc`
+	got := RedactText(input)
+	for _, secret := range []string{"target.internal", "source.internal", "sig=secret", "token=abc"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("RedactText leaked %q: %s", secret, got)
+		}
+	}
+}
+
 func TestRedactJSONBytesEmpty(t *testing.T) {
 	if got := string(RedactJSONBytes(nil)); got != "{}" {
 		t.Fatalf("nil input should map to {}, got %q", got)

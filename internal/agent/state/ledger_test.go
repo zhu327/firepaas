@@ -3,6 +3,7 @@ package state
 import (
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -56,6 +57,55 @@ func TestLedgerRestartReplay(t *testing.T) {
 	result, ok, err := l2.Check("op-1", "hash-1")
 	if err != nil || !ok || !jsonEqual(t, result, []byte(`{"machine_id":"m"}`)) {
 		t.Fatalf("replay failed: ok=%v err=%v result=%s", ok, err, result)
+	}
+}
+
+func TestLedgerInProgressSurvivesCrashWindowAndCompletesAfterRecovery(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ledger.json")
+	l, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := Record{OperationID: "op-crash", MachineID: "m-1", ExecutionID: "e-1", Generation: 7,
+		Kind: "snapshot.create", Identity: []byte(`{"snapshot_id":"s-1"}`), RequestHash: "hash-1"}
+	if _, existing, err := l.Begin(claim); err != nil || existing {
+		t.Fatalf("begin: existing=%v err=%v", existing, err)
+	}
+
+	// Simulate process death after the external side effect but before Complete.
+	restarted, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, existing, err := restarted.Begin(claim)
+	if err != nil || !existing || rec.Status != StatusInProgress || rec.Kind != claim.Kind || !jsonEqual(t, rec.Identity, claim.Identity) {
+		t.Fatalf("recovered claim = %#v existing=%v err=%v", rec, existing, err)
+	}
+	if _, completed, err := restarted.Check(claim.OperationID, claim.RequestHash); err != nil || completed {
+		t.Fatalf("in-progress claim must not replay as completed: completed=%v err=%v", completed, err)
+	}
+	if err := restarted.Complete(claim.OperationID, claim.RequestHash, []byte(`{"ok":true}`)); err != nil {
+		t.Fatal(err)
+	}
+	result, completed, err := restarted.Check(claim.OperationID, claim.RequestHash)
+	if err != nil || !completed || !jsonEqual(t, result, []byte(`{"ok":true}`)) {
+		t.Fatalf("completed recovery: completed=%v err=%v result=%s", completed, err, result)
+	}
+}
+
+func TestLedgerLoadsLegacyRecordAsCompleted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ledger.json")
+	legacy := `{"op-old":{"operation_id":"op-old","machine_id":"m-1","request_hash":"hash-1","result":{"legacy":true},"created_at":"2026-08-01T00:00:00Z"}}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	l, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, ok, err := l.Check("op-old", "hash-1")
+	if err != nil || !ok || !jsonEqual(t, result, []byte(`{"legacy":true}`)) {
+		t.Fatalf("legacy replay: ok=%v err=%v result=%s", ok, err, result)
 	}
 }
 

@@ -13,21 +13,26 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kernel/hypeman/lib/autostandby"
+	"github.com/kernel/hypeman/lib/guest"
 	"github.com/kernel/hypeman/lib/images"
 	"github.com/kernel/hypeman/lib/instances"
 	"github.com/kernel/hypeman/lib/network"
 	"github.com/kernel/hypeman/lib/tags"
+	"github.com/kernel/hypeman/lib/vmconfig"
 
-	"github.com/example/firepaas/internal/agent/health"
-	"github.com/example/firepaas/internal/agent/network/slot"
-	pb "github.com/example/firepaas/shared/gen/agent/v1"
+	"github.com/zhu327/firepaas/internal/agent/egress"
+	"github.com/zhu327/firepaas/internal/agent/health"
+	"github.com/zhu327/firepaas/internal/agent/network/slot"
+	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 const (
+	tagMachine    = "firepaas/machine_id"
 	tagProject    = "firepaas/project_id"
 	tagApp        = "firepaas/app_id"
 	tagDeployment = "firepaas/deployment_id"
@@ -38,6 +43,10 @@ const (
 	tagGeneration = "firepaas/generation"
 	// tagSecretKeys 是回显剔除用的键名列表（仅 opt-in 注入模式写入；值永不入 tag）。
 	tagSecretKeys = "firepaas/secret_keys"
+	// tagSecretLease（v1.2-B，ADR-0024）：one-shot delivery lease 的 ID。
+	// 存在即表示本 execution 接收过 secret（值永不入 tag）；用于 observed
+	// secret_delivery_state 推导与 memory snapshot 防护。
+	tagSecretLease = "firepaas/secret_lease"
 	// tagServices（v1.1，ADR-0022）：多端口 services 的紧凑 JSON
 	//（[{"n":"http","p":80}]），base64url 编码（tag 值字符集限制，同 tagHealth）。
 	// 只存主 service 之外的附加 service；主端口沿用 tagPort。
@@ -70,12 +79,114 @@ type ImageManager interface {
 	// 而上游 ListImages 返回 metadata 原始 name（含 digest 形态）——firepaas
 	// 只用这个稳定面。
 	ListImages(ctx context.Context) ([]images.Image, error)
+	DeleteImage(ctx context.Context, name string) error
+}
+
+// CachedImages returns ready local image metadata for the image service.
+func (a *Adapter) CachedImages(ctx context.Context) ([]images.Image, error) {
+	ims, err := a.images.ListImages(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]images.Image, 0, len(ims))
+	for _, img := range ims {
+		if img.Status == images.StatusReady {
+			out = append(out, img)
+		}
+	}
+	return out, nil
 }
 
 // CachedImageDigests 返回节点本地镜像缓存的 digest 列表（v1.1，ADR-0018）。
 // 每个镜像贡献两个形态：name 里的 digest 引用（与控制面 image_ref 对齐）
 // 与解析后的 manifest digest（M5 遗留：OCI index 引用两者不同，都入集合）。
 // 排序：CreatedAt 降序（最新创建优先；hypeman 未暴露 last-used，因此不是 LRU），截断上限 cap。
+
+// DeleteImage deletes a cached image only when no local instance references it.
+// The input may be a full OCI reference or a digest reported by CachedImageDigests.
+// Listing and reference resolution are intentionally fail-closed: GC must not rely
+// on the underlying image manager, which does not know about live instances.
+func (a *Adapter) DeleteImage(ctx context.Context, imageRef string) error {
+	if strings.TrimSpace(imageRef) == "" {
+		return fmt.Errorf("image reference is empty")
+	}
+	// The exclusive lock makes this ListImages/ListInstances/DeleteImage sequence
+	// the final, atomic reference check relative to pulls and machine creation.
+	// In particular, an active pull cannot finish and become deletable underneath
+	// this check, and a create cannot lose its image before its instance reference
+	// is visible to ListInstances.
+	a.imageUseMu.Lock()
+	defer a.imageUseMu.Unlock()
+	ims, err := a.images.ListImages(ctx)
+	if err != nil {
+		return fmt.Errorf("list images before delete: %w", err)
+	}
+	target := ""
+	for _, img := range ims {
+		if imageReferenceMatches(img, imageRef) {
+			if target != "" && target != img.Name {
+				return fmt.Errorf("image reference %q is ambiguous", imageRef)
+			}
+			target = img.Name
+		}
+	}
+	if target == "" {
+		return images.ErrNotFound
+	}
+	instancesList, err := a.instances.ListInstances(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("list instances before image delete: %w", err)
+	}
+	for _, inst := range instancesList {
+		if strings.TrimSpace(inst.Image) == "" {
+			return fmt.Errorf("instance %q has an unresolvable empty image reference", inst.Name)
+		}
+		resolved := ""
+		for _, img := range ims {
+			if !imageReferenceMatches(img, inst.Image) {
+				continue
+			}
+			if resolved != "" && resolved != img.Name {
+				return fmt.Errorf("instance %q image reference %q is ambiguous", inst.Name, inst.Image)
+			}
+			resolved = img.Name
+		}
+		if resolved == "" {
+			return fmt.Errorf("instance %q image reference %q cannot be resolved", inst.Name, inst.Image)
+		}
+		if resolved == target {
+			return fmt.Errorf("image %q is referenced by live instance %q", imageRef, inst.Name)
+		}
+	}
+	if err := a.images.DeleteImage(ctx, target); err != nil {
+		if errors.Is(err, images.ErrNotFound) {
+			return images.ErrNotFound
+		}
+		return fmt.Errorf("delete image: %w", err)
+	}
+	return nil
+}
+
+func imageReferenceMatches(img images.Image, ref string) bool {
+	if ref == img.Name || ref == img.Digest {
+		return true
+	}
+	if i := strings.LastIndex(img.Name, "@"); i >= 0 && ref == img.Name[i+1:] {
+		return true
+	}
+	if i := strings.LastIndex(ref, "@"); i >= 0 {
+		return ref[i+1:] == img.Digest || ref[i+1:] == imageDigestFromName(img.Name)
+	}
+	return false
+}
+
+func imageDigestFromName(name string) string {
+	if i := strings.LastIndex(name, "@"); i >= 0 && i+1 < len(name) {
+		return name[i+1:]
+	}
+	return ""
+}
+
 func (a *Adapter) CachedImageDigests(ctx context.Context, cap int) []string {
 	if cap <= 0 {
 		cap = 512
@@ -135,19 +246,53 @@ var ErrSecretEnvInjectionUnsupported = errors.New(
 
 // SecretInjectionMode：secret_env 注入策略。
 const (
-	// SecretInjectionOff：拒绝携带 secret_env 的 create（默认，安全）。
+	// SecretInjectionOff：拒绝携带 secret_env 的 create（安全拒绝）。
 	SecretInjectionOff = ""
+	// SecretInjectionOneShot（v1.2-B，ADR-0024）：默认通道。secret 经 vsock
+	// guest channel 写入 guest tmpfs（0700/0400），entrypoint 由 release gate
+	// 阻塞到 marker 写入；值不进入 hypeman Env/metadata/config disk。
+	SecretInjectionOneShot = "oneshot"
 	// SecretInjectionUnsafePersistedEnv：M4 语义——合并进 hypeman Env。
-	// 明知 hypeman 会把 Env 明文持久化到 metadata.json，仅限受信环境。
+	// 明知 hypeman 会把 Env 明文持久化到 metadata.json，仅限受信环境；
+	// 已废弃（ADR-0024 §10），保留一个版本，下版本删除。
 	SecretInjectionUnsafePersistedEnv = "unsafe-persisted-env"
 )
+
+// v1.2-B（ADR-0024）：one-shot secret 通道常量。
+const (
+	// secretDir：guest 内接收 secret 文件的 tmpfs 挂载点（init 在 guest
+	// agent 启动前挂载，mode 0700）。
+	secretDir = "/run/firepaas/secrets"
+	// secretMarkerFile：release marker（最后写入，原子放行 entrypoint gate）。
+	secretMarkerFile = secretDir + "/.delivered"
+	// secretGateTimeoutSeconds：guest init 等待 marker 的上限；覆盖 agent
+	// 侧 vsock 等待（含镜像拉取后的首次 boot）。
+	secretGateTimeoutSeconds = 120
+	// secretDeliverWaitForAgent：agent 侧等待 guest agent vsock 就绪的预算。
+	secretDeliverWaitForAgent = 90 * time.Second
+)
+
+// secretFileMode：secret 文件权限（ADR-0024：0400）。
+const secretFileMode = 0o400
+
+// ErrSecretSnapshotForbidden（ADR-0024 §9）：接收过 secret 的 execution
+// 禁止 memory snapshot/standby/checkpoint——tmpfs 属于 guest RAM，会进入
+// Firecracker 内存快照；canary 扫描不能证明无副本。
+var ErrSecretSnapshotForbidden = errors.New(
+	"execution received one-shot secrets; memory snapshot/standby forbidden (ADR-0024)")
+
+type slotManager interface {
+	Attach(ctx context.Context, machineID, tap, guestIP string) (slot.Slot, error)
+	Release(ctx context.Context, machineID string) error
+	SlotFor(machineID string) (slot.Slot, bool)
+}
 
 // Adapter 包装 hypeman 的 instance/image manager。slots 非空时启用 slot
 // 网络后端（ADR-0004）：create 后把 hypeman TAP 移入 slot netns，delete 后回收。
 type Adapter struct {
 	instances InstanceManager
 	images    ImageManager
-	slots     *slot.Manager
+	slots     slotManager
 	health    *health.Tracker
 	// M4.5：GetEndpoint 遇 Standby 实例时同步唤醒（autoresume，<5s SLO 来自
 	// M0 restore p95 基准）。默认开启；FIREPAAS_AGENT_AUTORESUME=false 关闭。
@@ -159,11 +304,21 @@ type Adapter struct {
 	// wakeObserver（v1.1，ADR-0017）：autoresume 唤醒观测（发生 standby
 	// restore 时回调；nil = 不观测）。
 	wakeObserver func(machineID string, took time.Duration)
+	// egressMgr（v1.3-A，ADR-0027）：egress 策略执行（slot 规则 + 透明代理）。
+	// nil = 未装配（桥接后端或单测）。
+	egressMgr *egress.Manager
+	// volumes（v1.3-D，ADR-0029）：hypeman volumes.Manager（nil = 未装配）。
+	volumes volumeProvider
+	// imageUseMu protects the transition between image readiness and a durable
+	// instance reference. Pulls/creates are readers; deletion is an exclusive
+	// final reference check plus delete. This is deliberately adapter-wide: an
+	// unresolved active pull has no trustworthy digest key yet.
+	imageUseMu sync.RWMutex
 }
 
 // New 构造 Adapter。slotManager 为 nil 时保持 M1 bridge 行为；
 // healthTracker 为 nil 时 readiness 退化为 UNKNOWN/UNCONFIGURED。
-func New(instances InstanceManager, images ImageManager, slotManager *slot.Manager, healthTracker *health.Tracker) *Adapter {
+func New(instances InstanceManager, images ImageManager, slotManager slotManager, healthTracker *health.Tracker) *Adapter {
 	return &Adapter{instances: instances, images: images, slots: slotManager,
 		health: healthTracker, autoResume: true}
 }
@@ -180,11 +335,49 @@ func (a *Adapter) SetSecretInjection(mode string) { a.secretInjection = mode }
 // SetWakeObserver 注入 autoresume 唤醒观测回调（v1.1，ADR-0017 metrics）。
 func (a *Adapter) SetWakeObserver(fn func(machineID string, took time.Duration)) { a.wakeObserver = fn }
 
+// SetEgressManager（v1.3-A，ADR-0027）注入 egress 策略执行层（nil = 禁用）。
+func (a *Adapter) SetEgressManager(mgr *egress.Manager) { a.egressMgr = mgr }
+
+// RebuildEgress（v1.3-A 重启恢复）：agentd 启动后按 hypeman 实例 tags 与
+// slot 持久化规则重建代理注册 + 幂等重放内核规则。策略不可重建（tags 只存
+// 身份）时记日志跳过，绝不静默放行：slot 侧规则仍按持久化状态生效。
+func (a *Adapter) RebuildEgress(ctx context.Context) error {
+	if a.egressMgr == nil || a.slots == nil {
+		return nil
+	}
+	listed, err := a.instances.ListInstances(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("rebuild egress: list instances: %w", err)
+	}
+	for i := range listed {
+		inst := &listed[i]
+		machineID := inst.Name
+		if machineID == "" {
+			machineID = inst.Id
+		}
+		s, ok := a.slots.SlotFor(machineID)
+		if !ok || s.Egress.Mode == "" {
+			continue
+		}
+		policy, perr := egress.FromRuleSet(s.Egress)
+		if perr != nil {
+			return fmt.Errorf("rebuild egress %s: %w", machineID, perr)
+		}
+		if err := a.egressMgr.Apply(ctx, machineID, inst.Tags[tagExecution],
+			inst.Tags[tagProject], inst.Tags[tagApp], inst.IP, policy); err != nil {
+			return fmt.Errorf("rebuild egress %s: %w", machineID, err)
+		}
+	}
+	return nil
+}
+
 // EnsureImage 确保 image_ref 就绪（v1.1，ADR-0018 部署预取的 agent 侧入口）。
 // 复用 create 路径的拉取与准入逻辑（digest 解析、LRU、解包上限）；
 // 幂等（已在队列/已就绪直接等待 ready）。磁盘水位检查由调用方（server
 // 的 PullImage）先行执行。
 func (a *Adapter) EnsureImage(ctx context.Context, imageRef string) error {
+	a.imageUseMu.RLock()
+	defer a.imageUseMu.RUnlock()
 	return a.ensureImageReady(ctx, imageRef)
 }
 
@@ -309,9 +502,31 @@ func decodeServicesTag(tag string) []svcJSON {
 
 // Create 确保镜像就绪后创建 VM。返回的 Machine 只含回显安全字段。
 func (a *Adapter) Create(ctx context.Context, req *pb.CreateMachineRequest) (*pb.Machine, error) {
-	// 默认 fail closed（hypeman Env 明文落盘）；受信环境 opt-in 恢复 M4 语义。
-	if len(req.GetSecretEnv()) != 0 && a.secretInjection != SecretInjectionUnsafePersistedEnv {
-		return nil, ErrSecretEnvInjectionUnsupported
+	// Keep the image protected until CreateInstance has made its local reference
+	// observable. DeleteImage takes the exclusive side and repeats its checks.
+	a.imageUseMu.RLock()
+	imageProtected := true
+	defer func() {
+		if imageProtected {
+			a.imageUseMu.RUnlock()
+		}
+	}()
+	// secret_env 模式分派（ADR-0024）：oneshot = vsock tmpfs 通道（默认）；
+	// unsafe-persisted-env = M4 明文 Env（已废弃，保留一个版本）；其余拒绝。
+	oneShot := false
+	if len(req.GetSecretEnv()) != 0 {
+		switch a.secretInjection {
+		case SecretInjectionOneShot:
+			oneShot = true
+		case SecretInjectionUnsafePersistedEnv:
+			// legacy 路径不支持 lease：unsafe 模式无投递状态上报，控制面
+			// 无法推进 lease 状态机（ADR-0024）；组合即拒绝。
+			if req.GetSecretLeaseId() != "" {
+				return nil, fmt.Errorf("unsafe-persisted-env does not support secret leases; use oneshot mode")
+			}
+		default:
+			return nil, ErrSecretEnvInjectionUnsupported
+		}
 	}
 	spec := req.Spec
 	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
@@ -327,14 +542,17 @@ func (a *Adapter) Create(ctx context.Context, req *pb.CreateMachineRequest) (*pb
 	for k, v := range spec.Env {
 		env[k] = v
 	}
-	// secret_env 单向注入（opt-in 模式）：值进入 VM 启动配置（hypeman Env，
-	// 明知会明文持久化到节点 metadata.json），键名记录在 tags 供回显剔除。
+	// legacy（unsafe-persisted-env）：secret_env 合并进 hypeman Env（明知会
+	// 明文持久化到节点 metadata.json）；oneshot 模式下值不进 Env，经 vsock
+	// 通道写入 guest tmpfs（见下）。
 	secretKeys := make([]string, 0, len(req.SecretEnv))
-	for k, v := range req.SecretEnv {
-		env[k] = v
-		secretKeys = append(secretKeys, k)
+	if !oneShot {
+		for k, v := range req.SecretEnv {
+			env[k] = v
+			secretKeys = append(secretKeys, k)
+		}
+		sort.Strings(secretKeys)
 	}
-	sort.Strings(secretKeys)
 	// 完整探针策略 JSON 入 tag（ADR-0008）；EXEC 或非法 target 降级为
 	// 未声明（UNCONFIGURED = RUNNING 即 READY）。
 	healthTag := "0"
@@ -366,6 +584,7 @@ func (a *Adapter) Create(ctx context.Context, req *pb.CreateMachineRequest) (*pb
 		NetworkEnabled: true,
 		AutoStandby:    standbyPolicy,
 		Tags: tags.Tags{
+			tagMachine:    req.MachineId,
 			tagProject:    spec.ProjectId,
 			tagApp:        spec.AppId,
 			tagDeployment: spec.DeploymentId,
@@ -378,11 +597,32 @@ func (a *Adapter) Create(ctx context.Context, req *pb.CreateMachineRequest) (*pb
 			tagServices:   servicesTag,
 		},
 	}
+	// v1.2-B（ADR-0024 §9）：接收过 secret 的 execution 禁止 memory snapshot。
+	// auto-standby = pause+snapshot+释放 VMM，在 create 时直接拒绝。
+	if oneShot && standbyPolicy != nil && standbyPolicy.Enabled {
+		return nil, ErrSecretSnapshotForbidden
+	}
+	if oneShot {
+		// release gate：init 在 guest agent 启动前挂 secret tmpfs，等待
+		// marker 出现才启动 entrypoint（ADR-0024）。lease id 入 tag（非敏感
+		// 标识）供 observed state 推导投递状态。
+		hreq.Tags[tagSecretLease] = req.GetSecretLeaseId()
+		hreq.SecretDelivery = &vmconfig.SecretDelivery{
+			Dir:            secretDir,
+			MarkerFile:     secretMarkerFile,
+			ExportAsEnv:    true,
+			TimeoutSeconds: secretGateTimeoutSeconds,
+		}
+	}
 
 	inst, err := a.instances.CreateInstance(ctx, hreq)
 	if err != nil {
 		return nil, fmt.Errorf("hypeman create: %w", err)
 	}
+	// The instance manager has now durably published the image reference, so
+	// DeleteImage's final ListInstances check is sufficient protection.
+	a.imageUseMu.RUnlock()
+	imageProtected = false
 	if a.slots != nil {
 		// slot 后端：把 hypeman 刚创建的 TAP 移入 slot netns。失败时回收
 		// 刚创建的实例并返回错误（controller 会按退避重试）。
@@ -390,6 +630,33 @@ func (a *Adapter) Create(ctx context.Context, req *pb.CreateMachineRequest) (*pb
 		if _, err := a.slots.Attach(ctx, req.MachineId, tap, inst.IP); err != nil {
 			_ = a.instances.DeleteInstance(ctx, inst.Id)
 			return nil, fmt.Errorf("slot attach: %w", err)
+		}
+	}
+	// v1.3-A（ADR-0027）：egress 策略落地（slot 规则 + 代理注册）。失败即
+	// 回收实例（fail closed：带策略的 execution 不能在没有执行层的情况下
+	// 运行，否则等于静默无防护）。
+	if a.egressMgr != nil && spec.GetNetwork().GetEgress() != nil {
+		policy, perr := egress.FromProto(spec.GetNetwork().GetEgress())
+		if perr != nil {
+			_ = a.instances.DeleteInstance(ctx, inst.Id)
+			return nil, fmt.Errorf("egress policy: %w", perr)
+		}
+		if err := a.egressMgr.Apply(ctx, req.MachineId, spec.GetExecutionId(),
+			spec.GetProjectId(), spec.GetAppId(), inst.IP, policy); err != nil {
+			_ = a.instances.DeleteInstance(ctx, inst.Id)
+			return nil, fmt.Errorf("egress apply: %w", err)
+		}
+	}
+	if oneShot {
+		// 同步投递（ADR-0024）：值只在本函数内存与 guest tmpfs 存在；
+		// 失败即销毁实例（gate 未放行，无泄漏面），控制面换新 execution 重试。
+		if err := a.deliverSecrets(ctx, inst.Id, req.SecretEnv); err != nil {
+			_ = a.instances.DeleteInstance(ctx, inst.Id)
+			return nil, fmt.Errorf("secret delivery: %w", err)
+		}
+		// 明文生命周期收口：投递完成立即清零，缩短明文在 agent 内存的停留。
+		for k := range req.SecretEnv {
+			req.SecretEnv[k] = ""
 		}
 	}
 	return mapMachine(inst), nil
@@ -416,6 +683,12 @@ func (a *Adapter) List(ctx context.Context, projectID string) ([]*pb.Machine, er
 				id = inst.Id
 			}
 			m.Readiness, m.LastReadinessChange = a.health.Readiness(id)
+		}
+		// v1.3-A（ADR-0027）：egress 审计聚合随 observed 上报（控制面入 PG 摘要）。
+		if a.egressMgr != nil {
+			if id := m.MachineId; id != "" {
+				m.EgressAudit = a.egressMgr.Stats(id)
+			}
 		}
 		if projectID != "" && m.Spec.GetProjectId() != projectID {
 			continue
@@ -444,6 +717,12 @@ func (a *Adapter) Delete(ctx context.Context, machineID, expectedExecution strin
 	if a.slots != nil {
 		if err := a.slots.Release(ctx, machineID); err != nil {
 			return fmt.Errorf("slot release: %w", err)
+		}
+	}
+	// v1.3-A（ADR-0027）：egress 策略随 machine 删除清除（代理注册 + slot 规则）。
+	if a.egressMgr != nil {
+		if err := a.egressMgr.Remove(ctx, machineID); err != nil {
+			return fmt.Errorf("egress remove: %w", err)
 		}
 	}
 	if a.health != nil {
@@ -661,6 +940,23 @@ func mapMachine(inst *instances.Instance) *pb.Machine {
 		Readiness:   readiness,
 		Generation:  generation, // R6 orphan 清理按它下发 fence 安全的 delete（P1-2）
 	}
+	// v1.2-D（ADR-0026）：execution-bound exit 报告（ON_FAILURE restart 输入）。
+	if inst.ExitCode != nil {
+		code := int32(*inst.ExitCode)
+		m.ExitCode = &code
+	}
+	// v1.2-B（ADR-0024）：one-shot 投递观测状态（仅状态，无任何元数据）。
+	// tagSecretLease 存在 = 本 execution 接收过 secret；entrypoint 启动
+	//（ProgramStartedAt）即 guest 已消费（init 读入并 unlink）→ ACKED。
+	if _, hasSecret := inst.Tags[tagSecretLease]; hasSecret {
+		if inst.ProgramStartedAt != nil {
+			m.SecretDeliveryState = pb.SecretDeliveryState_SECRET_DELIVERY_ACKED
+		} else {
+			m.SecretDeliveryState = pb.SecretDeliveryState_SECRET_DELIVERY_DELIVERED
+		}
+	} else {
+		m.SecretDeliveryState = pb.SecretDeliveryState_SECRET_DELIVERY_NONE
+	}
 	return m
 }
 
@@ -681,6 +977,31 @@ func mapState(s instances.State) pb.MachineState {
 	}
 }
 
+// deliverSecrets（v1.2-B，ADR-0024）：经 vsock guest channel 把 secret 写入
+// guest tmpfs 并释放 entrypoint gate。幂等（重试重写同值）；marker 最后
+// 写入，其出现即原子放行。值不进入错误信息与日志。
+func (a *Adapter) deliverSecrets(ctx context.Context, instanceID string, env map[string]string) error {
+	vp, ok := a.instances.(vsockProvider)
+	if !ok {
+		return fmt.Errorf("%w: secret delivery needs vsock guest channel", ErrGuestOpsUnsupported)
+	}
+	dialer, err := vp.GetVsockDialer(ctx, instanceID)
+	if err != nil {
+		return fmt.Errorf("vsock dialer: %w", err)
+	}
+	files := make(map[string][]byte, len(env))
+	for k, v := range env {
+		files[k] = []byte(v)
+	}
+	return guest.DeliverSecretFiles(ctx, dialer, guest.DeliverSecretsOptions{
+		Dir:          secretDir,
+		Files:        files,
+		FileMode:     secretFileMode,
+		MarkerFile:   secretMarkerFile,
+		WaitForAgent: secretDeliverWaitForAgent,
+	})
+}
+
 // Pause 将 machine 转入 standby（pause+snapshot+释放 VMM）。已 standby 直接
 // 返回（幂等）。slot 后端无需改动：TAP/netns 保留，恢复后 IP/端口不变。
 // executionID 非空时校验实例当前 execution 与之匹配（P3-18：旧代操作
@@ -696,6 +1017,11 @@ func (a *Adapter) Pause(ctx context.Context, machineID, executionID string) (*pb
 	if executionID != "" && inst.Tags[tagExecution] != executionID {
 		return nil, fmt.Errorf("execution mismatch for %s: want %s got %s",
 			machineID, executionID, inst.Tags[tagExecution])
+	}
+	// v1.2-B（ADR-0024 §9）：接收过 secret 的 execution 禁止 memory snapshot。
+	// standby = pause+snapshot+释放 VMM，快照会捕获 tmpfs 内的 secret。
+	if _, hasSecret := inst.Tags[tagSecretLease]; hasSecret {
+		return nil, ErrSecretSnapshotForbidden
 	}
 	inst, err = a.instances.StandbyInstance(ctx, inst.Id, instances.StandbyInstanceRequest{})
 	if err != nil {

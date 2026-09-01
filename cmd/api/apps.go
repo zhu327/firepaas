@@ -12,18 +12,20 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"strings"
 
-	"github.com/example/firepaas/internal/controlplane/store"
-	pb "github.com/example/firepaas/shared/gen/agent/v1"
-	"github.com/example/firepaas/shared/pkg/id"
+	"github.com/zhu327/firepaas/internal/capabilities"
+	agentv1 "github.com/zhu327/firepaas/internal/contracts/agentv1"
+	"github.com/zhu327/firepaas/internal/controlplane/appcommand"
+	"github.com/zhu327/firepaas/internal/controlplane/store"
+	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
+	"github.com/zhu327/firepaas/shared/pkg/id"
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
@@ -44,6 +46,18 @@ type createAppBody struct {
 	HealthCheck  *healthCheckBody           `json:"health_check"`
 	SecretRefs   map[string]store.SecretRef `json:"secret_refs"`
 	AutoStandby  *autoStandbyBody           `json:"auto_standby"` // v1.1（ADR-0017）
+	Egress       *egressPolicyBody          `json:"egress"`       // v1.3-A（ADR-0027）
+}
+
+// egressPolicyBody 是 egress policy 的 API 声明（v1.3-A，ADR-0027）。
+// policy_generation 由平台按 deployment generation 写入，客户端不得声明。
+type egressPolicyBody struct {
+	Mode              string   `json:"mode"` // unrestricted | deny_all | allowlist
+	AllowedCIDRs      []string `json:"allowed_cidrs"`
+	DeniedCIDRs       []string `json:"denied_cidrs"`
+	AllowedDomains    []string `json:"allowed_domains"`
+	MaxTCPConnections uint32   `json:"max_tcp_connections"`
+	AuditAll          bool     `json:"audit_all"`
 }
 
 // serviceBody 是 services 声明的单条（v1.1，ADR-0022）。
@@ -146,6 +160,13 @@ func (a *API) createApp(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	// v1.3-A（ADR-0027）：egress policy 校验与 protojson 固化（generation 与
+	// deployment 一致，初始 deployment = 1）。
+	egressJSON, err := marshalEgressPolicy(body.Egress, 1)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
 
 	// M4：create 时的 secret 引用校验（值不经 API 出现）。
 	if len(body.SecretRefs) > 0 {
@@ -154,14 +175,21 @@ func (a *API) createApp(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// P3-13：过滤移除绑定（null）条目并校验存在性。
-		refs, err := a.validateSecretRefs(r, body.SecretRefs)
+		refs, err := a.validateSecretRefs(r.Context(), effectiveProjectID(r, "dev"), body.SecretRefs)
 		if err != nil {
 			writeErr(w, 400, err.Error())
 			return
 		}
 		body.SecretRefs = refs
 	}
+	// v1.2-B（ADR-0024 §9）：secret_refs 与启用的 auto_standby 互斥。
+	if err := rejectSecretStandbyCombo(body.SecretRefs, body.AutoStandby); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
 	depID := "dep-" + body.AppID + "-1"
+	// v1.2-A（ADR-0023）：启动必需能力由平台从 deployment 语义推导。
+	requiredFeatures := requiredFeaturesForSecretRefs(body.SecretRefs)
 	// app 与其初始 deployment 必须作为一个业务单元提交；否则请求在两次
 	// 写之间失败会留下没有 ACTIVE deployment 的 app。
 	if err := a.store.CreateAppAndDeployment(r.Context(), body.ProjectID, store.App{
@@ -173,6 +201,8 @@ func (a *API) createApp(w http.ResponseWriter, r *http.Request) {
 		Services: services, AutoStandby: autoStandbyJSON,
 		Env: body.Env, SecretRefs: body.SecretRefs,
 		Placement: placeJSON, HealthCheck: hcJSON, Status: "ACTIVE",
+		RequiredFeatures: requiredFeatures,
+		EgressPolicy:     egressJSON,
 	}); err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -241,147 +271,84 @@ type deployBody struct {
 	HealthCheck  *healthCheckBody           `json:"health_check"`
 	SecretRefs   map[string]store.SecretRef `json:"secret_refs"`  // M4（ADR-0010）
 	AutoStandby  *autoStandbyBody           `json:"auto_standby"` // v1.1（ADR-0017）；nil = 继承
+	Egress       *egressPolicyBody          `json:"egress"`       // v1.3-A（ADR-0027）；nil = 继承
 }
 
 func (a *API) deployApp(w http.ResponseWriter, r *http.Request) {
-	appID := r.PathValue("id")
-	app, err := a.store.GetApp(r.Context(), appID)
-	if err != nil {
-		writeErr(w, 500, err.Error())
-		return
-	}
-	if app == nil {
-		writeErr(w, 404, "app not found")
-		return
-	}
 	var body deployBody
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, 400, "bad request: "+err.Error())
 		return
 	}
-	// 继承当前 ACTIVE deployment 的未覆盖字段（部署体不可变性的一部分）。
-	active, err := a.store.ActiveDeploymentForApp(r.Context(), appID)
-	if err != nil {
-		writeErr(w, 500, err.Error())
-		return
-	}
-	if active == nil {
-		writeErr(w, 409, "no active deployment")
-		return
-	}
-	if body.Image == "" {
-		body.Image = active.ImageRef
-	} else {
-		// P1-2：镜像引用策略（digest 形态 + registry allowlist）。
-		normalizedImage, err := a.images.Validate(body.Image)
-		if err != nil {
-			writeErr(w, 400, err.Error())
-			return
-		}
-		body.Image = normalizedImage
-	}
-	if body.VCPU == 0 {
-		body.VCPU = active.VCPU
-	}
-	if body.MemMIB == 0 {
-		body.MemMIB = active.MemMIB
-	}
-	// v1.1（ADR-0022）：services/port 继承语义——services 与 port 均未提供时
-	// 继承 ACTIVE deployment（多 service 声明原样继承）；只提供 port = 回到
-	// 单端口声明（清空 services）；只提供 services = 多端口声明。
-	if body.Services == nil && body.Port == 0 {
-		if len(active.Services) > 0 {
-			body.Services = make([]serviceBody, 0, len(active.Services))
-			for _, svc := range active.Services {
-				body.Services = append(body.Services, serviceBody{Name: svc.Name, InternalPort: svc.InternalPort})
-			}
-		} else {
-			body.Port = active.Port
-		}
-	}
-	// v1.1（ADR-0017）：auto_standby 未提供时继承（含“显式关闭”的继承）。
-	if body.AutoStandby == nil && len(active.AutoStandby) > 0 && string(active.AutoStandby) != "null" {
-		var inherited autoStandbyBody
-		if err := json.Unmarshal(active.AutoStandby, &inherited); err == nil {
-			body.AutoStandby = &inherited
-		}
-	}
-	if body.Env == nil {
-		body.Env = active.Env
-	}
-	// M4：secret_refs 未提供时继承当前 ACTIVE deployment 的绑定。
-	if body.SecretRefs == nil {
-		body.SecretRefs = active.SecretRefs
-	}
-	// P3-13：显式传 {"VAR": null} 移除绑定；nil 继承；其余校验后固化。
-	refs, err := a.validateSecretRefs(r, body.SecretRefs)
+	intent, err := deploymentIntent(r.PathValue("id"), effectiveProjectID(r, "dev"), body, false)
 	if err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	body.SecretRefs = refs
+	result, err := a.appCommands.Execute(r.Context(), intent)
+	if err != nil {
+		writeDeploymentCommandError(w, err)
+		return
+	}
+	writeDeploymentResult(w, result)
+}
 
-	hcJSON, err := marshalHealthCheck(body.HealthCheck)
-	if err != nil {
-		writeErr(w, 400, err.Error())
-		return
-	}
-	// v1.1：探针声明随 deployment 继承（与 vcpu/mem/port/env 同语义）。
-	// 此前 deploy 未携带 health_check 时新代静默丢掉探针（UNCONFIGURED
-	// 即入路由），rolling 逐批切流会在 guest 服务未起时打出 502。
-	if body.HealthCheck == nil && len(active.HealthCheck) > 0 && string(active.HealthCheck) != "null" {
-		hcJSON = active.HealthCheck
-	}
-	placeJSON, err := marshalPlacement(body.NodePool, body.Labels, body.AntiAffinity)
-	if err != nil {
-		writeErr(w, 500, err.Error())
-		return
-	}
-	// v1.1（ADR-0022/0017/F）：services / auto_standby / strategy 解析。
-	services, port, err := resolveServices(body.Services, body.Port)
-	if err != nil {
-		writeErr(w, 400, err.Error())
-		return
-	}
-	autoStandbyJSON, err := marshalAutoStandby(body.AutoStandby)
-	if err != nil {
-		writeErr(w, 400, err.Error())
-		return
-	}
-	strategy, err := resolveStrategy(body.Strategy)
-	if err != nil {
-		writeErr(w, 400, err.Error())
-		return
-	}
+type deploymentResult struct {
+	AppID      string `json:"app_id"`
+	Deployment string `json:"deployment"`
+	Generation int64  `json:"generation"`
+	RolloutID  string `json:"rollout_id"`
+	Status     string `json:"status"`
+}
 
-	newGen := app.Generation + 1
-	depID := fmt.Sprintf("dep-%s-%d", appID, newGen)
-	rolloutID := "rollout-" + id.New()
-
-	// P2-3：deployment + rollout + app.generation 同事务；中途失败不再
-	// 留下「有活跃 rollout、无 to-gen deployment」的孤儿（卡 S3 超时 + 409）。
-	// 单 rollout 互斥（ADR-0015 S7）由事务内 FOR UPDATE 检查 + 部分唯一索引
-	// 双重保证。
-	if err := a.store.DeployApp(r.Context(), store.Deployment{
-		ID: depID, AppID: appID, Generation: newGen,
-		ImageRef: body.Image, VCPU: body.VCPU, MemMIB: body.MemMIB, Port: port,
-		Services: services, AutoStandby: autoStandbyJSON, Strategy: strategy,
-		Env: body.Env, SecretRefs: body.SecretRefs,
-		Placement: placeJSON, HealthCheck: hcJSON, Status: "PREPARING",
-	}, store.Rollout{
-		ID: rolloutID, AppID: appID, FromGeneration: active.Generation, ToGeneration: newGen,
-	}, newGen); err != nil {
-		if errors.Is(err, store.ErrRolloutBusy) {
-			writeErr(w, 409, "rollout already in progress for this app")
-			return
+func deploymentIntent(appID, projectID string, body deployBody, inheritAll bool) (appcommand.Intent, error) {
+	var services []appcommand.Service
+	if body.Services != nil {
+		services = make([]appcommand.Service, len(body.Services))
+		for i, svc := range body.Services {
+			services[i] = appcommand.Service{Name: svc.Name, InternalPort: svc.InternalPort}
 		}
-		writeErr(w, 500, err.Error())
-		return
 	}
-	writeJSON(w, 202, map[string]any{
-		"app_id": appID, "deployment": depID, "generation": newGen,
-		"rollout_id": rolloutID, "status": "PREPARING",
-	})
+	var healthCheck *appcommand.HealthCheck
+	if body.HealthCheck != nil {
+		healthCheck = &appcommand.HealthCheck{Type: body.HealthCheck.Type, Target: body.HealthCheck.Target,
+			IntervalSeconds: body.HealthCheck.IntervalSeconds, TimeoutSeconds: body.HealthCheck.TimeoutSeconds,
+			UnhealthyThreshold: body.HealthCheck.UnhealthyThreshold}
+	}
+	var standby *appcommand.AutoStandby
+	if body.AutoStandby != nil {
+		standby = &appcommand.AutoStandby{Enabled: body.AutoStandby.Enabled, IdleTimeoutSeconds: body.AutoStandby.IdleTimeoutSeconds,
+			IgnoreDestinationPorts: append([]uint32(nil), body.AutoStandby.IgnoreDestinationPorts...)}
+	}
+	var egress *appcommand.EgressPolicy
+	if body.Egress != nil {
+		egress = &appcommand.EgressPolicy{Mode: body.Egress.Mode, AllowedCIDRs: body.Egress.AllowedCIDRs,
+			DeniedCIDRs: body.Egress.DeniedCIDRs, AllowedDomains: body.Egress.AllowedDomains,
+			MaxTCPConnections: body.Egress.MaxTCPConnections, AuditAll: body.Egress.AuditAll}
+	}
+	return appcommand.Intent{AppID: appID, ProjectID: projectID, Image: body.Image, VCPU: body.VCPU,
+		MemMIB: body.MemMIB, Port: body.Port, Services: services, Strategy: body.Strategy, Env: body.Env,
+		NodePool: body.NodePool, Labels: body.Labels, AntiAffinity: body.AntiAffinity, HealthCheck: healthCheck,
+		SecretRefs: body.SecretRefs, AutoStandby: standby, Egress: egress, InheritAll: inheritAll,
+		ReadActiveFirst: inheritAll}, nil
+}
+
+func writeDeploymentCommandError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, appcommand.ErrAppNotFound):
+		writeErr(w, 404, err.Error())
+	case errors.Is(err, appcommand.ErrNoActiveDeployment), errors.Is(err, appcommand.ErrRolloutBusy):
+		writeErr(w, 409, err.Error())
+	case errors.Is(err, appcommand.ErrInvalidIntent):
+		writeErr(w, 400, strings.TrimPrefix(err.Error(), appcommand.ErrInvalidIntent.Error()+": "))
+	default:
+		writeErr(w, 500, err.Error())
+	}
+}
+
+func writeDeploymentResult(w http.ResponseWriter, result appcommand.Result) {
+	writeJSON(w, 202, deploymentResult{AppID: result.AppID, Deployment: result.DeploymentID,
+		Generation: result.Generation, RolloutID: result.RolloutID, Status: result.Status})
 }
 
 func (a *API) scaleApp(w http.ResponseWriter, r *http.Request) {
@@ -528,7 +495,7 @@ func marshalPlacement(nodePool string, labels map[string]string, antiAffinity st
 // validateSecretRefs 校验引用格式与 secret 存在性（只查元数据，不取值）。
 // 值为 nil 的条目是"移除绑定"语义（CLI --secret VAR= 生成）：直接从 map
 // 剔除，不出错（P3-13；secret_refs 为 nil 才是继承语义，二者区分开）。
-func (a *API) validateSecretRefs(r *http.Request, refs map[string]store.SecretRef) (map[string]store.SecretRef, error) {
+func (a *API) validateSecretRefs(ctx context.Context, projectID string, refs map[string]store.SecretRef) (map[string]store.SecretRef, error) {
 	out := make(map[string]store.SecretRef, len(refs))
 	for varName, ref := range refs {
 		if varName == "" {
@@ -542,7 +509,7 @@ func (a *API) validateSecretRefs(r *http.Request, refs map[string]store.SecretRe
 			return nil, fmt.Errorf("secret ref %q: secret name is required", varName)
 		}
 		ver := ref.Version
-		if _, err := a.store.GetSecretMeta(r.Context(), effectiveProjectID(r, "dev"), ref.Secret, ver); err != nil {
+		if _, err := a.store.GetSecretMeta(ctx, projectID, ref.Secret, ver); err != nil {
 			return nil, fmt.Errorf("secret %q (ref %q) not found", ref.Secret, varName)
 		}
 		out[varName] = ref
@@ -550,9 +517,9 @@ func (a *API) validateSecretRefs(r *http.Request, refs map[string]store.SecretRe
 	return out, nil
 }
 
-// setAppSecretRefs 更新 app 的 secret 绑定：构造一次"仅换绑定"的发布
-// （其余字段继承 ACTIVE deployment），走现有 rollout 状态机（ADR-0010 §2：
-// 更新 secret 触发新 deployment version）。
+// setAppSecretRefs updates bindings by invoking the same transport-independent
+// deployment command as deployApp. Secret changes still create a new immutable
+// deployment and rollout (ADR-0010 §2).
 func (a *API) setAppSecretRefs(w http.ResponseWriter, r *http.Request) {
 	appID := r.PathValue("id")
 	var body struct {
@@ -562,54 +529,17 @@ func (a *API) setAppSecretRefs(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "bad request: "+err.Error())
 		return
 	}
-	active, err := a.store.ActiveDeploymentForApp(r.Context(), appID)
+	intent, err := deploymentIntent(appID, effectiveProjectID(r, "dev"), deployBody{SecretRefs: body.SecretRefs}, true)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeErr(w, 400, err.Error())
 		return
 	}
-	if active == nil {
-		writeErr(w, 409, "no active deployment")
-		return
-	}
-	hc := healthCheckBody{}
-	if active.HealthCheck != nil {
-		_ = json.Unmarshal(active.HealthCheck, &hc)
-	}
-	place := struct {
-		NodePool     string            `json:"node_pool"`
-		Labels       map[string]string `json:"labels"`
-		AntiAffinity string            `json:"anti_affinity"`
-	}{}
-	if active.Placement != nil && string(active.Placement) != "null" {
-		_ = json.Unmarshal(active.Placement, &place)
-	}
-	db := deployBody{
-		Image: active.ImageRef, VCPU: active.VCPU, MemMIB: active.MemMIB,
-		Port: active.Port, Env: active.Env, Strategy: active.EffectiveStrategy(),
-		NodePool: place.NodePool, Labels: place.Labels, AntiAffinity: place.AntiAffinity,
-		HealthCheck: &hc, SecretRefs: body.SecretRefs,
-	}
-	if len(active.Services) > 0 {
-		db.Services = make([]serviceBody, 0, len(active.Services))
-		for _, svc := range active.Services {
-			db.Services = append(db.Services, serviceBody{Name: svc.Name, InternalPort: svc.InternalPort})
-		}
-	}
-	if len(active.AutoStandby) > 0 && string(active.AutoStandby) != "null" {
-		var policy autoStandbyBody
-		if err := json.Unmarshal(active.AutoStandby, &policy); err != nil {
-			writeErr(w, 500, "decode active auto_standby: "+err.Error())
-			return
-		}
-		db.AutoStandby = &policy
-	}
-	raw, err := json.Marshal(db)
+	result, err := a.appCommands.Execute(r.Context(), intent)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeDeploymentCommandError(w, err)
 		return
 	}
-	r.Body = io.NopCloser(bytes.NewReader(raw))
-	a.deployApp(w, r)
+	writeDeploymentResult(w, result)
 }
 
 // ---------------------------------------------------------------------------
@@ -657,6 +587,22 @@ func resolveServices(services []serviceBody, port int) ([]store.ServiceSpec, int
 	return out, out[0].InternalPort, nil
 }
 
+// autoStandbyEnabled 判断 auto_standby 声明是否处于启用状态。
+func autoStandbyEnabled(b *autoStandbyBody) bool {
+	return b != nil && b.Enabled
+}
+
+// rejectSecretStandbyCombo（v1.2-B，ADR-0024 §9）：接收 secret 的
+// execution 禁止 memory snapshot，因此 secret_refs 与启用的 auto_standby
+// 互斥——在 deployment 固化前拒绝，避免到 agent 侧 create 才失败。
+func rejectSecretStandbyCombo(refs map[string]store.SecretRef, standby *autoStandbyBody) error {
+	if len(refs) > 0 && autoStandbyEnabled(standby) {
+		return fmt.Errorf("secret_refs cannot be combined with enabled auto_standby: " +
+			"secret executions forbid memory snapshots (ADR-0024)")
+	}
+	return nil
+}
+
 // marshalAutoStandby 校验并序列化 auto_standby 策略（protojson）。
 // nil / 未启用 → nil（未声明，行为与 M5 完全一致）。
 func marshalAutoStandby(b *autoStandbyBody) (json.RawMessage, error) {
@@ -692,4 +638,111 @@ func resolveStrategy(strategy string) (string, error) {
 	default:
 		return "", fmt.Errorf("strategy must be bluegreen or rolling")
 	}
+}
+
+// marshalEgressPolicy 校验并序列化 egress policy（v1.3-A，ADR-0027）。
+// nil → nil（未声明）。generation 由平台按 deployment generation 注入。
+// 域名条目经 NormalizeEgressDomain 归一（小写/去尾点）；CIDR 由契约校验。
+func marshalEgressPolicy(b *egressPolicyBody, generation int64) (json.RawMessage, error) {
+	if b == nil {
+		return nil, nil
+	}
+	var mode pb.EgressPolicySpec_Mode
+	switch strings.ToLower(b.Mode) {
+	case "", "unrestricted":
+		mode = pb.EgressPolicySpec_UNRESTRICTED
+	case "deny_all":
+		mode = pb.EgressPolicySpec_DENY_ALL
+	case "allowlist":
+		mode = pb.EgressPolicySpec_ALLOWLIST
+	default:
+		return nil, fmt.Errorf("egress.mode must be unrestricted, deny_all or allowlist")
+	}
+	if b.MaxTCPConnections > 65535 {
+		return nil, fmt.Errorf("egress.max_tcp_connections must be <= 65535")
+	}
+	domains := make([]string, 0, len(b.AllowedDomains))
+	for _, d := range b.AllowedDomains {
+		normalized, err := agentv1.NormalizeEgressDomain(d)
+		if err != nil {
+			return nil, err
+		}
+		domains = append(domains, normalized)
+	}
+	raw, err := protojson.Marshal(&pb.EgressPolicySpec{
+		Mode:              mode,
+		AllowedCidrs:      b.AllowedCIDRs,
+		DeniedCidrs:       b.DeniedCIDRs,
+		AllowedDomains:    domains,
+		MaxTcpConnections: b.MaxTCPConnections,
+		PolicyGeneration:  uint64(generation),
+		AuditAll:          b.AuditAll,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := agentv1.ValidateEgressPolicy(&pb.EgressPolicySpec{
+		Mode:              mode,
+		AllowedCidrs:      b.AllowedCIDRs,
+		DeniedCidrs:       b.DeniedCIDRs,
+		AllowedDomains:    domains,
+		MaxTcpConnections: b.MaxTCPConnections,
+		PolicyGeneration:  uint64(generation),
+		AuditAll:          b.AuditAll,
+	}); err != nil {
+		return nil, err
+	}
+	return json.RawMessage(raw), nil
+}
+
+// getAppEgressAudit（v1.3-A，ADR-0027）：app 的 egress 拒绝摘要与策略变更
+// 历史（project 隔离；只含计数与 strategy 事实，无 Host/SNI 明细）。
+func (a *API) getAppEgressAudit(w http.ResponseWriter, r *http.Request) {
+	appID := r.PathValue("id")
+	app, err := a.store.GetApp(r.Context(), appID)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if app == nil {
+		writeErr(w, 404, "app not found")
+		return
+	}
+	// project 隔离：非 admin 身份只能读自己 project 的摘要。
+	project := effectiveProjectID(r, "")
+	if project != "" && project != app.ProjectID {
+		writeErr(w, 403, "cross-project access denied")
+		return
+	}
+	sums, err := a.store.ListEgressDenySummaries(r.Context(), app.ProjectID)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	// 只回显本 app 的行。
+	appSums := make([]store.EgressDenySummary, 0, len(sums))
+	for _, s := range sums {
+		if s.AppID == appID {
+			appSums = append(appSums, s)
+		}
+	}
+	changes, err := a.store.ListEgressPolicyChanges(r.Context(), appID)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{
+		"app_id": appID, "project_id": app.ProjectID,
+		"deny_summaries": appSums, "policy_changes": changes,
+	})
+}
+
+// requiredFeaturesForSecretRefs 返回平台推导的启动必需能力（v1.2-A，
+// ADR-0023）。绑定 secret 的 deployment 要求 secret.oneshot.v1（one-shot
+// 安全通道）；客户端不能直接声明内部 feature。
+func requiredFeaturesForSecretRefs(refs map[string]store.SecretRef) []string {
+	if len(refs) == 0 {
+		return nil
+	}
+	return []string{capabilities.SecretOneShotV1}
 }

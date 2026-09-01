@@ -31,8 +31,8 @@ import (
 	"github.com/kernel/hypeman/lib/healthcheck"
 	"github.com/kernel/hypeman/lib/instances"
 
-	"github.com/example/firepaas/internal/agent/probeflow"
-	pb "github.com/example/firepaas/shared/gen/agent/v1"
+	"github.com/zhu327/firepaas/internal/agent/probeflow"
+	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 

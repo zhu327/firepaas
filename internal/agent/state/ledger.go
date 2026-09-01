@@ -1,14 +1,4 @@
-// Package state 实现 agent 侧 operation ledger（M1.4）。
-//
-// 语义（mvp-plan §5.5）：
-//   - 同一 operation_id 重试返回已记录结果；
-//   - 相同 operation_id、不同 request hash 被拒绝；
-//   - 重启后从磁盘重放；
-//   - 记录带 machine_id：machine 删除后立即清理同 machine 的历史记录，
-//     另有可配置的年龄 GC 窗口防止无限增长（M1 评审 P2-5）。
-//
-// 只持久化 request hash 与结果 JSON，不持久化 secret_env / proxy_credential
-// 等敏感字段（ADR-0010/ADR-0013）。
+// Package state implements the agent-side durable operation ledger.
 package state
 
 import (
@@ -21,26 +11,41 @@ import (
 	"time"
 )
 
-// ErrRequestHashConflict 表示同一 operation_id 携带了不同的 request hash。
-var ErrRequestHashConflict = errors.New("operation_id already completed with a different request hash")
+var ErrRequestHashConflict = errors.New("operation_id already exists with a different request hash")
 
-// Record 是 ledger 中一条已完成操作的持久化记录。
+// OperationStatus is omitted by legacy completed records. An empty status is
+// therefore interpreted as completed when a ledger written by an older agent is loaded.
+type OperationStatus string
+
+const (
+	StatusInProgress OperationStatus = "in_progress"
+	StatusCompleted  OperationStatus = "completed"
+)
+
+// Record is one durable operation. Kind and identity contain only stable,
+// non-secret recovery coordinates (for example snapshot_id or volume_id).
 type Record struct {
 	OperationID string          `json:"operation_id"`
-	MachineID   string          `json:"machine_id,omitempty"` // M1 评审前的历史记录可能为空
+	MachineID   string          `json:"machine_id,omitempty"`
+	ExecutionID string          `json:"execution_id,omitempty"`
+	Generation  uint64          `json:"generation,omitempty"`
+	Kind        string          `json:"kind,omitempty"`
+	Identity    json.RawMessage `json:"identity,omitempty"`
 	RequestHash string          `json:"request_hash"`
-	Result      json.RawMessage `json:"result"`
+	Status      OperationStatus `json:"status,omitempty"`
+	Result      json.RawMessage `json:"result,omitempty"`
 	CreatedAt   time.Time       `json:"created_at"`
+	UpdatedAt   time.Time       `json:"updated_at,omitempty"`
 }
 
-// Ledger 是进程内的 operation ledger，带原子落盘。
+func (r Record) Completed() bool { return r.Status == "" || r.Status == StatusCompleted }
+
 type Ledger struct {
 	mu      sync.Mutex
 	path    string
 	records map[string]Record
 }
 
-// Open 加载 ledger；文件不存在时从空状态开始。
 func Open(path string) (*Ledger, error) {
 	l := &Ledger{path: path, records: map[string]Record{}}
 	data, err := os.ReadFile(path)
@@ -50,32 +55,88 @@ func Open(path string) (*Ledger, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read ledger: %w", err)
 	}
-	if len(data) == 0 {
-		return l, nil
-	}
-	if err := json.Unmarshal(data, &l.records); err != nil {
-		return nil, fmt.Errorf("parse ledger %s: %w", path, err)
+	if len(data) != 0 {
+		if err := json.Unmarshal(data, &l.records); err != nil {
+			return nil, fmt.Errorf("parse ledger %s: %w", path, err)
+		}
 	}
 	return l, nil
 }
 
-// Check 返回 operation_id 已记录的 result（若存在且 hash 匹配）。
-func (l *Ledger) Check(operationID, requestHash string) (json.RawMessage, bool, error) {
+// Get returns either an in-progress claim or a completed result.
+func (l *Ledger) Get(operationID, requestHash string) (Record, bool, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	rec, ok := l.records[operationID]
 	if !ok {
-		return nil, false, nil
+		return Record{}, false, nil
 	}
 	if rec.RequestHash != requestHash {
-		return nil, false, ErrRequestHashConflict
+		return Record{}, false, ErrRequestHashConflict
+	}
+	return rec, true, nil
+}
+
+// Check preserves the original API: only completed records are replayable.
+func (l *Ledger) Check(operationID, requestHash string) (json.RawMessage, bool, error) {
+	rec, ok, err := l.Get(operationID, requestHash)
+	if err != nil || !ok || !rec.Completed() {
+		return nil, false, err
 	}
 	return rec.Result, true, nil
 }
 
-// Put 持久化一条结果。若已有同 operation_id：
-//   - hash 相同：幂等成功（保留首次结果）；
-//   - hash 不同：返回 ErrRequestHashConflict。
+// Begin durably claims an operation before its first external side effect.
+// existing is true for both an in-progress retry and a completed replay.
+func (l *Ledger) Begin(rec Record) (stored Record, existing bool, err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if old, ok := l.records[rec.OperationID]; ok {
+		if old.RequestHash != rec.RequestHash {
+			return Record{}, false, ErrRequestHashConflict
+		}
+		return old, true, nil
+	}
+	now := time.Now().UTC()
+	rec.Status = StatusInProgress
+	rec.Result = nil
+	rec.CreatedAt = now
+	rec.UpdatedAt = now
+	l.records[rec.OperationID] = rec
+	if err := l.persistLocked(); err != nil {
+		delete(l.records, rec.OperationID)
+		return Record{}, false, err
+	}
+	return rec, false, nil
+}
+
+// Complete atomically changes a durable claim to completed and records its response.
+func (l *Ledger) Complete(operationID, requestHash string, result json.RawMessage) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	rec, ok := l.records[operationID]
+	if !ok {
+		return fmt.Errorf("operation %s has no durable claim", operationID)
+	}
+	if rec.RequestHash != requestHash {
+		return ErrRequestHashConflict
+	}
+	if rec.Completed() {
+		return nil
+	}
+	old := rec
+	rec.Status = StatusCompleted
+	rec.Result = append(json.RawMessage(nil), result...)
+	rec.UpdatedAt = time.Now().UTC()
+	l.records[operationID] = rec
+	if err := l.persistLocked(); err != nil {
+		l.records[operationID] = old
+		return err
+	}
+	return nil
+}
+
+// Put remains compatible with pre-claim callers and writes a completed record.
 func (l *Ledger) Put(operationID, machineID, requestHash string, result json.RawMessage) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -83,19 +144,49 @@ func (l *Ledger) Put(operationID, machineID, requestHash string, result json.Raw
 		if rec.RequestHash != requestHash {
 			return ErrRequestHashConflict
 		}
+		if rec.Completed() {
+			return nil
+		}
+		old := rec
+		rec.Status, rec.Result, rec.UpdatedAt = StatusCompleted, append(json.RawMessage(nil), result...), time.Now().UTC()
+		l.records[operationID] = rec
+		if err := l.persistLocked(); err != nil {
+			l.records[operationID] = old
+			return err
+		}
 		return nil
 	}
-	l.records[operationID] = Record{
-		OperationID: operationID,
-		MachineID:   machineID,
-		RequestHash: requestHash,
-		Result:      result,
-		CreatedAt:   time.Now().UTC(),
+	now := time.Now().UTC()
+	l.records[operationID] = Record{OperationID: operationID, MachineID: machineID,
+		RequestHash: requestHash, Status: StatusCompleted, Result: result, CreatedAt: now, UpdatedAt: now}
+	if err := l.persistLocked(); err != nil {
+		delete(l.records, operationID)
+		return err
 	}
-	return l.persistLocked()
+	return nil
 }
 
-// PruneBefore 删除 createdAt 早于 cutoff 的记录（年龄 GC 窗口），返回删除条数。
+// Claim is retained for existing callers; its supplied result represents a
+// completed tombstone, as it did in the old ledger model.
+func (l *Ledger) Claim(operationID, machineID, requestHash string, result json.RawMessage) (bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if rec, ok := l.records[operationID]; ok {
+		if rec.RequestHash != requestHash {
+			return false, ErrRequestHashConflict
+		}
+		return false, nil
+	}
+	now := time.Now().UTC()
+	l.records[operationID] = Record{OperationID: operationID, MachineID: machineID,
+		RequestHash: requestHash, Status: StatusCompleted, Result: result, CreatedAt: now, UpdatedAt: now}
+	if err := l.persistLocked(); err != nil {
+		delete(l.records, operationID)
+		return false, err
+	}
+	return true, nil
+}
+
 func (l *Ledger) PruneBefore(cutoff time.Time) (int, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -115,9 +206,6 @@ func (l *Ledger) PruneBefore(cutoff time.Time) (int, error) {
 	return removed, nil
 }
 
-// PruneMachineExcept 删除指定 machine 的全部记录（保留 keepOperationID 一条）。
-// 在 machine 删除成功后调用：避免后续重放旧 create 时返回已删除 VM 的“成功”
-// 结果，同时保留 delete 自身的去重记录。machineID 为空的旧记录不受影响。
 func (l *Ledger) PruneMachineExcept(machineID, keepOperationID string) (int, error) {
 	if machineID == "" {
 		return 0, nil
@@ -140,20 +228,45 @@ func (l *Ledger) PruneMachineExcept(machineID, keepOperationID string) (int, err
 	return removed, nil
 }
 
+// persistLocked uses the crash-safe sequence write temp, fsync temp, rename,
+// fsync parent. A successful return means both data and directory entry are durable.
 func (l *Ledger) persistLocked() error {
 	data, err := json.MarshalIndent(l.records, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal ledger: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(l.path), 0o755); err != nil {
+	dir := filepath.Dir(l.path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create ledger dir: %w", err)
 	}
-	tmp := l.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	tmp, err := os.OpenFile(l.path+".tmp", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("open ledger tmp: %w", err)
+	}
+	cleanup := func() { _ = tmp.Close(); _ = os.Remove(tmp.Name()) }
+	if _, err := tmp.Write(data); err != nil {
+		cleanup()
 		return fmt.Errorf("write ledger tmp: %w", err)
 	}
-	if err := os.Rename(tmp, l.path); err != nil {
+	if err := tmp.Sync(); err != nil {
+		cleanup()
+		return fmt.Errorf("fsync ledger tmp: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmp.Name())
+		return fmt.Errorf("close ledger tmp: %w", err)
+	}
+	if err := os.Rename(tmp.Name(), l.path); err != nil {
+		_ = os.Remove(tmp.Name())
 		return fmt.Errorf("rename ledger: %w", err)
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open ledger dir: %w", err)
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil {
+		return fmt.Errorf("fsync ledger dir: %w", err)
 	}
 	return nil
 }

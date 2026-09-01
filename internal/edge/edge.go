@@ -116,7 +116,7 @@ func (t *TokenClient) Get(ctx context.Context, machineID, executionID string) (s
 	t.mu.Unlock()
 
 	// 回源在锁外执行（P2-5：不阻塞其它 machine 的取 token）。
-	tok, err := t.fetch(ctx, machineID)
+	tok, err := t.fetch(ctx, machineID, executionID)
 
 	t.mu.Lock()
 	delete(t.flights, key)
@@ -128,7 +128,7 @@ func (t *TokenClient) Get(ctx context.Context, machineID, executionID string) (s
 		return tok, nil
 	}
 	// 回源失败：execution 匹配且在 stale 窗口内 → last-known-good。
-	if e, ok := t.entries[key]; ok && e.execution == executionID {
+	if e, ok := t.entries[key]; ok && e.execution == executionID && !errors.Is(err, errTokenExecutionMismatch) {
 		if now.Sub(e.fetchedAt) < t.stale {
 			t.mu.Unlock()
 			fl.tok, fl.err = e.token, nil
@@ -142,8 +142,10 @@ func (t *TokenClient) Get(ctx context.Context, machineID, executionID string) (s
 	return "", err
 }
 
+var errTokenExecutionMismatch = errors.New("traffic-token execution mismatch")
+
 // fetch 回源控制面 traffic-token 端点（锁外调用）。
-func (t *TokenClient) fetch(ctx context.Context, machineID string) (string, error) {
+func (t *TokenClient) fetch(ctx context.Context, machineID, executionID string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		fmt.Sprintf("%s/v1/machines/%s/traffic-token", t.addr, machineID), nil)
 	if err != nil {
@@ -158,9 +160,15 @@ func (t *TokenClient) fetch(ctx context.Context, machineID string) (string, erro
 	if resp.StatusCode != 200 {
 		return "", fmt.Errorf("traffic-token %s: HTTP %d", machineID, resp.StatusCode)
 	}
-	var body struct{ Token, ExecutionID string }
+	var body struct {
+		Token       string `json:"token"`
+		ExecutionID string `json:"execution_id"`
+	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil || body.Token == "" {
 		return "", fmt.Errorf("traffic-token %s decode: %v", machineID, err)
+	}
+	if executionID != "" && body.ExecutionID != executionID {
+		return "", fmt.Errorf("%w for machine %s", errTokenExecutionMismatch, machineID)
 	}
 	return body.Token, nil
 }

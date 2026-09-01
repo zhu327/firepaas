@@ -11,8 +11,8 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/example/firepaas/internal/controlplane/store"
-	"github.com/example/firepaas/internal/security/redact"
+	"github.com/zhu327/firepaas/internal/controlplane/store"
+	"github.com/zhu327/firepaas/internal/security/redact"
 )
 
 func (a *API) listOperations(w http.ResponseWriter, r *http.Request) {
@@ -63,7 +63,7 @@ func opJSON(op store.OperationTrace) map[string]any {
 		"completed_at":  op.CompletedAt,
 		"request":       string(redact.RedactJSONBytes(op.Request)),
 		"result":        string(redact.RedactJSONBytes(op.Result)),
-		"error":         op.Error,
+		"error":         redact.RedactText(op.Error),
 	}
 	return fields
 }

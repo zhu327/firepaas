@@ -8,7 +8,9 @@ internal/controlplane/catalog/  # Redis route/location 投影（可重建，ADR-
 internal/controlplane/agentclient/ # agent gRPC 客户端（mTLS fail-closed）
 internal/controlplane/nodemanager/ # Nomad discovery + 节点状态机 + 连接池（M2.1）
 internal/controlplane/leader/   # PG advisory lock 选主（M2a，ADR-0007）
-internal/controlplane/controller/  # 操作 reconcile + 决策表 R1-R8 + route 重建
+internal/controlplane/controller/  # 操作 reconcile + 决策表 R1-R8；触发 route 重建
+internal/controlplane/routepublisher/ # 纯 route 派生 + PG-first/Redis-second 发布
+internal/controlplane/placement/ # 一致节点快照 + 调度/PG 配额/Redis 预约/派发节点提交
 internal/controlplane/reservations/ # Redis Lua 预约：配额/pending TTL/重建（M2.4）
 internal/scheduler/             # 先过滤后打分 Best-of-K（ADR-0002/0009）
 internal/controlplane/api/      # 完整 OpenAPI 路由（M3 起填）
