@@ -37,6 +37,6 @@ func NewSigner(key []byte) (*Signer, error) {
 // Token 计算指定 machine/execution 的 proxy credential。
 func (s *Signer) Token(machineID, executionID string) string {
 	mac := hmac.New(sha256.New, s.key)
-	fmt.Fprintf(mac, "%s/%s", machineID, executionID)
+	_, _ = fmt.Fprintf(mac, "%s/%s", machineID, executionID)
 	return hex.EncodeToString(mac.Sum(nil))[:32]
 }

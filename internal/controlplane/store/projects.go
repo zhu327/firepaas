@@ -41,7 +41,8 @@ func (s *Store) GetProjectQuotaDetail(ctx context.Context, projectID string) (*P
 // UpdateProjectQuota CAS 更新配额：revision 匹配才生效并 +1；不匹配返回
 // ErrQuotaRevisionConflict。配额降低不驱逐已有 machine/会话（ADR-0035 §2）。
 func (s *Store) UpdateProjectQuota(ctx context.Context, projectID string, rev int64,
-	d ProjectQuotaDetail) (*ProjectQuotaDetail, error) {
+	d ProjectQuotaDetail,
+) (*ProjectQuotaDetail, error) {
 	var out ProjectQuotaDetail
 	err := s.pool.QueryRow(ctx, `
 		UPDATE projects SET

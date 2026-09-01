@@ -13,7 +13,12 @@ func TestValidate(t *testing.T) {
 		wantErr   bool
 	}{
 		{"tag no allowlist", "", "nginx:alpine", false},
-		{"digest valid", "", "docker.io/library/nginx@sha256:1f25fedd50aec27413031afb3a4f8ee4effcc9d843f6a76e81bfa92245ac5c06", false},
+		{
+			"digest valid",
+			"",
+			"docker.io/library/nginx@sha256:1f25fedd50aec27413031afb3a4f8ee4effcc9d843f6a76e81bfa92245ac5c06",
+			false,
+		},
 		{"digest bad hex", "", "nginx@sha256:short", true},
 		{"digest bad algo", "", "nginx@sha512:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", true},
 		{"garbage", "", "not a valid ref !!", true},

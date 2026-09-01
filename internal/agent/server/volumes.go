@@ -20,17 +20,34 @@ func (s *Server) CreateVolume(ctx context.Context, req *pb.CreateVolumeRequest) 
 	if req.GetVolumeId() == "" || req.GetOperationId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume_id and operation_id are required")
 	}
-	return s.createVolumeClaimed(ctx, req.GetOperationId(), req.GetVolumeId(), hashRequest(req), "volume.create", func() (*pb.CreateVolumeResponse, error) {
-		if err := s.admitVolume(req.GetSizeBytes()); err != nil {
-			return nil, err
-		}
-		return s.machines.CreateVolume(ctx, req.GetVolumeId(), req.GetSizeBytes())
-	})
+	return s.createVolumeClaimed(
+		ctx,
+		req.GetOperationId(),
+		req.GetVolumeId(),
+		hashRequest(req),
+		"volume.create",
+		func() (*pb.CreateVolumeResponse, error) {
+			if err := s.admitVolume(req.GetSizeBytes()); err != nil {
+				return nil, err
+			}
+			return s.machines.CreateVolume(ctx, req.GetVolumeId(), req.GetSizeBytes())
+		},
+	)
 }
 
-func (s *Server) createVolumeClaimed(ctx context.Context, operationID, volumeID, hash, kind string, create func() (*pb.CreateVolumeResponse, error)) (*pb.CreateVolumeResponse, error) {
+func (s *Server) createVolumeClaimed(
+	ctx context.Context,
+	operationID, volumeID, hash, kind string,
+	create func() (*pb.CreateVolumeResponse, error),
+) (*pb.CreateVolumeResponse, error) {
 	out, err := mutation.RunResourceMutation(s.mutations, mutation.ClaimedMutation[*pb.CreateVolumeResponse]{
-		Identity:         mutation.Identity{OperationID: operationID, MachineID: volumeID, Kind: kind, Coordinates: identityJSON(map[string]string{"volume_id": volumeID}), RequestHash: hash},
+		Identity: mutation.Identity{
+			OperationID: operationID,
+			MachineID:   volumeID,
+			Kind:        kind,
+			Coordinates: identityJSON(map[string]string{"volume_id": volumeID}),
+			RequestHash: hash,
+		},
 		SerializationKey: volumeID,
 		Recover: func() (mutation.Recovery[*pb.CreateVolumeResponse], error) {
 			resp, found, err := s.machines.RecoverVolume(ctx, volumeID)
@@ -52,29 +69,55 @@ func (s *Server) admitVolume(sizeBytes uint64) error {
 		return status.Error(codes.Unavailable, "node disk capacity not available yet")
 	}
 	if diskAllocated+wantMib > diskTotal {
-		return status.Errorf(codes.ResourceExhausted, "volume disk admission: allocated %dMiB + requested %dMiB exceeds %dMiB", diskAllocated, wantMib, diskTotal)
+		return status.Errorf(
+			codes.ResourceExhausted,
+			"volume disk admission: allocated %dMiB + requested %dMiB exceeds %dMiB",
+			diskAllocated,
+			wantMib,
+			diskTotal,
+		)
 	}
 	if s.admissionDiskWatermark > 0 {
 		if frac := diskStatsFraction(s.info.DataDir()); frac >= s.admissionDiskWatermark {
-			return status.Errorf(codes.ResourceExhausted, "volume disk admission: watermark %.2f reached (%.2f)", s.admissionDiskWatermark, frac)
+			return status.Errorf(
+				codes.ResourceExhausted,
+				"volume disk admission: watermark %.2f reached (%.2f)",
+				s.admissionDiskWatermark,
+				frac,
+			)
 		}
 	}
 	return nil
 }
 
 func (s *Server) ImportDataset(ctx context.Context, req *pb.ImportDatasetRequest) (*pb.CreateVolumeResponse, error) {
-	if req.GetVolumeId() == "" || req.GetOperationId() == "" || req.GetExpectedDigest() == "" || req.GetExpiresAtUnix() <= 0 {
-		return nil, status.Error(codes.InvalidArgument, "volume_id/operation_id/expected_digest/expires_at are required")
+	if req.GetVolumeId() == "" || req.GetOperationId() == "" || req.GetExpectedDigest() == "" ||
+		req.GetExpiresAtUnix() <= 0 {
+		return nil, status.Error(
+			codes.InvalidArgument,
+			"volume_id/operation_id/expected_digest/expires_at are required",
+		)
 	}
-	return s.createVolumeClaimed(ctx, req.GetOperationId(), req.GetVolumeId(), hashRequest(req), "volume.import", func() (*pb.CreateVolumeResponse, error) {
-		if req.GetExpiresAtUnix() < time.Now().Unix() || req.GetExpiresAtUnix() > time.Now().Add(15*time.Minute).Unix() {
-			return nil, status.Error(codes.PermissionDenied, "dataset import authorization expired or exceeds maximum TTL")
-		}
-		if err := s.admitVolume(req.GetMaxExpandedBytes()); err != nil {
-			return nil, err
-		}
-		return s.machines.ImportDataset(ctx, req)
-	})
+	return s.createVolumeClaimed(
+		ctx,
+		req.GetOperationId(),
+		req.GetVolumeId(),
+		hashRequest(req),
+		"volume.import",
+		func() (*pb.CreateVolumeResponse, error) {
+			if req.GetExpiresAtUnix() < time.Now().Unix() ||
+				req.GetExpiresAtUnix() > time.Now().Add(15*time.Minute).Unix() {
+				return nil, status.Error(
+					codes.PermissionDenied,
+					"dataset import authorization expired or exceeds maximum TTL",
+				)
+			}
+			if err := s.admitVolume(req.GetMaxExpandedBytes()); err != nil {
+				return nil, err
+			}
+			return s.machines.ImportDataset(ctx, req)
+		},
+	)
 }
 
 // datasetOverlayEnabled is the agent enforcement truth source. It must only be
@@ -97,25 +140,58 @@ func (s *Server) AttachVolume(ctx context.Context, req *pb.AttachVolumeRequest) 
 			return nil, err
 		}
 	}
-	return s.mutateAttachment(ctx, req.GetOperationId(), req.GetMachineId(), req.GetExecutionId(), req.GetVolumeId(), req.GetGeneration(), hashRequest(req), true,
-		func() (*pb.Machine, error) { return s.machines.AttachVolume(ctx, req) })
+	return s.mutateAttachment(
+		ctx,
+		req.GetOperationId(),
+		req.GetMachineId(),
+		req.GetExecutionId(),
+		req.GetVolumeId(),
+		req.GetGeneration(),
+		hashRequest(req),
+		true,
+		func() (*pb.Machine, error) { return s.machines.AttachVolume(ctx, req) },
+	)
 }
 
 func (s *Server) DetachVolume(ctx context.Context, req *pb.DetachVolumeRequest) (*pb.Machine, error) {
 	if req.GetVolumeId() == "" || req.GetMachineId() == "" || req.GetExecutionId() == "" || req.GetOperationId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume_id/machine_id/execution_id/operation_id are required")
 	}
-	return s.mutateAttachment(ctx, req.GetOperationId(), req.GetMachineId(), req.GetExecutionId(), req.GetVolumeId(), req.GetGeneration(), hashRequest(req), false,
-		func() (*pb.Machine, error) { return s.machines.DetachVolume(ctx, req) })
+	return s.mutateAttachment(
+		ctx,
+		req.GetOperationId(),
+		req.GetMachineId(),
+		req.GetExecutionId(),
+		req.GetVolumeId(),
+		req.GetGeneration(),
+		hashRequest(req),
+		false,
+		func() (*pb.Machine, error) { return s.machines.DetachVolume(ctx, req) },
+	)
 }
 
-func (s *Server) mutateAttachment(ctx context.Context, operationID, machineID, executionID, volumeID string, generation uint64, hash string, wantAttached bool, mutate func() (*pb.Machine, error)) (*pb.Machine, error) {
+func (s *Server) mutateAttachment(
+	ctx context.Context,
+	operationID, machineID, executionID, volumeID string,
+	generation uint64,
+	hash string,
+	wantAttached bool,
+	mutate func() (*pb.Machine, error),
+) (*pb.Machine, error) {
 	kind := "volume.detach"
 	if wantAttached {
 		kind = "volume.attach"
 	}
 	out, err := mutation.RunMachineMutation(s.mutations, mutation.ClaimedMutation[*pb.Machine]{
-		Identity: mutation.Identity{OperationID: operationID, MachineID: machineID, ExecutionID: executionID, Generation: generation, Kind: kind, Coordinates: identityJSON(map[string]string{"volume_id": volumeID}), RequestHash: hash},
+		Identity: mutation.Identity{
+			OperationID: operationID,
+			MachineID:   machineID,
+			ExecutionID: executionID,
+			Generation:  generation,
+			Kind:        kind,
+			Coordinates: identityJSON(map[string]string{"volume_id": volumeID}),
+			RequestHash: hash,
+		},
 		Recover: func() (mutation.Recovery[*pb.Machine], error) {
 			m, attached, err := s.machines.VolumeAttachmentState(ctx, machineID, executionID, volumeID)
 			return mutation.Recovery[*pb.Machine]{Value: m, Found: attached == wantAttached}, err
@@ -150,7 +226,13 @@ func (s *Server) DeleteVolume(ctx context.Context, req *pb.DeleteVolumeRequest) 
 		return nil, status.Error(codes.InvalidArgument, "volume_id and operation_id are required")
 	}
 	err := mutation.RunResourceDelete(s.mutations, mutation.DeleteMutation{
-		Identity: mutation.Identity{OperationID: req.GetOperationId(), MachineID: req.GetVolumeId(), Kind: "volume.delete", Coordinates: identityJSON(map[string]string{"volume_id": req.GetVolumeId()}), RequestHash: hashRequest(req)}, SerializationKey: req.GetVolumeId(),
+		Identity: mutation.Identity{
+			OperationID: req.GetOperationId(),
+			MachineID:   req.GetVolumeId(),
+			Kind:        "volume.delete",
+			Coordinates: identityJSON(map[string]string{"volume_id": req.GetVolumeId()}),
+			RequestHash: hashRequest(req),
+		}, SerializationKey: req.GetVolumeId(),
 		AlreadyDeleted: func() (bool, error) {
 			_, found, err := s.machines.RecoverVolume(ctx, req.GetVolumeId())
 			return !found, err
@@ -171,8 +253,12 @@ func (s *Server) ListVolumes(ctx context.Context, _ *pb.ListVolumesRequest) (*pb
 	// v1.4-B：ListVolumes 无过滤语义，响应恒为节点全量 volume inventory。
 	generation := s.inventoryGeneration.Add(1)
 	observedAt := time.Now().Unix()
-	return &pb.ListVolumesResponse{Volumes: list,
+	return &pb.ListVolumesResponse{
+		Volumes:  list,
 		Complete: true, ObservationGeneration: generation, ObservedAtUnix: observedAt,
-		Observation: &pb.InventoryObservation{Complete: true, Epoch: s.inventoryEpoch,
-			Generation: generation, ObservedAtUnix: observedAt}}, nil
+		Observation: &pb.InventoryObservation{
+			Complete: true, Epoch: s.inventoryEpoch,
+			Generation: generation, ObservedAtUnix: observedAt,
+		},
+	}, nil
 }

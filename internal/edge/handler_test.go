@@ -26,14 +26,32 @@ type fakeCatalog struct {
 func (f *fakeCatalog) GetRouteForHostname(context.Context, string) (*catalog.Route, error) {
 	return f.route, f.err
 }
+
 func (f *fakeCatalog) GetRouteForPort(context.Context, string, int) (*catalog.Route, bool, error) {
 	return f.route, f.declared, f.err
 }
+
 func testBackend(id, endpoint string) catalog.Backend {
-	return catalog.Backend{MachineID: id, ExecutionID: "e-" + id, NodeProxyEndpoint: endpoint, AppPort: 80, Readiness: "READY"}
+	return catalog.Backend{
+		MachineID:         id,
+		ExecutionID:       "e-" + id,
+		NodeProxyEndpoint: endpoint,
+		AppPort:           80,
+		Readiness:         "READY",
+	}
 }
+
 func testHandler(cat RouteCatalog, hard int) *Handler {
-	return NewHandler(Config{Catalog: cat, Routes: NewRouteCache(time.Minute, time.Minute), Tokens: NewTokenClient("", "", time.Minute), Limiter: NewRateLimiter(0, 0), HardConcurrency: int64(hard), EdgePorts: map[int]bool{8081: true, 8447: true}})
+	return NewHandler(
+		Config{
+			Catalog:         cat,
+			Routes:          NewRouteCache(time.Minute, time.Minute),
+			Tokens:          NewTokenClient("", "", time.Minute),
+			Limiter:         NewRateLimiter(0, 0),
+			HardConcurrency: int64(hard),
+			EdgePorts:       map[int]bool{8081: true, 8447: true},
+		},
+	)
 }
 
 func TestSelectAndAcquireHonorsHardLimitAtomically(t *testing.T) {
@@ -56,6 +74,7 @@ func TestSelectAndAcquireHonorsHardLimitAtomically(t *testing.T) {
 		t.Fatalf("inflight=%d", got)
 	}
 }
+
 func TestInflightLifecycle(t *testing.T) {
 	h := testHandler(nil, 8)
 	h.inflight.acquire("m1")
@@ -64,6 +83,7 @@ func TestInflightLifecycle(t *testing.T) {
 		t.Fatal("released entry leaked")
 	}
 }
+
 func TestRequestRoutePort(t *testing.T) {
 	h := testHandler(nil, 8)
 	cases := map[string]int{"app.test": 0, "app.test:8081": 0, "app.test:8447": 0, "app.test:80": 80}
@@ -80,10 +100,17 @@ func TestRequestRoutePort(t *testing.T) {
 }
 
 func TestHandlerAuthoritativeMissNeverServesStale(t *testing.T) {
-	cat := &fakeCatalog{route: &catalog.Route{Backends: []catalog.Backend{testBackend("m1", "127.0.0.1:1")}}, declared: true}
+	cat := &fakeCatalog{
+		route:    &catalog.Route{Backends: []catalog.Backend{testBackend("m1", "127.0.0.1:1")}},
+		declared: true,
+	}
 	h := testHandler(cat, 8)
 	// Seed last-known-good without forwarding by filling the cache directly.
-	_, _, err := h.routes.Get(context.Background(), routeCacheKey("app.test", 0), func(context.Context, string) (any, error) { return cat.route, nil })
+	_, _, err := h.routes.Get(
+		context.Background(),
+		routeCacheKey("app.test", 0),
+		func(context.Context, string) (any, error) { return cat.route, nil },
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +170,7 @@ func TestHandlerSanitizesAllClientRoutingHeaders(t *testing.T) {
 	}))
 	defer up.Close()
 	tokens := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprint(w, `{"token":"trusted-credential","execution_id":"e-m1"}`)
+		_, _ = fmt.Fprint(w, `{"token":"trusted-credential","execution_id":"e-m1"}`)
 	}))
 	defer tokens.Close()
 	backend := testBackend("m1", strings.TrimPrefix(up.URL, "http://"))
@@ -169,7 +196,11 @@ func TestHandlerSanitizesAllClientRoutingHeaders(t *testing.T) {
 	}
 	got := <-seen
 	if got.Get(HeaderMachineID) != "m1" || got.Get(HeaderExecutionID) != "e-m1" {
-		t.Fatalf("untrusted routing identity forwarded: machine=%q execution=%q", got.Get(HeaderMachineID), got.Get(HeaderExecutionID))
+		t.Fatalf(
+			"untrusted routing identity forwarded: machine=%q execution=%q",
+			got.Get(HeaderMachineID),
+			got.Get(HeaderExecutionID),
+		)
 	}
 	if got.Get(traffic.HeaderCredential) != "trusted-credential" {
 		t.Fatalf("credential=%q", got.Get(traffic.HeaderCredential))
@@ -193,7 +224,10 @@ func TestHandlerDoesNotReplayConsumedBody(t *testing.T) {
 		w.WriteHeader(http.StatusBadGateway)
 	}))
 	defer up.Close()
-	cat := &fakeCatalog{route: &catalog.Route{Backends: []catalog.Backend{testBackend("m1", strings.TrimPrefix(up.URL, "http://"))}}, declared: true}
+	cat := &fakeCatalog{
+		route:    &catalog.Route{Backends: []catalog.Backend{testBackend("m1", strings.TrimPrefix(up.URL, "http://"))}},
+		declared: true,
+	}
 	h := testHandler(cat, 8)
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, httptest.NewRequest("POST", "http://app.test/", bytes.NewBufferString("payload")))

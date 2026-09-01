@@ -21,7 +21,12 @@ func policyFor(mode pb.EgressPolicySpec_Mode, allowedCidrs, deniedCidrs, domains
 }
 
 func TestFromProtoDomainNormalization(t *testing.T) {
-	p := policyFor(pb.EgressPolicySpec_ALLOWLIST, nil, nil, []string{"Example.COM", "*.Example.com", "api.example.com."})
+	p := policyFor(
+		pb.EgressPolicySpec_ALLOWLIST,
+		nil,
+		nil,
+		[]string{"Example.COM", "*.Example.com", "api.example.com."},
+	)
 	if len(p.AllowedDomains) != 3 {
 		t.Fatalf("domains = %v", p.AllowedDomains)
 	}
@@ -67,14 +72,16 @@ func TestDecideForProxiedUnrestricted(t *testing.T) {
 	if d := p.DecideForProxied("example.com", public); !d.Allow {
 		t.Fatalf("unrestricted allow: %+v", d)
 	}
-	if d := p.DecideForProxied("example.com", []netip.Addr{netip.MustParseAddr("203.0.113.5")}); d.Allow || d.MatchType != "cidr_denied" {
+	if d := p.DecideForProxied("example.com", []netip.Addr{netip.MustParseAddr("203.0.113.5")}); d.Allow ||
+		d.MatchType != "cidr_denied" {
 		t.Fatalf("denied cidr must deny: %+v", d)
 	}
 }
 
 func TestDecideForProxiedDenyAll(t *testing.T) {
 	p := policyFor(pb.EgressPolicySpec_DENY_ALL, []string{"93.184.216.0/24"}, nil, nil)
-	if d := p.DecideForProxied("", []netip.Addr{netip.MustParseAddr("93.184.216.34")}); !d.Allow || d.MatchType != "cidr_allowed" {
+	if d := p.DecideForProxied("", []netip.Addr{netip.MustParseAddr("93.184.216.34")}); !d.Allow ||
+		d.MatchType != "cidr_allowed" {
 		t.Fatalf("allowed cidr must allow: %+v", d)
 	}
 	if d := p.DecideForProxied("example.com", []netip.Addr{netip.MustParseAddr("1.2.3.4")}); d.Allow {
@@ -83,7 +90,12 @@ func TestDecideForProxiedDenyAll(t *testing.T) {
 }
 
 func TestDecideForProxiedAllowlist(t *testing.T) {
-	p := policyFor(pb.EgressPolicySpec_ALLOWLIST, []string{"203.0.113.0/24"}, []string{"198.51.100.0/24"}, []string{"*.example.com"})
+	p := policyFor(
+		pb.EgressPolicySpec_ALLOWLIST,
+		[]string{"203.0.113.0/24"},
+		[]string{"198.51.100.0/24"},
+		[]string{"*.example.com"},
+	)
 	cases := []struct {
 		name     string
 		host     string
@@ -92,11 +104,23 @@ func TestDecideForProxiedAllowlist(t *testing.T) {
 		match    string
 	}{
 		{"domain match", "api.example.com", []netip.Addr{netip.MustParseAddr("93.184.216.34")}, true, "domain"},
-		{"exact case-insensitive", "API.EXAMPLE.COM", []netip.Addr{netip.MustParseAddr("93.184.216.34")}, true, "domain"},
+		{
+			"exact case-insensitive",
+			"API.EXAMPLE.COM",
+			[]netip.Addr{netip.MustParseAddr("93.184.216.34")},
+			true,
+			"domain",
+		},
 		{"cidr allowed without host", "", []netip.Addr{netip.MustParseAddr("203.0.113.9")}, true, "cidr_allowed"},
 		{"no host allowlist default deny", "", []netip.Addr{netip.MustParseAddr("93.184.216.34")}, false, "no_host"},
 		{"host not listed", "evil.com", []netip.Addr{netip.MustParseAddr("93.184.216.34")}, false, "mode_default"},
-		{"denied wins over domain", "api.example.com", []netip.Addr{netip.MustParseAddr("198.51.100.4")}, false, "cidr_denied"},
+		{
+			"denied wins over domain",
+			"api.example.com",
+			[]netip.Addr{netip.MustParseAddr("198.51.100.4")},
+			false,
+			"cidr_denied",
+		},
 		{"denied wins over allowed cidr", "", []netip.Addr{netip.MustParseAddr("198.51.100.4")}, false, "cidr_denied"},
 		{"empty resolved with host", "api.example.com", nil, false, "mode_default"},
 	}
@@ -184,7 +208,8 @@ func TestRuleSetRoundTrip(t *testing.T) {
 		!back.matchesDomain("x.example.com") || !containsCIDR(back.AllowedCIDRs, netip.MustParseAddr("93.184.216.4")) {
 		t.Fatalf("round-trip mismatch: %+v", back)
 	}
-	if _, err := FromRuleSet(slot.EgressRuleSet{Mode: "bogus"}); err == nil || !strings.Contains(err.Error(), "unknown mode") {
+	if _, err := FromRuleSet(slot.EgressRuleSet{Mode: "bogus"}); err == nil ||
+		!strings.Contains(err.Error(), "unknown mode") {
 		t.Fatalf("unknown mode must error: %v", err)
 	}
 	if p2, err := FromRuleSet(slot.EgressRuleSet{}); err != nil || p2 != nil {

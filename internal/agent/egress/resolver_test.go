@@ -22,10 +22,11 @@ func startTestDNS(t *testing.T) (upstreams []string) {
 		q := r.Question[0]
 		switch q.Name {
 		case "example.com.":
-			if q.Qtype == dns.TypeA {
+			switch q.Qtype {
+			case dns.TypeA:
 				rr, _ := dns.NewRR("example.com. 30 IN A 93.184.216.34")
 				m.Answer = append(m.Answer, rr)
-			} else if q.Qtype == dns.TypeAAAA {
+			case dns.TypeAAAA:
 				rr, _ := dns.NewRR("example.com. 30 IN AAAA 2606:2800:220:1:248:1893:25c8:1946")
 				m.Answer = append(m.Answer, rr)
 			}

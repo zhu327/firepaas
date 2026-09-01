@@ -156,7 +156,7 @@ func (t *TokenClient) fetch(ctx context.Context, machineID, executionID string) 
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {
 		return "", fmt.Errorf("traffic-token %s: HTTP %d", machineID, resp.StatusCode)
 	}
@@ -302,8 +302,10 @@ type RateLimiter struct {
 }
 
 func NewRateLimiter(rate, burst float64) *RateLimiter {
-	return &RateLimiter{rate: rate, burst: burst,
-		buckets: map[string]*bucket{}, nowFn: time.Now}
+	return &RateLimiter{
+		rate: rate, burst: burst,
+		buckets: map[string]*bucket{}, nowFn: time.Now,
+	}
 }
 
 // allow 返回该 host 本次请求是否放行。

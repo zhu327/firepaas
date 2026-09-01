@@ -7,13 +7,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"time"
 
 	"github.com/zhu327/firepaas/internal/agent/machine"
 	"github.com/zhu327/firepaas/internal/agent/mutation"
 	"github.com/zhu327/firepaas/internal/agent/state"
 	contracts "github.com/zhu327/firepaas/internal/contracts/agentv1"
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
-	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -25,18 +25,32 @@ func identityJSON(v any) json.RawMessage {
 	return raw
 }
 
-func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotRequest) (*pb.CreateSnapshotResponse, error) {
+func (s *Server) CreateSnapshot(
+	ctx context.Context,
+	req *pb.CreateSnapshotRequest,
+) (*pb.CreateSnapshotResponse, error) {
 	if err := contracts.ValidateCreateSnapshotRequest(req); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	out, err := mutation.RunMachineMutation(s.mutations, mutation.ClaimedMutation[*pb.CreateSnapshotResponse]{
-		Identity: mutation.Identity{OperationID: req.GetOperationId(), MachineID: req.GetMachineId(), ExecutionID: req.GetExecutionId(), Generation: req.GetGeneration(), Kind: "snapshot.create", Coordinates: identityJSON(map[string]string{"snapshot_id": req.GetSnapshotId()}), RequestHash: hashRequest(req)},
+		Identity: mutation.Identity{
+			OperationID: req.GetOperationId(),
+			MachineID:   req.GetMachineId(),
+			ExecutionID: req.GetExecutionId(),
+			Generation:  req.GetGeneration(),
+			Kind:        "snapshot.create",
+			Coordinates: identityJSON(map[string]string{"snapshot_id": req.GetSnapshotId()}),
+			RequestHash: hashRequest(req),
+		},
 		Recover: func() (mutation.Recovery[*pb.CreateSnapshotResponse], error) {
 			info, found, err := s.machines.RecoverSnapshot(ctx, req)
 			if err != nil {
 				err = mapSnapshotError(err)
 			}
-			return mutation.Recovery[*pb.CreateSnapshotResponse]{Value: &pb.CreateSnapshotResponse{Snapshot: info}, Found: found}, err
+			return mutation.Recovery[*pb.CreateSnapshotResponse]{
+				Value: &pb.CreateSnapshotResponse{Snapshot: info},
+				Found: found,
+			}, err
 		},
 		Effect: func() (*pb.CreateSnapshotResponse, error) {
 			info, err := s.machines.CreateSnapshot(ctx, req)
@@ -62,7 +76,9 @@ func mapSnapshotError(err error) error {
 		return status.Error(codes.NotFound, err.Error())
 	case errors.Is(err, machine.ErrSnapshotUnsupported), errors.Is(err, machine.ErrGuestOpsUnsupported):
 		return status.Error(codes.Unimplemented, err.Error())
-	case errors.Is(err, machine.ErrSecretSnapshotForbidden), errors.Is(err, machine.ErrSnapshotIncompatible), errors.Is(err, state.ErrStaleGeneration):
+	case errors.Is(err, machine.ErrSecretSnapshotForbidden),
+		errors.Is(err, machine.ErrSnapshotIncompatible),
+		errors.Is(err, state.ErrStaleGeneration):
 		return status.Error(codes.FailedPrecondition, err.Error())
 	case errors.Is(err, mutation.ErrConflict):
 		return status.Error(codes.AlreadyExists, err.Error())
@@ -85,12 +101,16 @@ func (s *Server) ListSnapshots(ctx context.Context, req *pb.ListSnapshotsRequest
 	complete := req.GetMachineId() == "" && req.GetSnapshotId() == ""
 	generation := s.inventoryGeneration.Add(1)
 	observedAt := time.Now().Unix()
-	return &pb.ListSnapshotsResponse{Snapshots: list,
+	return &pb.ListSnapshotsResponse{
+		Snapshots: list,
 		// v1.4-B：无过滤参数 = 节点全量 inventory（控制面可推导 MISSING）。
 		// 带过滤的查询是子集视图，不得声称完整。
 		Complete: complete, ObservationGeneration: generation, ObservedAtUnix: observedAt,
-		Observation: &pb.InventoryObservation{Complete: complete, Epoch: s.inventoryEpoch,
-			Generation: generation, ObservedAtUnix: observedAt}}, nil
+		Observation: &pb.InventoryObservation{
+			Complete: complete, Epoch: s.inventoryEpoch,
+			Generation: generation, ObservedAtUnix: observedAt,
+		},
+	}, nil
 }
 
 func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotRequest) (*emptypb.Empty, error) {
@@ -98,7 +118,15 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	err := mutation.RunMachineDelete(s.mutations, mutation.DeleteMutation{
-		Identity: mutation.Identity{OperationID: req.GetOperationId(), MachineID: req.GetMachineId(), ExecutionID: req.GetExecutionId(), Generation: req.GetGeneration(), Kind: "snapshot.delete", Coordinates: identityJSON(map[string]string{"snapshot_id": req.GetSnapshotId()}), RequestHash: hashRequest(req)},
+		Identity: mutation.Identity{
+			OperationID: req.GetOperationId(),
+			MachineID:   req.GetMachineId(),
+			ExecutionID: req.GetExecutionId(),
+			Generation:  req.GetGeneration(),
+			Kind:        "snapshot.delete",
+			Coordinates: identityJSON(map[string]string{"snapshot_id": req.GetSnapshotId()}),
+			RequestHash: hashRequest(req),
+		},
 		AlreadyDeleted: func() (bool, error) {
 			list, err := s.machines.ListSnapshots(ctx, req.GetMachineId(), req.GetSnapshotId())
 			return len(list) == 0, err
@@ -119,10 +147,26 @@ func (s *Server) ForkSnapshot(ctx context.Context, req *pb.ForkSnapshotRequest) 
 		return nil, status.Error(codes.InvalidArgument, "missing proxy_credential for fork")
 	}
 	out, err := mutation.RunReplacement(s.mutations, mutation.Replacement[*pb.ForkSnapshotResponse]{
-		Identity: mutation.Identity{OperationID: req.GetOperationId(), MachineID: req.GetMachineId(), ExecutionID: req.GetExecutionId(), Generation: req.GetGeneration(), Kind: "snapshot.fork", Coordinates: identityJSON(map[string]string{"snapshot_id": req.GetSnapshotId()}), RequestHash: hashRequest(req)},
+		Identity: mutation.Identity{
+			OperationID: req.GetOperationId(),
+			MachineID:   req.GetMachineId(),
+			ExecutionID: req.GetExecutionId(),
+			Generation:  req.GetGeneration(),
+			Kind:        "snapshot.fork",
+			Coordinates: identityJSON(map[string]string{"snapshot_id": req.GetSnapshotId()}),
+			RequestHash: hashRequest(req),
+		},
 		Recover: func() (mutation.Recovery[*pb.ForkSnapshotResponse], error) {
-			m, found, err := s.machines.RecoverMachine(ctx, req.GetMachineId(), req.GetExecutionId(), req.GetGeneration())
-			return mutation.Recovery[*pb.ForkSnapshotResponse]{Value: &pb.ForkSnapshotResponse{Machine: m}, Found: found}, err
+			m, found, err := s.machines.RecoverMachine(
+				ctx,
+				req.GetMachineId(),
+				req.GetExecutionId(),
+				req.GetGeneration(),
+			)
+			return mutation.Recovery[*pb.ForkSnapshotResponse]{
+				Value: &pb.ForkSnapshotResponse{Machine: m},
+				Found: found,
+			}, err
 		},
 		Effect: func() (*pb.ForkSnapshotResponse, error) {
 			m, err := s.machines.ForkSnapshot(ctx, req)
@@ -142,7 +186,10 @@ func (s *Server) ForkSnapshot(ctx context.Context, req *pb.ForkSnapshotRequest) 
 	return out, nil
 }
 
-func (s *Server) RestoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotRequest) (*pb.RestoreSnapshotResponse, error) {
+func (s *Server) RestoreSnapshot(
+	ctx context.Context,
+	req *pb.RestoreSnapshotRequest,
+) (*pb.RestoreSnapshotResponse, error) {
 	if err := contracts.ValidateRestoreSnapshotRequest(req); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -150,14 +197,33 @@ func (s *Server) RestoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 		return nil, status.Error(codes.InvalidArgument, "missing proxy_credential for restore")
 	}
 	out, err := mutation.RunReplacement(s.mutations, mutation.Replacement[*pb.RestoreSnapshotResponse]{
-		Identity: mutation.Identity{OperationID: req.GetOperationId(), MachineID: req.GetMachineId(), ExecutionID: req.GetExecutionId(), Generation: req.GetGeneration(), Kind: "snapshot.restore", Coordinates: identityJSON(map[string]string{"snapshot_id": req.GetSnapshotId()}), RequestHash: hashRequest(req)},
+		Identity: mutation.Identity{
+			OperationID: req.GetOperationId(),
+			MachineID:   req.GetMachineId(),
+			ExecutionID: req.GetExecutionId(),
+			Generation:  req.GetGeneration(),
+			Kind:        "snapshot.restore",
+			Coordinates: identityJSON(map[string]string{"snapshot_id": req.GetSnapshotId()}),
+			RequestHash: hashRequest(req),
+		},
 		Recover: func() (mutation.Recovery[*pb.RestoreSnapshotResponse], error) {
 			m, mode, consistency, found, err := s.machines.RecoverRestore(ctx, req)
-			return mutation.Recovery[*pb.RestoreSnapshotResponse]{Value: &pb.RestoreSnapshotResponse{Machine: m, RestoreModeUsed: mode, FilesystemConsistency: consistency}, Found: found}, err
+			return mutation.Recovery[*pb.RestoreSnapshotResponse]{
+				Value: &pb.RestoreSnapshotResponse{
+					Machine:               m,
+					RestoreModeUsed:       mode,
+					FilesystemConsistency: consistency,
+				},
+				Found: found,
+			}, err
 		},
 		Effect: func() (*pb.RestoreSnapshotResponse, error) {
 			m, mode, consistency, err := s.machines.RestoreSnapshot(ctx, req)
-			return &pb.RestoreSnapshotResponse{Machine: m, RestoreModeUsed: mode, FilesystemConsistency: consistency}, err
+			return &pb.RestoreSnapshotResponse{
+				Machine:               m,
+				RestoreModeUsed:       mode,
+				FilesystemConsistency: consistency,
+			}, err
 		},
 		PersistCredential: func() error {
 			if s.creds != nil && req.GetProxyCredential() != "" {

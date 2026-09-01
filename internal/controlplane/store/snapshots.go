@@ -107,7 +107,11 @@ func (s *Store) CreateSnapshot(ctx context.Context, snap Snapshot) (*Snapshot, e
 
 // CreateSnapshotAndEnqueue atomically persists the CREATING business fact and
 // its node-pinned outbox operation. Neither side is visible without the other.
-func (s *Store) CreateSnapshotAndEnqueue(ctx context.Context, snap Snapshot, p EnqueueOperationParams) (*Snapshot, Operation, error) {
+func (s *Store) CreateSnapshotAndEnqueue(
+	ctx context.Context,
+	snap Snapshot,
+	p EnqueueOperationParams,
+) (*Snapshot, Operation, error) {
 	var out *Snapshot
 	var op Operation
 	if snap.ID == "" || snap.ProjectID == "" || snap.SourceMachineID == "" || snap.SourceExecutionID == "" ||
@@ -121,12 +125,25 @@ func (s *Store) CreateSnapshotAndEnqueue(ctx context.Context, snap Snapshot, p E
 		if snap.CompressionLevel != nil {
 			level = *snap.CompressionLevel
 		}
-		row := tx.QueryRow(ctx, `INSERT INTO snapshots(id,project_id,source_machine_id,source_execution_id,source_generation,
+		row := tx.QueryRow(
+			ctx,
+			`INSERT INTO snapshots(id,project_id,source_machine_id,source_execution_id,source_generation,
 			kind,status,node_id,compatibility_key,compression,compression_level,compression_state,retention_class,schedule_id)
 			VALUES($1,$2,$3,$4,$5,$6,'CREATING',$7,$8,$9,$10,$11,$12,$13) RETURNING `+snapshotCols,
-			snap.ID, snap.ProjectID, snap.SourceMachineID, snap.SourceExecutionID, snap.SourceGeneration,
-			snap.Kind, snap.NodeID, snap.CompatibilityKey, snap.Compression, level,
-			snap.CompressionState, snap.RetentionClass, snap.ScheduleID)
+			snap.ID,
+			snap.ProjectID,
+			snap.SourceMachineID,
+			snap.SourceExecutionID,
+			snap.SourceGeneration,
+			snap.Kind,
+			snap.NodeID,
+			snap.CompatibilityKey,
+			snap.Compression,
+			level,
+			snap.CompressionState,
+			snap.RetentionClass,
+			snap.ScheduleID,
+		)
 		var err error
 		out, err = scanSnapshot(row)
 		if err != nil {
@@ -211,7 +228,8 @@ func (s *Store) TransitionSnapshot(ctx context.Context, id, from, to string) (*S
 // checksum）不得 READY：调用方必须在 capture 完成后才携带完整事实。
 func (s *Store) UpdateSnapshotArtifact(ctx context.Context, id string,
 	sizeBytes int64, checksum, compressionState, algorithm, consistency string,
-	compressionLevel *int, ready bool) (*Snapshot, error) {
+	compressionLevel *int, ready bool,
+) (*Snapshot, error) {
 	var level any
 	if compressionLevel != nil {
 		level = *compressionLevel
@@ -298,7 +316,11 @@ func (s *Store) ListSnapshotsForRetention(ctx context.Context, scheduleID string
 // (FAILED) attempt is re-enqueued under a fresh suffixed key so the snapshot
 // never wedges in DELETING, and an orphaned DELETING row (no live operation)
 // accepts a fresh delete as well.
-func (s *Store) BeginSnapshotDeleteAndEnqueue(ctx context.Context, snapshotID string, p EnqueueOperationParams) (Operation, error) {
+func (s *Store) BeginSnapshotDeleteAndEnqueue(
+	ctx context.Context,
+	snapshotID string,
+	p EnqueueOperationParams,
+) (Operation, error) {
 	var op Operation
 	err := s.inTx(ctx, func(tx pgx.Tx) error {
 		var projectID, machineID, executionID, nodeID, status string
@@ -351,7 +373,8 @@ func (s *Store) BeginSnapshotDeleteAndEnqueue(ctx context.Context, snapshotID st
 		}
 		// DELETING is legal here only for a fresh (re-keyed) attempt after a
 		// terminal failure or an orphaned row; the state itself is unchanged.
-		if referenced || (status != "READY" && status != "UNAVAILABLE" && status != "CREATING" && status != "DELETING") {
+		if referenced ||
+			(status != "READY" && status != "UNAVAILABLE" && status != "CREATING" && status != "DELETING") {
 			return ErrSnapshotStatusConflict
 		}
 		if status != "DELETING" {
@@ -441,7 +464,8 @@ func (s *Store) EnqueueRescueReplacement(ctx context.Context, p RescueReplacemen
 				return ErrRescueConflict
 			}
 		}
-		if p.OldExecutionID == "" || p.NewExecutionID == "" || p.NewExecutionID == p.OldExecutionID || p.OldGeneration < 1 {
+		if p.OldExecutionID == "" || p.NewExecutionID == "" || p.NewExecutionID == p.OldExecutionID ||
+			p.OldGeneration < 1 {
 			return ErrRescueConflict
 		}
 		var actualProject string
@@ -748,7 +772,11 @@ func (s *Store) ApplySnapshotIntegrity(ctx context.Context, id, integrity string
 // inventory in one transaction. Metadata is compared against PG immutable
 // facts; absent non-creating rows become MISSING. Every touched row retains the
 // observation ID, epoch, generation and receive time that justified it.
-func (s *Store) ApplySnapshotInventoryObservation(ctx context.Context, o InventoryObservation, items map[string]SnapshotInventoryItem) (bool, []IntegrityTransition, error) {
+func (s *Store) ApplySnapshotInventoryObservation(
+	ctx context.Context,
+	o InventoryObservation,
+	items map[string]SnapshotInventoryItem,
+) (bool, []IntegrityTransition, error) {
 	if o.ResourceType != "snapshot" || o.ItemCount != len(items) {
 		return false, nil, nil
 	}
@@ -757,8 +785,12 @@ func (s *Store) ApplySnapshotInventoryObservation(ctx context.Context, o Invento
 		if err := acceptInventoryObservationTx(ctx, tx, &o); err != nil {
 			return err
 		}
-		rows, err := tx.Query(ctx, `SELECT id,project_id,source_machine_id,kind,status,size_bytes,checksum,compatibility_key,integrity
-			FROM snapshots WHERE node_id=$1 AND status IN ('CREATING','READY','UNAVAILABLE') FOR UPDATE`, o.NodeID)
+		rows, err := tx.Query(
+			ctx,
+			`SELECT id,project_id,source_machine_id,kind,status,size_bytes,checksum,compatibility_key,integrity
+			FROM snapshots WHERE node_id=$1 AND status IN ('CREATING','READY','UNAVAILABLE') FOR UPDATE`,
+			o.NodeID,
+		)
 		if err != nil {
 			return err
 		}
@@ -790,7 +822,8 @@ func (s *Store) ApplySnapshotInventoryObservation(ctx context.Context, o Invento
 				integrity, reason = "METADATA_VERIFIED", ""
 				// Missing immutable fields are not mismatch evidence. They are an
 				// insufficient observation and therefore fail closed to UNKNOWN.
-				if item.SizeBytes <= 0 || item.Checksum == "" || item.Kind == "" || (r.compatibility != "" && item.CompatibilityKey == "") {
+				if item.SizeBytes <= 0 || item.Checksum == "" || item.Kind == "" ||
+					(r.compatibility != "" && item.CompatibilityKey == "") {
 					integrity, reason = "UNKNOWN", "incomplete immutable metadata"
 				} else if item.Checksum != r.checksum || item.Kind != r.kind || item.CompatibilityKey != r.compatibility {
 					integrity, reason = "CORRUPT", "immutable metadata mismatch"
@@ -812,7 +845,16 @@ func (s *Store) ApplySnapshotInventoryObservation(ctx context.Context, o Invento
 				newStatus = "READY"
 			}
 			if r.integrity != integrity || r.status != newStatus {
-				transitions = append(transitions, IntegrityTransition{ID: r.id, ProjectID: r.project, MachineID: r.machine, From: r.integrity, To: integrity})
+				transitions = append(
+					transitions,
+					IntegrityTransition{
+						ID:        r.id,
+						ProjectID: r.project,
+						MachineID: r.machine,
+						From:      r.integrity,
+						To:        integrity,
+					},
+				)
 			}
 			if _, err := tx.Exec(ctx, `UPDATE snapshots SET integrity=$2,integrity_reason=$3,status=$4,
 				integrity_observed_at=$5,inventory_epoch=$6,inventory_generation=$7,inventory_received_at=$8,
@@ -878,7 +920,12 @@ type ForkMachineParams struct {
 
 // CreateForkMachineAndEnqueue atomically protects the READY snapshot, creates
 // the ephemeral machine fact, and writes the fork outbox operation.
-func (s *Store) CreateForkMachineAndEnqueue(ctx context.Context, snapshotID string, p ForkMachineParams, operation EnqueueOperationParams) (Operation, error) {
+func (s *Store) CreateForkMachineAndEnqueue(
+	ctx context.Context,
+	snapshotID string,
+	p ForkMachineParams,
+	operation EnqueueOperationParams,
+) (Operation, error) {
 	var op Operation
 	if p.MachineID == "" || p.ExecutionID == "" || operation.Kind != "fork" || operation.ProjectID != p.ProjectID ||
 		operation.MachineID != p.MachineID || operation.ExecutionID != p.ExecutionID || operation.Generation != 1 ||

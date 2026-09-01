@@ -28,7 +28,14 @@ func TestTokenBucketAllowsBurstThenLimits(t *testing.T) {
 	l := testLimiter(t)
 	ctx := context.Background()
 	_ = l.rdb.Del(ctx, "rl:p-bucket:read").Err()
-	l.SetConfig("p-bucket", Config{Read: Limits{Rate: 100, Burst: 3}, Mutation: Limits{Rate: 1, Burst: 1}, Stream: Limits{Rate: 1, Burst: 1}})
+	l.SetConfig(
+		"p-bucket",
+		Config{
+			Read:     Limits{Rate: 100, Burst: 3},
+			Mutation: Limits{Rate: 1, Burst: 1},
+			Stream:   Limits{Rate: 1, Burst: 1},
+		},
+	)
 
 	for i := 0; i < 3; i++ {
 		ok, _, err := l.Allow(ctx, "p-bucket", Read)
@@ -83,7 +90,8 @@ func TestSessionLeaseSharedAndReleased(t *testing.T) {
 	if err != nil || release == nil || active != 1 {
 		t.Fatalf("first acquire: release=%v active=%d err=%v", release != nil, active, err)
 	}
-	if release2, active2, err := l2.AcquireSession(ctx, "p-session", 1, time.Minute); err != nil || release2 != nil || active2 != 1 {
+	if release2, active2, err := l2.AcquireSession(ctx, "p-session", 1, time.Minute); err != nil || release2 != nil ||
+		active2 != 1 {
 		t.Fatalf("shared limit: release=%v active=%d err=%v", release2 != nil, active2, err)
 	}
 	release()
@@ -124,7 +132,10 @@ func TestZeroConfigDisablesClass(t *testing.T) {
 	l := testLimiter(t)
 	ctx := context.Background()
 	_ = l.rdb.Del(ctx, "rl:p-off:read").Err()
-	l.SetConfig("p-off", Config{Read: Limits{Rate: 0, Burst: 0}, Mutation: Limits{Rate: 1, Burst: 1}, Stream: Limits{Rate: 1, Burst: 1}})
+	l.SetConfig(
+		"p-off",
+		Config{Read: Limits{Rate: 0, Burst: 0}, Mutation: Limits{Rate: 1, Burst: 1}, Stream: Limits{Rate: 1, Burst: 1}},
+	)
 	for i := 0; i < 100; i++ {
 		ok, _, err := l.Allow(ctx, "p-off", Read)
 		if err != nil || !ok {
@@ -141,8 +152,15 @@ func TestRedisFailureSurfacesError(t *testing.T) {
 	}
 	l := New(testLimiter(t).rdb, nil, time.Second)
 	// 独立 client 指向不存在的地址。
-	bad := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1", DialTimeout: 50 * time.Millisecond, ReadTimeout: 50 * time.Millisecond, WriteTimeout: 50 * time.Millisecond})
-	defer bad.Close()
+	bad := redis.NewClient(
+		&redis.Options{
+			Addr:         "127.0.0.1:1",
+			DialTimeout:  50 * time.Millisecond,
+			ReadTimeout:  50 * time.Millisecond,
+			WriteTimeout: 50 * time.Millisecond,
+		},
+	)
+	defer func() { _ = bad.Close() }()
 	l.rdb = bad
 	if _, _, err := l.Allow(context.Background(), "p", Read); err == nil {
 		t.Fatal("redis failure must surface error")

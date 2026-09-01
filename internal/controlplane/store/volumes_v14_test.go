@@ -91,8 +91,10 @@ func TestBeginVolumeDeleteReEnqueuesAfterTerminalFailure(t *testing.T) {
 		_, _ = s.pool.Exec(ctx, `DELETE FROM projects WHERE id=$1`, project)
 	})
 	seedVolume(t, s, project, "vol-del-retry", "LOCAL_RW", "READY")
-	p := EnqueueOperationParams{OperationID: "op-vol-del-retry", ProjectID: project, Kind: "volume_delete",
-		Request: []byte(`{"volume_id":"vol-del-retry"}`), DispatchNodeID: "node-v14d"}
+	p := EnqueueOperationParams{
+		OperationID: "op-vol-del-retry", ProjectID: project, Kind: "volume_delete",
+		Request: []byte(`{"volume_id":"vol-del-retry"}`), DispatchNodeID: "node-v14d",
+	}
 	first, err := s.BeginVolumeDeleteAndEnqueue(ctx, "vol-del-retry", p)
 	if err != nil {
 		t.Fatal(err)
@@ -132,7 +134,8 @@ func TestFailedDatasetImportIsDeletable(t *testing.T) {
 	}
 	if _, err := s.BeginVolumeDeleteAndEnqueue(ctx, v.ID, EnqueueOperationParams{
 		OperationID: "op-del-ds-failed", ProjectID: project, Kind: "volume_delete",
-		Request: []byte(`{}`), DispatchNodeID: "node-v14d"}); err != nil {
+		Request: []byte(`{}`), DispatchNodeID: "node-v14d",
+	}); err != nil {
 		t.Fatalf("delete failed dataset: %v", err)
 	}
 }
@@ -183,11 +186,15 @@ func TestDatasetMultiAttachAllowed(t *testing.T) {
 	seedVolume(t, s, project, "vol-dsm", "DATASET_RO", "READY")
 
 	for i, m := range []string{"m-ds-1", "m-ds-2"} {
-		att := VolumeAttachment{VolumeID: "vol-dsm", MachineID: m,
-			ExecutionID: "exec-ds-" + fmt.Sprint(i+1), MountPath: "/data", Readonly: true}
-		p := EnqueueOperationParams{OperationID: fmt.Sprintf("op-dsm-%d", i+1), ProjectID: project,
+		att := VolumeAttachment{
+			VolumeID: "vol-dsm", MachineID: m,
+			ExecutionID: "exec-ds-" + fmt.Sprint(i+1), MountPath: "/data", Readonly: true,
+		}
+		p := EnqueueOperationParams{
+			OperationID: fmt.Sprintf("op-dsm-%d", i+1), ProjectID: project,
 			MachineID: m, ExecutionID: att.ExecutionID, Generation: 1,
-			Kind: "volume_attach", Request: []byte(`{}`), DispatchNodeID: "node-v14d"}
+			Kind: "volume_attach", Request: []byte(`{}`), DispatchNodeID: "node-v14d",
+		}
 		if _, err := s.ClaimDatasetAttachmentAndEnqueue(ctx, att, p); err != nil {
 			t.Fatalf("readonly attach %d: %v", i+1, err)
 		}
@@ -199,7 +206,8 @@ func TestDatasetMultiAttachAllowed(t *testing.T) {
 	// 删除被 active attachment 阻塞。
 	if _, err := s.BeginVolumeDeleteAndEnqueue(ctx, "vol-dsm", EnqueueOperationParams{
 		OperationID: "op-dsm-del", ProjectID: project, Kind: "volume_delete",
-		Request: []byte(`{}`), DispatchNodeID: "node-v14d"}); !errors.Is(err, ErrVolumeStateConflict) {
+		Request: []byte(`{}`), DispatchNodeID: "node-v14d",
+	}); !errors.Is(err, ErrVolumeStateConflict) {
 		t.Fatalf("delete with active attachments = %v, want conflict", err)
 	}
 }
@@ -223,11 +231,15 @@ func TestUnsealedDatasetCannotAttach(t *testing.T) {
 	seedV14Machine(t, s, project, "m-dss", "exec-dss", 3)
 	seedVolume(t, s, project, "vol-dss", "DATASET_RO", "CREATING")
 
-	att := VolumeAttachment{VolumeID: "vol-dss", MachineID: "m-dss", ExecutionID: "exec-dss",
-		MountPath: "/data", Readonly: true}
-	p := EnqueueOperationParams{OperationID: "op-dss-1", ProjectID: project, MachineID: "m-dss",
+	att := VolumeAttachment{
+		VolumeID: "vol-dss", MachineID: "m-dss", ExecutionID: "exec-dss",
+		MountPath: "/data", Readonly: true,
+	}
+	p := EnqueueOperationParams{
+		OperationID: "op-dss-1", ProjectID: project, MachineID: "m-dss",
 		ExecutionID: "exec-dss", Generation: 1, Kind: "volume_attach",
-		Request: []byte(`{}`), DispatchNodeID: "node-v14d"}
+		Request: []byte(`{}`), DispatchNodeID: "node-v14d",
+	}
 	if _, err := s.ClaimDatasetAttachmentAndEnqueue(ctx, att, p); !errors.Is(err, ErrVolumeStateConflict) {
 		t.Fatalf("attach unsealed dataset = %v, want conflict", err)
 	}

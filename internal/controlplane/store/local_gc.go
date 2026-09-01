@@ -27,7 +27,8 @@ func localGCLockKey(nodeID, artifactKey string) string {
 // ClaimImageForGC serializes deletion intent with pin creation. The returned
 // clear token is never persisted; only its digest is stored.
 func (s *Store) ClaimImageForGC(ctx context.Context, claim LocalGCClaim, token string) error {
-	if claim.ID == "" || claim.NodeID == "" || claim.ArtifactKey == "" || token == "" || !claim.GraceUntil.After(time.Now()) {
+	if claim.ID == "" || claim.NodeID == "" || claim.ArtifactKey == "" || token == "" ||
+		!claim.GraceUntil.After(time.Now()) {
 		return fmt.Errorf("invalid local GC claim")
 	}
 	sum := sha256.Sum256([]byte(token))
@@ -43,10 +44,21 @@ func (s *Store) ClaimImageForGC(ctx context.Context, claim LocalGCClaim, token s
 		if rooted {
 			return ErrLocalGCClaimConflict
 		}
-		_, err := tx.Exec(ctx, `INSERT INTO local_gc_claims
+		_, err := tx.Exec(
+			ctx,
+			`INSERT INTO local_gc_claims
 			(id,node_id,artifact_type,artifact_key,project_id,status,claim_token_hash,artifact_revision,size_bytes,grace_until,reason)
-			VALUES($1,$2,'image',$3,$4,'CLAIMED',$5,$6,$7,$8,$9)`, claim.ID, claim.NodeID,
-			claim.ArtifactKey, claim.ProjectID, claim.TokenHash, claim.Revision, claim.SizeBytes, claim.GraceUntil, claim.Reason)
+			VALUES($1,$2,'image',$3,$4,'CLAIMED',$5,$6,$7,$8,$9)`,
+			claim.ID,
+			claim.NodeID,
+			claim.ArtifactKey,
+			claim.ProjectID,
+			claim.TokenHash,
+			claim.Revision,
+			claim.SizeBytes,
+			claim.GraceUntil,
+			claim.Reason,
+		)
 		return err
 	})
 }
@@ -56,7 +68,12 @@ func (s *Store) MarkLocalGCQuarantined(ctx context.Context, id, token string) er
 		return fmt.Errorf("empty quarantine token")
 	}
 	sum := sha256.Sum256([]byte(token))
-	tag, err := s.pool.Exec(ctx, `UPDATE local_gc_claims SET status='QUARANTINED',claim_token_hash=$2,updated_at=now() WHERE id=$1 AND status='CLAIMED'`, id, hex.EncodeToString(sum[:]))
+	tag, err := s.pool.Exec(
+		ctx,
+		`UPDATE local_gc_claims SET status='QUARANTINED',claim_token_hash=$2,updated_at=now() WHERE id=$1 AND status='CLAIMED'`,
+		id,
+		hex.EncodeToString(sum[:]),
+	)
 	if err != nil {
 		return err
 	}
@@ -85,7 +102,9 @@ func (s *Store) FinalizeImageGCClaim(ctx context.Context, claim LocalGCClaim, fi
 			&current.SizeBytes, &current.GraceUntil, &current.Reason); err != nil {
 			return err
 		}
-		if current.NodeID != claim.NodeID || current.ArtifactKey != claim.ArtifactKey || current.Revision != claim.Revision || current.TokenHash != claim.TokenHash ||
+		if current.NodeID != claim.NodeID || current.ArtifactKey != claim.ArtifactKey ||
+			current.Revision != claim.Revision ||
+			current.TokenHash != claim.TokenHash ||
 			(current.Status != "QUARANTINED" && current.Status != "FINALIZING") {
 			return ErrLocalGCClaimConflict
 		}
@@ -101,7 +120,11 @@ func (s *Store) FinalizeImageGCClaim(ctx context.Context, claim LocalGCClaim, fi
 		if err := finalize(); err != nil {
 			return err
 		}
-		tag, err := tx.Exec(ctx, `UPDATE local_gc_claims SET status='DELETED',updated_at=now() WHERE id=$1 AND status='FINALIZING'`, claim.ID)
+		tag, err := tx.Exec(
+			ctx,
+			`UPDATE local_gc_claims SET status='DELETED',updated_at=now() WHERE id=$1 AND status='FINALIZING'`,
+			claim.ID,
+		)
 		if err != nil {
 			return err
 		}
@@ -146,7 +169,13 @@ func (s *Store) CompleteLocalGCClaim(ctx context.Context, id, status, reason str
 	if status != "DELETED" && status != "ROLLED_BACK" {
 		return fmt.Errorf("invalid local GC completion")
 	}
-	tag, err := s.pool.Exec(ctx, `UPDATE local_gc_claims SET status=$2,reason=$3,updated_at=now() WHERE id=$1 AND status IN ('QUARANTINED','FINALIZING','ROLLBACK_REQUESTED')`, id, status, reason)
+	tag, err := s.pool.Exec(
+		ctx,
+		`UPDATE local_gc_claims SET status=$2,reason=$3,updated_at=now() WHERE id=$1 AND status IN ('QUARANTINED','FINALIZING','ROLLBACK_REQUESTED')`,
+		id,
+		status,
+		reason,
+	)
 	if err != nil {
 		return err
 	}
@@ -162,7 +191,10 @@ func VerifyLocalGCToken(claim LocalGCClaim, token string) bool {
 }
 
 func (s *Store) ListActiveLocalGCClaims(ctx context.Context) ([]LocalGCClaim, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id,node_id,artifact_type,artifact_key,project_id,status,claim_token_hash,artifact_revision,size_bytes,grace_until,reason FROM local_gc_claims WHERE status IN ('CLAIMED','QUARANTINED','FINALIZING','ROLLBACK_REQUESTED') ORDER BY created_at`)
+	rows, err := s.pool.Query(
+		ctx,
+		`SELECT id,node_id,artifact_type,artifact_key,project_id,status,claim_token_hash,artifact_revision,size_bytes,grace_until,reason FROM local_gc_claims WHERE status IN ('CLAIMED','QUARANTINED','FINALIZING','ROLLBACK_REQUESTED') ORDER BY created_at`,
+	)
 	if err != nil {
 		return nil, err
 	}

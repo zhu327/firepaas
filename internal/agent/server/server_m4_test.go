@@ -88,10 +88,14 @@ func TestCreateRequiresProxyCredential(t *testing.T) {
 // 重新解析引用值、现算凭证，同一 operation_id 的幂等重放不能被破坏。
 func TestSnapshotRequestHashIgnoresProxyCredential(t *testing.T) {
 	for _, pair := range [][2]proto.Message{
-		{&pb.ForkSnapshotRequest{MachineId: "m", ExecutionId: "e", Generation: 1, OperationId: "o", SnapshotId: "s", ProxyCredential: "old"},
-			&pb.ForkSnapshotRequest{MachineId: "m", ExecutionId: "e", Generation: 1, OperationId: "o", SnapshotId: "s", ProxyCredential: "new"}},
-		{&pb.RestoreSnapshotRequest{MachineId: "m", ExecutionId: "e", Generation: 1, OperationId: "o", SnapshotId: "s", ProxyCredential: "old"},
-			&pb.RestoreSnapshotRequest{MachineId: "m", ExecutionId: "e", Generation: 1, OperationId: "o", SnapshotId: "s", ProxyCredential: "new"}},
+		{
+			&pb.ForkSnapshotRequest{MachineId: "m", ExecutionId: "e", Generation: 1, OperationId: "o", SnapshotId: "s", ProxyCredential: "old"},
+			&pb.ForkSnapshotRequest{MachineId: "m", ExecutionId: "e", Generation: 1, OperationId: "o", SnapshotId: "s", ProxyCredential: "new"},
+		},
+		{
+			&pb.RestoreSnapshotRequest{MachineId: "m", ExecutionId: "e", Generation: 1, OperationId: "o", SnapshotId: "s", ProxyCredential: "old"},
+			&pb.RestoreSnapshotRequest{MachineId: "m", ExecutionId: "e", Generation: 1, OperationId: "o", SnapshotId: "s", ProxyCredential: "new"},
+		},
 	} {
 		if hashRequest(pair[0]) != hashRequest(pair[1]) {
 			t.Fatal("one-way snapshot credential changed idempotency hash")
@@ -121,8 +125,10 @@ func TestRequestHashIgnoresOneWayFields(t *testing.T) {
 
 // M4：字段黑名单覆盖单向下发字段与密文字段。
 func TestRedactBlacklist(t *testing.T) {
-	for _, k := range []string{"secret_env", "SecretEnv", "proxy_credential",
-		"traffic_token", "value_ciphertext", "dek_wrapped", "authorization"} {
+	for _, k := range []string{
+		"secret_env", "SecretEnv", "proxy_credential",
+		"traffic_token", "value_ciphertext", "dek_wrapped", "authorization",
+	} {
 		if !redact.IsSensitive(k) {
 			t.Fatalf("%q must be sensitive", k)
 		}

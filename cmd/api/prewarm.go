@@ -101,7 +101,11 @@ type prewarmTargetView struct {
 // eligiblePrewarmNodes resolves the target node set: explicit node IDs or all
 // healthy non-draining nodes in a pool. Disk hard-watermark nodes are reported
 // per node instead of silently dropped.
-func (a *API) eligiblePrewarmNodes(r *http.Request, body prewarmBody, limits prewarmLimits) ([]store.Node, []prewarmTargetView, error) {
+func (a *API) eligiblePrewarmNodes(
+	r *http.Request,
+	body prewarmBody,
+	limits prewarmLimits,
+) ([]store.Node, []prewarmTargetView, error) {
 	nodes, err := a.store.ListNodes(r.Context())
 	if err != nil {
 		return nil, nil, err
@@ -138,11 +142,17 @@ func (a *API) eligiblePrewarmNodes(r *http.Request, body prewarmBody, limits pre
 	for _, n := range wanted {
 		switch {
 		case n.Status != "HEALTHY":
-			rejected = append(rejected, prewarmTargetView{NodeID: n.ID, Status: "rejected", Reason: "node not healthy (" + n.Status + ")"})
+			rejected = append(
+				rejected,
+				prewarmTargetView{NodeID: n.ID, Status: "rejected", Reason: "node not healthy (" + n.Status + ")"},
+			)
 		case n.Draining:
 			rejected = append(rejected, prewarmTargetView{NodeID: n.ID, Status: "rejected", Reason: "node draining"})
 		case n.DiskTotalMib > 0 && float64(n.DiskUsedMib)/float64(n.DiskTotalMib) >= limits.HardWatermarkFrac:
-			rejected = append(rejected, prewarmTargetView{NodeID: n.ID, Status: "rejected", Reason: "disk hard watermark reached"})
+			rejected = append(
+				rejected,
+				prewarmTargetView{NodeID: n.ID, Status: "rejected", Reason: "disk hard watermark reached"},
+			)
 		default:
 			eligible = append(eligible, n)
 		}
@@ -195,7 +205,11 @@ func (a *API) prewarmImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if active >= limits.MaxActivePrewarms {
-		writeErr(w, 429, fmt.Sprintf("project has %d active prewarm operations (limit %d)", active, limits.MaxActivePrewarms))
+		writeErr(
+			w,
+			429,
+			fmt.Sprintf("project has %d active prewarm operations (limit %d)", active, limits.MaxActivePrewarms),
+		)
 		return
 	}
 	eligible, rejected, err := a.eligiblePrewarmNodes(r, body, limits)
@@ -212,7 +226,12 @@ func (a *API) prewarmImage(w http.ResponseWriter, r *http.Request) {
 		nodeIDs = append(nodeIDs, n.ID)
 	}
 	opID := "op-prewarm-" + id.New()
-	request := map[string]any{"intent": json.RawMessage(intentRaw), "image_ref": body.ImageRef, "digest": digest, "targets": nodeIDs}
+	request := map[string]any{
+		"intent":    json.RawMessage(intentRaw),
+		"image_ref": body.ImageRef,
+		"digest":    digest,
+		"targets":   nodeIDs,
+	}
 	raw, _ := json.Marshal(request)
 	op, err := a.store.CreatePrewarmAndEnqueue(r.Context(), digest, idemKey, store.EnqueueOperationParams{
 		OperationID: opID, ProjectID: project, Kind: "image_prewarm", Request: raw,
@@ -304,8 +323,10 @@ func (a *API) imageCoverage(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		st := prewarmByNode[n.ID]
-		view := nodeView{NodeID: n.ID, NodePool: n.NodePool, Cached: isCached,
-			Pending: st.Pending, Failed: st.Failed, LastObserved: n.LastSeenAt.UTC().Format(time.RFC3339)}
+		view := nodeView{
+			NodeID: n.ID, NodePool: n.NodePool, Cached: isCached,
+			Pending: st.Pending, Failed: st.Failed, LastObserved: n.LastSeenAt.UTC().Format(time.RFC3339),
+		}
 		if isCached {
 			cached++
 		}
@@ -441,13 +462,22 @@ func (a *API) createImagePin(w http.ResponseWriter, r *http.Request) {
 	}
 	batch := make([]store.ImagePin, 0, len(selectors))
 	for _, selector := range selectors {
-		batch = append(batch, store.ImagePin{ID: "pin-" + id.New(), ProjectID: project,
-			ImageDigest: digest, Selector: selector, Owner: owner, Reason: body.Reason})
+		batch = append(batch, store.ImagePin{
+			ID: "pin-" + id.New(), ProjectID: project,
+			ImageDigest: digest, Selector: selector, Owner: owner, Reason: body.Reason,
+		})
 	}
-	created, err := a.store.CreateImagePinsAtomic(r.Context(), batch, time.Duration(body.TTLSeconds)*time.Second, idemKey, intentRaw, store.ImagePinLimits{
-		MaxPins: limits.MaxPinsPerProject, MaxBytesMib: limits.MaxPinnedBytesMib,
-		MaxTargets: limits.MaxTargetNodes, HardWatermark: limits.HardWatermarkFrac,
-	})
+	created, err := a.store.CreateImagePinsAtomic(
+		r.Context(),
+		batch,
+		time.Duration(body.TTLSeconds)*time.Second,
+		idemKey,
+		intentRaw,
+		store.ImagePinLimits{
+			MaxPins: limits.MaxPinsPerProject, MaxBytesMib: limits.MaxPinnedBytesMib,
+			MaxTargets: limits.MaxTargetNodes, HardWatermark: limits.HardWatermarkFrac,
+		},
+	)
 	if err != nil {
 		switch {
 		case errors.Is(err, store.ErrImageSizeUnknown):

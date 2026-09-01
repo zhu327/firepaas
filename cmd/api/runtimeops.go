@@ -202,7 +202,8 @@ func (a *API) machineExec(w http.ResponseWriter, r *http.Request) {
 	}
 	if open.TTY {
 		_ = stream.Send(&pb.ExecInput{Frame: &pb.ExecInput_Resize{
-			Resize: &pb.ExecResize{Rows: open.Rows, Cols: open.Cols}}})
+			Resize: &pb.ExecResize{Rows: open.Rows, Cols: open.Cols},
+		}})
 	}
 	if open.Stdin != "" {
 		raw, derr := base64.StdEncoding.DecodeString(open.Stdin)
@@ -353,8 +354,10 @@ func (a *API) machineFilesPut(w http.ResponseWriter, r *http.Request) {
 		"machine_id", m.ID, "execution_id", m.CurrentExecutionID,
 		"direction", "upload", "path_digest", runtimeDigest(path),
 		"bytes", resp.BytesWritten, "result", "completed")
-	writeJSON(w, 200, map[string]any{"machine_id": m.ID, "path": path,
-		"bytes_written": resp.BytesWritten})
+	writeJSON(w, 200, map[string]any{
+		"machine_id": m.ID, "path": path,
+		"bytes_written": resp.BytesWritten,
+	})
 }
 
 // machineFilesGet 下载单个普通文件（原始字节流）。

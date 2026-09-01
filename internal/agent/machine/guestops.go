@@ -9,9 +9,9 @@ import (
 	"errors"
 	"fmt"
 
-	contracts "github.com/zhu327/firepaas/internal/contracts/agentv1"
 	"github.com/kernel/hypeman/lib/hypervisor"
 	"github.com/kernel/hypeman/lib/instances"
+	contracts "github.com/zhu327/firepaas/internal/contracts/agentv1"
 )
 
 // ErrGuestOpsUnsupported 表示 hypeman instance manager 未提供 guest 运维通道
@@ -23,7 +23,13 @@ var ErrStaleExecution = errors.New("execution mismatch")
 
 // logStreamProvider 是 hypeman instances.Manager 的日志能力子集。
 type logStreamProvider interface {
-	StreamInstanceLogs(ctx context.Context, id string, tail int, follow bool, source instances.LogSource) (<-chan string, error)
+	StreamInstanceLogs(
+		ctx context.Context,
+		id string,
+		tail int,
+		follow bool,
+		source instances.LogSource,
+	) (<-chan string, error)
 }
 
 // vsockProvider 是 hypeman instances.Manager 的 vsock dialer 能力子集。
@@ -50,7 +56,8 @@ func (a *Adapter) resolveGuest(ctx context.Context, machineID, executionID strin
 
 // StreamLogs 返回 app serial console 日志流（tail 行历史 + 可选 follow）。
 func (a *Adapter) StreamLogs(ctx context.Context, machineID, executionID string,
-	tail int, follow bool) (<-chan string, error) {
+	tail int, follow bool,
+) (<-chan string, error) {
 	inst, err := a.resolveGuest(ctx, machineID, executionID)
 	if err != nil {
 		return nil, err

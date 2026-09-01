@@ -66,8 +66,8 @@ var (
 // 才复用现有行；同 machine/execution 的任何其它历史行（包括终态）都拒绝，
 // 不确定投递只能销毁旧 execution 后再签发。数据库唯一约束封闭并发窗口。
 func (s *Store) EnsureSecretLease(ctx context.Context, projectID, machineID, executionID string,
-	generation int64, operationID, requestHash string, ttl time.Duration) (*SecretLease, error) {
-
+	generation int64, operationID, requestHash string, ttl time.Duration,
+) (*SecretLease, error) {
 	if ttl <= 0 {
 		ttl = DefaultSecretLeaseTTL
 	}
@@ -86,12 +86,22 @@ func (s *Store) EnsureSecretLease(ctx context.Context, projectID, machineID, exe
 		suffix = suffix[len(suffix)-8:]
 	}
 	id := "sdl-" + uuid.NewString()[:8] + "-" + suffix
-	row := s.pool.QueryRow(ctx, `
+	row := s.pool.QueryRow(
+		ctx,
+		`
 		INSERT INTO secret_delivery_leases
 			(id, project_id, machine_id, execution_id, generation, operation_id, request_hash, state, expires_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,'ISSUED',now()+$8::interval)
 		RETURNING id, project_id, machine_id, execution_id, generation, operation_id, request_hash, state, expires_at, created_at, updated_at`,
-		id, projectID, machineID, executionID, generation, operationID, requestHash, fmt.Sprintf("%.0f seconds", ttl.Seconds()))
+		id,
+		projectID,
+		machineID,
+		executionID,
+		generation,
+		operationID,
+		requestHash,
+		fmt.Sprintf("%.0f seconds", ttl.Seconds()),
+	)
 
 	l, err := scanSecretLease(row)
 	if err != nil {
@@ -116,7 +126,12 @@ func (s *Store) ClaimSecretLease(ctx context.Context, l *SecretLease) error {
 		return fmt.Errorf("%w: nil lease", ErrSecretLeaseTransition)
 	}
 	switch l.State {
-	case SecretLeaseClaimed, SecretLeaseDelivered, SecretLeaseUncertain, SecretLeaseExpired, SecretLeaseRevoked, SecretLeaseAcked:
+	case SecretLeaseClaimed,
+		SecretLeaseDelivered,
+		SecretLeaseUncertain,
+		SecretLeaseExpired,
+		SecretLeaseRevoked,
+		SecretLeaseAcked:
 		return fmt.Errorf("%w: lease %s is %s", ErrSecretLeaseTerminal, l.ID, l.State)
 	}
 	if l.ExpiresAt.IsZero() {
@@ -139,7 +154,8 @@ func (s *Store) MarkSecretLeaseDelivered(ctx context.Context, l *SecretLease) er
 // reap. A leader may repeat this transaction after a crash; it never makes the
 // original create dispatchable again.
 func (s *Store) MarkSecretCreateUncertainAndEnqueueCleanup(ctx context.Context, op Operation,
-	l *SecretLease, cleanupOperationID string, cleanupRequest []byte, cause string) error {
+	l *SecretLease, cleanupOperationID string, cleanupRequest []byte, cause string,
+) error {
 	if l == nil {
 		return fmt.Errorf("%w: nil lease", ErrSecretLeaseTransition)
 	}
@@ -180,13 +196,29 @@ func (s *Store) MarkSecretLeaseAcked(ctx context.Context, l *SecretLease) error 
 	})
 }
 
-func (s *Store) transitionSecretLease(ctx context.Context, l *SecretLease, next SecretLeaseState, from []SecretLeaseState) error {
+func (s *Store) transitionSecretLease(
+	ctx context.Context,
+	l *SecretLease,
+	next SecretLeaseState,
+	from []SecretLeaseState,
+) error {
 	if l == nil {
 		return fmt.Errorf("%w: nil lease", ErrSecretLeaseTransition)
 	}
 	states := make([]string, len(from))
 	args := make([]any, 0, 9+len(from))
-	args = append(args, next, l.ID, l.ProjectID, l.MachineID, l.ExecutionID, l.Generation, l.OperationID, l.RequestHash, l.ExpiresAt)
+	args = append(
+		args,
+		next,
+		l.ID,
+		l.ProjectID,
+		l.MachineID,
+		l.ExecutionID,
+		l.Generation,
+		l.OperationID,
+		l.RequestHash,
+		l.ExpiresAt,
+	)
 	for i, state := range from {
 		states[i] = fmt.Sprintf("$%d", 10+i)
 		args = append(args, state)

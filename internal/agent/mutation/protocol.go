@@ -182,7 +182,12 @@ func RunMachineMutation[T any](p *Protocol, op ClaimedMutation[T]) (T, error) {
 	return runClaimed(p, op, true, nil, nil)
 }
 
-func runClaimed[T any](p *Protocol, op ClaimedMutation[T], checkFence bool, beforeResult, beforeComplete func() error) (T, error) {
+func runClaimed[T any](
+	p *Protocol,
+	op ClaimedMutation[T],
+	checkFence bool,
+	beforeResult, beforeComplete func() error,
+) (T, error) {
 	var zero T
 	key := op.SerializationKey
 	if key == "" {
@@ -223,7 +228,12 @@ func runClaimed[T any](p *Protocol, op ClaimedMutation[T], checkFence bool, befo
 	return completeClaimed(p, op, out, beforeResult, beforeComplete)
 }
 
-func completeClaimed[T any](p *Protocol, op ClaimedMutation[T], out T, beforeResult, beforeComplete func() error) (T, error) {
+func completeClaimed[T any](
+	p *Protocol,
+	op ClaimedMutation[T],
+	out T,
+	beforeResult, beforeComplete func() error,
+) (T, error) {
 	var zero T
 	if beforeResult != nil {
 		if err := beforeResult(); err != nil {
@@ -286,8 +296,10 @@ func runDelete(p *Protocol, op DeleteMutation, checkFence bool) error {
 	}
 	unlock := p.fences.LockMachine(key)
 	defer unlock()
-	rec, existed, err := p.ledger.Begin(state.Record{OperationID: op.OperationID, MachineID: op.MachineID,
-		ExecutionID: op.ExecutionID, Generation: op.Generation, Kind: op.Kind, Identity: op.Coordinates, RequestHash: op.RequestHash})
+	rec, existed, err := p.ledger.Begin(state.Record{
+		OperationID: op.OperationID, MachineID: op.MachineID,
+		ExecutionID: op.ExecutionID, Generation: op.Generation, Kind: op.Kind, Identity: op.Coordinates, RequestHash: op.RequestHash,
+	})
 	if err != nil || rec.Completed() {
 		return err
 	}

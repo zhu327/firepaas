@@ -12,8 +12,8 @@ import (
 
 	"github.com/kernel/hypeman/lib/healthcheck"
 
-	"github.com/zhu327/firepaas/internal/agent/probeflow"
 	"github.com/kernel/hypeman/lib/instances"
+	"github.com/zhu327/firepaas/internal/agent/probeflow"
 
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 )
@@ -23,7 +23,7 @@ func TestRecordingDialReleasesOnClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 	accepted := make(chan struct{})
 	go func() {
 		conn, err := listener.Accept()
@@ -210,7 +210,7 @@ func TestWorkerNotReady(t *testing.T) {
 		t.Fatal(err)
 	}
 	port := l.Addr().(*net.TCPAddr).Port
-	l.Close()
+	_ = l.Close()
 
 	tag2, err := EncodePolicy(&pb.HealthCheckSpec{
 		Type:               pb.HealthCheckSpec_HTTP,
@@ -283,8 +283,8 @@ func TestObserveResetsOnNewExecution(t *testing.T) {
 	// interval=10s 未到期不会立即执行）。Observe 必须立即把 readiness
 	// 打回 UNKNOWN（新 VM 尚未证明自己）。
 	newInst := oldInst
-	newInst.StoredMetadata.CreatedAt = time.Now()
-	newInst.StoredMetadata.IP = "127.0.0.1" // 与探针 target 无关；重点在重置
+	newInst.CreatedAt = time.Now()
+	newInst.IP = "127.0.0.1" // 与探针 target 无关；重点在重置
 	tr.Observe(context.Background(), &newInst)
 	if r, _ := tr.Readiness("m-1"); r != pb.MachineReadiness_UNKNOWN {
 		t.Fatalf("new execution must reset readiness to UNKNOWN, got %v", r)

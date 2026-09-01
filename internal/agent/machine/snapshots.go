@@ -31,7 +31,12 @@ type snapshotProvider interface {
 	StopInstance(ctx context.Context, id string) (*instances.Instance, error)
 	StartInstance(ctx context.Context, id string, req instances.StartInstanceRequest) (*instances.Instance, error)
 	ForkSnapshot(ctx context.Context, snapshotID string, req instances.ForkSnapshotRequest) (*instances.Instance, error)
-	RestoreSnapshot(ctx context.Context, id string, snapshotID string, req instances.RestoreSnapshotRequest) (*instances.Instance, error)
+	RestoreSnapshot(
+		ctx context.Context,
+		id string,
+		snapshotID string,
+		req instances.RestoreSnapshotRequest,
+	) (*instances.Instance, error)
 }
 
 // ErrSnapshotNotFound 表示 agent 本地不存在该快照（tag 解析失败或已删）。
@@ -120,7 +125,10 @@ func (a *Adapter) RecoverSnapshot(ctx context.Context, req *pb.CreateSnapshotReq
 	if !ok {
 		return nil, false, ErrSnapshotUnsupported
 	}
-	list, err := sp.ListSnapshots(ctx, &instances.ListSnapshotsFilter{Tags: tags.Tags{tagSnapshotID: req.GetSnapshotId()}})
+	list, err := sp.ListSnapshots(
+		ctx,
+		&instances.ListSnapshotsFilter{Tags: tags.Tags{tagSnapshotID: req.GetSnapshotId()}},
+	)
 	if err != nil {
 		return nil, false, fmt.Errorf("recover snapshot inventory: %w", err)
 	}
@@ -138,7 +146,11 @@ func (a *Adapter) RecoverSnapshot(ctx context.Context, req *pb.CreateSnapshotReq
 
 // RecoverMachine returns a machine only when its durable runtime identity
 // matches the operation's intended execution and generation.
-func (a *Adapter) RecoverMachine(ctx context.Context, machineID, executionID string, generation uint64) (*pb.Machine, bool, error) {
+func (a *Adapter) RecoverMachine(
+	ctx context.Context,
+	machineID, executionID string,
+	generation uint64,
+) (*pb.Machine, bool, error) {
 	inst, err := a.instances.GetInstance(ctx, machineID)
 	if errors.Is(err, instances.ErrNotFound) {
 		return nil, false, nil
@@ -154,7 +166,10 @@ func (a *Adapter) RecoverMachine(ctx context.Context, machineID, executionID str
 
 // RecoverRestore reconstructs the observable restore response from the target
 // execution identity and immutable snapshot metadata.
-func (a *Adapter) RecoverRestore(ctx context.Context, req *pb.RestoreSnapshotRequest) (*pb.Machine, string, string, bool, error) {
+func (a *Adapter) RecoverRestore(
+	ctx context.Context,
+	req *pb.RestoreSnapshotRequest,
+) (*pb.Machine, string, string, bool, error) {
 	m, found, err := a.RecoverMachine(ctx, req.GetMachineId(), req.GetExecutionId(), req.GetGeneration())
 	if err != nil || !found {
 		return nil, "", "", found, err
@@ -177,7 +192,10 @@ func (a *Adapter) RecoverRestore(ctx context.Context, req *pb.RestoreSnapshotReq
 	if !ok {
 		return nil, "", "", false, ErrSnapshotUnsupported
 	}
-	snaps, err := sp.ListSnapshots(ctx, &instances.ListSnapshotsFilter{Tags: tags.Tags{tagSnapshotID: req.GetSnapshotId()}})
+	snaps, err := sp.ListSnapshots(
+		ctx,
+		&instances.ListSnapshotsFilter{Tags: tags.Tags{tagSnapshotID: req.GetSnapshotId()}},
+	)
 	if err != nil || len(snaps) != 1 {
 		return nil, "", "", false, ErrSnapshotNotFound
 	}
@@ -186,7 +204,8 @@ func (a *Adapter) RecoverRestore(ctx context.Context, req *pb.RestoreSnapshotReq
 		mode = "auto"
 	}
 	if mode == "auto" {
-		if snaps[0].CompatibilityKey != "" && req.GetCompatibilityKey() != "" && snaps[0].CompatibilityKey == req.GetCompatibilityKey() {
+		if snaps[0].CompatibilityKey != "" && req.GetCompatibilityKey() != "" &&
+			snaps[0].CompatibilityKey == req.GetCompatibilityKey() {
 			mode = "memory"
 		} else {
 			mode = "filesystem"
@@ -239,7 +258,10 @@ func (a *Adapter) ForkSnapshot(ctx context.Context, req *pb.ForkSnapshotRequest)
 	if !ok {
 		return nil, ErrSnapshotUnsupported
 	}
-	snaps, err := sp.ListSnapshots(ctx, &instances.ListSnapshotsFilter{Tags: tags.Tags{tagSnapshotID: req.GetSnapshotId()}})
+	snaps, err := sp.ListSnapshots(
+		ctx,
+		&instances.ListSnapshotsFilter{Tags: tags.Tags{tagSnapshotID: req.GetSnapshotId()}},
+	)
 	if err != nil || len(snaps) != 1 {
 		return nil, ErrSnapshotNotFound
 	}
@@ -249,7 +271,14 @@ func (a *Adapter) ForkSnapshot(ctx context.Context, req *pb.ForkSnapshotRequest)
 	}
 	forked, err := sp.ForkSnapshot(ctx, snaps[0].Id, instances.ForkSnapshotRequest{
 		ID: req.GetMachineId(), Name: req.GetMachineId(), TargetState: instances.StateRunning, ClearVolumes: true,
-		Tags: tags.Tags{tagMachine: req.GetMachineId(), tagProject: spec.GetProjectId(), tagApp: spec.GetAppId(), tagDeployment: spec.GetDeploymentId(), tagExecution: req.GetExecutionId(), tagGeneration: strconv.FormatUint(req.GetGeneration(), 10)},
+		Tags: tags.Tags{
+			tagMachine:    req.GetMachineId(),
+			tagProject:    spec.GetProjectId(),
+			tagApp:        spec.GetAppId(),
+			tagDeployment: spec.GetDeploymentId(),
+			tagExecution:  req.GetExecutionId(),
+			tagGeneration: strconv.FormatUint(req.GetGeneration(), 10),
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("hypeman fork snapshot: %w", err)
@@ -266,12 +295,18 @@ func (a *Adapter) ForkSnapshot(ctx context.Context, req *pb.ForkSnapshotRequest)
 
 // RestoreSnapshot（v1.3-C）：restore_mode=memory|filesystem|auto。memory 要求
 // 目标节点 compatibility key 与快照来源一致；filesystem 冷启动 rootfs。
-func (a *Adapter) RestoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotRequest) (*pb.Machine, string, string, error) {
+func (a *Adapter) RestoreSnapshot(
+	ctx context.Context,
+	req *pb.RestoreSnapshotRequest,
+) (*pb.Machine, string, string, error) {
 	sp, ok := a.instances.(snapshotProvider)
 	if !ok {
 		return nil, "", "", ErrSnapshotUnsupported
 	}
-	snaps, err := sp.ListSnapshots(ctx, &instances.ListSnapshotsFilter{Tags: tags.Tags{tagSnapshotID: req.GetSnapshotId()}})
+	snaps, err := sp.ListSnapshots(
+		ctx,
+		&instances.ListSnapshotsFilter{Tags: tags.Tags{tagSnapshotID: req.GetSnapshotId()}},
+	)
 	if err != nil || len(snaps) != 1 {
 		return nil, "", "", ErrSnapshotNotFound
 	}
@@ -306,7 +341,17 @@ func (a *Adapter) RestoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotRe
 			return nil, "", "", fmt.Errorf("stop old execution before restore: %w", err)
 		}
 	}
-	restored, err := sp.RestoreSnapshot(ctx, inst.Id, snaps[0].Id, instances.RestoreSnapshotRequest{TargetState: instances.StateRunning, FilesystemOnly: filesystemOnly, CompatibilityKey: req.GetCompatibilityKey(), Tags: targetTags})
+	restored, err := sp.RestoreSnapshot(
+		ctx,
+		inst.Id,
+		snaps[0].Id,
+		instances.RestoreSnapshotRequest{
+			TargetState:      instances.StateRunning,
+			FilesystemOnly:   filesystemOnly,
+			CompatibilityKey: req.GetCompatibilityKey(),
+			Tags:             targetTags,
+		},
+	)
 	if err != nil {
 		// Compatibility is decided above from immutable artifact metadata. Do not
 		// reinterpret corruption, checksum, permission or runtime errors as a
@@ -351,8 +396,10 @@ func translateCompression(c *pb.SnapshotCompressionSpec) (*snapshot.SnapshotComp
 		if level > snapshot.MaxSnapshotCompressionZstdLevel {
 			return nil, fmt.Errorf("zstd level %d exceeds max %d", level, snapshot.MaxSnapshotCompressionZstdLevel)
 		}
-		return &snapshot.SnapshotCompressionConfig{Enabled: true,
-			Algorithm: snapshot.SnapshotCompressionAlgorithmZstd, Level: &level}, nil
+		return &snapshot.SnapshotCompressionConfig{
+			Enabled:   true,
+			Algorithm: snapshot.SnapshotCompressionAlgorithmZstd, Level: &level,
+		}, nil
 	case pb.SnapshotCompressionSpec_LZ4:
 		level := int(c.GetLevel())
 		if level < 0 {
@@ -361,8 +408,10 @@ func translateCompression(c *pb.SnapshotCompressionSpec) (*snapshot.SnapshotComp
 		if level > snapshot.MaxSnapshotCompressionLz4Level {
 			return nil, fmt.Errorf("lz4 level %d exceeds max %d", level, snapshot.MaxSnapshotCompressionLz4Level)
 		}
-		return &snapshot.SnapshotCompressionConfig{Enabled: true,
-			Algorithm: snapshot.SnapshotCompressionAlgorithmLz4, Level: &level}, nil
+		return &snapshot.SnapshotCompressionConfig{
+			Enabled:   true,
+			Algorithm: snapshot.SnapshotCompressionAlgorithmLz4, Level: &level,
+		}, nil
 	default:
 		return nil, fmt.Errorf("unsupported compression algorithm %v", c.GetAlgorithm())
 	}

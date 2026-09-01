@@ -197,7 +197,6 @@ func (a *Adapter) CachedImageDigests(ctx context.Context, cap int) []string {
 	}
 	type entry struct {
 		name    string
-		digest  string
 		created time.Time
 	}
 	list := make([]entry, 0, len(ims))
@@ -318,9 +317,16 @@ type Adapter struct {
 
 // New 构造 Adapter。slotManager 为 nil 时保持 M1 bridge 行为；
 // healthTracker 为 nil 时 readiness 退化为 UNKNOWN/UNCONFIGURED。
-func New(instances InstanceManager, images ImageManager, slotManager slotManager, healthTracker *health.Tracker) *Adapter {
-	return &Adapter{instances: instances, images: images, slots: slotManager,
-		health: healthTracker, autoResume: true}
+func New(
+	instances InstanceManager,
+	images ImageManager,
+	slotManager slotManager,
+	healthTracker *health.Tracker,
+) *Adapter {
+	return &Adapter{
+		instances: instances, images: images, slots: slotManager,
+		health: healthTracker, autoResume: true,
+	}
 }
 
 // SetAutoResume 控制 GetEndpoint 的 standby 同步唤醔。
@@ -441,9 +447,7 @@ func translateAutoStandby(as *pb.AutoStandbyPolicy) (*autostandby.Policy, error)
 		Enabled:     true,
 		IdleTimeout: fmt.Sprintf("%ds", as.GetIdleTimeoutSeconds()),
 	}
-	for _, cidr := range as.GetIgnoreSourceCidrs() {
-		policy.IgnoreSourceCIDRs = append(policy.IgnoreSourceCIDRs, cidr)
-	}
+	policy.IgnoreSourceCIDRs = append(policy.IgnoreSourceCIDRs, as.GetIgnoreSourceCidrs()...)
 	for _, p := range as.GetIgnoreDestinationPorts() {
 		if p == 0 || p > 65535 {
 			return nil, fmt.Errorf("%w: ignore_destination_ports entry %d out of range", ErrInvalidAutoStandby, p)
@@ -742,7 +746,11 @@ func (a *Adapter) GetEndpoint(ctx context.Context, machineID, executionID string
 // X-Firepaas-App-Port 头时走此分支）；wantPort > 0 → 必须在 services
 // 白名单内（主端口 + tagServices 附加端口），否则 ErrPortNotAllowed
 // （proxy 拒绝未声明端口）。
-func (a *Adapter) GetEndpointForPort(ctx context.Context, machineID, executionID string, wantPort int) (ip string, port int, err error) {
+func (a *Adapter) GetEndpointForPort(
+	ctx context.Context,
+	machineID, executionID string,
+	wantPort int,
+) (ip string, port int, err error) {
 	inst, err := a.instances.GetInstance(ctx, machineID)
 	if err != nil {
 		return "", 0, fmt.Errorf("get instance %s: %w", machineID, err)
@@ -805,9 +813,8 @@ func servicePortAllowed(servicesTag string, wantPort int) bool {
 }
 
 func (a *Adapter) ensureImageReady(ctx context.Context, imageRef string) error {
-	if _, err := a.images.CreateImage(ctx, images.CreateImageRequest{Name: imageRef}); err != nil {
-		// 已在队列/已存在等错误继续等待 ready。
-	}
+	// 已在队列/已存在等错误继续等待 ready。
+	_, _ = a.images.CreateImage(ctx, images.CreateImageRequest{Name: imageRef})
 	// M5.1：改为 ListImages 轮询取代 WaitForReady——hypeman 对 OCI index
 	// digest 引用的 GetImage 寻址有缺陷（目录键是平台 manifest digest），
 	// 而 ListImages 的 Name 保留请求时的 digest 形态，可用于匹配。

@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 	"github.com/miekg/dns"
+	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 )
 
 // fakeDNSServer 解析固定域名 → 指定 A 记录（无记录 = NXDOMAIN）。
@@ -118,7 +118,7 @@ func TestProxyFencingKeepsOldPolicy(t *testing.T) {
 func TestProxyUnregisteredSourceFailClosed(t *testing.T) {
 	p, _ := testProxy(t)
 	server, client := net.Pipe()
-	defer server.Close()
+	defer func() { _ = server.Close() }()
 	go p.handle(context.Background(), server, 0)
 	_, _ = client.Write([]byte("GET / HTTP/1.1\r\nHost: ok.example.com\r\n\r\n"))
 	_ = client.SetReadDeadline(time.Now().Add(time.Second))
@@ -209,7 +209,7 @@ func TestDialFirstFallsThrough(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -243,8 +243,8 @@ func TestHandleAllowlistNoHostDenied(t *testing.T) {
 func TestRelayReplaysPrefix(t *testing.T) {
 	upSrv, upCli := net.Pipe()
 	downSrv, downCli := net.Pipe()
-	defer upSrv.Close()
-	defer downSrv.Close()
+	defer func() { _ = upSrv.Close() }()
+	defer func() { _ = downSrv.Close() }()
 	msg := []byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n")
 	prefix := []byte("PREFIX:")
 	done := make(chan error, 1)
@@ -272,8 +272,8 @@ func TestRelayReplaysPrefix(t *testing.T) {
 	if string(buf) != string(resp) {
 		t.Fatalf("response = %q, want %q", buf, resp)
 	}
-	upSrv.Close()
-	downSrv.Close()
+	_ = upSrv.Close()
+	_ = downSrv.Close()
 	select {
 	case err := <-done:
 		if err != nil && !errors.Is(err, net.ErrClosed) {

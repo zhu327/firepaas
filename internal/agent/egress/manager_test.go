@@ -81,7 +81,11 @@ func TestManagerApplyNftFailureKeepsProxyGenerationAndBinding(t *testing.T) {
 	if err := p.BindIP("10.100.0.7", "m1"); err != nil {
 		t.Fatal(err)
 	}
-	fs := &fakeSlots{current: slot.EgressRuleSet{Mode: "allowlist", Generation: 1}, present: true, applyErr: errors.New("nft failed")}
+	fs := &fakeSlots{
+		current:  slot.EgressRuleSet{Mode: "allowlist", Generation: 1},
+		present:  true,
+		applyErr: errors.New("nft failed"),
+	}
 	m := NewManager(p, fs)
 	if err := m.Apply(context.Background(), "m1", "e2", "p", "a", "10.100.0.8", managerPolicy(2)); err == nil {
 		t.Fatal("expected failure")

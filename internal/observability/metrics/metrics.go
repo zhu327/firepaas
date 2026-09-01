@@ -135,7 +135,7 @@ func (r *Registry) Handler() http.Handler {
 		})
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		for _, e := range snap {
-			fmt.Fprintf(w, "%s%s %d\n", e.name, renderLabels(e.labels), e.value)
+			_, _ = fmt.Fprintf(w, "%s%s %d\n", e.name, renderLabels(e.labels), e.value)
 		}
 	})
 }

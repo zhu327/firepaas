@@ -48,7 +48,14 @@ func TestIsPermanentAgentError(t *testing.T) {
 
 func TestSecretLeaseConfirmsCreate(t *testing.T) {
 	now := time.Now()
-	op := store.Operation{ID: "op-1", ProjectID: "p-1", MachineID: "m-1", ExecutionID: "e-1", Generation: 2, Request: []byte(`{"x":1}`)}
+	op := store.Operation{
+		ID:          "op-1",
+		ProjectID:   "p-1",
+		MachineID:   "m-1",
+		ExecutionID: "e-1",
+		Generation:  2,
+		Request:     []byte(`{"x":1}`),
+	}
 	lease := &store.SecretLease{
 		ProjectID: "p-1", MachineID: "m-1", ExecutionID: "e-1", Generation: 2,
 		OperationID: "op-1", RequestHash: hashRequestPayload(op.Request),

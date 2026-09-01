@@ -165,7 +165,11 @@ func (s *Store) ApplyVolumeIntegrity(ctx context.Context, id, integrity string) 
 // ApplyVolumeInventoryObservation atomically accepts a complete observation and
 // applies availability/integrity consequences. DATASET_RO requires sealed
 // digest metadata; LOCAL_RW requires healthy materialization metadata.
-func (s *Store) ApplyVolumeInventoryObservation(ctx context.Context, o InventoryObservation, items map[string]VolumeInventoryItem) (bool, []IntegrityTransition, error) {
+func (s *Store) ApplyVolumeInventoryObservation(
+	ctx context.Context,
+	o InventoryObservation,
+	items map[string]VolumeInventoryItem,
+) (bool, []IntegrityTransition, error) {
 	if o.ResourceType != "volume" || o.ItemCount != len(items) {
 		return false, nil, nil
 	}
@@ -205,7 +209,8 @@ func (s *Store) ApplyVolumeInventoryObservation(ctx context.Context, o Inventory
 			integrity, reason := "MISSING", "absent from complete inventory"
 			if present {
 				integrity, reason = "METADATA_VERIFIED", ""
-				if item.SizeBytes <= 0 || item.Mode == "" || item.MetadataHealth == "" || (r.mode == "DATASET_RO" && item.ContentDigest == "") {
+				if item.SizeBytes <= 0 || item.Mode == "" || item.MetadataHealth == "" ||
+					(r.mode == "DATASET_RO" && item.ContentDigest == "") {
 					integrity, reason = "UNKNOWN", "incomplete materialization metadata"
 				} else {
 					matches := item.SizeBytes == r.size && item.Mode == r.mode && item.MetadataHealth == "HEALTHY" &&
@@ -227,7 +232,10 @@ func (s *Store) ApplyVolumeInventoryObservation(ctx context.Context, o Inventory
 				newState = "READY"
 			}
 			if r.integrity != integrity || r.state != newState {
-				transitions = append(transitions, IntegrityTransition{ID: r.id, ProjectID: r.project, From: r.integrity, To: integrity})
+				transitions = append(
+					transitions,
+					IntegrityTransition{ID: r.id, ProjectID: r.project, From: r.integrity, To: integrity},
+				)
 			}
 			if _, err := tx.Exec(ctx, `UPDATE volumes SET integrity=$2,integrity_reason=$3,state=$4,
 				integrity_observed_at=$5,inventory_epoch=$6,inventory_generation=$7,inventory_received_at=$8,
@@ -266,7 +274,11 @@ func (s *Store) ListVolumesOnNode(ctx context.Context, nodeID string) ([]Volume,
 // BeginVolumeDeleteAndEnqueue atomically tombstones the business fact and
 // records the node-pinned delete outbox command. A crash can therefore never
 // leave DELETING without work to dispatch (or work without DELETING).
-func (s *Store) BeginVolumeDeleteAndEnqueue(ctx context.Context, id string, p EnqueueOperationParams) (Operation, error) {
+func (s *Store) BeginVolumeDeleteAndEnqueue(
+	ctx context.Context,
+	id string,
+	p EnqueueOperationParams,
+) (Operation, error) {
 	var op Operation
 	err := s.inTx(ctx, func(tx pgx.Tx) error {
 		var projectID, nodeID, state string
@@ -378,7 +390,11 @@ func (s *Store) MarkVolumesAvailable(ctx context.Context, nodeID string) (int, e
 // the origin node, creates the volume business fact, and inserts its outbox op.
 // node_id is deliberately mandatory: a later controller fallback could create
 // the local data on a different node after a retry/leader change.
-func (s *Store) CreateLocalRWVolumeAndEnqueue(ctx context.Context, v Volume, p EnqueueOperationParams) (*Volume, Operation, error) {
+func (s *Store) CreateLocalRWVolumeAndEnqueue(
+	ctx context.Context,
+	v Volume,
+	p EnqueueOperationParams,
+) (*Volume, Operation, error) {
 	var out *Volume
 	var op Operation
 	if v.ID == "" || v.ProjectID == "" || v.NodeID == "" || v.SizeBytes <= 0 ||
@@ -409,7 +425,11 @@ func (s *Store) CreateLocalRWVolumeAndEnqueue(ctx context.Context, v Volume, p E
 
 // CreateDatasetAndEnqueue atomically creates an immutable dataset import fact
 // and its node-pinned outbox operation. The digest cannot be changed after insert.
-func (s *Store) CreateDatasetAndEnqueue(ctx context.Context, v Volume, p EnqueueOperationParams) (*Volume, Operation, error) {
+func (s *Store) CreateDatasetAndEnqueue(
+	ctx context.Context,
+	v Volume,
+	p EnqueueOperationParams,
+) (*Volume, Operation, error) {
 	var out *Volume
 	var op Operation
 	if v.ID == "" || v.ProjectID == "" || v.NodeID == "" || v.SizeBytes <= 0 || v.ContentDigest == "" ||
@@ -420,9 +440,17 @@ func (s *Store) CreateDatasetAndEnqueue(ctx context.Context, v Volume, p Enqueue
 		if err := reserveVolumeQuota(ctx, tx, v.ProjectID, v.SizeBytes); err != nil {
 			return err
 		}
-		row := tx.QueryRow(ctx, `INSERT INTO volumes(id,project_id,name,mode,node_id,size_bytes,state,content_digest,import_status)
+		row := tx.QueryRow(
+			ctx,
+			`INSERT INTO volumes(id,project_id,name,mode,node_id,size_bytes,state,content_digest,import_status)
 			VALUES($1,$2,$3,'DATASET_RO',$4,$5,'CREATING',$6,'importing') RETURNING `+volumeCols,
-			v.ID, v.ProjectID, v.Name, v.NodeID, v.SizeBytes, v.ContentDigest)
+			v.ID,
+			v.ProjectID,
+			v.Name,
+			v.NodeID,
+			v.SizeBytes,
+			v.ContentDigest,
+		)
 		var err error
 		out, err = scanVolume(row)
 		if err != nil {
@@ -469,14 +497,20 @@ func (s *Store) SealDataset(ctx context.Context, id, digest string, size int64) 
 
 // ClaimDatasetAttachmentAndEnqueue allows same-project readonly multi-attach.
 // Overlay storage is separately accounted and always execution scoped.
-func (s *Store) ClaimDatasetAttachmentAndEnqueue(ctx context.Context, att VolumeAttachment, p EnqueueOperationParams) (Operation, error) {
+func (s *Store) ClaimDatasetAttachmentAndEnqueue(
+	ctx context.Context,
+	att VolumeAttachment,
+	p EnqueueOperationParams,
+) (Operation, error) {
 	var op Operation
 	err := s.inTx(ctx, func(tx pgx.Tx) error {
 		var projectID, nodeID, state, mode string
 		if err := tx.QueryRow(ctx, `SELECT project_id,node_id,state,mode FROM volumes WHERE id=$1 FOR UPDATE`, att.VolumeID).Scan(&projectID, &nodeID, &state, &mode); err != nil {
 			return err
 		}
-		if mode != "DATASET_RO" || state != "READY" || !att.Readonly || att.OverlaySizeBytes < 0 || p.ProjectID != projectID || p.DispatchNodeID != nodeID {
+		if mode != "DATASET_RO" || state != "READY" || !att.Readonly || att.OverlaySizeBytes < 0 ||
+			p.ProjectID != projectID ||
+			p.DispatchNodeID != nodeID {
 			return ErrVolumeStateConflict
 		}
 		if att.OverlaySizeBytes > 0 {
@@ -507,9 +541,17 @@ func (s *Store) ClaimDatasetAttachmentAndEnqueue(ctx context.Context, att Volume
 }
 
 // WritableActiveAttachments returns attachment roots that forbid memory checkpoint.
-func (s *Store) WritableActiveAttachments(ctx context.Context, machineID, executionID string) ([]VolumeAttachment, error) {
-	rows, err := s.pool.Query(ctx, `SELECT volume_id,machine_id,execution_id,mount_path,readonly,overlay_size_bytes,status,created_at,updated_at
-		FROM volume_attachments WHERE machine_id=$1 AND execution_id=$2 AND status<>'DETACHED' AND (NOT readonly OR overlay_size_bytes>0)`, machineID, executionID)
+func (s *Store) WritableActiveAttachments(
+	ctx context.Context,
+	machineID, executionID string,
+) ([]VolumeAttachment, error) {
+	rows, err := s.pool.Query(
+		ctx,
+		`SELECT volume_id,machine_id,execution_id,mount_path,readonly,overlay_size_bytes,status,created_at,updated_at
+		FROM volume_attachments WHERE machine_id=$1 AND execution_id=$2 AND status<>'DETACHED' AND (NOT readonly OR overlay_size_bytes>0)`,
+		machineID,
+		executionID,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -528,7 +570,11 @@ func (s *Store) WritableActiveAttachments(ctx context.Context, machineID, execut
 // ClaimLocalRWAttachmentAndEnqueue atomically takes the single-writer claim and
 // inserts the fenced attach outbox operation. The volume row lock serializes
 // concurrent claimers even before the recommended partial unique index exists.
-func (s *Store) ClaimLocalRWAttachmentAndEnqueue(ctx context.Context, att VolumeAttachment, p EnqueueOperationParams) (Operation, error) {
+func (s *Store) ClaimLocalRWAttachmentAndEnqueue(
+	ctx context.Context,
+	att VolumeAttachment,
+	p EnqueueOperationParams,
+) (Operation, error) {
 	var op Operation
 	err := s.inTx(ctx, func(tx pgx.Tx) error {
 		var projectID, mode, nodeID, state string
@@ -576,7 +622,11 @@ func (s *Store) ClaimLocalRWAttachmentAndEnqueue(ctx context.Context, att Volume
 // BeginDetachVolumeAndEnqueue changes ATTACHED to DETACHING before dispatch and
 // atomically records the outbox operation. Only agent acknowledgement may call
 // CompleteVolumeDetach and make the claim reusable.
-func (s *Store) BeginDetachVolumeAndEnqueue(ctx context.Context, volumeID, machineID, executionID string, p EnqueueOperationParams) (Operation, error) {
+func (s *Store) BeginDetachVolumeAndEnqueue(
+	ctx context.Context,
+	volumeID, machineID, executionID string,
+	p EnqueueOperationParams,
+) (Operation, error) {
 	var op Operation
 	err := s.inTx(ctx, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `UPDATE volume_attachments SET status='DETACHING',updated_at=now()
@@ -629,8 +679,19 @@ func insertVolumeOperation(ctx context.Context, tx pgx.Tx, p EnqueueOperationPar
 		}
 		return existing, nil
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO operations(id,project_id,machine_id,execution_id,generation,kind,idempotency_key,status,request,dispatch_node_id)
-		VALUES($1,$2,$3,$4,$5,$6,$1,'PENDING',$7::jsonb,NULLIF($8,''))`, p.OperationID, p.ProjectID, p.MachineID, p.ExecutionID, p.Generation, p.Kind, string(p.Request), p.DispatchNodeID)
+	_, err = tx.Exec(
+		ctx,
+		`INSERT INTO operations(id,project_id,machine_id,execution_id,generation,kind,idempotency_key,status,request,dispatch_node_id)
+		VALUES($1,$2,$3,$4,$5,$6,$1,'PENDING',$7::jsonb,NULLIF($8,''))`,
+		p.OperationID,
+		p.ProjectID,
+		p.MachineID,
+		p.ExecutionID,
+		p.Generation,
+		p.Kind,
+		string(p.Request),
+		p.DispatchNodeID,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("enqueue %s: %w", p.Kind, err)
 	}
@@ -694,8 +755,12 @@ func (s *Store) ActiveAttachments(ctx context.Context, volumeID string) ([]Volum
 // MachineLocalRWNode returns the hard locality claim for a machine. Multiple
 // different origin nodes are treated as a conflict and fail closed.
 func (s *Store) MachineLocalRWNode(ctx context.Context, machineID string) (string, error) {
-	rows, err := s.pool.Query(ctx, `SELECT DISTINCT v.node_id FROM volume_attachments a JOIN volumes v ON v.id=a.volume_id
-		WHERE a.machine_id=$1 AND a.status<>'DETACHED' AND v.mode='LOCAL_RW' AND v.state<>'DELETED'`, machineID)
+	rows, err := s.pool.Query(
+		ctx,
+		`SELECT DISTINCT v.node_id FROM volume_attachments a JOIN volumes v ON v.id=a.volume_id
+		WHERE a.machine_id=$1 AND a.status<>'DETACHED' AND v.mode='LOCAL_RW' AND v.state<>'DELETED'`,
+		machineID,
+	)
 	if err != nil {
 		return "", err
 	}

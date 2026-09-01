@@ -51,9 +51,12 @@ type Service struct {
 }
 
 func New(st *store.Store, nodes *nodemanager.Manager, resv *reservations.Manager,
-	placer *scheduler.Placer, reg *metrics.Registry, compensationTimeout time.Duration) *Service {
-	return &Service{store: st, nodes: nodes, resv: resv, placer: placer, metrics: reg,
-		compensationTimeout: compensationTimeout}
+	placer *scheduler.Placer, reg *metrics.Registry, compensationTimeout time.Duration,
+) *Service {
+	return &Service{
+		store: st, nodes: nodes, resv: resv, placer: placer, metrics: reg,
+		compensationTimeout: compensationTimeout,
+	}
 }
 
 func (s *Service) liveNodes() []liveNode {
@@ -98,7 +101,8 @@ func pendingMap(rows []store.PendingUsage) map[string]store.PendingUsage {
 }
 
 func assembleSchedulerNodes(live []liveNode, allocated map[string]store.Allocated,
-	pending map[string]store.PendingUsage, stored []store.Node) []scheduler.Node {
+	pending map[string]store.PendingUsage, stored []store.Node,
+) []scheduler.Node {
 	draining := map[string]bool{}
 	images := map[string]map[string]bool{}
 	features := map[string]map[string]bool{}
@@ -120,8 +124,11 @@ func assembleSchedulerNodes(live []liveNode, allocated map[string]store.Allocate
 	}
 	out := make([]scheduler.Node, 0, len(live))
 	for _, view := range live {
-		n := scheduler.Node{ID: view.NodeID, Status: view.Status, Pool: view.Node.NodePool,
-			Draining: draining[view.NodeID] || draining[view.NomadID], CachedImageDigests: images[view.NodeID], FeatureIDs: features[view.NodeID]}
+		n := scheduler.Node{
+			ID: view.NodeID, Status: view.Status, Pool: view.Node.NodePool,
+			Draining: draining[view.NodeID] ||
+				draining[view.NomadID], CachedImageDigests: images[view.NodeID], FeatureIDs: features[view.NodeID],
+		}
 		if info := view.Node.Info; info != nil {
 			if n.FeatureIDs == nil && len(info.FeatureIds) > 0 {
 				n.FeatureIDs = capabilities.SetOf(info.FeatureIds)
@@ -158,7 +165,8 @@ func assembleSchedulerNodes(live []liveNode, allocated map[string]store.Allocate
 // Place chooses a node, persists scheduler events, checks PG-authoritative
 // quotas, acquires the Redis soft reservation, and records the dispatch node.
 func (s *Service) Place(ctx context.Context, op store.Operation, req *pb.CreateMachineRequest,
-	excluded map[string]bool) (*Choice, error) {
+	excluded map[string]bool,
+) (*Choice, error) {
 	live := s.liveNodes()
 	allocated, err := s.store.AllocatedByNode(ctx)
 	if err != nil {
@@ -210,11 +218,13 @@ func (s *Service) Place(ctx context.Context, op store.Operation, req *pb.CreateM
 		required = append(required, capabilities.VolumeLocalRWV1)
 	}
 
-	schedReq := scheduler.Request{VCPU: vcpu, MemMib: memMib,
+	schedReq := scheduler.Request{
+		VCPU: vcpu, MemMib: memMib,
 		DiskMib: agentv1.EffectiveDiskMib(spec.GetDiskMib()), DeploymentID: spec.GetDeploymentId(),
 		Pool: pool, Labels: labels, AntiAffinity: antiAffinity,
 		ExistingDeploymentNodes: deployNodes[spec.GetDeploymentId()], ExcludedNodes: excluded,
-		ImageDigest: ImageDigest(spec.GetImageRef()), RequiredFeatures: required, RequiredNodeID: localNode}
+		ImageDigest: ImageDigest(spec.GetImageRef()), RequiredFeatures: required, RequiredNodeID: localNode,
+	}
 	result, err := s.placer.Place(schedReq, assembleSchedulerNodes(live, allocated, pendingMap(pending), stored), nil)
 	s.recordSchedulerEvents(ctx, op, result.Events)
 	if err != nil {
@@ -288,8 +298,10 @@ func (s *Service) recordSchedulerEvents(ctx context.Context, op store.Operation,
 }
 
 func (s *Service) recordEvent(ctx context.Context, op store.Operation, kind, nodeID, reason string) {
-	if err := s.store.RecordSchedulerEvent(ctx, store.SchedulerEvent{ProjectID: op.ProjectID, Kind: kind,
-		MachineID: op.MachineID, OperationID: op.ID, NodeID: nodeID, Reason: reason}); err != nil {
+	if err := s.store.RecordSchedulerEvent(ctx, store.SchedulerEvent{
+		ProjectID: op.ProjectID, Kind: kind,
+		MachineID: op.MachineID, OperationID: op.ID, NodeID: nodeID, Reason: reason,
+	}); err != nil {
 		slog.Error("record scheduler event", "error", err)
 	}
 }
@@ -302,7 +314,8 @@ func (s *Service) metric(name string, labels map[string]string) {
 
 func commitDispatch(ctx context.Context, opID, nodeID string, compensationTimeout time.Duration,
 	persist func(context.Context, string, string) error,
-	release func(context.Context, string) error) error {
+	release func(context.Context, string) error,
+) error {
 	if err := persist(ctx, opID, nodeID); err != nil {
 		if compensationTimeout <= 0 {
 			compensationTimeout = defaultCompensationTimeout
@@ -312,7 +325,13 @@ func commitDispatch(ctx context.Context, opID, nodeID string, compensationTimeou
 		compensationCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), compensationTimeout)
 		defer cancel()
 		if releaseErr := release(compensationCtx, opID); releaseErr != nil {
-			slog.Warn("release reservation after dispatch persistence failure", "operation_id", opID, "error", releaseErr)
+			slog.Warn(
+				"release reservation after dispatch persistence failure",
+				"operation_id",
+				opID,
+				"error",
+				releaseErr,
+			)
 		}
 		return err
 	}
@@ -339,7 +358,8 @@ func RequiredFeatures(requiredFeatures []string, hasSecretRefs bool, egressPolic
 	}
 	if len(egressPolicy) > 0 && string(egressPolicy) != "null" {
 		var policy pb.EgressPolicySpec
-		if err := protojson.Unmarshal(egressPolicy, &policy); err != nil || agentv1.ValidateEgressPolicy(&policy) != nil {
+		if err := protojson.Unmarshal(egressPolicy, &policy); err != nil ||
+			agentv1.ValidateEgressPolicy(&policy) != nil {
 			out = append(out, "egress.invalid-policy")
 		} else {
 			out = append(out, capabilities.EgressCidrV1)

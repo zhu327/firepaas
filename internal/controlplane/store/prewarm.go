@@ -46,13 +46,16 @@ var (
 	ErrPrewarmNotFound    = errors.New("prewarm operation not found")
 	ErrImagePinQuota      = errors.New("image pin quota exceeded")
 	ErrImagePinWatermark  = errors.New("image pin target reached disk hard watermark")
-	prewarmTerminalStates = []string{"SUCCEEDED", "FAILED"}
 )
 
 // FindPrewarmReplay resolves a client idempotency key without consulting any
 // mutable admission inputs. The persisted request wraps the canonical client
 // intent separately from the resolved dispatch targets.
-func (s *Store) FindPrewarmReplay(ctx context.Context, projectID, idempotencyKey string, intent []byte) (*Operation, []PrewarmTarget, error) {
+func (s *Store) FindPrewarmReplay(
+	ctx context.Context,
+	projectID, idempotencyKey string,
+	intent []byte,
+) (*Operation, []PrewarmTarget, error) {
 	if idempotencyKey == "" {
 		return nil, nil, nil
 	}
@@ -94,7 +97,13 @@ func prewarmIntent(request []byte) []byte {
 // per-node targets. Retrying with the same operation ID replays the existing
 // rows (idempotent), so leader handover never re-pulls completed nodes.
 // maxActive 在同一事务内强制 prewarm 并发上限（避免 check-then-insert 竞态）。
-func (s *Store) CreatePrewarmAndEnqueue(ctx context.Context, digest, idempotencyKey string, p EnqueueOperationParams, nodeIDs []string, maxActive int) (Operation, error) {
+func (s *Store) CreatePrewarmAndEnqueue(
+	ctx context.Context,
+	digest, idempotencyKey string,
+	p EnqueueOperationParams,
+	nodeIDs []string,
+	maxActive int,
+) (Operation, error) {
 	var op Operation
 	if p.Kind != "image_prewarm" || p.OperationID == "" || p.ProjectID == "" || digest == "" || len(nodeIDs) == 0 {
 		return op, errors.New("prewarm: invalid atomic command")
@@ -184,12 +193,16 @@ func (s *Store) CreatePrewarmAndEnqueue(ctx context.Context, digest, idempotency
 // operation queue. A slow registry can therefore not occupy slots used by
 // create/delete/rescue operations.
 func (s *Store) ClaimPendingPrewarmOperations(ctx context.Context, limit int) ([]Operation, error) {
-	rows, err := s.pool.Query(ctx, `UPDATE operations SET status='CLAIMED',claimed_at=now(),attempts=attempts+1,updated_at=now()
+	rows, err := s.pool.Query(
+		ctx,
+		`UPDATE operations SET status='CLAIMED',claimed_at=now(),attempts=attempts+1,updated_at=now()
 		WHERE id IN (SELECT id FROM operations WHERE status='PENDING' AND kind='image_prewarm'
 		AND (attempts=0 OR updated_at < now()-(interval '2 seconds'*power(2,least(attempts,5))))
 		ORDER BY created_at LIMIT $1 FOR UPDATE SKIP LOCKED)
 		RETURNING id,project_id,machine_id,execution_id,generation,kind,status,coalesce(dispatch_node_id,''),
-		coalesce(request::text,'{}'),coalesce(result::text,'{}'),coalesce(error,''),created_at,updated_at`, limit)
+		coalesce(request::text,'{}'),coalesce(result::text,'{}'),coalesce(error,''),created_at,updated_at`,
+		limit,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("claim prewarm operations: %w", err)
 	}
@@ -247,7 +260,10 @@ func (s *Store) SetPrewarmTargetStatus(ctx context.Context, operationID, nodeID,
 // RecordPrewarmTargetAttemptFailure bounds transient/unreachable retries. It
 // increments the durable target attempt and converts it to FAILED at the
 // attempt budget or deadline. terminal reports whether retrying must stop.
-func (s *Store) RecordPrewarmTargetAttemptFailure(ctx context.Context, operationID, nodeID, errText string) (terminal bool, err error) {
+func (s *Store) RecordPrewarmTargetAttemptFailure(
+	ctx context.Context,
+	operationID, nodeID, errText string,
+) (terminal bool, err error) {
 	err = s.pool.QueryRow(ctx, `
 		UPDATE image_prewarm_targets
 		SET attempts=attempts+1,
@@ -270,7 +286,8 @@ func (s *Store) CompletePrewarmWithEvent(ctx context.Context, opID string, resul
 	return s.inTx(ctx, func(tx pgx.Tx) error {
 		var project string
 		err := tx.QueryRow(ctx, `UPDATE operations SET status='SUCCEEDED',result=$2::jsonb,error='',completed_at=now(),updated_at=now()
-			WHERE id=$1 AND kind='image_prewarm' AND status IN ('PENDING','CLAIMED') RETURNING project_id`, opID, string(result)).Scan(&project)
+			WHERE id=$1 AND kind='image_prewarm' AND status IN ('PENDING','CLAIMED') RETURNING project_id`, opID, string(result)).
+			Scan(&project)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}
@@ -335,13 +352,18 @@ func (s *Store) GetImageSize(ctx context.Context, digest string) (int64, bool, e
 
 // FindImagePinReplay resolves a pin idempotency key before selector expansion
 // or other mutable admission checks.
-func (s *Store) FindImagePinReplay(ctx context.Context, projectID, idempotencyKey string, request []byte) ([]ImagePin, bool, error) {
+func (s *Store) FindImagePinReplay(
+	ctx context.Context,
+	projectID, idempotencyKey string,
+	request []byte,
+) ([]ImagePin, bool, error) {
 	if idempotencyKey == "" {
 		return nil, false, nil
 	}
 	var kind string
 	var oldRequest, result []byte
-	err := s.pool.QueryRow(ctx, `SELECT kind,request::text,result::text FROM image_pin_idempotency WHERE project_id=$1 AND idempotency_key=$2`, projectID, idempotencyKey).Scan(&kind, &oldRequest, &result)
+	err := s.pool.QueryRow(ctx, `SELECT kind,request::text,result::text FROM image_pin_idempotency WHERE project_id=$1 AND idempotency_key=$2`, projectID, idempotencyKey).
+		Scan(&kind, &oldRequest, &result)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, false, nil
 	}
@@ -369,7 +391,14 @@ type ImagePinLimits struct {
 // watermark and count/byte/target quotas, and upserts the complete batch in one
 // transaction. Selectors must be frozen node:<id> values so later pool growth
 // cannot silently expand quota usage.
-func (s *Store) CreateImagePinsAtomic(ctx context.Context, pins []ImagePin, ttl time.Duration, idempotencyKey string, request []byte, limits ImagePinLimits) ([]ImagePin, error) {
+func (s *Store) CreateImagePinsAtomic(
+	ctx context.Context,
+	pins []ImagePin,
+	ttl time.Duration,
+	idempotencyKey string,
+	request []byte,
+	limits ImagePinLimits,
+) ([]ImagePin, error) {
 	if len(pins) == 0 || pins[0].ProjectID == "" || len(pins) > limits.MaxTargets || ttl <= 0 {
 		return nil, ErrImagePinQuota
 	}
@@ -382,7 +411,8 @@ func (s *Store) CreateImagePinsAtomic(ctx context.Context, pins []ImagePin, ttl 
 		if idempotencyKey != "" {
 			var kind string
 			var oldRequest, result []byte
-			err := tx.QueryRow(ctx, `SELECT kind,request::text,result::text FROM image_pin_idempotency WHERE project_id=$1 AND idempotency_key=$2`, project, idempotencyKey).Scan(&kind, &oldRequest, &result)
+			err := tx.QueryRow(ctx, `SELECT kind,request::text,result::text FROM image_pin_idempotency WHERE project_id=$1 AND idempotency_key=$2`, project, idempotencyKey).
+				Scan(&kind, &oldRequest, &result)
 			if err == nil {
 				if kind != "pin" || !jsonEqual(oldRequest, request) {
 					return ErrRequestConflict
@@ -405,7 +435,9 @@ func (s *Store) CreateImagePinsAtomic(ctx context.Context, pins []ImagePin, ttl 
 			return err
 		}
 		for _, pin := range pins {
-			if pin.ProjectID != project || pin.ImageDigest != digest || !pin.ExpiresAt.After(time.Now()) || len(pin.Selector) <= 5 || pin.Selector[:5] != "node:" {
+			if pin.ProjectID != project || pin.ImageDigest != digest || !pin.ExpiresAt.After(time.Now()) ||
+				len(pin.Selector) <= 5 ||
+				pin.Selector[:5] != "node:" {
 				return errors.New("invalid image pin batch")
 			}
 			nodeID := pin.Selector[5:]
@@ -530,7 +562,8 @@ func (s *Store) DeleteImagePin(ctx context.Context, id, projectID, idempotencyKe
 		if idempotencyKey != "" {
 			var kind string
 			var oldRequest []byte
-			err := tx.QueryRow(ctx, `SELECT kind,request::text FROM image_pin_idempotency WHERE project_id=$1 AND idempotency_key=$2`, projectID, idempotencyKey).Scan(&kind, &oldRequest)
+			err := tx.QueryRow(ctx, `SELECT kind,request::text FROM image_pin_idempotency WHERE project_id=$1 AND idempotency_key=$2`, projectID, idempotencyKey).
+				Scan(&kind, &oldRequest)
 			if err == nil {
 				if kind != "unpin" || !jsonEqual(oldRequest, request) {
 					return ErrRequestConflict
@@ -642,7 +675,10 @@ type NodePrewarmStatus struct {
 
 // PrewarmStatusByNode returns only the latest per-node observation for a
 // digest. Older failed/pending attempts must not override a newer success.
-func (s *Store) PrewarmStatusByNode(ctx context.Context, projectID, digest string) (map[string]NodePrewarmStatus, error) {
+func (s *Store) PrewarmStatusByNode(
+	ctx context.Context,
+	projectID, digest string,
+) (map[string]NodePrewarmStatus, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT DISTINCT ON (t.node_id) t.node_id,
 			t.status='PENDING' AS pending,

@@ -35,7 +35,12 @@ func TestCreatePrewarmAndEnqueueIdempotent(t *testing.T) {
 	})
 	digest := "sha256:" + repeatHex(0, 64)
 	raw := []byte(fmt.Sprintf(`{"image_ref":"r/app@%s","digest":"%s","targets":["n1","n2"]}`, digest, digest))
-	p := EnqueueOperationParams{OperationID: "op-prewarm-store-1", ProjectID: project, Kind: "image_prewarm", Request: raw}
+	p := EnqueueOperationParams{
+		OperationID: "op-prewarm-store-1",
+		ProjectID:   project,
+		Kind:        "image_prewarm",
+		Request:     raw,
+	}
 	if _, err := s.CreatePrewarmAndEnqueue(ctx, digest, "", p, []string{"n1", "n2"}, 4); err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +67,10 @@ func TestCreatePrewarmAndEnqueueIdempotent(t *testing.T) {
 		t.Fatalf("HTTP idempotency replay = %+v, %v", replayed, err)
 	}
 	p2.Request = []byte(`{"different":true}`)
-	if _, err := s.CreatePrewarmAndEnqueue(ctx, digest, "http-key", p2, []string{"n1"}, 4); !errors.Is(err, ErrRequestConflict) {
+	if _, err := s.CreatePrewarmAndEnqueue(ctx, digest, "http-key", p2, []string{"n1"}, 4); !errors.Is(
+		err,
+		ErrRequestConflict,
+	) {
 		t.Fatalf("HTTP idempotency mismatch = %v, want ErrRequestConflict", err)
 	}
 
@@ -134,7 +142,9 @@ func TestImagePinCommandsAreIdempotent(t *testing.T) {
 	})
 	limits := ImagePinLimits{MaxPins: 4, MaxBytesMib: 100, MaxTargets: 4, HardWatermark: .9}
 	request := []byte(`{"digest":"same","ttl_seconds":60}`)
-	batch := []ImagePin{{ID: "pin-idem-1", ProjectID: project, ImageDigest: digest, Selector: "node:pin-idem-n1", Owner: "test"}}
+	batch := []ImagePin{
+		{ID: "pin-idem-1", ProjectID: project, ImageDigest: digest, Selector: "node:pin-idem-n1", Owner: "test"},
+	}
 	first, err := s.CreateImagePinsAtomic(ctx, batch, time.Minute, "create-key", request, limits)
 	if err != nil || len(first) != 1 {
 		t.Fatalf("first pin = %+v, %v", first, err)
@@ -145,7 +155,10 @@ func TestImagePinCommandsAreIdempotent(t *testing.T) {
 	if err != nil || len(replay) != 1 || replay[0].ID != first[0].ID || !replay[0].ExpiresAt.Equal(first[0].ExpiresAt) {
 		t.Fatalf("pin replay = %+v, %v; first=%+v", replay, err, first)
 	}
-	if _, err := s.CreateImagePinsAtomic(ctx, batch, time.Minute, "create-key", []byte(`{"different":true}`), limits); !errors.Is(err, ErrRequestConflict) {
+	if _, err := s.CreateImagePinsAtomic(ctx, batch, time.Minute, "create-key", []byte(`{"different":true}`), limits); !errors.Is(
+		err,
+		ErrRequestConflict,
+	) {
 		t.Fatalf("changed pin request = %v", err)
 	}
 
@@ -156,7 +169,10 @@ func TestImagePinCommandsAreIdempotent(t *testing.T) {
 	if err := s.DeleteImagePin(ctx, first[0].ID, project, "delete-key", unpinRequest); err != nil {
 		t.Fatalf("unpin replay: %v", err)
 	}
-	if err := s.DeleteImagePin(ctx, "other", project, "delete-key", []byte(`{"pin_id":"other"}`)); !errors.Is(err, ErrRequestConflict) {
+	if err := s.DeleteImagePin(ctx, "other", project, "delete-key", []byte(`{"pin_id":"other"}`)); !errors.Is(
+		err,
+		ErrRequestConflict,
+	) {
 		t.Fatalf("changed unpin request = %v", err)
 	}
 }
@@ -216,19 +232,25 @@ func TestPinnedDigestsForNodeScope(t *testing.T) {
 	seedNode(t, s, "pin-n3", "pool-b")
 
 	digestA := testDigest(0)
-	if _, err := s.CreateImagePin(ctx, ImagePin{ID: "pin-1", ProjectID: project, ImageDigest: digestA,
-		Selector: "node:pin-n1", Owner: "test", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+	if _, err := s.CreateImagePin(ctx, ImagePin{
+		ID: "pin-1", ProjectID: project, ImageDigest: digestA,
+		Selector: "node:pin-n1", Owner: "test", ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
 		t.Fatal(err)
 	}
 	digestB := testDigest(1)
-	if _, err := s.CreateImagePin(ctx, ImagePin{ID: "pin-2", ProjectID: project, ImageDigest: digestB,
-		Selector: "node_pool:pool-a", Owner: "test", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+	if _, err := s.CreateImagePin(ctx, ImagePin{
+		ID: "pin-2", ProjectID: project, ImageDigest: digestB,
+		Selector: "node_pool:pool-a", Owner: "test", ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
 		t.Fatal(err)
 	}
 	// 过期 pin 不保护（先有效创建，再过期）。
 	digestC := testDigest(2)
-	if _, err := s.CreateImagePin(ctx, ImagePin{ID: "pin-3", ProjectID: project, ImageDigest: digestC,
-		Selector: "node:pin-n3", Owner: "test", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+	if _, err := s.CreateImagePin(ctx, ImagePin{
+		ID: "pin-3", ProjectID: project, ImageDigest: digestC,
+		Selector: "node:pin-n3", Owner: "test", ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.pool.Exec(ctx, `UPDATE image_pins SET expires_at=now()-interval '1 second' WHERE id='pin-3'`); err != nil {
@@ -305,8 +327,10 @@ func TestPinnedBytesForProject(t *testing.T) {
 	if err := s.UpsertImageSize(ctx, digest, 100); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.CreateImagePin(ctx, ImagePin{ID: "pin-b1", ProjectID: project, ImageDigest: digest,
-		Selector: "node_pool:pool-b", Owner: "t", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+	if _, err := s.CreateImagePin(ctx, ImagePin{
+		ID: "pin-b1", ProjectID: project, ImageDigest: digest,
+		Selector: "node_pool:pool-b", Owner: "t", ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
 		t.Fatal(err)
 	}
 	// node pin upsert（同 project+digest+selector 幂等）。
@@ -314,8 +338,10 @@ func TestPinnedBytesForProject(t *testing.T) {
 	if err := s.UpsertImageSize(ctx, digest2, 10); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.CreateImagePin(ctx, ImagePin{ID: "pin-b2", ProjectID: project, ImageDigest: digest2,
-		Selector: "node:pb-n1", Owner: "t", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+	if _, err := s.CreateImagePin(ctx, ImagePin{
+		ID: "pin-b2", ProjectID: project, ImageDigest: digest2,
+		Selector: "node:pb-n1", Owner: "t", ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.PinnedBytesForProject(ctx, project)

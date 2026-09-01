@@ -41,7 +41,10 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		return fmt.Errorf("lock migrations: %w", err)
 	}
 	defer func() {
-		_, _ = conn.Exec(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock(hashtext('firepaas-schema-migrations'))`)
+		_, _ = conn.Exec(
+			context.WithoutCancel(ctx),
+			`SELECT pg_advisory_unlock(hashtext('firepaas-schema-migrations'))`,
+		)
 	}()
 
 	if _, err := conn.Exec(ctx, `

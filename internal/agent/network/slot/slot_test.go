@@ -178,7 +178,7 @@ func TestSlotLifecycle(t *testing.T) {
 	tap := ""
 	if err := exec.Command("ip", "tuntap", "add", "dev", "fp-testtap", "mode", "tap").Run(); err == nil {
 		tap = "fp-testtap"
-		defer exec.Command("ip", "link", "del", "fp-testtap").Run()
+		defer func() { _ = exec.Command("ip", "link", "del", "fp-testtap").Run() }()
 	}
 
 	s, err := m.Attach(ctx, "m-test", tap, guestIP)

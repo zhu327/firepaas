@@ -16,10 +16,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/zhu327/firepaas/internal/controlplane/catalog"
 	edgesvc "github.com/zhu327/firepaas/internal/edge"
 	"github.com/zhu327/firepaas/internal/security/mtls"
-	"github.com/redis/go-redis/v9"
 )
 
 const (
@@ -49,7 +49,7 @@ func run() error {
 	}
 
 	rdb := redis.NewClient(&redis.Options{Addr: envOr("FIREPAAS_REDIS_ADDR", "127.0.0.1:6379")})
-	defer rdb.Close()
+	defer func() { _ = rdb.Close() }()
 
 	agentTLS, err := loadAgentTLS()
 	if err != nil {
@@ -65,12 +65,19 @@ func run() error {
 		return fmt.Errorf("FIREPAAS_EDGE_EXTRA_PORTS: %w", err)
 	}
 	edgePorts := listenerPorts(port, tlsPort, extraPorts)
-	tokens := edgesvc.NewTokenClient(envOr("FIREPAAS_API_ADDR", "http://127.0.0.1:8080"), os.Getenv("FIREPAAS_API_TOKEN"), 30*time.Second)
+	tokens := edgesvc.NewTokenClient(
+		envOr("FIREPAAS_API_ADDR", "http://127.0.0.1:8080"),
+		os.Getenv("FIREPAAS_API_TOKEN"),
+		30*time.Second,
+	)
 	tokens.SetStaleWindow(staleWindow)
 	counters := &edgesvc.Counters{}
 	handler := edgesvc.NewHandler(edgesvc.Config{
 		Catalog: catalog.New(rdb), Routes: edgesvc.NewRouteCache(freshTTL, staleWindow), Tokens: tokens,
-		Limiter:  edgesvc.NewRateLimiter(envFloatOr("FIREPAAS_EDGE_RATE_LIMIT", 100), envFloatOr("FIREPAAS_EDGE_RATE_BURST", 200)),
+		Limiter: edgesvc.NewRateLimiter(
+			envFloatOr("FIREPAAS_EDGE_RATE_LIMIT", 100),
+			envFloatOr("FIREPAAS_EDGE_RATE_BURST", 200),
+		),
 		Counters: counters, AgentTLS: agentTLS, HardConcurrency: hardConcurrency, EdgePorts: edgePorts,
 	})
 
@@ -101,14 +108,22 @@ func run() error {
 			return fmt.Errorf("listen extra :%d: %w", p, listenErr)
 		}
 		p := p
-		srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { handler.ServeHTTP(w, edgesvc.WithListenPort(r, p)) })}
+		srv := &http.Server{
+			Handler: http.HandlerFunc(
+				func(w http.ResponseWriter, r *http.Request) { handler.ServeHTTP(w, edgesvc.WithListenPort(r, p)) },
+			),
+		}
 		extraServers = append(extraServers, srv)
 		serve(srv, listener, fmt.Sprintf("edge extra serve port=%d", p))
 	}
 
 	var tlsServer *http.Server
 	if tlsEnabled {
-		tlsCfg := &tls.Config{Certificates: clientCerts, MinVersion: tls.VersionTLS12, NextProtos: []string{"h2", "http/1.1"}}
+		tlsCfg := &tls.Config{
+			Certificates: clientCerts,
+			MinVersion:   tls.VersionTLS12,
+			NextProtos:   []string{"h2", "http/1.1"},
+		}
 		listener, listenErr := net.Listen("tcp", tlsPort)
 		if listenErr != nil {
 			return fmt.Errorf("listen %s: %w", tlsPort, listenErr)
@@ -130,7 +145,13 @@ func run() error {
 }
 
 func loadAgentTLS() (*tls.Config, error) {
-	cert, key, ca := os.Getenv("FIREPAAS_EDGE_TLS_CERT"), os.Getenv("FIREPAAS_EDGE_TLS_KEY"), os.Getenv("FIREPAAS_EDGE_TLS_CA")
+	cert, key, ca := os.Getenv(
+		"FIREPAAS_EDGE_TLS_CERT",
+	), os.Getenv(
+		"FIREPAAS_EDGE_TLS_KEY",
+	), os.Getenv(
+		"FIREPAAS_EDGE_TLS_CA",
+	)
 	if cert == "" || key == "" || ca == "" {
 		return nil, nil
 	}
@@ -147,7 +168,9 @@ func loadServerCertificates(tlsPort string) ([]tls.Certificate, error) {
 		return nil, errors.New("FIREPAAS_EDGE_SERVER_CERT and FIREPAAS_EDGE_SERVER_KEY must be set together")
 	}
 	if tlsPort != "" && cert == "" && !isTruthy(os.Getenv("FIREPAAS_ALLOW_INSECURE_DEV")) {
-		return nil, errors.New("public edge TLS requires FIREPAAS_EDGE_SERVER_CERT/KEY (set FIREPAAS_ALLOW_INSECURE_DEV=true only for local development)")
+		return nil, errors.New(
+			"public edge TLS requires FIREPAAS_EDGE_SERVER_CERT/KEY (set FIREPAAS_ALLOW_INSECURE_DEV=true only for local development)",
+		)
 	}
 	if cert == "" {
 		return nil, nil
@@ -185,6 +208,7 @@ func serve(server *http.Server, listener net.Listener, label string) {
 		}
 	}()
 }
+
 func redirectHandler(tlsPort string) http.Handler {
 	suffix := ""
 	if p, err := strconv.Atoi(strings.TrimPrefix(tlsPort, ":")); err == nil && p != 443 {
@@ -199,6 +223,7 @@ func redirectHandler(tlsPort string) http.Handler {
 		http.Redirect(w, r, "https://"+stripPort(r.Host)+suffix+r.URL.RequestURI(), http.StatusPermanentRedirect)
 	})
 }
+
 func listenerPorts(port, tlsPort string, extra []int) map[int]bool {
 	out := map[int]bool{}
 	for _, raw := range []string{port, tlsPort} {
@@ -211,6 +236,7 @@ func listenerPorts(port, tlsPort string, extra []int) map[int]bool {
 	}
 	return out
 }
+
 func parseExtraPorts(raw string) ([]int, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -241,6 +267,7 @@ func parseExtraPorts(raw string) ([]int, error) {
 	}
 	return out, nil
 }
+
 func stripPort(hostport string) string {
 	host, _, err := net.SplitHostPort(hostport)
 	if err != nil {
@@ -248,16 +275,19 @@ func stripPort(hostport string) string {
 	}
 	return host
 }
+
 func isTruthy(v string) bool {
 	b, err := strconv.ParseBool(strings.TrimSpace(v))
 	return err == nil && b
 }
+
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}
 	return def
 }
+
 func envDurOr(key string, def time.Duration) time.Duration {
 	if v := os.Getenv(key); v != "" {
 		if d, e := time.ParseDuration(v); e == nil && d > 0 {
@@ -266,6 +296,7 @@ func envDurOr(key string, def time.Duration) time.Duration {
 	}
 	return def
 }
+
 func envFloatOr(key string, def float64) float64 {
 	if v := os.Getenv(key); v != "" {
 		var f float64

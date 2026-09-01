@@ -26,7 +26,9 @@ var (
 	urlPattern = regexp.MustCompile(`(?i)https?://[^\s"'<>]+`)
 	// Error strings commonly flatten structured fields as key=value or key: value.
 	// Keep the key for diagnosis while removing its value.
-	sensitiveAssignmentPattern = regexp.MustCompile(`(?i)(source[_-]?url|authorization|password|api[_-]?key|bearer|token)\s*[:=]\s*[^\s,;]+`)
+	sensitiveAssignmentPattern = regexp.MustCompile(
+		`(?i)(source[_-]?url|authorization|password|api[_-]?key|bearer|token)\s*[:=]\s*[^\s,;]+`,
+	)
 )
 
 // RedactText removes URL-bearing and common flattened secret values from

@@ -27,7 +27,8 @@ func TestResolveServices(t *testing.T) {
 		t.Fatalf("services order/content wrong: %+v", svcs)
 	}
 	// 非 8080 主端口是合法的；create handler 仅在没有 services 时默认 8080。
-	if _, port, err := resolveServices([]serviceBody{{Name: "http", InternalPort: 8081}}, 0); err != nil || port != 8081 {
+	if _, port, err := resolveServices([]serviceBody{{Name: "http", InternalPort: 8081}}, 0); err != nil ||
+		port != 8081 {
 		t.Fatalf("non-8080 primary service: port=%d err=%v", port, err)
 	}
 

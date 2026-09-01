@@ -20,10 +20,10 @@ import (
 	"sync"
 	"time"
 
+	guestpb "github.com/kernel/hypeman/lib/guest"
 	"github.com/zhu327/firepaas/internal/agent/machine"
 	"github.com/zhu327/firepaas/internal/agent/mutation"
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
-	guestpb "github.com/kernel/hypeman/lib/guest"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -288,7 +288,10 @@ func (s *Server) Exec(stream pb.MachineService_ExecServer) error {
 		return status.Error(codes.InvalidArgument, "first frame must be open")
 	}
 	if open.MachineId == "" || open.ExecutionId == "" || open.OperationId == "" || len(open.Command) == 0 {
-		return status.Error(codes.InvalidArgument, "open.machine_id, open.execution_id, open.operation_id and open.command are required")
+		return status.Error(
+			codes.InvalidArgument,
+			"open.machine_id, open.execution_id, open.operation_id and open.command are required",
+		)
 	}
 	requestHash := hashRequest(open)
 
@@ -299,7 +302,11 @@ func (s *Server) Exec(stream pb.MachineService_ExecServer) error {
 	defer release()
 
 	created, _ := json.Marshal(map[string]string{"status": "created", "execution_id": open.ExecutionId})
-	claimed, claimErr := mutation.ClaimExec(s.mutations, mutation.Identity{OperationID: open.OperationId, MachineID: open.MachineId, RequestHash: requestHash}, created)
+	claimed, claimErr := mutation.ClaimExec(
+		s.mutations,
+		mutation.Identity{OperationID: open.OperationId, MachineID: open.MachineId, RequestHash: requestHash},
+		created,
+	)
 	if claimErr != nil {
 		return status.Error(codes.AlreadyExists, claimErr.Error())
 	}
@@ -319,7 +326,7 @@ func (s *Server) Exec(stream pb.MachineService_ExecServer) error {
 	sender := &execSender{stream: stream}
 	budget := &byteBudget{limit: s.runtimeLimits.maxBytes}
 	stdinR, stdinW := io.Pipe()
-	defer stdinW.Close()
+	defer func() { _ = stdinW.Close() }()
 	resizeCh := make(chan *guestpb.WindowSize, 8)
 
 	// 空闲看门狗（ADR-0025 §6）：任何方向的活动都会重置；超时取消会话。
@@ -350,7 +357,8 @@ func (s *Server) Exec(stream pb.MachineService_ExecServer) error {
 				timer.Reset(s.runtimeLimits.idleTimeout)
 			case <-timer.C:
 				_ = sender.send(&pb.ExecOutput{Frame: &pb.ExecOutput_Error{
-					Error: fmt.Sprintf("exec session idle timeout (%s)", s.runtimeLimits.idleTimeout)}})
+					Error: fmt.Sprintf("exec session idle timeout (%s)", s.runtimeLimits.idleTimeout),
+				}})
 				cancel()
 				return
 			}
@@ -359,7 +367,7 @@ func (s *Server) Exec(stream pb.MachineService_ExecServer) error {
 
 	// 输入转发 goroutine：stdin/resize/signal 帧 → guest 流桥接。
 	go func() {
-		defer stdinW.Close()
+		defer func() { _ = stdinW.Close() }()
 		for {
 			in, rerr := stream.Recv()
 			if rerr != nil {
@@ -386,14 +394,16 @@ func (s *Server) Exec(stream pb.MachineService_ExecServer) error {
 				// Shutdown RPC，无 exec 子进程 signal。不能借道 Shutdown——
 				// 那会杀死整个 VM。明确拒绝并保留契约字段。
 				_ = sender.send(&pb.ExecOutput{Frame: &pb.ExecOutput_Error{
-					Error: fmt.Sprintf("signal %d not supported: hypeman guest channel has no per-exec signal RPC (upstream gap, see docs/v1.2-implementation-notes.md)", f.Signal)}})
-				stdinW.Close()
+					Error: fmt.Sprintf("signal %d not supported: hypeman guest channel has no per-exec signal RPC (upstream gap, see docs/v1.2-implementation-notes.md)", f.Signal),
+				}})
+				_ = stdinW.Close()
 				return
 			case *pb.ExecInput_Open:
 				// 会话建立后不允许第二个 open 帧。
 				_ = sender.send(&pb.ExecOutput{Frame: &pb.ExecOutput_Error{
-					Error: "duplicate open frame"}})
-				stdinW.Close()
+					Error: "duplicate open frame",
+				}})
+				_ = stdinW.Close()
 				return
 			}
 		}
@@ -441,7 +451,10 @@ func (s *Server) CopyTo(stream pb.MachineService_CopyToServer) error {
 	}
 	open := first.GetOpen()
 	if open == nil || open.MachineId == "" || open.ExecutionId == "" || open.Generation == 0 || open.OperationId == "" {
-		return status.Error(codes.InvalidArgument, "first frame must be open with machine_id/execution_id/generation/operation_id")
+		return status.Error(
+			codes.InvalidArgument,
+			"first frame must be open with machine_id/execution_id/generation/operation_id",
+		)
 	}
 	if err := machine.ValidateGuestFilePath(open.Path); err != nil {
 		return status.Error(codes.InvalidArgument, err.Error())
@@ -496,7 +509,15 @@ func (s *Server) CopyTo(stream pb.MachineService_CopyToServer) error {
 			break
 		}
 		if rerr != nil {
-			s.auditRuntime("cp-to", open.MachineId, open.ExecutionId, pathDigest(open.Path), total, time.Since(start), rerr)
+			s.auditRuntime(
+				"cp-to",
+				open.MachineId,
+				open.ExecutionId,
+				pathDigest(open.Path),
+				total,
+				time.Since(start),
+				rerr,
+			)
 			return status.Error(codes.Internal, rerr.Error())
 		}
 		if in.GetOpen() != nil {
@@ -518,65 +539,76 @@ func (s *Server) CopyTo(stream pb.MachineService_CopyToServer) error {
 		}
 	}
 	requestHash := hex.EncodeToString(digest.Sum(nil))
-	response, err := mutation.RunCopyTo(s.mutations, mutation.CopyTo[*pb.CopyToResponse]{Lifecycle: mutation.Lifecycle[*pb.CopyToResponse]{
-		Identity: mutation.Identity{OperationID: open.OperationId, MachineID: open.MachineId, ExecutionID: open.ExecutionId, Generation: open.Generation, RequestHash: requestHash},
-		Effect: func() (*pb.CopyToResponse, error) {
-			dialer, err := s.machines.GuestDialer(ctx, open.MachineId, open.ExecutionId)
-			if err != nil {
-				return nil, mapGuestOpError(err)
-			}
-			conn, err := guestpb.GetOrCreateConn(ctx, dialer)
-			if err != nil {
-				return nil, status.Error(codes.Internal, err.Error())
-			}
-			gstream, err := guestpb.NewGuestServiceClient(conn).CopyToGuest(ctx)
-			if err != nil {
-				return nil, status.Error(codes.Internal, err.Error())
-			}
-			mode := open.Mode
-			if mode == 0 {
-				mode = 0644
-			}
-			if err := gstream.Send(&guestpb.CopyToGuestRequest{Request: &guestpb.CopyToGuestRequest_Start{Start: &guestpb.CopyToGuestStart{Path: open.Path, Mode: mode}}}); err != nil {
-				return nil, status.Error(codes.Internal, err.Error())
-			}
-			if _, err := payload.Seek(0, io.SeekStart); err != nil {
-				return nil, status.Error(codes.Internal, err.Error())
-			}
-			buf := make([]byte, 32*1024)
-			for {
-				n, readErr := payload.Read(buf)
-				if n > 0 {
-					if err := gstream.Send(&guestpb.CopyToGuestRequest{Request: &guestpb.CopyToGuestRequest_Data{Data: buf[:n]}}); err != nil {
-						return nil, status.Error(codes.Internal, err.Error())
+	response, err := mutation.RunCopyTo(
+		s.mutations,
+		mutation.CopyTo[*pb.CopyToResponse]{Lifecycle: mutation.Lifecycle[*pb.CopyToResponse]{
+			Identity: mutation.Identity{
+				OperationID: open.OperationId,
+				MachineID:   open.MachineId,
+				ExecutionID: open.ExecutionId,
+				Generation:  open.Generation,
+				RequestHash: requestHash,
+			},
+			Effect: func() (*pb.CopyToResponse, error) {
+				dialer, err := s.machines.GuestDialer(ctx, open.MachineId, open.ExecutionId)
+				if err != nil {
+					return nil, mapGuestOpError(err)
+				}
+				conn, err := guestpb.GetOrCreateConn(ctx, dialer)
+				if err != nil {
+					return nil, status.Error(codes.Internal, err.Error())
+				}
+				gstream, err := guestpb.NewGuestServiceClient(conn).CopyToGuest(ctx)
+				if err != nil {
+					return nil, status.Error(codes.Internal, err.Error())
+				}
+				mode := open.Mode
+				if mode == 0 {
+					mode = 0o644
+				}
+				if err := gstream.Send(&guestpb.CopyToGuestRequest{Request: &guestpb.CopyToGuestRequest_Start{Start: &guestpb.CopyToGuestStart{Path: open.Path, Mode: mode}}}); err != nil {
+					return nil, status.Error(codes.Internal, err.Error())
+				}
+				if _, err := payload.Seek(0, io.SeekStart); err != nil {
+					return nil, status.Error(codes.Internal, err.Error())
+				}
+				buf := make([]byte, 32*1024)
+				for {
+					n, readErr := payload.Read(buf)
+					if n > 0 {
+						if err := gstream.Send(&guestpb.CopyToGuestRequest{Request: &guestpb.CopyToGuestRequest_Data{Data: buf[:n]}}); err != nil {
+							return nil, status.Error(codes.Internal, err.Error())
+						}
+					}
+					if readErr == io.EOF {
+						break
+					}
+					if readErr != nil {
+						return nil, status.Error(codes.Internal, readErr.Error())
 					}
 				}
-				if readErr == io.EOF {
-					break
+				if err := gstream.Send(&guestpb.CopyToGuestRequest{Request: &guestpb.CopyToGuestRequest_End{End: &guestpb.CopyToGuestEnd{}}}); err != nil {
+					return nil, status.Error(codes.Internal, err.Error())
 				}
-				if readErr != nil {
-					return nil, status.Error(codes.Internal, readErr.Error())
+				guestResp, err := gstream.CloseAndRecv()
+				if err != nil {
+					return nil, status.Error(codes.Internal, err.Error())
 				}
-			}
-			if err := gstream.Send(&guestpb.CopyToGuestRequest{Request: &guestpb.CopyToGuestRequest_End{End: &guestpb.CopyToGuestEnd{}}}); err != nil {
-				return nil, status.Error(codes.Internal, err.Error())
-			}
-			guestResp, err := gstream.CloseAndRecv()
-			if err != nil {
-				return nil, status.Error(codes.Internal, err.Error())
-			}
-			if !guestResp.Success {
-				return nil, status.Error(codes.Internal, guestResp.Error)
-			}
-			return &pb.CopyToResponse{BytesWritten: uint64(total)}, nil
-		},
-		Codec: mutation.Codec[*pb.CopyToResponse]{Encode: func(v *pb.CopyToResponse) (json.RawMessage, error) { return json.Marshal(v) }, Decode: func(raw json.RawMessage) (*pb.CopyToResponse, error) {
-			var v pb.CopyToResponse
-			err := json.Unmarshal(raw, &v)
-			return &v, err
+				if !guestResp.Success {
+					return nil, status.Error(codes.Internal, guestResp.Error)
+				}
+				return &pb.CopyToResponse{BytesWritten: uint64(total)}, nil
+			},
+			Codec: mutation.Codec[*pb.CopyToResponse]{
+				Encode: func(v *pb.CopyToResponse) (json.RawMessage, error) { return json.Marshal(v) },
+				Decode: func(raw json.RawMessage) (*pb.CopyToResponse, error) {
+					var v pb.CopyToResponse
+					err := json.Unmarshal(raw, &v)
+					return &v, err
+				},
+			},
 		}},
-	}})
-
+	)
 	if err != nil {
 		err = mutationError(err)
 		s.auditRuntime("cp-to", open.MachineId, open.ExecutionId, pathDigest(open.Path), total, time.Since(start), err)
@@ -617,7 +649,8 @@ func (s *Server) CopyFrom(req *pb.CopyFromRequest, stream pb.MachineService_Copy
 	}
 	client := guestpb.NewGuestServiceClient(conn)
 	gstream, err := client.CopyFromGuest(ctx, &guestpb.CopyFromGuestRequest{
-		Path: req.Path, FollowLinks: false})
+		Path: req.Path, FollowLinks: false,
+	})
 	if err != nil {
 		return status.Error(codes.Internal, err.Error())
 	}
@@ -630,7 +663,15 @@ func (s *Server) CopyFrom(req *pb.CopyFromRequest, stream pb.MachineService_Copy
 			break
 		}
 		if rerr != nil {
-			s.auditRuntime("cp-from", req.MachineId, req.ExecutionId, pathDigest(req.Path), total, time.Since(start), rerr)
+			s.auditRuntime(
+				"cp-from",
+				req.MachineId,
+				req.ExecutionId,
+				pathDigest(req.Path),
+				total,
+				time.Since(start),
+				rerr,
+			)
 			return status.Error(codes.Internal, rerr.Error())
 		}
 		touch()
@@ -649,7 +690,8 @@ func (s *Server) CopyFrom(req *pb.CopyFromRequest, stream pb.MachineService_Copy
 				return status.Error(codes.InvalidArgument, "path is a symlink; symlink follow disabled")
 			}
 			if err := stream.Send(&pb.CopyFromResponse{Frame: &pb.CopyFromResponse_Header{
-				Header: &pb.CopyFromHeader{Path: r.Header.Path, Size: uint64(r.Header.Size), Mode: r.Header.Mode}}}); err != nil {
+				Header: &pb.CopyFromHeader{Path: r.Header.Path, Size: uint64(r.Header.Size), Mode: r.Header.Mode},
+			}}); err != nil {
 				return err
 			}
 			headerSent = true

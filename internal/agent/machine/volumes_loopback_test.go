@@ -16,7 +16,6 @@ import (
 	"testing"
 
 	"github.com/kernel/hypeman/lib/instances"
-	"github.com/kernel/hypeman/lib/tags"
 	"github.com/kernel/hypeman/lib/volumes"
 
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
@@ -24,7 +23,6 @@ import (
 
 type loopbackVolumes struct {
 	created   []volumes.CreateVolumeFromArchiveRequest
-	tags      tags.Tags
 	deleted   []string
 	deleteErr error
 }
@@ -33,7 +31,11 @@ func (v *loopbackVolumes) CreateVolume(context.Context, volumes.CreateVolumeRequ
 	return &volumes.Volume{Id: "vol-lb", SizeGb: 1}, nil
 }
 
-func (v *loopbackVolumes) CreateVolumeFromArchive(_ context.Context, req volumes.CreateVolumeFromArchiveRequest, _ io.Reader) (*volumes.Volume, error) {
+func (v *loopbackVolumes) CreateVolumeFromArchive(
+	_ context.Context,
+	req volumes.CreateVolumeFromArchiveRequest,
+	_ io.Reader,
+) (*volumes.Volume, error) {
 	v.created = append(v.created, req)
 	return &volumes.Volume{Id: *req.Id, SizeGb: req.SizeGb, Tags: req.Tags}, nil
 }
@@ -60,7 +62,12 @@ type loopbackInstances struct {
 	fakeInstances
 }
 
-func (v *loopbackInstances) AttachVolume(context.Context, string, string, instances.AttachVolumeRequest) (*instances.Instance, error) {
+func (v *loopbackInstances) AttachVolume(
+	context.Context,
+	string,
+	string,
+	instances.AttachVolumeRequest,
+) (*instances.Instance, error) {
 	return nil, instances.ErrNotSupported
 }
 
@@ -72,7 +79,11 @@ func (v *loopbackInstances) StopInstance(context.Context, string) (*instances.In
 	return nil, instances.ErrNotSupported
 }
 
-func (v *loopbackInstances) StartInstance(context.Context, string, instances.StartInstanceRequest) (*instances.Instance, error) {
+func (v *loopbackInstances) StartInstance(
+	context.Context,
+	string,
+	instances.StartInstanceRequest,
+) (*instances.Instance, error) {
 	return nil, instances.ErrNotSupported
 }
 

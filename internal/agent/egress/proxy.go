@@ -190,15 +190,18 @@ func (p *Proxy) stage(machineID, executionID, projectID, appID, guestIP string, 
 	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	if existing := p.byMach[machineID]; existing != nil && existing.ExecutionID == executionID && existing.Policy.Generation > policy.Generation {
+	if existing := p.byMach[machineID]; existing != nil && existing.ExecutionID == executionID &&
+		existing.Policy.Generation > policy.Generation {
 		return nil, fmt.Errorf("egress policy generation fencing: machine %s has newer policy generation %d, reject %d",
 			machineID, existing.Policy.Generation, policy.Generation)
 	}
 	if old := p.byIP[addr]; addr.IsValid() && old != nil && old.MachineID != machineID {
 		return nil, fmt.Errorf("egress bind ip: guest ip %s already bound to machine %s", guestIP, old.MachineID)
 	}
-	return &stagedEntry{entry: &Entry{MachineID: machineID, ExecutionID: executionID,
-		ProjectID: projectID, AppID: appID, Policy: policy, bucket: map[string]*bucketStat{}}, guestIP: addr}, nil
+	return &stagedEntry{entry: &Entry{
+		MachineID: machineID, ExecutionID: executionID,
+		ProjectID: projectID, AppID: appID, Policy: policy, bucket: map[string]*bucketStat{},
+	}, guestIP: addr}, nil
 }
 
 // current returns a staging-compatible snapshot of the currently published entry.
@@ -224,7 +227,8 @@ func (p *Proxy) swap(staged *stagedEntry) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	e := staged.entry
-	if existing := p.byMach[e.MachineID]; existing != nil && existing.ExecutionID == e.ExecutionID && existing.Policy.Generation > e.Policy.Generation {
+	if existing := p.byMach[e.MachineID]; existing != nil && existing.ExecutionID == e.ExecutionID &&
+		existing.Policy.Generation > e.Policy.Generation {
 		return fmt.Errorf("egress policy generation changed while staged")
 	}
 	if old := p.byIP[staged.guestIP]; staged.guestIP.IsValid() && old != nil && old.MachineID != e.MachineID {
@@ -305,15 +309,6 @@ func (p *Proxy) Unregister(machineID string) error {
 	return nil
 }
 
-func (e *Entry) reset() {
-	e.allowed.Store(0)
-	e.denied.Store(0)
-	e.limitReject.Store(0)
-	e.mu.Lock()
-	e.bucket = map[string]*bucketStat{}
-	e.mu.Unlock()
-}
-
 func (e *Entry) recordDeny(protocol string, port uint32) {
 	e.denied.Add(1)
 	key := protocol + ":" + strconv.FormatUint(uint64(port), 10)
@@ -371,7 +366,7 @@ func (p *Proxy) entryForIP(ip net.IP) *Entry {
 
 // handle 处理一条代理连接。idx: 0=80(HTTP), 1=443(TLS)。
 func (p *Proxy) handle(ctx context.Context, conn net.Conn, idx int) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	remote := conn.RemoteAddr()
 	tcpAddr, ok := remote.(*net.TCPAddr)
 	if !ok {
@@ -456,7 +451,7 @@ func (p *Proxy) handle(ctx context.Context, conn net.Conn, idx int) {
 		p.recordAudit(entry, record)
 		return
 	}
-	defer upstream.Close()
+	defer func() { _ = upstream.Close() }()
 	entry.allowed.Add(1)
 	p.recordAudit(entry, record)
 	_ = relay(upstream, conn, br, prefix)
@@ -506,13 +501,17 @@ func (p *Proxy) dialFor(policy *Policy, host string, port uint32, _ []byte) (net
 	}
 	addrs, err := p.resolver.Resolve(context.Background(), host)
 	if err != nil {
-		return nil, Decision{Allow: false, MatchType: "resolution_failed",
-			Reason: "trusted resolution failed: " + err.Error()}
+		return nil, Decision{
+			Allow: false, MatchType: "resolution_failed",
+			Reason: "trusted resolution failed: " + err.Error(),
+		}
 	}
 	public := p.reserved.FilterPublic(addrs)
 	if len(public) == 0 {
-		return nil, Decision{Allow: false, MatchType: "reserved",
-			Reason: "all resolved addresses are in reserved segments"}
+		return nil, Decision{
+			Allow: false, MatchType: "reserved",
+			Reason: "all resolved addresses are in reserved segments",
+		}
 	}
 	decision := policy.DecideForProxied(host, public)
 	if !decision.Allow {
@@ -520,8 +519,10 @@ func (p *Proxy) dialFor(policy *Policy, host string, port uint32, _ []byte) (net
 	}
 	conn, err := dialFirst(public, port)
 	if err != nil {
-		return nil, Decision{Allow: false, MatchType: "dial_failed",
-			Reason: "connect to resolved set failed: " + err.Error()}
+		return nil, Decision{
+			Allow: false, MatchType: "dial_failed",
+			Reason: "connect to resolved set failed: " + err.Error(),
+		}
 	}
 	decision.Reason = decision.Reason + " (resolved " + conn.RemoteAddr().(*net.TCPAddr).IP.String() + ")"
 	return conn, decision

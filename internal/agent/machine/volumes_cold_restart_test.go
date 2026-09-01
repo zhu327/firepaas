@@ -29,7 +29,11 @@ func (f *coldVolumeInstances) StopInstance(_ context.Context, id string) (*insta
 	return f.created, nil
 }
 
-func (f *coldVolumeInstances) StartInstance(_ context.Context, id string, _ instances.StartInstanceRequest) (*instances.Instance, error) {
+func (f *coldVolumeInstances) StartInstance(
+	_ context.Context,
+	id string,
+	_ instances.StartInstanceRequest,
+) (*instances.Instance, error) {
 	f.calls = append(f.calls, "start")
 	if f.created == nil || f.created.Id != id {
 		return nil, instances.ErrNotFound
@@ -42,7 +46,11 @@ func (f *coldVolumeInstances) StartInstance(_ context.Context, id string, _ inst
 	return f.created, nil
 }
 
-func (f *coldVolumeInstances) AttachVolume(_ context.Context, id, volumeID string, req instances.AttachVolumeRequest) (*instances.Instance, error) {
+func (f *coldVolumeInstances) AttachVolume(
+	_ context.Context,
+	id, volumeID string,
+	req instances.AttachVolumeRequest,
+) (*instances.Instance, error) {
 	f.calls = append(f.calls, "attach")
 	if f.created.State != instances.StateStopped {
 		return nil, instances.ErrInvalidState
@@ -74,9 +82,15 @@ type coldVolumeProvider struct{ volume volumes.Volume }
 func (p *coldVolumeProvider) CreateVolume(context.Context, volumes.CreateVolumeRequest) (*volumes.Volume, error) {
 	return &p.volume, nil
 }
-func (p *coldVolumeProvider) CreateVolumeFromArchive(context.Context, volumes.CreateVolumeFromArchiveRequest, io.Reader) (*volumes.Volume, error) {
+
+func (p *coldVolumeProvider) CreateVolumeFromArchive(
+	context.Context,
+	volumes.CreateVolumeFromArchiveRequest,
+	io.Reader,
+) (*volumes.Volume, error) {
 	return &p.volume, nil
 }
+
 func (p *coldVolumeProvider) GetVolume(context.Context, string) (*volumes.Volume, error) {
 	return &p.volume, nil
 }
@@ -123,7 +137,11 @@ func TestAttachVolumeStartFailureRestoresAttachmentAndRunningState(t *testing.T)
 		t.Fatal("expected the failed restart to be reported")
 	}
 	if manager.created.State != instances.StateRunning || len(manager.created.Volumes) != 0 {
-		t.Fatalf("compensation did not restore source: state=%s volumes=%v", manager.created.State, manager.created.Volumes)
+		t.Fatalf(
+			"compensation did not restore source: state=%s volumes=%v",
+			manager.created.State,
+			manager.created.Volumes,
+		)
 	}
 	want := []string{"stop", "attach", "start", "stop", "detach", "start"}
 	if !slices.Equal(manager.calls, want) {
@@ -144,7 +162,11 @@ func TestDetachVolumeStartFailureRestoresAttachmentAndRunningState(t *testing.T)
 		t.Fatal("expected the failed restart to be reported")
 	}
 	if manager.created.State != instances.StateRunning || len(manager.created.Volumes) != 1 {
-		t.Fatalf("compensation did not restore source: state=%s volumes=%v", manager.created.State, manager.created.Volumes)
+		t.Fatalf(
+			"compensation did not restore source: state=%s volumes=%v",
+			manager.created.State,
+			manager.created.Volumes,
+		)
 	}
 	got := manager.created.Volumes[0]
 	if got.MountPath != "/dataset" || !got.Readonly || !got.Overlay || got.OverlaySize != 4096 {

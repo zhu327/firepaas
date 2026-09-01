@@ -73,14 +73,20 @@ func TestEnsureSecretLeaseReuseAndConflict(t *testing.T) {
 		t.Fatalf("expected reuse, got %s vs %s", l1.ID, l2.ID)
 	}
 	for _, tc := range []struct{ op, hash string }{{"op-b", "hash-1"}, {"op-a", "hash-2"}} {
-		if _, err := s.EnsureSecretLease(ctx, project, machine, exec, 2, tc.op, tc.hash, time.Minute); !errors.Is(err, ErrSecretLeaseConflict) {
+		if _, err := s.EnsureSecretLease(ctx, project, machine, exec, 2, tc.op, tc.hash, time.Minute); !errors.Is(
+			err,
+			ErrSecretLeaseConflict,
+		) {
 			t.Fatalf("binding mismatch must conflict, got %v", err)
 		}
 	}
 	if _, err := s.pool.Exec(ctx, `UPDATE secret_delivery_leases SET state='EXPIRED' WHERE id=$1`, l1.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.EnsureSecretLease(ctx, project, machine, exec, 2, "op-new", "hash-new", time.Minute); !errors.Is(err, ErrSecretLeaseConflict) {
+	if _, err := s.EnsureSecretLease(ctx, project, machine, exec, 2, "op-new", "hash-new", time.Minute); !errors.Is(
+		err,
+		ErrSecretLeaseConflict,
+	) {
 		t.Fatalf("terminal history must prohibit reissue, got %v", err)
 	}
 }
@@ -105,9 +111,13 @@ func TestSecretCreateUncertainAtomicallyEnqueuesCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	cleanupID := "op-secret-cleanup-" + opID
-	cleanup := []byte(`{"machine_id":"m-uncertain","execution_id":"exec-uncertain","generation":"2","operation_id":"` + cleanupID + `"}`)
-	op := Operation{ID: opID, ProjectID: project, MachineID: machine, ExecutionID: exec,
-		Generation: 2, DispatchNodeID: "node-1"}
+	cleanup := []byte(
+		`{"machine_id":"m-uncertain","execution_id":"exec-uncertain","generation":"2","operation_id":"` + cleanupID + `"}`,
+	)
+	op := Operation{
+		ID: opID, ProjectID: project, MachineID: machine, ExecutionID: exec,
+		Generation: 2, DispatchNodeID: "node-1",
+	}
 	if err := s.MarkSecretCreateUncertainAndEnqueueCleanup(ctx, op, lease, cleanupID, cleanup, "ambiguous"); err != nil {
 		t.Fatal(err)
 	}

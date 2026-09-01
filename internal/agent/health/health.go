@@ -390,7 +390,12 @@ func toHypemanPolicy(pj *PolicyJSON) *healthcheck.Policy {
 
 // readinessFromRuntime 把 hypeman Runtime 映射为 proto readiness：
 // healthy→READY；unhealthy→NOT_READY；starting/unknown→UNKNOWN。
-func readinessFromRuntime(policy *healthcheck.Policy, inst healthcheck.Instance, runtime *healthcheck.Runtime, now time.Time) pb.MachineReadiness {
+func readinessFromRuntime(
+	policy *healthcheck.Policy,
+	inst healthcheck.Instance,
+	runtime *healthcheck.Runtime,
+	now time.Time,
+) pb.MachineReadiness {
 	snap := healthcheck.Snapshot(policy, inst.State, runtime)
 	switch snap.Status {
 	case healthcheck.StatusHealthy:
@@ -477,7 +482,9 @@ func (t *Tracker) SetRunner(r healthcheck.ProbeRunner) { t.runner = r }
 // recordingDialContext returns a DialContext that records before SYN and
 // releases exactly when the resulting socket closes. No timer is involved:
 // keepalive probes stay filtered while alive, and a later port reuse is clean.
-func (r *RecordingRunner) recordingDialContext(reg *probeflow.Registry) func(ctx context.Context, network, addr string) (net.Conn, error) {
+func (r *RecordingRunner) recordingDialContext(
+	reg *probeflow.Registry,
+) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		dstHost, dstPortStr, err := net.SplitHostPort(addr)
 		if err != nil {
@@ -543,7 +550,11 @@ func (c *recordedConn) Close() error {
 }
 
 // Check 实现 ProbeRunner：HTTP/TCP 走登记型 dialer；EXEC 透传 inner。
-func (r *RecordingRunner) Check(ctx context.Context, inst healthcheck.Instance, policy *healthcheck.Policy) healthcheck.ProbeResult {
+func (r *RecordingRunner) Check(
+	ctx context.Context,
+	inst healthcheck.Instance,
+	policy *healthcheck.Policy,
+) healthcheck.ProbeResult {
 	if policy != nil {
 		switch policy.Type {
 		case healthcheck.TypeHTTP:
@@ -555,7 +566,11 @@ func (r *RecordingRunner) Check(ctx context.Context, inst healthcheck.Instance, 
 	return r.inner.Check(ctx, inst, policy)
 }
 
-func (r *RecordingRunner) checkHTTP(ctx context.Context, inst healthcheck.Instance, check healthcheck.HTTPCheck) healthcheck.ProbeResult {
+func (r *RecordingRunner) checkHTTP(
+	ctx context.Context,
+	inst healthcheck.Instance,
+	check healthcheck.HTTPCheck,
+) healthcheck.ProbeResult {
 	if !inst.NetworkEnabled || inst.IP == "" {
 		return healthcheck.ProbeResult{Success: false, Error: "instance has no network address"}
 	}
@@ -575,7 +590,7 @@ func (r *RecordingRunner) checkHTTP(ctx context.Context, inst healthcheck.Instan
 	// Close rather than drain/reuse: the registry is socket-lifecycle based, and
 	// one short-lived connection per readiness probe prevents both stale flow
 	// records and an unrelated long-lived conntrack activity signal.
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != check.ExpectedStatus {
 		return healthcheck.ProbeResult{
 			Success: false,
@@ -585,7 +600,11 @@ func (r *RecordingRunner) checkHTTP(ctx context.Context, inst healthcheck.Instan
 	return healthcheck.ProbeResult{Success: true}
 }
 
-func (r *RecordingRunner) checkTCP(ctx context.Context, inst healthcheck.Instance, check healthcheck.TCPCheck) healthcheck.ProbeResult {
+func (r *RecordingRunner) checkTCP(
+	ctx context.Context,
+	inst healthcheck.Instance,
+	check healthcheck.TCPCheck,
+) healthcheck.ProbeResult {
 	if !inst.NetworkEnabled || inst.IP == "" {
 		return healthcheck.ProbeResult{Success: false, Error: "instance has no network address"}
 	}

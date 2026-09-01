@@ -24,6 +24,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	agentv1 "github.com/zhu327/firepaas/internal/contracts/agentv1"
 	"github.com/zhu327/firepaas/internal/controlplane/agentclient"
 	"github.com/zhu327/firepaas/internal/controlplane/apikeys"
@@ -42,7 +43,6 @@ import (
 	"github.com/zhu327/firepaas/internal/observability/metrics"
 	"github.com/zhu327/firepaas/internal/scheduler"
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
-	"github.com/redis/go-redis/v9"
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
@@ -115,7 +115,7 @@ func run() error {
 	}
 
 	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
-	defer rdb.Close()
+	defer func() { _ = rdb.Close() }()
 	cat := catalog.New(rdb)
 	resv := reservations.New(rdb, 120*time.Second)
 	reg := metrics.New()
@@ -224,13 +224,18 @@ func run() error {
 	}
 	images := imagepolicy.NewWithOptions(envOr("FIREPAAS_REGISTRY_ALLOWLIST", ""),
 		isTruthy(envOr("FIREPAAS_IMAGE_REQUIRE_DIGEST", "false")))
-	api := &API{store: st, apiToken: apiToken, authDisabled: authDisabled,
+	api := &API{
+		store: st, apiToken: apiToken, authDisabled: authDisabled,
 		images: images, appCommands: appcommand.New(st, images),
 		secrets: secretsMgr, traffic: trafficSigner, apiKeys: apiKeyMgr,
 		cat: cat, metrics: reg, kicker: kicker, rgw: rgw,
-		limiter: apiLimiter, sessions: newSessionCounter()}
+		limiter: apiLimiter, sessions: newSessionCounter(),
+	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/health", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) })
+	mux.HandleFunc(
+		"GET /v1/health",
+		func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) },
+	)
 	mux.HandleFunc("POST /v1/machines", api.auth(api.createMachine))
 	mux.HandleFunc("GET /v1/machines", api.auth(api.listMachines))
 	mux.HandleFunc("GET /v1/machines/{id}", api.auth(api.getMachine))
@@ -719,9 +724,11 @@ func (a *API) listEvents(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "project_id query parameter is required")
 		return
 	}
-	f := store.UserEventFilter{ProjectID: project,
-		AppID: r.URL.Query().Get("app_id"), MachineID: r.URL.Query().Get("machine_id"),
-		Type: r.URL.Query().Get("type")}
+	f := store.UserEventFilter{
+		ProjectID: project,
+		AppID:     r.URL.Query().Get("app_id"), MachineID: r.URL.Query().Get("machine_id"),
+		Type: r.URL.Query().Get("type"),
+	}
 	if v := r.URL.Query().Get("before"); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
 			f.Before = n

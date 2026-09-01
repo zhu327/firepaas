@@ -8,9 +8,9 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/zhu327/firepaas/internal/agent/machine"
 	"github.com/kernel/hypeman/lib/images"
 	"github.com/kernel/hypeman/lib/instances"
+	"github.com/zhu327/firepaas/internal/agent/machine"
 )
 
 type testInstances struct {
@@ -21,9 +21,11 @@ type testInstances struct {
 func (m *testInstances) CreateInstance(context.Context, instances.CreateInstanceRequest) (*instances.Instance, error) {
 	return nil, errors.New("unused")
 }
+
 func (m *testInstances) ListInstances(context.Context, *instances.ListInstancesFilter) ([]instances.Instance, error) {
 	return nil, nil
 }
+
 func (m *testInstances) GetInstance(context.Context, string) (*instances.Instance, error) {
 	if m.err != nil {
 		return nil, m.err
@@ -31,9 +33,15 @@ func (m *testInstances) GetInstance(context.Context, string) (*instances.Instanc
 	return m.instance, nil
 }
 func (m *testInstances) DeleteInstance(context.Context, string) error { return nil }
-func (m *testInstances) StandbyInstance(context.Context, string, instances.StandbyInstanceRequest) (*instances.Instance, error) {
+
+func (m *testInstances) StandbyInstance(
+	context.Context,
+	string,
+	instances.StandbyInstanceRequest,
+) (*instances.Instance, error) {
 	return nil, errors.New("unused")
 }
+
 func (m *testInstances) RestoreInstance(context.Context, string) (*instances.Instance, error) {
 	return nil, errors.New("unused")
 }
@@ -77,7 +85,7 @@ func TestProxyMarksGuestTransport502Retryable(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, port, err := net.SplitHostPort(listener.Addr().String())
-	listener.Close() // preserve a known-unused endpoint for the proxy transport.
+	_ = listener.Close() // preserve a known-unused endpoint for the proxy transport.
 	if err != nil {
 		t.Fatal(err)
 	}

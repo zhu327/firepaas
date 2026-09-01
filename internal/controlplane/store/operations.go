@@ -23,7 +23,11 @@ const operationTraceColumns = `id, project_id, machine_id, execution_id, generat
 
 // ListOperations 按项目及条件查操作。projectID 是强制租户边界，不能为空。
 // limit<=0 默认 100。
-func (s *Store) ListOperations(ctx context.Context, projectID, machineID, kind, status string, limit int) ([]OperationTrace, error) {
+func (s *Store) ListOperations(
+	ctx context.Context,
+	projectID, machineID, kind, status string,
+	limit int,
+) ([]OperationTrace, error) {
 	if projectID == "" {
 		return nil, errors.New("project_id is required")
 	}

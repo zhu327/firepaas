@@ -42,9 +42,11 @@ func seedIntegrityNode(t *testing.T, s *store.Store, nodeID string, inventoryCap
 func seedIntegritySnapshot(t *testing.T, s *store.Store, project, snapID, nodeID, status string) {
 	t.Helper()
 	ctx := context.Background()
-	if _, err := s.CreateSnapshot(ctx, store.Snapshot{ID: snapID, ProjectID: project,
+	if _, err := s.CreateSnapshot(ctx, store.Snapshot{
+		ID: snapID, ProjectID: project,
 		SourceMachineID: "m-int", SourceExecutionID: "exec-int", SourceGeneration: 1,
-		Kind: "MEMORY", NodeID: nodeID}); err != nil {
+		Kind: "MEMORY", NodeID: nodeID,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if status != "CREATING" {
@@ -79,11 +81,18 @@ func TestReconcileSnapshotIntegrity(t *testing.T) {
 	seedIntegritySnapshot(t, s, project, creating, node.ID, "CREATING")
 
 	now := time.Now().Unix()
-	inv := &pb.ListSnapshotsResponse{Complete: true, ObservationGeneration: 1, ObservedAtUnix: now,
-		Observation: &pb.InventoryObservation{Complete: true, Epoch: "snap-epoch", Generation: 1, ObservedAtUnix: now}, Snapshots: []*pb.SnapshotInfo{
+	inv := &pb.ListSnapshotsResponse{
+		Complete: true, ObservationGeneration: 1, ObservedAtUnix: now,
+		Observation: &pb.InventoryObservation{
+			Complete:       true,
+			Epoch:          "snap-epoch",
+			Generation:     1,
+			ObservedAtUnix: now,
+		}, Snapshots: []*pb.SnapshotInfo{
 			{Id: present, ArtifactSha256: "sha256:int-test", SizeBytes: 4096, Kind: pb.SnapshotKind_SNAPSHOT_MEMORY},
 			{Id: "snap-orphan-1", SizeBytes: 8192}, // 本地 orphan（PG 无行）
-		}}
+		},
+	}
 	c.reconcileSnapshotIntegrity(ctx, node, inv)
 
 	if snap, _ := s.GetSnapshot(ctx, present); snap.Integrity != "METADATA_VERIFIED" || snap.Status != "READY" {
@@ -130,9 +139,23 @@ func TestAuthoritativeInventoryOrderingAndCorruptStickiness(t *testing.T) {
 	seedIntegritySnapshot(t, s, project, "snap-int-order", node.ID, "READY")
 	observation := func(epoch string, generation uint64, checksum string) *pb.ListSnapshotsResponse {
 		now := time.Now().Unix()
-		return &pb.ListSnapshotsResponse{Complete: true, ObservationGeneration: generation, ObservedAtUnix: now,
-			Observation: &pb.InventoryObservation{Complete: true, Epoch: epoch, Generation: generation, ObservedAtUnix: now},
-			Snapshots:   []*pb.SnapshotInfo{{Id: "snap-int-order", ArtifactSha256: checksum, SizeBytes: 4096, Kind: pb.SnapshotKind_SNAPSHOT_MEMORY}}}
+		return &pb.ListSnapshotsResponse{
+			Complete: true, ObservationGeneration: generation, ObservedAtUnix: now,
+			Observation: &pb.InventoryObservation{
+				Complete:       true,
+				Epoch:          epoch,
+				Generation:     generation,
+				ObservedAtUnix: now,
+			},
+			Snapshots: []*pb.SnapshotInfo{
+				{
+					Id:             "snap-int-order",
+					ArtifactSha256: checksum,
+					SizeBytes:      4096,
+					Kind:           pb.SnapshotKind_SNAPSHOT_MEMORY,
+				},
+			},
+		}
 	}
 	c.reconcileSnapshotIntegrity(ctx, node, observation("epoch-a", 1, "sha256:mismatch"))
 	snap, _ := s.GetSnapshot(ctx, "snap-int-order")
@@ -149,12 +172,15 @@ func TestAuthoritativeInventoryOrderingAndCorruptStickiness(t *testing.T) {
 	c.reconcileSnapshotIntegrity(ctx, node, observation("epoch-b", 1, "sha256:int-test"))
 	c.reconcileSnapshotIntegrity(ctx, node, observation("epoch-a", 3, ""))
 	var observations int
-	if err := s.Pool().QueryRow(ctx, `SELECT count(*) FROM local_inventory_observations WHERE node_id=$1`, node.ID).Scan(&observations); err != nil || observations != 3 {
+	if err := s.Pool().QueryRow(ctx, `SELECT count(*) FROM local_inventory_observations WHERE node_id=$1`, node.ID).Scan(&observations); err != nil ||
+		observations != 3 {
 		t.Fatalf("accepted observations=%d err=%v, want 3", observations, err)
 	}
 	var observationID *int64
 	var receivedAt *time.Time
-	if err := s.Pool().QueryRow(ctx, `SELECT inventory_observation_id,inventory_received_at FROM snapshots WHERE id='snap-int-order'`).Scan(&observationID, &receivedAt); err != nil || observationID == nil || receivedAt == nil {
+	if err := s.Pool().QueryRow(ctx, `SELECT inventory_observation_id,inventory_received_at FROM snapshots WHERE id='snap-int-order'`).Scan(&observationID, &receivedAt); err != nil ||
+		observationID == nil ||
+		receivedAt == nil {
 		t.Fatalf("observation reference not persisted: id=%v at=%v err=%v", observationID, receivedAt, err)
 	}
 }
@@ -188,11 +214,18 @@ func TestReconcileVolumeIntegrity(t *testing.T) {
 	seed("vol-int-creating", "CREATING")   // 在途 → 不推导
 
 	now := time.Now().Unix()
-	inv := &pb.ListVolumesResponse{Complete: true, ObservationGeneration: 1, ObservedAtUnix: now,
-		Observation: &pb.InventoryObservation{Complete: true, Epoch: "volume-epoch", Generation: 1, ObservedAtUnix: now}, Volumes: []*pb.VolumeInfo{
+	inv := &pb.ListVolumesResponse{
+		Complete: true, ObservationGeneration: 1, ObservedAtUnix: now,
+		Observation: &pb.InventoryObservation{
+			Complete:       true,
+			Epoch:          "volume-epoch",
+			Generation:     1,
+			ObservedAtUnix: now,
+		}, Volumes: []*pb.VolumeInfo{
 			{Id: "vol-int-present", SizeBytes: 1073741824, Mode: "LOCAL_RW", MetadataHealth: "HEALTHY"},
 			{Id: "vol-int-orphan", SizeBytes: 2097152},
-		}}
+		},
+	}
 	volumes, err := s.ListVolumesOnNode(ctx, node.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -211,7 +244,8 @@ func TestReconcileVolumeIntegrity(t *testing.T) {
 	}
 	// orphan 只报告：不存在自动删除路径（volume 仍在 agent 本地；PG 无行）。
 	var orphanEvents int
-	if err := s.Pool().QueryRow(ctx, `SELECT count(*) FROM scheduler_events WHERE node_id=$1 AND reason LIKE '%orphan%'`, node.ID).Scan(&orphanEvents); err != nil || orphanEvents == 0 {
+	if err := s.Pool().QueryRow(ctx, `SELECT count(*) FROM scheduler_events WHERE node_id=$1 AND reason LIKE '%orphan%'`, node.ID).Scan(&orphanEvents); err != nil ||
+		orphanEvents == 0 {
 		t.Fatalf("orphan artifacts must be reported (report-only): events=%d err=%v", orphanEvents, err)
 	}
 }

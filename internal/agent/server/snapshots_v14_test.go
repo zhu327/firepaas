@@ -6,12 +6,12 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/kernel/hypeman/lib/instances"
+	"github.com/kernel/hypeman/lib/volumes"
 	"github.com/zhu327/firepaas/internal/agent/info"
 	"github.com/zhu327/firepaas/internal/agent/machine"
 	"github.com/zhu327/firepaas/internal/agent/state"
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
-	"github.com/kernel/hypeman/lib/instances"
-	"github.com/kernel/hypeman/lib/volumes"
 )
 
 // inventoryFake 实现 snapshot/volume inventory 所需的最小 hypeman 能力。
@@ -25,7 +25,11 @@ func (f *inventoryFake) ListSnapshots(context.Context, *instances.ListSnapshotsF
 	return f.snapshots, nil
 }
 
-func (f *inventoryFake) CreateSnapshot(context.Context, string, instances.CreateSnapshotRequest) (*instances.Snapshot, error) {
+func (f *inventoryFake) CreateSnapshot(
+	context.Context,
+	string,
+	instances.CreateSnapshotRequest,
+) (*instances.Snapshot, error) {
 	return nil, instances.ErrNotSupported
 }
 
@@ -39,15 +43,28 @@ func (f *inventoryFake) StopInstance(_ context.Context, _ string) (*instances.In
 	return nil, instances.ErrNotSupported
 }
 
-func (f *inventoryFake) StartInstance(_ context.Context, _ string, _ instances.StartInstanceRequest) (*instances.Instance, error) {
+func (f *inventoryFake) StartInstance(
+	_ context.Context,
+	_ string,
+	_ instances.StartInstanceRequest,
+) (*instances.Instance, error) {
 	return nil, instances.ErrNotSupported
 }
 
-func (f *inventoryFake) ForkSnapshot(context.Context, string, instances.ForkSnapshotRequest) (*instances.Instance, error) {
+func (f *inventoryFake) ForkSnapshot(
+	context.Context,
+	string,
+	instances.ForkSnapshotRequest,
+) (*instances.Instance, error) {
 	return nil, instances.ErrNotSupported
 }
 
-func (f *inventoryFake) RestoreSnapshot(context.Context, string, string, instances.RestoreSnapshotRequest) (*instances.Instance, error) {
+func (f *inventoryFake) RestoreSnapshot(
+	context.Context,
+	string,
+	string,
+	instances.RestoreSnapshotRequest,
+) (*instances.Instance, error) {
 	return nil, instances.ErrNotSupported
 }
 
@@ -66,7 +83,12 @@ func newInventoryServer(t *testing.T) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	adapter := machine.New(&inventoryFake{fakeInstances: fakeInstances{byName: map[string]*instances.Instance{}}}, fakeImages{}, nil, nil)
+	adapter := machine.New(
+		&inventoryFake{fakeInstances: fakeInstances{byName: map[string]*instances.Instance{}}},
+		fakeImages{},
+		nil,
+		nil,
+	)
 	provider := info.New("node-inv", "test", "test", "compute", "v1.14.2", "10.100.0.0/16", dir, nil, nil)
 	return New(adapter, ledger, fences, provider)
 }

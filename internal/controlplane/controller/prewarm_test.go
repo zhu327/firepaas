@@ -9,11 +9,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/zhu327/firepaas/internal/controlplane/db"
 	"github.com/zhu327/firepaas/internal/controlplane/store"
 	"github.com/zhu327/firepaas/internal/observability/metrics"
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -37,8 +37,10 @@ const digestHex = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 func newPrewarmController(t *testing.T) (*Controller, *store.Store) {
 	t.Helper()
 	s := testStoreController(t)
-	c := &Controller{store: s, metrics: metrics.New(),
-		cfg: Config{AgentRPCTimeout: 5 * time.Second}}
+	c := &Controller{
+		store: s, metrics: metrics.New(),
+		cfg: Config{AgentRPCTimeout: 5 * time.Second},
+	}
 	return c, s
 }
 

@@ -157,8 +157,15 @@ func run(n int, seed int64) error {
 					}
 				}
 				if outside > 0 {
-					return fmt.Errorf("iter %d: anti-affinity violated: %s already hosts %s, %d alternatives available; existing=%v events=%v",
-						i, pl.NodeID, req.DeploymentID, outside, req.ExistingDeploymentNodes, pl.Events)
+					return fmt.Errorf(
+						"iter %d: anti-affinity violated: %s already hosts %s, %d alternatives available; existing=%v events=%v",
+						i,
+						pl.NodeID,
+						req.DeploymentID,
+						outside,
+						req.ExistingDeploymentNodes,
+						pl.Events,
+					)
 				}
 				degraded++ // 候选不足：合法降级（ADR-0009）
 			}
@@ -186,30 +193,63 @@ func run(n int, seed int64) error {
 		chosen.allocDisk += req.DiskMib
 		chosen.placements++
 		if float64(chosen.allocVCPU) > float64(chosen.node.CPUTotal)*4 {
-			return fmt.Errorf("iter %d: node %s cpu overcommit %d > 4x%d", i, chosen.node.ID, chosen.allocVCPU, chosen.node.CPUTotal)
+			return fmt.Errorf(
+				"iter %d: node %s cpu overcommit %d > 4x%d",
+				i,
+				chosen.node.ID,
+				chosen.allocVCPU,
+				chosen.node.CPUTotal,
+			)
 		}
 		if chosen.allocMem > chosen.node.MemTotalMib {
-			return fmt.Errorf("iter %d: node %s mem overcommit %d > %d", i, chosen.node.ID, chosen.allocMem, chosen.node.MemTotalMib)
+			return fmt.Errorf(
+				"iter %d: node %s mem overcommit %d > %d",
+				i,
+				chosen.node.ID,
+				chosen.allocMem,
+				chosen.node.MemTotalMib,
+			)
 		}
 		if chosen.allocDisk > chosen.node.DiskTotalMib {
-			return fmt.Errorf("iter %d: node %s disk overcommit %d > %d", i, chosen.node.ID, chosen.allocDisk, chosen.node.DiskTotalMib)
+			return fmt.Errorf(
+				"iter %d: node %s disk overcommit %d > %d",
+				i,
+				chosen.node.ID,
+				chosen.allocDisk,
+				chosen.node.DiskTotalMib,
+			)
 		}
 		if _, dup := live[machineID]; dup {
 			return fmt.Errorf("iter %d: duplicate machine id %s", i, machineID)
 		}
-		live[machineID] = placedMachine{id: machineID, nodeID: chosen.node.ID, dep: req.DeploymentID, vcpu: req.VCPU, mem: req.MemMib, disk: req.DiskMib}
+		live[machineID] = placedMachine{
+			id:     machineID,
+			nodeID: chosen.node.ID,
+			dep:    req.DeploymentID,
+			vcpu:   req.VCPU,
+			mem:    req.MemMib,
+			disk:   req.DiskMib,
+		}
 		if req.DeploymentID != "" {
 			deployments[req.DeploymentID][chosen.node.ID]++
 		}
 	}
 
-	fmt.Printf("PASS: %d placements, %d rejected (no candidates), %d anti-affinity degradations, %d deletes, %d live machines\n",
-		placed, rejected, degraded, deleted, len(live))
+	fmt.Printf(
+		"PASS: %d placements, %d rejected (no candidates), %d anti-affinity degradations, %d deletes, %d live machines\n",
+		placed,
+		rejected,
+		degraded,
+		deleted,
+		len(live),
+	)
 	for _, sn := range nodes {
 		fmt.Printf("  node %-4s pool=%-8s placements=%-6d vcpu=%3d/%3d mem=%5d/%5d MiB\n",
 			sn.node.ID, sn.node.Pool, sn.placements, sn.allocVCPU, sn.node.CPUTotal, sn.allocMem, sn.node.MemTotalMib)
 	}
-	fmt.Println("assertions: filter-before-score OK, hard admission OK, unique machines OK, lost-node exclusion OK, anti-affinity distinct OK")
+	fmt.Println(
+		"assertions: filter-before-score OK, hard admission OK, unique machines OK, lost-node exclusion OK, anti-affinity distinct OK",
+	)
 	return nil
 }
 

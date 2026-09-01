@@ -222,7 +222,10 @@ func (p *Publisher) publishRedis(ctx context.Context, projection Projection) err
 	for _, route := range projection.Routes {
 		keepRoutes[fmt.Sprintf("route:%s:%d", route.Hostname, route.Port)] = true
 		keepHosts[route.Hostname] = true
-		converted := catalog.Route{RouteGeneration: route.Generation, Backends: make([]catalog.Backend, 0, len(route.Backends))}
+		converted := catalog.Route{
+			RouteGeneration: route.Generation,
+			Backends:        make([]catalog.Backend, 0, len(route.Backends)),
+		}
 		for _, backend := range route.Backends {
 			converted.Backends = append(converted.Backends, catalog.Backend{
 				MachineID: backend.MachineID, ExecutionID: backend.ExecutionID,
@@ -230,7 +233,10 @@ func (p *Publisher) publishRedis(ctx context.Context, projection Projection) err
 				Readiness: backend.Readiness, Weight: backend.Weight, Draining: backend.Draining,
 			})
 		}
-		hostRoutes[route.Hostname] = append(hostRoutes[route.Hostname], catalog.HostRoute{Port: route.Port, Route: converted})
+		hostRoutes[route.Hostname] = append(
+			hostRoutes[route.Hostname],
+			catalog.HostRoute{Port: route.Port, Route: converted},
+		)
 	}
 	hostnames := make([]string, 0, len(hostRoutes))
 	for hostname := range hostRoutes {

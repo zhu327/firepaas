@@ -176,7 +176,7 @@ func (f *Fences) persistLocked() error {
 	if err != nil {
 		return fmt.Errorf("open fences dir: %w", err)
 	}
-	defer d.Close()
+	defer func() { _ = d.Close() }()
 	if err := d.Sync(); err != nil {
 		return fmt.Errorf("fsync fences dir: %w", err)
 	}

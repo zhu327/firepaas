@@ -73,7 +73,11 @@ type cachedConfig struct {
 }
 
 // New 构造 Limiter。loader 为 nil 时全部使用默认配置（限流仍生效）。
-func New(rdb *redis.Client, loader func(ctx context.Context, project string) (Config, error), cacheTTL time.Duration) *Limiter {
+func New(
+	rdb *redis.Client,
+	loader func(ctx context.Context, project string) (Config, error),
+	cacheTTL time.Duration,
+) *Limiter {
 	if cacheTTL <= 0 {
 		cacheTTL = 10 * time.Second
 	}
@@ -133,7 +137,11 @@ return 0`)
 
 // Allow 取一个令牌。ok=false 时 retryAfter 是建议等待时长。
 // err 非 nil = Redis 不可用（调用方按 class fail-open/closed）。
-func (l *Limiter) Allow(ctx context.Context, project string, class Class) (ok bool, retryAfter time.Duration, err error) {
+func (l *Limiter) Allow(
+	ctx context.Context,
+	project string,
+	class Class,
+) (ok bool, retryAfter time.Duration, err error) {
 	lim := l.config(ctx, project).limits(class)
 	if lim.Rate <= 0 || lim.Burst <= 0 {
 		return true, 0, nil // 显式 0 = 该维度不限
@@ -181,7 +189,13 @@ var sessionRelease = redis.NewScript(`return redis.call('ZREM', KEYS[1], ARGV[1]
 
 // AcquireSession 获取跨 API 实例共享的 runtime-session 名额。Redis 错误
 // 原样返回，由 runtime 路径 fail closed。release 会停止续租并删除 lease。
-func (l *Limiter) AcquireSession(ctx context.Context, project string, limit int64, ttl time.Duration, onLostOpt ...func()) (release func(), active int64, err error) {
+func (l *Limiter) AcquireSession(
+	ctx context.Context,
+	project string,
+	limit int64,
+	ttl time.Duration,
+	onLostOpt ...func(),
+) (release func(), active int64, err error) {
 	var onLost func()
 	if len(onLostOpt) > 0 {
 		onLost = onLostOpt[0]

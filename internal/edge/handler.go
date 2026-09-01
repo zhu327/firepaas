@@ -44,7 +44,7 @@ type Counters struct {
 
 func (c *Counters) WritePrometheus(w http.ResponseWriter) {
 	write := func(name, help string, v uint64) {
-		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n%s %d\n", name, help, name, name, v)
+		_, _ = fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n%s %d\n", name, help, name, name, v)
 	}
 	write("firepaas_edge_stale_serves_total", "requests served from last-known-good route cache", c.staleServes.Load())
 	write("firepaas_edge_beyond_stale_total", "requests rejected 503 beyond serve-stale window", c.beyondStale.Load())
@@ -53,21 +53,36 @@ func (c *Counters) WritePrometheus(w http.ResponseWriter) {
 	write("firepaas_edge_token_stale_serves_total", "requests using last-known-good token", c.tokenStaleServes.Load())
 	write("firepaas_edge_rate_limited_total", "requests rejected 429", c.rateLimited.Load())
 	write("firepaas_edge_proxied_requests_total", "requests forwarded to agent proxy", c.proxiedReqs.Load())
-	write("firepaas_edge_forbidden_retries_total", "agent 403 responses triggering token invalidate+retry", c.forbiddenRetry.Load())
-	write("firepaas_edge_hard_rejected_total", "requests rejected 503 at per-machine hard concurrency limit", c.hardRejected.Load())
-	write("firepaas_edge_pin_hits_total", "requests pinned to an eligible backend via X-Firepaas-Pin-Machine", c.pinHits.Load())
+	write(
+		"firepaas_edge_forbidden_retries_total",
+		"agent 403 responses triggering token invalidate+retry",
+		c.forbiddenRetry.Load(),
+	)
+	write(
+		"firepaas_edge_hard_rejected_total",
+		"requests rejected 503 at per-machine hard concurrency limit",
+		c.hardRejected.Load(),
+	)
+	write(
+		"firepaas_edge_pin_hits_total",
+		"requests pinned to an eligible backend via X-Firepaas-Pin-Machine",
+		c.pinHits.Load(),
+	)
 	write("firepaas_edge_pin_misses_total", "pin requests whose machine was not eligible (404)", c.pinMisses.Load())
 }
 
-type inflightEntry struct{ count atomic.Int64 }
-type inflightTracker struct {
-	mu      sync.Mutex
-	entries map[string]*inflightEntry
-}
+type (
+	inflightEntry   struct{ count atomic.Int64 }
+	inflightTracker struct {
+		mu      sync.Mutex
+		entries map[string]*inflightEntry
+	}
+)
 
 func newInflightTracker() *inflightTracker {
 	return &inflightTracker{entries: map[string]*inflightEntry{}}
 }
+
 func (t *inflightTracker) acquire(id string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -78,6 +93,7 @@ func (t *inflightTracker) acquire(id string) {
 	}
 	e.count.Add(1)
 }
+
 func (t *inflightTracker) release(id string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -85,6 +101,7 @@ func (t *inflightTracker) release(id string) {
 		delete(t.entries, id)
 	}
 }
+
 func (t *inflightTracker) load(id string) int64 {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -93,6 +110,7 @@ func (t *inflightTracker) load(id string) int64 {
 	}
 	return 0
 }
+
 func (t *inflightTracker) snapshot() map[string]int64 {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -104,6 +122,7 @@ func (t *inflightTracker) snapshot() map[string]int64 {
 	}
 	return out
 }
+
 func (t *inflightTracker) selectAndAcquire(bs []catalog.Backend, hard int64) (catalog.Backend, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -159,12 +178,14 @@ type Handler struct {
 	edgePorts       map[int]bool
 }
 
-type backendKey struct{}
-type credKey struct{}
-type transportRetryKey struct{}
-type listenPortKey struct{}
-type attemptStateKey struct{}
-type retryReason uint8
+type (
+	backendKey        struct{}
+	credKey           struct{}
+	transportRetryKey struct{}
+	listenPortKey     struct{}
+	attemptStateKey   struct{}
+	retryReason       uint8
+)
 
 const (
 	retryNone retryReason = iota
@@ -192,7 +213,17 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.HardConcurrency <= 0 {
 		cfg.HardConcurrency = 256
 	}
-	h := &Handler{catalog: cfg.Catalog, routes: cfg.Routes, tokens: cfg.Tokens, limiter: cfg.Limiter, cnt: cfg.Counters, agentTLS: cfg.AgentTLS, inflight: newInflightTracker(), hardConcurrency: cfg.HardConcurrency, edgePorts: cfg.EdgePorts}
+	h := &Handler{
+		catalog:         cfg.Catalog,
+		routes:          cfg.Routes,
+		tokens:          cfg.Tokens,
+		limiter:         cfg.Limiter,
+		cnt:             cfg.Counters,
+		agentTLS:        cfg.AgentTLS,
+		inflight:        newInflightTracker(),
+		hardConcurrency: cfg.HardConcurrency,
+		edgePorts:       cfg.EdgePorts,
+	}
 	h.proxy = &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			b, _ := req.Context().Value(backendKey{}).(catalog.Backend)
@@ -225,7 +256,8 @@ func NewHandler(cfg Config) *Handler {
 			}
 		},
 		ModifyResponse: func(resp *http.Response) error {
-			retryable := resp.StatusCode == http.StatusBadGateway && resp.Header.Get(headerProxyRetryable) == retryableProxyValue
+			retryable := resp.StatusCode == http.StatusBadGateway &&
+				resp.Header.Get(headerProxyRetryable) == retryableProxyValue
 			resp.Header.Del(headerProxyRetryable)
 			// The execution credential is edge→agent-only, even if an upstream
 			// implementation accidentally reflects or authors this header.
@@ -234,17 +266,22 @@ func NewHandler(cfg Config) *Handler {
 				resp.Header.Set(HeaderMachineID, b.MachineID)
 			}
 			if retryable {
-				resp.Body.Close()
+				_ = resp.Body.Close()
 				return errRetryProxyRoute
 			}
 			if resp.StatusCode == http.StatusForbidden {
-				resp.Body.Close()
+				_ = resp.Body.Close()
 				return errRetryForbidden
 			}
 			return nil
 		},
 		ErrorHandler: h.handleProxyError,
-		Transport:    &http.Transport{TLSClientConfig: cfg.AgentTLS, MaxIdleConns: 64, MaxIdleConnsPerHost: 64, IdleConnTimeout: 30 * time.Second},
+		Transport: &http.Transport{
+			TLSClientConfig:     cfg.AgentTLS,
+			MaxIdleConns:        64,
+			MaxIdleConnsPerHost: 64,
+			IdleConnTimeout:     30 * time.Second,
+		},
 	}
 	return h
 }
@@ -270,13 +307,15 @@ func (h *Handler) handleProxyError(w http.ResponseWriter, r *http.Request, err e
 		}
 	}
 	if errors.Is(err, errRetryProxyRoute) {
-		if r.Context().Value(transportRetryKey{}) == true && r.Context().Err() == nil && requestHasNoBody(r) && mark(retryTransport) {
+		if r.Context().Value(transportRetryKey{}) == true && r.Context().Err() == nil && requestHasNoBody(r) &&
+			mark(retryTransport) {
 			return
 		}
 		http.Error(w, "agent proxy unavailable", http.StatusBadGateway)
 		return
 	}
-	if r.Context().Value(transportRetryKey{}) == true && r.Context().Err() == nil && requestHasNoBody(r) && mark(retryTransport) {
+	if r.Context().Value(transportRetryKey{}) == true && r.Context().Err() == nil && requestHasNoBody(r) &&
+		mark(retryTransport) {
 		return
 	}
 	http.Error(w, err.Error(), http.StatusBadGateway)
@@ -288,6 +327,7 @@ func routeCacheKey(host string, port int) string {
 	}
 	return host + "|" + strconv.Itoa(port)
 }
+
 func (h *Handler) loadRoute(ctx context.Context, host string, port int) (any, error) {
 	var r *catalog.Route
 	var err error
@@ -308,6 +348,7 @@ func (h *Handler) loadRoute(ctx context.Context, host string, port int) (any, er
 	}
 	return r, nil
 }
+
 func (h *Handler) requestRoutePort(r *http.Request) int {
 	if p, ok := r.Context().Value(listenPortKey{}).(int); ok && p > 0 {
 		return p
@@ -319,6 +360,7 @@ func (h *Handler) requestRoutePort(r *http.Request) int {
 	}
 	return 0
 }
+
 func stripPort(hostport string) string {
 	h, _, err := net.SplitHostPort(hostport)
 	if err != nil {
@@ -326,6 +368,7 @@ func stripPort(hostport string) string {
 	}
 	return h
 }
+
 func writePlain(w http.ResponseWriter, code int, s string) {
 	w.WriteHeader(code)
 	_, _ = w.Write([]byte(s))
@@ -345,7 +388,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	key := routeCacheKey(host, port)
-	v, stale, err := h.routes.Get(r.Context(), key, func(ctx context.Context, _ string) (any, error) { return h.loadRoute(ctx, host, port) })
+	v, stale, err := h.routes.Get(
+		r.Context(),
+		key,
+		func(ctx context.Context, _ string) (any, error) { return h.loadRoute(ctx, host, port) },
+	)
 	if errors.Is(err, ErrNotFound) {
 		http.Error(w, "no route for hostname", http.StatusNotFound)
 		return
@@ -462,6 +509,7 @@ func (h *Handler) selectBackend(route *catalog.Route, pin string) (catalog.Backe
 		return chosen, nil
 	}
 }
+
 func (h *Handler) writeSelectionError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, errPinMiss):
@@ -476,7 +524,14 @@ func (h *Handler) writeSelectionError(w http.ResponseWriter, err error) {
 		http.Error(w, "no ready backend for hostname", http.StatusServiceUnavailable)
 	}
 }
-func (h *Handler) tryServe(w http.ResponseWriter, r *http.Request, b catalog.Backend, cred string, stale, allowTransportRetry bool) retryReason {
+
+func (h *Handler) tryServe(
+	w http.ResponseWriter,
+	r *http.Request,
+	b catalog.Backend,
+	cred string,
+	stale, allowTransportRetry bool,
+) retryReason {
 	defer h.inflight.release(b.MachineID)
 	state := &attemptState{}
 	ctx := context.WithValue(r.Context(), backendKey{}, b)
@@ -500,8 +555,11 @@ func (h *Handler) WriteInflightPrometheus(w http.ResponseWriter) {
 	if len(snap) == 0 {
 		return
 	}
-	fmt.Fprint(w, "# HELP firepaas_edge_backend_inflight in-flight requests per backend machine (per-edge local view)\n# TYPE firepaas_edge_backend_inflight gauge\n")
+	_, _ = fmt.Fprint(
+		w,
+		"# HELP firepaas_edge_backend_inflight in-flight requests per backend machine (per-edge local view)\n# TYPE firepaas_edge_backend_inflight gauge\n",
+	)
 	for id, v := range snap {
-		fmt.Fprintf(w, "firepaas_edge_backend_inflight{machine_id=%q} %d\n", id, v)
+		_, _ = fmt.Fprintf(w, "firepaas_edge_backend_inflight{machine_id=%q} %d\n", id, v)
 	}
 }

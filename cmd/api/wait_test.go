@@ -8,7 +8,9 @@ import (
 )
 
 func TestOperationJSONRedactsUnstructuredError(t *testing.T) {
-	out := opJSON(store.OperationTrace{Operation: store.Operation{Error: "GET https://source.internal/path?token=secret failed"}})
+	out := opJSON(
+		store.OperationTrace{Operation: store.Operation{Error: "GET https://source.internal/path?token=secret failed"}},
+	)
 	got, _ := out["error"].(string)
 	if strings.Contains(got, "source.internal") || strings.Contains(got, "secret") {
 		t.Fatalf("operation error leaked: %q", got)

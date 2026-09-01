@@ -54,7 +54,11 @@ func NewInfoServiceClient(cc grpc.ClientConnInterface) InfoServiceClient {
 	return &infoServiceClient{cc}
 }
 
-func (c *infoServiceClient) ServiceInfo(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ServiceInfoResponse, error) {
+func (c *infoServiceClient) ServiceInfo(
+	ctx context.Context,
+	in *emptypb.Empty,
+	opts ...grpc.CallOption,
+) (*ServiceInfoResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ServiceInfoResponse)
 	err := c.cc.Invoke(ctx, InfoService_ServiceInfo_FullMethodName, in, out, cOpts...)
@@ -104,7 +108,12 @@ func RegisterInfoServiceServer(s grpc.ServiceRegistrar, srv InfoServiceServer) {
 	s.RegisterService(&InfoService_ServiceDesc, srv)
 }
 
-func _InfoService_ServiceInfo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _InfoService_ServiceInfo_Handler(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
 	in := new(emptypb.Empty)
 	if err := dec(in); err != nil {
 		return nil, err
@@ -158,7 +167,11 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type MachineServiceClient interface {
-	CreateMachine(ctx context.Context, in *CreateMachineRequest, opts ...grpc.CallOption) (*CreateMachineResponse, error)
+	CreateMachine(
+		ctx context.Context,
+		in *CreateMachineRequest,
+		opts ...grpc.CallOption,
+	) (*CreateMachineResponse, error)
 	UpdateMachine(ctx context.Context, in *UpdateMachineRequest, opts ...grpc.CallOption) (*Machine, error)
 	ListMachines(ctx context.Context, in *ListMachinesRequest, opts ...grpc.CallOption) (*ListMachinesResponse, error)
 	DeleteMachine(ctx context.Context, in *DeleteMachineRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
@@ -169,14 +182,25 @@ type MachineServiceClient interface {
 	CheckpointMachine(ctx context.Context, in *CheckpointMachineRequest, opts ...grpc.CallOption) (*Machine, error)
 	// 运行时交互通道：M1 确认数据通道边界，但 Exec 在 MVP 中保持实验状态。
 	// 调用方是控制面(代理 CLI/用户);同样受 mTLS 身份与 execution fencing 约束。
-	StreamLogs(ctx context.Context, in *StreamLogsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[LogChunk], error)
+	StreamLogs(
+		ctx context.Context,
+		in *StreamLogsRequest,
+		opts ...grpc.CallOption,
+	) (grpc.ServerStreamingClient[LogChunk], error)
 	// exec 为双向流:第一帧必须是 open。operation_id 只保证“创建会话”幂等；
 	// MVP 中连接断开即终止会话，不承诺 stdin/stdout 无损续传或重新 attach。
 	Exec(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ExecInput, ExecOutput], error)
 	// v1.2-C（ADR-0025）：单文件 cp。第一帧必须是 open；数据帧按到达顺序
 	// 写入 guest，流结束（CloseSend）触发最终落盘与 bytes_written 响应。
-	CopyTo(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[CopyToInput, CopyToResponse], error)
-	CopyFrom(ctx context.Context, in *CopyFromRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[CopyFromResponse], error)
+	CopyTo(
+		ctx context.Context,
+		opts ...grpc.CallOption,
+	) (grpc.ClientStreamingClient[CopyToInput, CopyToResponse], error)
+	CopyFrom(
+		ctx context.Context,
+		in *CopyFromRequest,
+		opts ...grpc.CallOption,
+	) (grpc.ServerStreamingClient[CopyFromResponse], error)
 }
 
 type machineServiceClient struct {
@@ -187,7 +211,11 @@ func NewMachineServiceClient(cc grpc.ClientConnInterface) MachineServiceClient {
 	return &machineServiceClient{cc}
 }
 
-func (c *machineServiceClient) CreateMachine(ctx context.Context, in *CreateMachineRequest, opts ...grpc.CallOption) (*CreateMachineResponse, error) {
+func (c *machineServiceClient) CreateMachine(
+	ctx context.Context,
+	in *CreateMachineRequest,
+	opts ...grpc.CallOption,
+) (*CreateMachineResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CreateMachineResponse)
 	err := c.cc.Invoke(ctx, MachineService_CreateMachine_FullMethodName, in, out, cOpts...)
@@ -197,7 +225,11 @@ func (c *machineServiceClient) CreateMachine(ctx context.Context, in *CreateMach
 	return out, nil
 }
 
-func (c *machineServiceClient) UpdateMachine(ctx context.Context, in *UpdateMachineRequest, opts ...grpc.CallOption) (*Machine, error) {
+func (c *machineServiceClient) UpdateMachine(
+	ctx context.Context,
+	in *UpdateMachineRequest,
+	opts ...grpc.CallOption,
+) (*Machine, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(Machine)
 	err := c.cc.Invoke(ctx, MachineService_UpdateMachine_FullMethodName, in, out, cOpts...)
@@ -207,7 +239,11 @@ func (c *machineServiceClient) UpdateMachine(ctx context.Context, in *UpdateMach
 	return out, nil
 }
 
-func (c *machineServiceClient) ListMachines(ctx context.Context, in *ListMachinesRequest, opts ...grpc.CallOption) (*ListMachinesResponse, error) {
+func (c *machineServiceClient) ListMachines(
+	ctx context.Context,
+	in *ListMachinesRequest,
+	opts ...grpc.CallOption,
+) (*ListMachinesResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListMachinesResponse)
 	err := c.cc.Invoke(ctx, MachineService_ListMachines_FullMethodName, in, out, cOpts...)
@@ -217,7 +253,11 @@ func (c *machineServiceClient) ListMachines(ctx context.Context, in *ListMachine
 	return out, nil
 }
 
-func (c *machineServiceClient) DeleteMachine(ctx context.Context, in *DeleteMachineRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+func (c *machineServiceClient) DeleteMachine(
+	ctx context.Context,
+	in *DeleteMachineRequest,
+	opts ...grpc.CallOption,
+) (*emptypb.Empty, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
 	err := c.cc.Invoke(ctx, MachineService_DeleteMachine_FullMethodName, in, out, cOpts...)
@@ -227,7 +267,11 @@ func (c *machineServiceClient) DeleteMachine(ctx context.Context, in *DeleteMach
 	return out, nil
 }
 
-func (c *machineServiceClient) StartMachine(ctx context.Context, in *StartMachineRequest, opts ...grpc.CallOption) (*Machine, error) {
+func (c *machineServiceClient) StartMachine(
+	ctx context.Context,
+	in *StartMachineRequest,
+	opts ...grpc.CallOption,
+) (*Machine, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(Machine)
 	err := c.cc.Invoke(ctx, MachineService_StartMachine_FullMethodName, in, out, cOpts...)
@@ -237,7 +281,11 @@ func (c *machineServiceClient) StartMachine(ctx context.Context, in *StartMachin
 	return out, nil
 }
 
-func (c *machineServiceClient) StopMachine(ctx context.Context, in *StopMachineRequest, opts ...grpc.CallOption) (*Machine, error) {
+func (c *machineServiceClient) StopMachine(
+	ctx context.Context,
+	in *StopMachineRequest,
+	opts ...grpc.CallOption,
+) (*Machine, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(Machine)
 	err := c.cc.Invoke(ctx, MachineService_StopMachine_FullMethodName, in, out, cOpts...)
@@ -247,7 +295,11 @@ func (c *machineServiceClient) StopMachine(ctx context.Context, in *StopMachineR
 	return out, nil
 }
 
-func (c *machineServiceClient) PauseMachine(ctx context.Context, in *PauseMachineRequest, opts ...grpc.CallOption) (*Machine, error) {
+func (c *machineServiceClient) PauseMachine(
+	ctx context.Context,
+	in *PauseMachineRequest,
+	opts ...grpc.CallOption,
+) (*Machine, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(Machine)
 	err := c.cc.Invoke(ctx, MachineService_PauseMachine_FullMethodName, in, out, cOpts...)
@@ -257,7 +309,11 @@ func (c *machineServiceClient) PauseMachine(ctx context.Context, in *PauseMachin
 	return out, nil
 }
 
-func (c *machineServiceClient) ResumeMachine(ctx context.Context, in *ResumeMachineRequest, opts ...grpc.CallOption) (*Machine, error) {
+func (c *machineServiceClient) ResumeMachine(
+	ctx context.Context,
+	in *ResumeMachineRequest,
+	opts ...grpc.CallOption,
+) (*Machine, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(Machine)
 	err := c.cc.Invoke(ctx, MachineService_ResumeMachine_FullMethodName, in, out, cOpts...)
@@ -267,7 +323,11 @@ func (c *machineServiceClient) ResumeMachine(ctx context.Context, in *ResumeMach
 	return out, nil
 }
 
-func (c *machineServiceClient) CheckpointMachine(ctx context.Context, in *CheckpointMachineRequest, opts ...grpc.CallOption) (*Machine, error) {
+func (c *machineServiceClient) CheckpointMachine(
+	ctx context.Context,
+	in *CheckpointMachineRequest,
+	opts ...grpc.CallOption,
+) (*Machine, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(Machine)
 	err := c.cc.Invoke(ctx, MachineService_CheckpointMachine_FullMethodName, in, out, cOpts...)
@@ -277,9 +337,17 @@ func (c *machineServiceClient) CheckpointMachine(ctx context.Context, in *Checkp
 	return out, nil
 }
 
-func (c *machineServiceClient) StreamLogs(ctx context.Context, in *StreamLogsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[LogChunk], error) {
+func (c *machineServiceClient) StreamLogs(
+	ctx context.Context,
+	in *StreamLogsRequest,
+	opts ...grpc.CallOption,
+) (grpc.ServerStreamingClient[LogChunk], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &MachineService_ServiceDesc.Streams[0], MachineService_StreamLogs_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(
+		ctx,
+		&MachineService_ServiceDesc.Streams[0],
+		MachineService_StreamLogs_FullMethodName,
+		cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -296,9 +364,16 @@ func (c *machineServiceClient) StreamLogs(ctx context.Context, in *StreamLogsReq
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type MachineService_StreamLogsClient = grpc.ServerStreamingClient[LogChunk]
 
-func (c *machineServiceClient) Exec(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ExecInput, ExecOutput], error) {
+func (c *machineServiceClient) Exec(
+	ctx context.Context,
+	opts ...grpc.CallOption,
+) (grpc.BidiStreamingClient[ExecInput, ExecOutput], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &MachineService_ServiceDesc.Streams[1], MachineService_Exec_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(
+		ctx,
+		&MachineService_ServiceDesc.Streams[1],
+		MachineService_Exec_FullMethodName,
+		cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -309,9 +384,16 @@ func (c *machineServiceClient) Exec(ctx context.Context, opts ...grpc.CallOption
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type MachineService_ExecClient = grpc.BidiStreamingClient[ExecInput, ExecOutput]
 
-func (c *machineServiceClient) CopyTo(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[CopyToInput, CopyToResponse], error) {
+func (c *machineServiceClient) CopyTo(
+	ctx context.Context,
+	opts ...grpc.CallOption,
+) (grpc.ClientStreamingClient[CopyToInput, CopyToResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &MachineService_ServiceDesc.Streams[2], MachineService_CopyTo_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(
+		ctx,
+		&MachineService_ServiceDesc.Streams[2],
+		MachineService_CopyTo_FullMethodName,
+		cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -322,9 +404,17 @@ func (c *machineServiceClient) CopyTo(ctx context.Context, opts ...grpc.CallOpti
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type MachineService_CopyToClient = grpc.ClientStreamingClient[CopyToInput, CopyToResponse]
 
-func (c *machineServiceClient) CopyFrom(ctx context.Context, in *CopyFromRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[CopyFromResponse], error) {
+func (c *machineServiceClient) CopyFrom(
+	ctx context.Context,
+	in *CopyFromRequest,
+	opts ...grpc.CallOption,
+) (grpc.ServerStreamingClient[CopyFromResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &MachineService_ServiceDesc.Streams[3], MachineService_CopyFrom_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(
+		ctx,
+		&MachineService_ServiceDesc.Streams[3],
+		MachineService_CopyFrom_FullMethodName,
+		cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -374,13 +464,20 @@ type MachineServiceServer interface {
 // pointer dereference when methods are called.
 type UnimplementedMachineServiceServer struct{}
 
-func (UnimplementedMachineServiceServer) CreateMachine(context.Context, *CreateMachineRequest) (*CreateMachineResponse, error) {
+func (UnimplementedMachineServiceServer) CreateMachine(
+	context.Context,
+	*CreateMachineRequest,
+) (*CreateMachineResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method CreateMachine not implemented")
 }
 func (UnimplementedMachineServiceServer) UpdateMachine(context.Context, *UpdateMachineRequest) (*Machine, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method UpdateMachine not implemented")
 }
-func (UnimplementedMachineServiceServer) ListMachines(context.Context, *ListMachinesRequest) (*ListMachinesResponse, error) {
+
+func (UnimplementedMachineServiceServer) ListMachines(
+	context.Context,
+	*ListMachinesRequest,
+) (*ListMachinesResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ListMachines not implemented")
 }
 func (UnimplementedMachineServiceServer) DeleteMachine(context.Context, *DeleteMachineRequest) (*emptypb.Empty, error) {
@@ -398,7 +495,11 @@ func (UnimplementedMachineServiceServer) PauseMachine(context.Context, *PauseMac
 func (UnimplementedMachineServiceServer) ResumeMachine(context.Context, *ResumeMachineRequest) (*Machine, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ResumeMachine not implemented")
 }
-func (UnimplementedMachineServiceServer) CheckpointMachine(context.Context, *CheckpointMachineRequest) (*Machine, error) {
+
+func (UnimplementedMachineServiceServer) CheckpointMachine(
+	context.Context,
+	*CheckpointMachineRequest,
+) (*Machine, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method CheckpointMachine not implemented")
 }
 func (UnimplementedMachineServiceServer) StreamLogs(*StreamLogsRequest, grpc.ServerStreamingServer[LogChunk]) error {
@@ -410,7 +511,11 @@ func (UnimplementedMachineServiceServer) Exec(grpc.BidiStreamingServer[ExecInput
 func (UnimplementedMachineServiceServer) CopyTo(grpc.ClientStreamingServer[CopyToInput, CopyToResponse]) error {
 	return status.Errorf(codes.Unimplemented, "method CopyTo not implemented")
 }
-func (UnimplementedMachineServiceServer) CopyFrom(*CopyFromRequest, grpc.ServerStreamingServer[CopyFromResponse]) error {
+
+func (UnimplementedMachineServiceServer) CopyFrom(
+	*CopyFromRequest,
+	grpc.ServerStreamingServer[CopyFromResponse],
+) error {
 	return status.Errorf(codes.Unimplemented, "method CopyFrom not implemented")
 }
 func (UnimplementedMachineServiceServer) mustEmbedUnimplementedMachineServiceServer() {}
@@ -434,7 +539,12 @@ func RegisterMachineServiceServer(s grpc.ServiceRegistrar, srv MachineServiceSer
 	s.RegisterService(&MachineService_ServiceDesc, srv)
 }
 
-func _MachineService_CreateMachine_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _MachineService_CreateMachine_Handler(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
 	in := new(CreateMachineRequest)
 	if err := dec(in); err != nil {
 		return nil, err
@@ -452,7 +562,12 @@ func _MachineService_CreateMachine_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
-func _MachineService_UpdateMachine_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _MachineService_UpdateMachine_Handler(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
 	in := new(UpdateMachineRequest)
 	if err := dec(in); err != nil {
 		return nil, err
@@ -470,7 +585,12 @@ func _MachineService_UpdateMachine_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
-func _MachineService_ListMachines_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _MachineService_ListMachines_Handler(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
 	in := new(ListMachinesRequest)
 	if err := dec(in); err != nil {
 		return nil, err
@@ -488,7 +608,12 @@ func _MachineService_ListMachines_Handler(srv interface{}, ctx context.Context, 
 	return interceptor(ctx, in, info, handler)
 }
 
-func _MachineService_DeleteMachine_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _MachineService_DeleteMachine_Handler(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
 	in := new(DeleteMachineRequest)
 	if err := dec(in); err != nil {
 		return nil, err
@@ -506,7 +631,12 @@ func _MachineService_DeleteMachine_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
-func _MachineService_StartMachine_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _MachineService_StartMachine_Handler(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
 	in := new(StartMachineRequest)
 	if err := dec(in); err != nil {
 		return nil, err
@@ -524,7 +654,12 @@ func _MachineService_StartMachine_Handler(srv interface{}, ctx context.Context, 
 	return interceptor(ctx, in, info, handler)
 }
 
-func _MachineService_StopMachine_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _MachineService_StopMachine_Handler(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
 	in := new(StopMachineRequest)
 	if err := dec(in); err != nil {
 		return nil, err
@@ -542,7 +677,12 @@ func _MachineService_StopMachine_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
-func _MachineService_PauseMachine_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _MachineService_PauseMachine_Handler(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
 	in := new(PauseMachineRequest)
 	if err := dec(in); err != nil {
 		return nil, err
@@ -560,7 +700,12 @@ func _MachineService_PauseMachine_Handler(srv interface{}, ctx context.Context, 
 	return interceptor(ctx, in, info, handler)
 }
 
-func _MachineService_ResumeMachine_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _MachineService_ResumeMachine_Handler(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
 	in := new(ResumeMachineRequest)
 	if err := dec(in); err != nil {
 		return nil, err
@@ -578,7 +723,12 @@ func _MachineService_ResumeMachine_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
-func _MachineService_CheckpointMachine_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _MachineService_CheckpointMachine_Handler(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
 	in := new(CheckpointMachineRequest)
 	if err := dec(in); err != nil {
 		return nil, err
@@ -601,7 +751,10 @@ func _MachineService_StreamLogs_Handler(srv interface{}, stream grpc.ServerStrea
 	if err := stream.RecvMsg(m); err != nil {
 		return err
 	}
-	return srv.(MachineServiceServer).StreamLogs(m, &grpc.GenericServerStream[StreamLogsRequest, LogChunk]{ServerStream: stream})
+	return srv.(MachineServiceServer).StreamLogs(
+		m,
+		&grpc.GenericServerStream[StreamLogsRequest, LogChunk]{ServerStream: stream},
+	)
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
@@ -615,7 +768,9 @@ func _MachineService_Exec_Handler(srv interface{}, stream grpc.ServerStream) err
 type MachineService_ExecServer = grpc.BidiStreamingServer[ExecInput, ExecOutput]
 
 func _MachineService_CopyTo_Handler(srv interface{}, stream grpc.ServerStream) error {
-	return srv.(MachineServiceServer).CopyTo(&grpc.GenericServerStream[CopyToInput, CopyToResponse]{ServerStream: stream})
+	return srv.(MachineServiceServer).CopyTo(
+		&grpc.GenericServerStream[CopyToInput, CopyToResponse]{ServerStream: stream},
+	)
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
@@ -626,7 +781,10 @@ func _MachineService_CopyFrom_Handler(srv interface{}, stream grpc.ServerStream)
 	if err := stream.RecvMsg(m); err != nil {
 		return err
 	}
-	return srv.(MachineServiceServer).CopyFrom(m, &grpc.GenericServerStream[CopyFromRequest, CopyFromResponse]{ServerStream: stream})
+	return srv.(MachineServiceServer).CopyFrom(
+		m,
+		&grpc.GenericServerStream[CopyFromRequest, CopyFromResponse]{ServerStream: stream},
+	)
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
@@ -722,9 +880,21 @@ type ImageServiceClient interface {
 	// v1.4-C: path-free, reversible local cache deletion. Destructive GC must
 	// never substitute DeleteImage for this quarantine protocol.
 	QuarantineImage(ctx context.Context, in *QuarantineImageRequest, opts ...grpc.CallOption) (*ImageQuarantine, error)
-	ListImageQuarantines(ctx context.Context, in *ListImageQuarantinesRequest, opts ...grpc.CallOption) (*ListImageQuarantinesResponse, error)
-	RollbackImageQuarantine(ctx context.Context, in *ImageQuarantineActionRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
-	FinalizeImageQuarantine(ctx context.Context, in *ImageQuarantineActionRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	ListImageQuarantines(
+		ctx context.Context,
+		in *ListImageQuarantinesRequest,
+		opts ...grpc.CallOption,
+	) (*ListImageQuarantinesResponse, error)
+	RollbackImageQuarantine(
+		ctx context.Context,
+		in *ImageQuarantineActionRequest,
+		opts ...grpc.CallOption,
+	) (*emptypb.Empty, error)
+	FinalizeImageQuarantine(
+		ctx context.Context,
+		in *ImageQuarantineActionRequest,
+		opts ...grpc.CallOption,
+	) (*emptypb.Empty, error)
 }
 
 type imageServiceClient struct {
@@ -735,7 +905,11 @@ func NewImageServiceClient(cc grpc.ClientConnInterface) ImageServiceClient {
 	return &imageServiceClient{cc}
 }
 
-func (c *imageServiceClient) PullImage(ctx context.Context, in *PullImageRequest, opts ...grpc.CallOption) (*PullImageResponse, error) {
+func (c *imageServiceClient) PullImage(
+	ctx context.Context,
+	in *PullImageRequest,
+	opts ...grpc.CallOption,
+) (*PullImageResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(PullImageResponse)
 	err := c.cc.Invoke(ctx, ImageService_PullImage_FullMethodName, in, out, cOpts...)
@@ -745,7 +919,11 @@ func (c *imageServiceClient) PullImage(ctx context.Context, in *PullImageRequest
 	return out, nil
 }
 
-func (c *imageServiceClient) ListImages(ctx context.Context, in *ListImagesRequest, opts ...grpc.CallOption) (*ListImagesResponse, error) {
+func (c *imageServiceClient) ListImages(
+	ctx context.Context,
+	in *ListImagesRequest,
+	opts ...grpc.CallOption,
+) (*ListImagesResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListImagesResponse)
 	err := c.cc.Invoke(ctx, ImageService_ListImages_FullMethodName, in, out, cOpts...)
@@ -755,7 +933,11 @@ func (c *imageServiceClient) ListImages(ctx context.Context, in *ListImagesReque
 	return out, nil
 }
 
-func (c *imageServiceClient) DeleteImage(ctx context.Context, in *DeleteImageRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+func (c *imageServiceClient) DeleteImage(
+	ctx context.Context,
+	in *DeleteImageRequest,
+	opts ...grpc.CallOption,
+) (*emptypb.Empty, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
 	err := c.cc.Invoke(ctx, ImageService_DeleteImage_FullMethodName, in, out, cOpts...)
@@ -765,7 +947,11 @@ func (c *imageServiceClient) DeleteImage(ctx context.Context, in *DeleteImageReq
 	return out, nil
 }
 
-func (c *imageServiceClient) QuarantineImage(ctx context.Context, in *QuarantineImageRequest, opts ...grpc.CallOption) (*ImageQuarantine, error) {
+func (c *imageServiceClient) QuarantineImage(
+	ctx context.Context,
+	in *QuarantineImageRequest,
+	opts ...grpc.CallOption,
+) (*ImageQuarantine, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ImageQuarantine)
 	err := c.cc.Invoke(ctx, ImageService_QuarantineImage_FullMethodName, in, out, cOpts...)
@@ -775,7 +961,11 @@ func (c *imageServiceClient) QuarantineImage(ctx context.Context, in *Quarantine
 	return out, nil
 }
 
-func (c *imageServiceClient) ListImageQuarantines(ctx context.Context, in *ListImageQuarantinesRequest, opts ...grpc.CallOption) (*ListImageQuarantinesResponse, error) {
+func (c *imageServiceClient) ListImageQuarantines(
+	ctx context.Context,
+	in *ListImageQuarantinesRequest,
+	opts ...grpc.CallOption,
+) (*ListImageQuarantinesResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListImageQuarantinesResponse)
 	err := c.cc.Invoke(ctx, ImageService_ListImageQuarantines_FullMethodName, in, out, cOpts...)
@@ -785,7 +975,11 @@ func (c *imageServiceClient) ListImageQuarantines(ctx context.Context, in *ListI
 	return out, nil
 }
 
-func (c *imageServiceClient) RollbackImageQuarantine(ctx context.Context, in *ImageQuarantineActionRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+func (c *imageServiceClient) RollbackImageQuarantine(
+	ctx context.Context,
+	in *ImageQuarantineActionRequest,
+	opts ...grpc.CallOption,
+) (*emptypb.Empty, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
 	err := c.cc.Invoke(ctx, ImageService_RollbackImageQuarantine_FullMethodName, in, out, cOpts...)
@@ -795,7 +989,11 @@ func (c *imageServiceClient) RollbackImageQuarantine(ctx context.Context, in *Im
 	return out, nil
 }
 
-func (c *imageServiceClient) FinalizeImageQuarantine(ctx context.Context, in *ImageQuarantineActionRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+func (c *imageServiceClient) FinalizeImageQuarantine(
+	ctx context.Context,
+	in *ImageQuarantineActionRequest,
+	opts ...grpc.CallOption,
+) (*emptypb.Empty, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
 	err := c.cc.Invoke(ctx, ImageService_FinalizeImageQuarantine_FullMethodName, in, out, cOpts...)
@@ -837,16 +1035,32 @@ func (UnimplementedImageServiceServer) ListImages(context.Context, *ListImagesRe
 func (UnimplementedImageServiceServer) DeleteImage(context.Context, *DeleteImageRequest) (*emptypb.Empty, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method DeleteImage not implemented")
 }
-func (UnimplementedImageServiceServer) QuarantineImage(context.Context, *QuarantineImageRequest) (*ImageQuarantine, error) {
+
+func (UnimplementedImageServiceServer) QuarantineImage(
+	context.Context,
+	*QuarantineImageRequest,
+) (*ImageQuarantine, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method QuarantineImage not implemented")
 }
-func (UnimplementedImageServiceServer) ListImageQuarantines(context.Context, *ListImageQuarantinesRequest) (*ListImageQuarantinesResponse, error) {
+
+func (UnimplementedImageServiceServer) ListImageQuarantines(
+	context.Context,
+	*ListImageQuarantinesRequest,
+) (*ListImageQuarantinesResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ListImageQuarantines not implemented")
 }
-func (UnimplementedImageServiceServer) RollbackImageQuarantine(context.Context, *ImageQuarantineActionRequest) (*emptypb.Empty, error) {
+
+func (UnimplementedImageServiceServer) RollbackImageQuarantine(
+	context.Context,
+	*ImageQuarantineActionRequest,
+) (*emptypb.Empty, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method RollbackImageQuarantine not implemented")
 }
-func (UnimplementedImageServiceServer) FinalizeImageQuarantine(context.Context, *ImageQuarantineActionRequest) (*emptypb.Empty, error) {
+
+func (UnimplementedImageServiceServer) FinalizeImageQuarantine(
+	context.Context,
+	*ImageQuarantineActionRequest,
+) (*emptypb.Empty, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method FinalizeImageQuarantine not implemented")
 }
 func (UnimplementedImageServiceServer) mustEmbedUnimplementedImageServiceServer() {}
@@ -870,7 +1084,12 @@ func RegisterImageServiceServer(s grpc.ServiceRegistrar, srv ImageServiceServer)
 	s.RegisterService(&ImageService_ServiceDesc, srv)
 }
 
-func _ImageService_PullImage_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _ImageService_PullImage_Handler(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
 	in := new(PullImageRequest)
 	if err := dec(in); err != nil {
 		return nil, err
@@ -888,7 +1107,12 @@ func _ImageService_PullImage_Handler(srv interface{}, ctx context.Context, dec f
 	return interceptor(ctx, in, info, handler)
 }
 
-func _ImageService_ListImages_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _ImageService_ListImages_Handler(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
 	in := new(ListImagesRequest)
 	if err := dec(in); err != nil {
 		return nil, err
@@ -906,7 +1130,12 @@ func _ImageService_ListImages_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
-func _ImageService_DeleteImage_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _ImageService_DeleteImage_Handler(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
 	in := new(DeleteImageRequest)
 	if err := dec(in); err != nil {
 		return nil, err
@@ -924,7 +1153,12 @@ func _ImageService_DeleteImage_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
-func _ImageService_QuarantineImage_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _ImageService_QuarantineImage_Handler(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
 	in := new(QuarantineImageRequest)
 	if err := dec(in); err != nil {
 		return nil, err
@@ -942,7 +1176,12 @@ func _ImageService_QuarantineImage_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
-func _ImageService_ListImageQuarantines_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _ImageService_ListImageQuarantines_Handler(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
 	in := new(ListImageQuarantinesRequest)
 	if err := dec(in); err != nil {
 		return nil, err
@@ -960,7 +1199,12 @@ func _ImageService_ListImageQuarantines_Handler(srv interface{}, ctx context.Con
 	return interceptor(ctx, in, info, handler)
 }
 
-func _ImageService_RollbackImageQuarantine_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _ImageService_RollbackImageQuarantine_Handler(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
 	in := new(ImageQuarantineActionRequest)
 	if err := dec(in); err != nil {
 		return nil, err
@@ -978,7 +1222,12 @@ func _ImageService_RollbackImageQuarantine_Handler(srv interface{}, ctx context.
 	return interceptor(ctx, in, info, handler)
 }
 
-func _ImageService_FinalizeImageQuarantine_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _ImageService_FinalizeImageQuarantine_Handler(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
 	in := new(ImageQuarantineActionRequest)
 	if err := dec(in); err != nil {
 		return nil, err
@@ -1049,14 +1298,30 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type SnapshotServiceClient interface {
-	CreateSnapshot(ctx context.Context, in *CreateSnapshotRequest, opts ...grpc.CallOption) (*CreateSnapshotResponse, error)
-	ListSnapshots(ctx context.Context, in *ListSnapshotsRequest, opts ...grpc.CallOption) (*ListSnapshotsResponse, error)
+	CreateSnapshot(
+		ctx context.Context,
+		in *CreateSnapshotRequest,
+		opts ...grpc.CallOption,
+	) (*CreateSnapshotResponse, error)
+	ListSnapshots(
+		ctx context.Context,
+		in *ListSnapshotsRequest,
+		opts ...grpc.CallOption,
+	) (*ListSnapshotsResponse, error)
 	DeleteSnapshot(ctx context.Context, in *DeleteSnapshotRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// v1.3-C（ADR-0028）：受限 fork（origin node 本地）与 filesystem rescue。
 	ForkSnapshot(ctx context.Context, in *ForkSnapshotRequest, opts ...grpc.CallOption) (*ForkSnapshotResponse, error)
-	RestoreSnapshot(ctx context.Context, in *RestoreSnapshotRequest, opts ...grpc.CallOption) (*RestoreSnapshotResponse, error)
+	RestoreSnapshot(
+		ctx context.Context,
+		in *RestoreSnapshotRequest,
+		opts ...grpc.CallOption,
+	) (*RestoreSnapshotResponse, error)
 	// Content verification is path-free and does not mutate runtime state.
-	ScrubSnapshot(ctx context.Context, in *ScrubSnapshotRequest, opts ...grpc.CallOption) (*ScrubSnapshotResponse, error)
+	ScrubSnapshot(
+		ctx context.Context,
+		in *ScrubSnapshotRequest,
+		opts ...grpc.CallOption,
+	) (*ScrubSnapshotResponse, error)
 }
 
 type snapshotServiceClient struct {
@@ -1067,7 +1332,11 @@ func NewSnapshotServiceClient(cc grpc.ClientConnInterface) SnapshotServiceClient
 	return &snapshotServiceClient{cc}
 }
 
-func (c *snapshotServiceClient) CreateSnapshot(ctx context.Context, in *CreateSnapshotRequest, opts ...grpc.CallOption) (*CreateSnapshotResponse, error) {
+func (c *snapshotServiceClient) CreateSnapshot(
+	ctx context.Context,
+	in *CreateSnapshotRequest,
+	opts ...grpc.CallOption,
+) (*CreateSnapshotResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CreateSnapshotResponse)
 	err := c.cc.Invoke(ctx, SnapshotService_CreateSnapshot_FullMethodName, in, out, cOpts...)
@@ -1077,7 +1346,11 @@ func (c *snapshotServiceClient) CreateSnapshot(ctx context.Context, in *CreateSn
 	return out, nil
 }
 
-func (c *snapshotServiceClient) ListSnapshots(ctx context.Context, in *ListSnapshotsRequest, opts ...grpc.CallOption) (*ListSnapshotsResponse, error) {
+func (c *snapshotServiceClient) ListSnapshots(
+	ctx context.Context,
+	in *ListSnapshotsRequest,
+	opts ...grpc.CallOption,
+) (*ListSnapshotsResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListSnapshotsResponse)
 	err := c.cc.Invoke(ctx, SnapshotService_ListSnapshots_FullMethodName, in, out, cOpts...)
@@ -1087,7 +1360,11 @@ func (c *snapshotServiceClient) ListSnapshots(ctx context.Context, in *ListSnaps
 	return out, nil
 }
 
-func (c *snapshotServiceClient) DeleteSnapshot(ctx context.Context, in *DeleteSnapshotRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+func (c *snapshotServiceClient) DeleteSnapshot(
+	ctx context.Context,
+	in *DeleteSnapshotRequest,
+	opts ...grpc.CallOption,
+) (*emptypb.Empty, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
 	err := c.cc.Invoke(ctx, SnapshotService_DeleteSnapshot_FullMethodName, in, out, cOpts...)
@@ -1097,7 +1374,11 @@ func (c *snapshotServiceClient) DeleteSnapshot(ctx context.Context, in *DeleteSn
 	return out, nil
 }
 
-func (c *snapshotServiceClient) ForkSnapshot(ctx context.Context, in *ForkSnapshotRequest, opts ...grpc.CallOption) (*ForkSnapshotResponse, error) {
+func (c *snapshotServiceClient) ForkSnapshot(
+	ctx context.Context,
+	in *ForkSnapshotRequest,
+	opts ...grpc.CallOption,
+) (*ForkSnapshotResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ForkSnapshotResponse)
 	err := c.cc.Invoke(ctx, SnapshotService_ForkSnapshot_FullMethodName, in, out, cOpts...)
@@ -1107,7 +1388,11 @@ func (c *snapshotServiceClient) ForkSnapshot(ctx context.Context, in *ForkSnapsh
 	return out, nil
 }
 
-func (c *snapshotServiceClient) RestoreSnapshot(ctx context.Context, in *RestoreSnapshotRequest, opts ...grpc.CallOption) (*RestoreSnapshotResponse, error) {
+func (c *snapshotServiceClient) RestoreSnapshot(
+	ctx context.Context,
+	in *RestoreSnapshotRequest,
+	opts ...grpc.CallOption,
+) (*RestoreSnapshotResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(RestoreSnapshotResponse)
 	err := c.cc.Invoke(ctx, SnapshotService_RestoreSnapshot_FullMethodName, in, out, cOpts...)
@@ -1117,7 +1402,11 @@ func (c *snapshotServiceClient) RestoreSnapshot(ctx context.Context, in *Restore
 	return out, nil
 }
 
-func (c *snapshotServiceClient) ScrubSnapshot(ctx context.Context, in *ScrubSnapshotRequest, opts ...grpc.CallOption) (*ScrubSnapshotResponse, error) {
+func (c *snapshotServiceClient) ScrubSnapshot(
+	ctx context.Context,
+	in *ScrubSnapshotRequest,
+	opts ...grpc.CallOption,
+) (*ScrubSnapshotResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ScrubSnapshotResponse)
 	err := c.cc.Invoke(ctx, SnapshotService_ScrubSnapshot_FullMethodName, in, out, cOpts...)
@@ -1149,22 +1438,45 @@ type SnapshotServiceServer interface {
 // pointer dereference when methods are called.
 type UnimplementedSnapshotServiceServer struct{}
 
-func (UnimplementedSnapshotServiceServer) CreateSnapshot(context.Context, *CreateSnapshotRequest) (*CreateSnapshotResponse, error) {
+func (UnimplementedSnapshotServiceServer) CreateSnapshot(
+	context.Context,
+	*CreateSnapshotRequest,
+) (*CreateSnapshotResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method CreateSnapshot not implemented")
 }
-func (UnimplementedSnapshotServiceServer) ListSnapshots(context.Context, *ListSnapshotsRequest) (*ListSnapshotsResponse, error) {
+
+func (UnimplementedSnapshotServiceServer) ListSnapshots(
+	context.Context,
+	*ListSnapshotsRequest,
+) (*ListSnapshotsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ListSnapshots not implemented")
 }
-func (UnimplementedSnapshotServiceServer) DeleteSnapshot(context.Context, *DeleteSnapshotRequest) (*emptypb.Empty, error) {
+
+func (UnimplementedSnapshotServiceServer) DeleteSnapshot(
+	context.Context,
+	*DeleteSnapshotRequest,
+) (*emptypb.Empty, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method DeleteSnapshot not implemented")
 }
-func (UnimplementedSnapshotServiceServer) ForkSnapshot(context.Context, *ForkSnapshotRequest) (*ForkSnapshotResponse, error) {
+
+func (UnimplementedSnapshotServiceServer) ForkSnapshot(
+	context.Context,
+	*ForkSnapshotRequest,
+) (*ForkSnapshotResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ForkSnapshot not implemented")
 }
-func (UnimplementedSnapshotServiceServer) RestoreSnapshot(context.Context, *RestoreSnapshotRequest) (*RestoreSnapshotResponse, error) {
+
+func (UnimplementedSnapshotServiceServer) RestoreSnapshot(
+	context.Context,
+	*RestoreSnapshotRequest,
+) (*RestoreSnapshotResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method RestoreSnapshot not implemented")
 }
-func (UnimplementedSnapshotServiceServer) ScrubSnapshot(context.Context, *ScrubSnapshotRequest) (*ScrubSnapshotResponse, error) {
+
+func (UnimplementedSnapshotServiceServer) ScrubSnapshot(
+	context.Context,
+	*ScrubSnapshotRequest,
+) (*ScrubSnapshotResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ScrubSnapshot not implemented")
 }
 func (UnimplementedSnapshotServiceServer) mustEmbedUnimplementedSnapshotServiceServer() {}
@@ -1188,7 +1500,12 @@ func RegisterSnapshotServiceServer(s grpc.ServiceRegistrar, srv SnapshotServiceS
 	s.RegisterService(&SnapshotService_ServiceDesc, srv)
 }
 
-func _SnapshotService_CreateSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _SnapshotService_CreateSnapshot_Handler(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
 	in := new(CreateSnapshotRequest)
 	if err := dec(in); err != nil {
 		return nil, err
@@ -1206,7 +1523,12 @@ func _SnapshotService_CreateSnapshot_Handler(srv interface{}, ctx context.Contex
 	return interceptor(ctx, in, info, handler)
 }
 
-func _SnapshotService_ListSnapshots_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _SnapshotService_ListSnapshots_Handler(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
 	in := new(ListSnapshotsRequest)
 	if err := dec(in); err != nil {
 		return nil, err
@@ -1224,7 +1546,12 @@ func _SnapshotService_ListSnapshots_Handler(srv interface{}, ctx context.Context
 	return interceptor(ctx, in, info, handler)
 }
 
-func _SnapshotService_DeleteSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _SnapshotService_DeleteSnapshot_Handler(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
 	in := new(DeleteSnapshotRequest)
 	if err := dec(in); err != nil {
 		return nil, err
@@ -1242,7 +1569,12 @@ func _SnapshotService_DeleteSnapshot_Handler(srv interface{}, ctx context.Contex
 	return interceptor(ctx, in, info, handler)
 }
 
-func _SnapshotService_ForkSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _SnapshotService_ForkSnapshot_Handler(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
 	in := new(ForkSnapshotRequest)
 	if err := dec(in); err != nil {
 		return nil, err
@@ -1260,7 +1592,12 @@ func _SnapshotService_ForkSnapshot_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
-func _SnapshotService_RestoreSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _SnapshotService_RestoreSnapshot_Handler(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
 	in := new(RestoreSnapshotRequest)
 	if err := dec(in); err != nil {
 		return nil, err
@@ -1278,7 +1615,12 @@ func _SnapshotService_RestoreSnapshot_Handler(srv interface{}, ctx context.Conte
 	return interceptor(ctx, in, info, handler)
 }
 
-func _SnapshotService_ScrubSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _SnapshotService_ScrubSnapshot_Handler(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
 	in := new(ScrubSnapshotRequest)
 	if err := dec(in); err != nil {
 		return nil, err
@@ -1357,10 +1699,26 @@ type VolumeServiceClient interface {
 	DetachVolume(ctx context.Context, in *DetachVolumeRequest, opts ...grpc.CallOption) (*Machine, error)
 	DeleteVolume(ctx context.Context, in *DeleteVolumeRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	ListVolumes(ctx context.Context, in *ListVolumesRequest, opts ...grpc.CallOption) (*ListVolumesResponse, error)
-	QuarantineVolume(ctx context.Context, in *QuarantineVolumeRequest, opts ...grpc.CallOption) (*VolumeQuarantine, error)
-	ListVolumeQuarantines(ctx context.Context, in *ListVolumeQuarantinesRequest, opts ...grpc.CallOption) (*ListVolumeQuarantinesResponse, error)
-	RollbackVolumeQuarantine(ctx context.Context, in *VolumeQuarantineActionRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
-	FinalizeVolumeQuarantine(ctx context.Context, in *VolumeQuarantineActionRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	QuarantineVolume(
+		ctx context.Context,
+		in *QuarantineVolumeRequest,
+		opts ...grpc.CallOption,
+	) (*VolumeQuarantine, error)
+	ListVolumeQuarantines(
+		ctx context.Context,
+		in *ListVolumeQuarantinesRequest,
+		opts ...grpc.CallOption,
+	) (*ListVolumeQuarantinesResponse, error)
+	RollbackVolumeQuarantine(
+		ctx context.Context,
+		in *VolumeQuarantineActionRequest,
+		opts ...grpc.CallOption,
+	) (*emptypb.Empty, error)
+	FinalizeVolumeQuarantine(
+		ctx context.Context,
+		in *VolumeQuarantineActionRequest,
+		opts ...grpc.CallOption,
+	) (*emptypb.Empty, error)
 }
 
 type volumeServiceClient struct {
@@ -1371,7 +1729,11 @@ func NewVolumeServiceClient(cc grpc.ClientConnInterface) VolumeServiceClient {
 	return &volumeServiceClient{cc}
 }
 
-func (c *volumeServiceClient) CreateVolume(ctx context.Context, in *CreateVolumeRequest, opts ...grpc.CallOption) (*CreateVolumeResponse, error) {
+func (c *volumeServiceClient) CreateVolume(
+	ctx context.Context,
+	in *CreateVolumeRequest,
+	opts ...grpc.CallOption,
+) (*CreateVolumeResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CreateVolumeResponse)
 	err := c.cc.Invoke(ctx, VolumeService_CreateVolume_FullMethodName, in, out, cOpts...)
@@ -1381,7 +1743,11 @@ func (c *volumeServiceClient) CreateVolume(ctx context.Context, in *CreateVolume
 	return out, nil
 }
 
-func (c *volumeServiceClient) ImportDataset(ctx context.Context, in *ImportDatasetRequest, opts ...grpc.CallOption) (*CreateVolumeResponse, error) {
+func (c *volumeServiceClient) ImportDataset(
+	ctx context.Context,
+	in *ImportDatasetRequest,
+	opts ...grpc.CallOption,
+) (*CreateVolumeResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CreateVolumeResponse)
 	err := c.cc.Invoke(ctx, VolumeService_ImportDataset_FullMethodName, in, out, cOpts...)
@@ -1391,7 +1757,11 @@ func (c *volumeServiceClient) ImportDataset(ctx context.Context, in *ImportDatas
 	return out, nil
 }
 
-func (c *volumeServiceClient) AttachVolume(ctx context.Context, in *AttachVolumeRequest, opts ...grpc.CallOption) (*Machine, error) {
+func (c *volumeServiceClient) AttachVolume(
+	ctx context.Context,
+	in *AttachVolumeRequest,
+	opts ...grpc.CallOption,
+) (*Machine, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(Machine)
 	err := c.cc.Invoke(ctx, VolumeService_AttachVolume_FullMethodName, in, out, cOpts...)
@@ -1401,7 +1771,11 @@ func (c *volumeServiceClient) AttachVolume(ctx context.Context, in *AttachVolume
 	return out, nil
 }
 
-func (c *volumeServiceClient) DetachVolume(ctx context.Context, in *DetachVolumeRequest, opts ...grpc.CallOption) (*Machine, error) {
+func (c *volumeServiceClient) DetachVolume(
+	ctx context.Context,
+	in *DetachVolumeRequest,
+	opts ...grpc.CallOption,
+) (*Machine, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(Machine)
 	err := c.cc.Invoke(ctx, VolumeService_DetachVolume_FullMethodName, in, out, cOpts...)
@@ -1411,7 +1785,11 @@ func (c *volumeServiceClient) DetachVolume(ctx context.Context, in *DetachVolume
 	return out, nil
 }
 
-func (c *volumeServiceClient) DeleteVolume(ctx context.Context, in *DeleteVolumeRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+func (c *volumeServiceClient) DeleteVolume(
+	ctx context.Context,
+	in *DeleteVolumeRequest,
+	opts ...grpc.CallOption,
+) (*emptypb.Empty, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
 	err := c.cc.Invoke(ctx, VolumeService_DeleteVolume_FullMethodName, in, out, cOpts...)
@@ -1421,7 +1799,11 @@ func (c *volumeServiceClient) DeleteVolume(ctx context.Context, in *DeleteVolume
 	return out, nil
 }
 
-func (c *volumeServiceClient) ListVolumes(ctx context.Context, in *ListVolumesRequest, opts ...grpc.CallOption) (*ListVolumesResponse, error) {
+func (c *volumeServiceClient) ListVolumes(
+	ctx context.Context,
+	in *ListVolumesRequest,
+	opts ...grpc.CallOption,
+) (*ListVolumesResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListVolumesResponse)
 	err := c.cc.Invoke(ctx, VolumeService_ListVolumes_FullMethodName, in, out, cOpts...)
@@ -1431,7 +1813,11 @@ func (c *volumeServiceClient) ListVolumes(ctx context.Context, in *ListVolumesRe
 	return out, nil
 }
 
-func (c *volumeServiceClient) QuarantineVolume(ctx context.Context, in *QuarantineVolumeRequest, opts ...grpc.CallOption) (*VolumeQuarantine, error) {
+func (c *volumeServiceClient) QuarantineVolume(
+	ctx context.Context,
+	in *QuarantineVolumeRequest,
+	opts ...grpc.CallOption,
+) (*VolumeQuarantine, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(VolumeQuarantine)
 	err := c.cc.Invoke(ctx, VolumeService_QuarantineVolume_FullMethodName, in, out, cOpts...)
@@ -1441,7 +1827,11 @@ func (c *volumeServiceClient) QuarantineVolume(ctx context.Context, in *Quaranti
 	return out, nil
 }
 
-func (c *volumeServiceClient) ListVolumeQuarantines(ctx context.Context, in *ListVolumeQuarantinesRequest, opts ...grpc.CallOption) (*ListVolumeQuarantinesResponse, error) {
+func (c *volumeServiceClient) ListVolumeQuarantines(
+	ctx context.Context,
+	in *ListVolumeQuarantinesRequest,
+	opts ...grpc.CallOption,
+) (*ListVolumeQuarantinesResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListVolumeQuarantinesResponse)
 	err := c.cc.Invoke(ctx, VolumeService_ListVolumeQuarantines_FullMethodName, in, out, cOpts...)
@@ -1451,7 +1841,11 @@ func (c *volumeServiceClient) ListVolumeQuarantines(ctx context.Context, in *Lis
 	return out, nil
 }
 
-func (c *volumeServiceClient) RollbackVolumeQuarantine(ctx context.Context, in *VolumeQuarantineActionRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+func (c *volumeServiceClient) RollbackVolumeQuarantine(
+	ctx context.Context,
+	in *VolumeQuarantineActionRequest,
+	opts ...grpc.CallOption,
+) (*emptypb.Empty, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
 	err := c.cc.Invoke(ctx, VolumeService_RollbackVolumeQuarantine_FullMethodName, in, out, cOpts...)
@@ -1461,7 +1855,11 @@ func (c *volumeServiceClient) RollbackVolumeQuarantine(ctx context.Context, in *
 	return out, nil
 }
 
-func (c *volumeServiceClient) FinalizeVolumeQuarantine(ctx context.Context, in *VolumeQuarantineActionRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+func (c *volumeServiceClient) FinalizeVolumeQuarantine(
+	ctx context.Context,
+	in *VolumeQuarantineActionRequest,
+	opts ...grpc.CallOption,
+) (*emptypb.Empty, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
 	err := c.cc.Invoke(ctx, VolumeService_FinalizeVolumeQuarantine_FullMethodName, in, out, cOpts...)
@@ -1497,10 +1895,17 @@ type VolumeServiceServer interface {
 // pointer dereference when methods are called.
 type UnimplementedVolumeServiceServer struct{}
 
-func (UnimplementedVolumeServiceServer) CreateVolume(context.Context, *CreateVolumeRequest) (*CreateVolumeResponse, error) {
+func (UnimplementedVolumeServiceServer) CreateVolume(
+	context.Context,
+	*CreateVolumeRequest,
+) (*CreateVolumeResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method CreateVolume not implemented")
 }
-func (UnimplementedVolumeServiceServer) ImportDataset(context.Context, *ImportDatasetRequest) (*CreateVolumeResponse, error) {
+
+func (UnimplementedVolumeServiceServer) ImportDataset(
+	context.Context,
+	*ImportDatasetRequest,
+) (*CreateVolumeResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ImportDataset not implemented")
 }
 func (UnimplementedVolumeServiceServer) AttachVolume(context.Context, *AttachVolumeRequest) (*Machine, error) {
@@ -1512,19 +1917,39 @@ func (UnimplementedVolumeServiceServer) DetachVolume(context.Context, *DetachVol
 func (UnimplementedVolumeServiceServer) DeleteVolume(context.Context, *DeleteVolumeRequest) (*emptypb.Empty, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method DeleteVolume not implemented")
 }
-func (UnimplementedVolumeServiceServer) ListVolumes(context.Context, *ListVolumesRequest) (*ListVolumesResponse, error) {
+
+func (UnimplementedVolumeServiceServer) ListVolumes(
+	context.Context,
+	*ListVolumesRequest,
+) (*ListVolumesResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ListVolumes not implemented")
 }
-func (UnimplementedVolumeServiceServer) QuarantineVolume(context.Context, *QuarantineVolumeRequest) (*VolumeQuarantine, error) {
+
+func (UnimplementedVolumeServiceServer) QuarantineVolume(
+	context.Context,
+	*QuarantineVolumeRequest,
+) (*VolumeQuarantine, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method QuarantineVolume not implemented")
 }
-func (UnimplementedVolumeServiceServer) ListVolumeQuarantines(context.Context, *ListVolumeQuarantinesRequest) (*ListVolumeQuarantinesResponse, error) {
+
+func (UnimplementedVolumeServiceServer) ListVolumeQuarantines(
+	context.Context,
+	*ListVolumeQuarantinesRequest,
+) (*ListVolumeQuarantinesResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ListVolumeQuarantines not implemented")
 }
-func (UnimplementedVolumeServiceServer) RollbackVolumeQuarantine(context.Context, *VolumeQuarantineActionRequest) (*emptypb.Empty, error) {
+
+func (UnimplementedVolumeServiceServer) RollbackVolumeQuarantine(
+	context.Context,
+	*VolumeQuarantineActionRequest,
+) (*emptypb.Empty, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method RollbackVolumeQuarantine not implemented")
 }
-func (UnimplementedVolumeServiceServer) FinalizeVolumeQuarantine(context.Context, *VolumeQuarantineActionRequest) (*emptypb.Empty, error) {
+
+func (UnimplementedVolumeServiceServer) FinalizeVolumeQuarantine(
+	context.Context,
+	*VolumeQuarantineActionRequest,
+) (*emptypb.Empty, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method FinalizeVolumeQuarantine not implemented")
 }
 func (UnimplementedVolumeServiceServer) mustEmbedUnimplementedVolumeServiceServer() {}
@@ -1548,7 +1973,12 @@ func RegisterVolumeServiceServer(s grpc.ServiceRegistrar, srv VolumeServiceServe
 	s.RegisterService(&VolumeService_ServiceDesc, srv)
 }
 
-func _VolumeService_CreateVolume_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _VolumeService_CreateVolume_Handler(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
 	in := new(CreateVolumeRequest)
 	if err := dec(in); err != nil {
 		return nil, err
@@ -1566,7 +1996,12 @@ func _VolumeService_CreateVolume_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
-func _VolumeService_ImportDataset_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _VolumeService_ImportDataset_Handler(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
 	in := new(ImportDatasetRequest)
 	if err := dec(in); err != nil {
 		return nil, err
@@ -1584,7 +2019,12 @@ func _VolumeService_ImportDataset_Handler(srv interface{}, ctx context.Context, 
 	return interceptor(ctx, in, info, handler)
 }
 
-func _VolumeService_AttachVolume_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _VolumeService_AttachVolume_Handler(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
 	in := new(AttachVolumeRequest)
 	if err := dec(in); err != nil {
 		return nil, err
@@ -1602,7 +2042,12 @@ func _VolumeService_AttachVolume_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
-func _VolumeService_DetachVolume_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _VolumeService_DetachVolume_Handler(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
 	in := new(DetachVolumeRequest)
 	if err := dec(in); err != nil {
 		return nil, err
@@ -1620,7 +2065,12 @@ func _VolumeService_DetachVolume_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
-func _VolumeService_DeleteVolume_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _VolumeService_DeleteVolume_Handler(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
 	in := new(DeleteVolumeRequest)
 	if err := dec(in); err != nil {
 		return nil, err
@@ -1638,7 +2088,12 @@ func _VolumeService_DeleteVolume_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
-func _VolumeService_ListVolumes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _VolumeService_ListVolumes_Handler(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
 	in := new(ListVolumesRequest)
 	if err := dec(in); err != nil {
 		return nil, err
@@ -1656,7 +2111,12 @@ func _VolumeService_ListVolumes_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
-func _VolumeService_QuarantineVolume_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _VolumeService_QuarantineVolume_Handler(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
 	in := new(QuarantineVolumeRequest)
 	if err := dec(in); err != nil {
 		return nil, err
@@ -1674,7 +2134,12 @@ func _VolumeService_QuarantineVolume_Handler(srv interface{}, ctx context.Contex
 	return interceptor(ctx, in, info, handler)
 }
 
-func _VolumeService_ListVolumeQuarantines_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _VolumeService_ListVolumeQuarantines_Handler(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
 	in := new(ListVolumeQuarantinesRequest)
 	if err := dec(in); err != nil {
 		return nil, err
@@ -1692,7 +2157,12 @@ func _VolumeService_ListVolumeQuarantines_Handler(srv interface{}, ctx context.C
 	return interceptor(ctx, in, info, handler)
 }
 
-func _VolumeService_RollbackVolumeQuarantine_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _VolumeService_RollbackVolumeQuarantine_Handler(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
 	in := new(VolumeQuarantineActionRequest)
 	if err := dec(in); err != nil {
 		return nil, err
@@ -1710,7 +2180,12 @@ func _VolumeService_RollbackVolumeQuarantine_Handler(srv interface{}, ctx contex
 	return interceptor(ctx, in, info, handler)
 }
 
-func _VolumeService_FinalizeVolumeQuarantine_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _VolumeService_FinalizeVolumeQuarantine_Handler(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
 	in := new(VolumeQuarantineActionRequest)
 	if err := dec(in); err != nil {
 		return nil, err

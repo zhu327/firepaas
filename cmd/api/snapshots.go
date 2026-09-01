@@ -122,7 +122,8 @@ func (a *API) createSnapshot(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 409, "memory checkpoint forbidden with writable volume attachments")
 			return
 		}
-		if dep, err := a.store.ActiveDeploymentForApp(r.Context(), m.AppID); err == nil && dep != nil && len(dep.SecretRefs) > 0 {
+		if dep, err := a.store.ActiveDeploymentForApp(r.Context(), m.AppID); err == nil && dep != nil &&
+			len(dep.SecretRefs) > 0 {
 			writeErr(w, 409, "memory checkpoint forbidden: execution may have received secrets (ADR-0024)")
 			return
 		}
@@ -188,7 +189,23 @@ func (a *API) createSnapshot(w http.ResponseWriter, r *http.Request) {
 }
 
 func snapshotDTO(s store.Snapshot) map[string]any {
-	return map[string]any{"id": s.ID, "project_id": s.ProjectID, "source_machine_id": s.SourceMachineID, "source_execution_id": s.SourceExecutionID, "source_generation": s.SourceGeneration, "kind": s.Kind, "status": s.Status, "origin_node_id": s.NodeID, "locality": "node-local", "durability": "best-effort", "compatibility_key": s.CompatibilityKey, "size_bytes": s.SizeBytes, "checksum": s.Checksum, "integrity": s.Integrity, "created_at": s.CreatedAt}
+	return map[string]any{
+		"id":                  s.ID,
+		"project_id":          s.ProjectID,
+		"source_machine_id":   s.SourceMachineID,
+		"source_execution_id": s.SourceExecutionID,
+		"source_generation":   s.SourceGeneration,
+		"kind":                s.Kind,
+		"status":              s.Status,
+		"origin_node_id":      s.NodeID,
+		"locality":            "node-local",
+		"durability":          "best-effort",
+		"compatibility_key":   s.CompatibilityKey,
+		"size_bytes":          s.SizeBytes,
+		"checksum":            s.Checksum,
+		"integrity":           s.Integrity,
+		"created_at":          s.CreatedAt,
+	}
 }
 
 // integrityBlocked（v1.4-B）：MISSING/CORRUPT 的产物不得 restore/fork/attach。
@@ -720,15 +737,18 @@ func (a *API) rescueMachine(w http.ResponseWriter, r *http.Request) {
 		RequireMemoryCompatible: decision.ResolvedMode == "memory",
 	})
 	if err != nil {
-		if errors.Is(err, store.ErrRescueConflict) || errors.Is(err, store.ErrSnapshotStatusConflict) || errors.Is(err, store.ErrRequestConflict) {
+		if errors.Is(err, store.ErrRescueConflict) || errors.Is(err, store.ErrSnapshotStatusConflict) ||
+			errors.Is(err, store.ErrRequestConflict) {
 			writeErr(w, 409, err.Error())
 			return
 		}
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 202, map[string]any{"operation_id": opID, "machine_id": machineID,
-		"execution_id": newExecution, "generation": newGeneration, "snapshot_id": snap.ID})
+	writeJSON(w, 202, map[string]any{
+		"operation_id": opID, "machine_id": machineID,
+		"execution_id": newExecution, "generation": newGeneration, "snapshot_id": snap.ID,
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -754,7 +774,8 @@ var datasetDigestPattern = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
 // loopback exception exists only for hermetic e2e runs.
 func normalizeDatasetSourceURL(raw string) (string, error) {
 	u, err := url.Parse(raw)
-	if err != nil || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.RawFragment != "" {
+	if err != nil || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" ||
+		u.RawFragment != "" {
 		return "", errors.New("source_url must be a credential-free HTTPS URL without userinfo, query or fragment")
 	}
 	loopback := u.Scheme == "http" && net.ParseIP(u.Hostname()) != nil && net.ParseIP(u.Hostname()).IsLoopback()
@@ -841,14 +862,17 @@ func (a *API) createVolume(w http.ResponseWriter, r *http.Request) {
 	opID := "op-vol-" + volID
 	params := store.EnqueueOperationParams{OperationID: opID, ProjectID: project, Generation: 1, DispatchNodeID: nodeID}
 	v := store.Volume{ID: volID, ProjectID: project, Name: body.Name, NodeID: nodeID, SizeBytes: sizeBytes}
-	if mode == "LOCAL_RW" {
+	switch mode {
+	case "LOCAL_RW":
 		params.Kind = "volume_create"
-		params.Request = []byte(fmt.Sprintf(`{"volume_id":%q,"size_bytes":%d,"operation_id":%q}`, volID, sizeBytes, opID))
+		params.Request = []byte(
+			fmt.Sprintf(`{"volume_id":%q,"size_bytes":%d,"operation_id":%q}`, volID, sizeBytes, opID),
+		)
 		if _, _, err := a.store.CreateLocalRWVolumeAndEnqueue(r.Context(), v, params); err != nil {
 			writeErr(w, 409, err.Error())
 			return
 		}
-	} else if mode == "DATASET_RO" {
+	case "DATASET_RO":
 		if !datasetDigestPattern.MatchString(body.ContentDigest) || body.SourceURL == "" {
 			writeErr(w, 400, "DATASET_RO requires source_url and lowercase sha256 content_digest")
 			return
@@ -882,11 +906,21 @@ func (a *API) createVolume(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 409, err.Error())
 			return
 		}
-	} else {
+	default:
 		writeErr(w, 400, "mode must be LOCAL_RW or DATASET_RO")
 		return
 	}
-	writeJSON(w, 202, map[string]any{"volume_id": volID, "project_id": project, "node_id": nodeID, "mode": mode, "status": "CREATING"})
+	writeJSON(
+		w,
+		202,
+		map[string]any{
+			"volume_id":  volID,
+			"project_id": project,
+			"node_id":    nodeID,
+			"mode":       mode,
+			"status":     "CREATING",
+		},
+	)
 }
 
 func (a *API) listVolumes(w http.ResponseWriter, r *http.Request) {
@@ -1034,10 +1068,39 @@ func (a *API) attachVolume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	opID := "op-vol-att-" + volID + "-" + m.CurrentExecutionID[:8]
-	raw := []byte(fmt.Sprintf(`{"volume_id":%q,"machine_id":%q,"execution_id":%q,"generation":%d,"operation_id":%q,"mount_path":%q,"readonly":%v,"overlay":%v,"overlay_size_bytes":%d}`,
-		volID, machineID, m.CurrentExecutionID, m.Generation, opID, body.MountPath, body.Readonly, body.OverlaySizeBytes > 0, body.OverlaySizeBytes))
-	p := store.EnqueueOperationParams{OperationID: opID, ProjectID: v.ProjectID, MachineID: machineID, ExecutionID: m.CurrentExecutionID, Generation: m.Generation, Kind: "volume_attach", Request: raw, DispatchNodeID: v.NodeID}
-	att := store.VolumeAttachment{VolumeID: volID, MachineID: machineID, ExecutionID: m.CurrentExecutionID, MountPath: body.MountPath, Readonly: body.Readonly, OverlaySizeBytes: body.OverlaySizeBytes, Status: "PENDING"}
+	raw := []byte(
+		fmt.Sprintf(
+			`{"volume_id":%q,"machine_id":%q,"execution_id":%q,"generation":%d,"operation_id":%q,"mount_path":%q,"readonly":%v,"overlay":%v,"overlay_size_bytes":%d}`,
+			volID,
+			machineID,
+			m.CurrentExecutionID,
+			m.Generation,
+			opID,
+			body.MountPath,
+			body.Readonly,
+			body.OverlaySizeBytes > 0,
+			body.OverlaySizeBytes,
+		),
+	)
+	p := store.EnqueueOperationParams{
+		OperationID:    opID,
+		ProjectID:      v.ProjectID,
+		MachineID:      machineID,
+		ExecutionID:    m.CurrentExecutionID,
+		Generation:     m.Generation,
+		Kind:           "volume_attach",
+		Request:        raw,
+		DispatchNodeID: v.NodeID,
+	}
+	att := store.VolumeAttachment{
+		VolumeID:         volID,
+		MachineID:        machineID,
+		ExecutionID:      m.CurrentExecutionID,
+		MountPath:        body.MountPath,
+		Readonly:         body.Readonly,
+		OverlaySizeBytes: body.OverlaySizeBytes,
+		Status:           "PENDING",
+	}
 	if v.Mode == "DATASET_RO" {
 		_, err = a.store.ClaimDatasetAttachmentAndEnqueue(r.Context(), att, p)
 	} else {
@@ -1075,7 +1138,16 @@ func (a *API) detachVolume(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "volume not found")
 		return
 	}
-	p := store.EnqueueOperationParams{OperationID: opID, ProjectID: v.ProjectID, MachineID: machineID, ExecutionID: m.CurrentExecutionID, Generation: m.Generation, Kind: "volume_detach", Request: raw, DispatchNodeID: m.NodeID}
+	p := store.EnqueueOperationParams{
+		OperationID:    opID,
+		ProjectID:      v.ProjectID,
+		MachineID:      machineID,
+		ExecutionID:    m.CurrentExecutionID,
+		Generation:     m.Generation,
+		Kind:           "volume_detach",
+		Request:        raw,
+		DispatchNodeID: m.NodeID,
+	}
 	if _, err := a.store.BeginDetachVolumeAndEnqueue(r.Context(), volID, machineID, m.CurrentExecutionID, p); err != nil {
 		writeErr(w, 409, err.Error())
 		return

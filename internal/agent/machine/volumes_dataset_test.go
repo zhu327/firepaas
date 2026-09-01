@@ -99,7 +99,10 @@ func TestValidateDatasetURL(t *testing.T) {
 // v1.4：下载失败错误不得携带来源 URL（含 host）。
 func TestRedactDatasetSource(t *testing.T) {
 	secret := "https://objects.internal.example/a/b/d.tar.gz"
-	err := redactDatasetSource(secret, fmt.Errorf("Get %q: dial tcp: lookup objects.internal.example: no such host", secret))
+	err := redactDatasetSource(
+		secret,
+		fmt.Errorf("Get %q: dial tcp: lookup objects.internal.example: no such host", secret),
+	)
 	msg := err.Error()
 	if strings.Contains(msg, "objects.internal.example") || strings.Contains(msg, "d.tar.gz") {
 		t.Fatalf("error leaks dataset origin: %s", msg)

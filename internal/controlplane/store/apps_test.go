@@ -18,9 +18,21 @@ func TestCreateAppAndDeploymentAtomic(t *testing.T) {
 	t.Cleanup(func() { cleanupProject(t, s, project) })
 
 	// Invalid deployment FK forces the transaction to fail; the app must not remain.
-	err := s.CreateAppAndDeployment(ctx, project,
+	err := s.CreateAppAndDeployment(
+		ctx,
+		project,
 		App{ID: "app-atomic", Hostname: "atomic.local", ImageRef: "img:v1", VCPU: 1, MemMIB: 512, DesiredReplicas: 1},
-		Deployment{ID: "dep-atomic", AppID: "wrong-app", Generation: 1, ImageRef: "img:v1", VCPU: 1, MemMIB: 512, Port: 80, Status: "ACTIVE"})
+		Deployment{
+			ID:         "dep-atomic",
+			AppID:      "wrong-app",
+			Generation: 1,
+			ImageRef:   "img:v1",
+			VCPU:       1,
+			MemMIB:     512,
+			Port:       80,
+			Status:     "ACTIVE",
+		},
+	)
 	if err == nil {
 		t.Fatal("expected transaction failure")
 	}
@@ -128,8 +140,26 @@ func TestMachinesCrossGenerationCoexist(t *testing.T) {
 	if err := s.EnsureApp(ctx, project, appID, "co.local", "img:v1", 1, 512, 80, 1); err != nil {
 		t.Fatal(err)
 	}
-	gen1 := &Deployment{ID: "d1", AppID: appID, Generation: 1, ImageRef: "img:v1", VCPU: 1, MemMIB: 512, Port: 80, Status: "ACTIVE"}
-	gen2 := &Deployment{ID: "d2", AppID: appID, Generation: 2, ImageRef: "img:v2", VCPU: 1, MemMIB: 512, Port: 80, Status: "PREPARING"}
+	gen1 := &Deployment{
+		ID:         "d1",
+		AppID:      appID,
+		Generation: 1,
+		ImageRef:   "img:v1",
+		VCPU:       1,
+		MemMIB:     512,
+		Port:       80,
+		Status:     "ACTIVE",
+	}
+	gen2 := &Deployment{
+		ID:         "d2",
+		AppID:      appID,
+		Generation: 2,
+		ImageRef:   "img:v2",
+		VCPU:       1,
+		MemMIB:     512,
+		Port:       80,
+		Status:     "PREPARING",
+	}
 	if err := s.CreateDeployment(ctx, *gen1); err != nil {
 		t.Fatal(err)
 	}
@@ -253,7 +283,16 @@ func TestDeployAppTx(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dep2 := Deployment{ID: "dep-tx-2", AppID: appID, Generation: 2, ImageRef: "img:v2", VCPU: 1, MemMIB: 512, Port: 80, Status: "PREPARING"}
+	dep2 := Deployment{
+		ID:         "dep-tx-2",
+		AppID:      appID,
+		Generation: 2,
+		ImageRef:   "img:v2",
+		VCPU:       1,
+		MemMIB:     512,
+		Port:       80,
+		Status:     "PREPARING",
+	}
 	if err := s.DeployApp(ctx, dep2, Rollout{ID: "rl-tx-1", AppID: appID, FromGeneration: 1, ToGeneration: 2}, 2); err != nil {
 		t.Fatal(err)
 	}
@@ -267,8 +306,20 @@ func TestDeployAppTx(t *testing.T) {
 		t.Fatalf("rollout = %+v", rl)
 	}
 	// 再次 deploy → ErrRolloutBusy（事务内互斥）。
-	dep3 := Deployment{ID: "dep-tx-3", AppID: appID, Generation: 3, ImageRef: "img:v3", VCPU: 1, MemMIB: 512, Port: 80, Status: "PREPARING"}
-	if err := s.DeployApp(ctx, dep3, Rollout{ID: "rl-tx-2", AppID: appID, FromGeneration: 2, ToGeneration: 3}, 3); !errors.Is(err, ErrRolloutBusy) {
+	dep3 := Deployment{
+		ID:         "dep-tx-3",
+		AppID:      appID,
+		Generation: 3,
+		ImageRef:   "img:v3",
+		VCPU:       1,
+		MemMIB:     512,
+		Port:       80,
+		Status:     "PREPARING",
+	}
+	if err := s.DeployApp(ctx, dep3, Rollout{ID: "rl-tx-2", AppID: appID, FromGeneration: 2, ToGeneration: 3}, 3); !errors.Is(
+		err,
+		ErrRolloutBusy,
+	) {
 		t.Fatalf("second deploy err = %v, want ErrRolloutBusy", err)
 	}
 	// 事务失败不留部分状态：gen=3 的 deployment 因 rollout 互斥不应存在。

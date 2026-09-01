@@ -18,6 +18,7 @@ func localGCError(err error) error {
 	}
 	return status.Error(codes.FailedPrecondition, err.Error())
 }
+
 func (s *Server) QuarantineImage(ctx context.Context, r *pb.QuarantineImageRequest) (*pb.ImageQuarantine, error) {
 	if e := contracts.ValidateQuarantineImageRequest(r); e != nil {
 		return nil, status.Error(codes.InvalidArgument, e.Error())
@@ -28,14 +29,22 @@ func (s *Server) QuarantineImage(ctx context.Context, r *pb.QuarantineImageReque
 	}
 	return v, nil
 }
-func (s *Server) ListImageQuarantines(ctx context.Context, _ *pb.ListImageQuarantinesRequest) (*pb.ListImageQuarantinesResponse, error) {
+
+func (s *Server) ListImageQuarantines(
+	ctx context.Context,
+	_ *pb.ListImageQuarantinesRequest,
+) (*pb.ListImageQuarantinesResponse, error) {
 	v, e := s.machines.ListImageQuarantines(ctx)
 	if e != nil {
 		return nil, localGCError(e)
 	}
 	return &pb.ListImageQuarantinesResponse{Quarantines: v}, nil
 }
-func (s *Server) RollbackImageQuarantine(ctx context.Context, r *pb.ImageQuarantineActionRequest) (*emptypb.Empty, error) {
+
+func (s *Server) RollbackImageQuarantine(
+	ctx context.Context,
+	r *pb.ImageQuarantineActionRequest,
+) (*emptypb.Empty, error) {
 	if e := contracts.ValidateImageQuarantineActionRequest(r); e != nil {
 		return nil, status.Error(codes.InvalidArgument, e.Error())
 	}
@@ -44,7 +53,11 @@ func (s *Server) RollbackImageQuarantine(ctx context.Context, r *pb.ImageQuarant
 	}
 	return &emptypb.Empty{}, nil
 }
-func (s *Server) FinalizeImageQuarantine(ctx context.Context, r *pb.ImageQuarantineActionRequest) (*emptypb.Empty, error) {
+
+func (s *Server) FinalizeImageQuarantine(
+	ctx context.Context,
+	r *pb.ImageQuarantineActionRequest,
+) (*emptypb.Empty, error) {
 	if e := contracts.ValidateImageQuarantineActionRequest(r); e != nil {
 		return nil, status.Error(codes.InvalidArgument, e.Error())
 	}
@@ -53,6 +66,7 @@ func (s *Server) FinalizeImageQuarantine(ctx context.Context, r *pb.ImageQuarant
 	}
 	return &emptypb.Empty{}, nil
 }
+
 func (s *Server) QuarantineVolume(ctx context.Context, r *pb.QuarantineVolumeRequest) (*pb.VolumeQuarantine, error) {
 	if e := contracts.ValidateQuarantineVolumeRequest(r); e != nil {
 		return nil, status.Error(codes.InvalidArgument, e.Error())
@@ -63,14 +77,22 @@ func (s *Server) QuarantineVolume(ctx context.Context, r *pb.QuarantineVolumeReq
 	}
 	return v, nil
 }
-func (s *Server) ListVolumeQuarantines(ctx context.Context, _ *pb.ListVolumeQuarantinesRequest) (*pb.ListVolumeQuarantinesResponse, error) {
+
+func (s *Server) ListVolumeQuarantines(
+	ctx context.Context,
+	_ *pb.ListVolumeQuarantinesRequest,
+) (*pb.ListVolumeQuarantinesResponse, error) {
 	v, e := s.machines.ListVolumeQuarantines(ctx)
 	if e != nil {
 		return nil, localGCError(e)
 	}
 	return &pb.ListVolumeQuarantinesResponse{Quarantines: v}, nil
 }
-func (s *Server) RollbackVolumeQuarantine(ctx context.Context, r *pb.VolumeQuarantineActionRequest) (*emptypb.Empty, error) {
+
+func (s *Server) RollbackVolumeQuarantine(
+	ctx context.Context,
+	r *pb.VolumeQuarantineActionRequest,
+) (*emptypb.Empty, error) {
 	if e := contracts.ValidateVolumeQuarantineActionRequest(r); e != nil {
 		return nil, status.Error(codes.InvalidArgument, e.Error())
 	}
@@ -79,7 +101,11 @@ func (s *Server) RollbackVolumeQuarantine(ctx context.Context, r *pb.VolumeQuara
 	}
 	return &emptypb.Empty{}, nil
 }
-func (s *Server) FinalizeVolumeQuarantine(ctx context.Context, r *pb.VolumeQuarantineActionRequest) (*emptypb.Empty, error) {
+
+func (s *Server) FinalizeVolumeQuarantine(
+	ctx context.Context,
+	r *pb.VolumeQuarantineActionRequest,
+) (*emptypb.Empty, error) {
 	if e := contracts.ValidateVolumeQuarantineActionRequest(r); e != nil {
 		return nil, status.Error(codes.InvalidArgument, e.Error())
 	}

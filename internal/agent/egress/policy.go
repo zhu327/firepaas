@@ -118,8 +118,14 @@ func FromProto(p *pb.EgressPolicySpec) (*Policy, error) {
 	if p.GetPolicyGeneration() == 0 {
 		return nil, errors.New("egress policy_generation must be > 0")
 	}
-	sort.Slice(out.AllowedCIDRs, func(i, j int) bool { return out.AllowedCIDRs[i].String() < out.AllowedCIDRs[j].String() })
-	sort.Slice(out.DeniedCIDRs, func(i, j int) bool { return out.DeniedCIDRs[i].String() < out.DeniedCIDRs[j].String() })
+	sort.Slice(
+		out.AllowedCIDRs,
+		func(i, j int) bool { return out.AllowedCIDRs[i].String() < out.AllowedCIDRs[j].String() },
+	)
+	sort.Slice(
+		out.DeniedCIDRs,
+		func(i, j int) bool { return out.DeniedCIDRs[i].String() < out.DeniedCIDRs[j].String() },
+	)
 	return &out, nil
 }
 
@@ -271,7 +277,11 @@ func (p *Policy) DecideForProxied(host string, resolved []netip.Addr) Decision {
 		}
 		if host == "" {
 			// 无 Host/SNI/ECH：域名规则无法保护，allowlist-only 默认拒绝。
-			return Decision{Allow: false, MatchType: "no_host", Reason: "no host/sni to authorize (allowlist default deny)"}
+			return Decision{
+				Allow:     false,
+				MatchType: "no_host",
+				Reason:    "no host/sni to authorize (allowlist default deny)",
+			}
 		}
 		if len(resolved) == 0 {
 			// 解析失败/集合为空：fail closed，不回退 guest DNS。
@@ -309,7 +319,11 @@ func (p *Policy) DecideByCIDR(addr netip.Addr) Decision {
 		if containsCIDR(p.AllowedCIDRs, addr) {
 			return Decision{Allow: true, MatchType: "cidr_allowed", Reason: "destination in allowed_cidrs"}
 		}
-		return Decision{Allow: false, MatchType: "mode_default", Reason: "allowlist default deny (no host/sni protection)"}
+		return Decision{
+			Allow:     false,
+			MatchType: "mode_default",
+			Reason:    "allowlist default deny (no host/sni protection)",
+		}
 	}
 	return Decision{Allow: false, MatchType: "mode_default", Reason: "unknown mode"}
 }
@@ -405,12 +419,5 @@ func sortedIPs(addrs []netip.Addr) []netip.Addr {
 		out = append(out, u)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Less(out[j]) })
-	return out
-}
-
-// sortedPrefixes 去重排序（仅内部工具）。
-func sortedPrefixes(list []netip.Prefix) []netip.Prefix {
-	out := append([]netip.Prefix(nil), list...)
-	sort.Slice(out, func(i, j int) bool { return out[i].String() < out[j].String() })
 	return out
 }

@@ -22,13 +22,20 @@ func TestAssembleSchedulerNodesCombinesOneSnapshot(t *testing.T) {
 				Info: &pb.ServiceInfoResponse{
 					NodeId: "agent-1", Labels: map[string]string{"zone": "a"},
 					Capacity: &pb.NodeCapacity{VcpuTotal: 8, MemTotalMib: 16384, DiskTotalMib: 50000},
-					Usage:    &pb.NodeUsage{MemAllocatedMib: 2048, DiskAllocatedMib: 4096, CpuPercent: 25, MemUsedMib: 1024},
+					Usage: &pb.NodeUsage{
+						MemAllocatedMib:  2048,
+						DiskAllocatedMib: 4096,
+						CpuPercent:       25,
+						MemUsedMib:       1024,
+					},
 				},
 			},
 		},
 	}
-	stored := []store.Node{{ID: "agent-1", NomadNodeID: "nomad-1", Draining: true,
-		ImageCache: []string{"sha256:cached"}, FeatureIDs: []string{capabilities.SecretOneShotV1}}}
+	stored := []store.Node{{
+		ID: "agent-1", NomadNodeID: "nomad-1", Draining: true,
+		ImageCache: []string{"sha256:cached"}, FeatureIDs: []string{capabilities.SecretOneShotV1},
+	}}
 	got := assembleSchedulerNodes(live,
 		map[string]store.Allocated{"agent-1": {VCPU: 3, MemMib: 9999, DiskMib: 9999}},
 		map[string]store.PendingUsage{"agent-1": {NodeID: "agent-1", VCPU: 2, MemMib: 512, DiskMib: 1024}}, stored)

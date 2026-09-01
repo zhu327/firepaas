@@ -55,7 +55,10 @@ func ensureCreateRequest(t *testing.T, machineID, deploymentID, executionID, opI
 
 func TestResetRestartAttemptsNotFound(t *testing.T) {
 	s := testStore(t)
-	if err := s.ResetRestartAttempts(context.Background(), "missing-restart-reset"); !errors.Is(err, ErrMachineNotFound) {
+	if err := s.ResetRestartAttempts(context.Background(), "missing-restart-reset"); !errors.Is(
+		err,
+		ErrMachineNotFound,
+	) {
 		t.Fatalf("want ErrMachineNotFound, got %v", err)
 	}
 }
@@ -85,7 +88,10 @@ func TestRecordRestartAttemptResetsStableWindow(t *testing.T) {
 		t.Fatal("get machine after restart attempt")
 	}
 	if m.RestartStableSince != nil {
-		t.Fatalf("restart_stable_since must be NULL after RecordRestartAttempt (new execution not READY yet), got %v", *m.RestartStableSince)
+		t.Fatalf(
+			"restart_stable_since must be NULL after RecordRestartAttempt (new execution not READY yet), got %v",
+			*m.RestartStableSince,
+		)
 	}
 	if m.RestartAttempts != 1 {
 		t.Fatalf("restart_attempts = %d, want 1", m.RestartAttempts)

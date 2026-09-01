@@ -58,8 +58,10 @@ func NewResolver(upstreams []string, ttlCap time.Duration) (*Resolver, error) {
 	if ttlCap <= 0 {
 		ttlCap = defaultTTLCap
 	}
-	return &Resolver{upstreams: upstreams, ttlCap: ttlCap, timeout: defaultResolveTO,
-		cache: map[string]cacheEntry{}}, nil
+	return &Resolver{
+		upstreams: upstreams, ttlCap: ttlCap, timeout: defaultResolveTO,
+		cache: map[string]cacheEntry{},
+	}, nil
 }
 
 func systemUpstreams() ([]string, error) {
@@ -67,7 +69,7 @@ func systemUpstreams() ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read /etc/resolv.conf: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	var out []string
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {

@@ -10,8 +10,8 @@ import (
 	"syscall"
 	"time"
 
-	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 	"github.com/google/uuid"
+	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -52,7 +52,11 @@ type Provider struct {
 
 // New 构造 Provider。dataDir 用于磁盘容量/用量统计（评审 P3：不得用 / 代替
 // 数据目录）；memAllocatedMib/vcpuAllocated 可为 nil（视为 0）。
-func New(nodeID, version, commit, nodePool, fcVersion, networkCIDR, dataDir string, memAllocatedMib func() uint64, vcpuAllocated func() int) *Provider {
+func New(
+	nodeID, version, commit, nodePool, fcVersion, networkCIDR, dataDir string,
+	memAllocatedMib func() uint64,
+	vcpuAllocated func() int,
+) *Provider {
 	now := time.Now()
 	return &Provider{
 		NodeID:          nodeID,

@@ -311,26 +311,35 @@ func deploymentIntent(appID, projectID string, body deployBody, inheritAll bool)
 	}
 	var healthCheck *appcommand.HealthCheck
 	if body.HealthCheck != nil {
-		healthCheck = &appcommand.HealthCheck{Type: body.HealthCheck.Type, Target: body.HealthCheck.Target,
+		healthCheck = &appcommand.HealthCheck{
+			Type: body.HealthCheck.Type, Target: body.HealthCheck.Target,
 			IntervalSeconds: body.HealthCheck.IntervalSeconds, TimeoutSeconds: body.HealthCheck.TimeoutSeconds,
-			UnhealthyThreshold: body.HealthCheck.UnhealthyThreshold}
+			UnhealthyThreshold: body.HealthCheck.UnhealthyThreshold,
+		}
 	}
 	var standby *appcommand.AutoStandby
 	if body.AutoStandby != nil {
-		standby = &appcommand.AutoStandby{Enabled: body.AutoStandby.Enabled, IdleTimeoutSeconds: body.AutoStandby.IdleTimeoutSeconds,
-			IgnoreDestinationPorts: append([]uint32(nil), body.AutoStandby.IgnoreDestinationPorts...)}
+		standby = &appcommand.AutoStandby{
+			Enabled:                body.AutoStandby.Enabled,
+			IdleTimeoutSeconds:     body.AutoStandby.IdleTimeoutSeconds,
+			IgnoreDestinationPorts: append([]uint32(nil), body.AutoStandby.IgnoreDestinationPorts...),
+		}
 	}
 	var egress *appcommand.EgressPolicy
 	if body.Egress != nil {
-		egress = &appcommand.EgressPolicy{Mode: body.Egress.Mode, AllowedCIDRs: body.Egress.AllowedCIDRs,
+		egress = &appcommand.EgressPolicy{
+			Mode: body.Egress.Mode, AllowedCIDRs: body.Egress.AllowedCIDRs,
 			DeniedCIDRs: body.Egress.DeniedCIDRs, AllowedDomains: body.Egress.AllowedDomains,
-			MaxTCPConnections: body.Egress.MaxTCPConnections, AuditAll: body.Egress.AuditAll}
+			MaxTCPConnections: body.Egress.MaxTCPConnections, AuditAll: body.Egress.AuditAll,
+		}
 	}
-	return appcommand.Intent{AppID: appID, ProjectID: projectID, Image: body.Image, VCPU: body.VCPU,
+	return appcommand.Intent{
+		AppID: appID, ProjectID: projectID, Image: body.Image, VCPU: body.VCPU,
 		MemMIB: body.MemMIB, Port: body.Port, Services: services, Strategy: body.Strategy, Env: body.Env,
 		NodePool: body.NodePool, Labels: body.Labels, AntiAffinity: body.AntiAffinity, HealthCheck: healthCheck,
 		SecretRefs: body.SecretRefs, AutoStandby: standby, Egress: egress, InheritAll: inheritAll,
-		ReadActiveFirst: inheritAll}, nil
+		ReadActiveFirst: inheritAll,
+	}, nil
 }
 
 func writeDeploymentCommandError(w http.ResponseWriter, err error) {
@@ -347,8 +356,10 @@ func writeDeploymentCommandError(w http.ResponseWriter, err error) {
 }
 
 func writeDeploymentResult(w http.ResponseWriter, result appcommand.Result) {
-	writeJSON(w, 202, deploymentResult{AppID: result.AppID, Deployment: result.DeploymentID,
-		Generation: result.Generation, RolloutID: result.RolloutID, Status: result.Status})
+	writeJSON(w, 202, deploymentResult{
+		AppID: result.AppID, Deployment: result.DeploymentID,
+		Generation: result.Generation, RolloutID: result.RolloutID, Status: result.Status,
+	})
 }
 
 func (a *API) scaleApp(w http.ResponseWriter, r *http.Request) {
@@ -495,7 +506,11 @@ func marshalPlacement(nodePool string, labels map[string]string, antiAffinity st
 // validateSecretRefs 校验引用格式与 secret 存在性（只查元数据，不取值）。
 // 值为 nil 的条目是"移除绑定"语义（CLI --secret VAR= 生成）：直接从 map
 // 剔除，不出错（P3-13；secret_refs 为 nil 才是继承语义，二者区分开）。
-func (a *API) validateSecretRefs(ctx context.Context, projectID string, refs map[string]store.SecretRef) (map[string]store.SecretRef, error) {
+func (a *API) validateSecretRefs(
+	ctx context.Context,
+	projectID string,
+	refs map[string]store.SecretRef,
+) (map[string]store.SecretRef, error) {
 	out := make(map[string]store.SecretRef, len(refs))
 	for varName, ref := range refs {
 		if varName == "" {

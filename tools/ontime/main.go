@@ -41,7 +41,7 @@ func main() {
 		go func(p string) { _ = http.ListenAndServe(":"+p, nil) }(p)
 	}
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, `{"epoch_ms":%d,"uptime_s":%d}`,
+		_, _ = fmt.Fprintf(w, `{"epoch_ms":%d,"uptime_s":%d}`,
 			time.Now().UnixMilli(), int64(time.Since(started).Seconds()))
 	})
 	// v1.2-B（ADR-0024）：/env?k=NAME —— 回显 entrypoint 进程环境变量。
@@ -49,7 +49,7 @@ func main() {
 	// entrypoint 环境；平台链路（PG/agent 落盘/hypeman metadata）不得出现明文。
 	http.HandleFunc("/env", func(w http.ResponseWriter, r *http.Request) {
 		k := r.URL.Query().Get("k")
-		fmt.Fprintf(w, `{"value":%q}`, os.Getenv(k))
+		_, _ = fmt.Fprintf(w, `{"value":%q}`, os.Getenv(k))
 	})
 	// v1.1：/slow?ms=N —— 睡 N 毫秒后回 JSON（edge inflight/hard 并发测试）。
 	http.HandleFunc("/slow", func(w http.ResponseWriter, r *http.Request) {
@@ -58,7 +58,7 @@ func main() {
 			ms = 1000
 		}
 		time.Sleep(time.Duration(ms) * time.Millisecond)
-		fmt.Fprintf(w, `{"slept_ms":%d,"epoch_ms":%d}`,
+		_, _ = fmt.Fprintf(w, `{"slept_ms":%d,"epoch_ms":%d}`,
 			ms, time.Now().UnixMilli())
 	})
 	if err := http.ListenAndServe(":"+port, nil); err != nil {

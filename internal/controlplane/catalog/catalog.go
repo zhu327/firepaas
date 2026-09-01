@@ -156,7 +156,11 @@ func (c *Catalog) GetRouteForHostname(ctx context.Context, hostname string) (*Ro
 // GetRouteForPort 查询 (hostname, 请求端口) 的 route。declared 返回该端口
 // 是否在 hostidx 集合内（false = 未声明端口，调用方 404 权威 miss 语义）。
 // route 键存在但 hostidx 缺失（投影中间态）视为已声明。
-func (c *Catalog) GetRouteForPort(ctx context.Context, hostname string, port int) (route *Route, declared bool, err error) {
+func (c *Catalog) GetRouteForPort(
+	ctx context.Context,
+	hostname string,
+	port int,
+) (route *Route, declared bool, err error) {
 	ports, err := c.HostPorts(ctx, hostname)
 	if err != nil {
 		return nil, false, err

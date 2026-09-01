@@ -68,7 +68,10 @@ func TestAcquireCommitRelease(t *testing.T) {
 func TestProjectQuotaExceeded(t *testing.T) {
 	m, _ := testManager(t)
 	ctx := context.Background()
-	if err := m.Acquire(ctx, "op-q", "n1", "dev", 50, 512, 1, 64, 65536, 1048576, 10, 32768, 1048576); !errors.Is(err, ErrProjectQuota) {
+	if err := m.Acquire(ctx, "op-q", "n1", "dev", 50, 512, 1, 64, 65536, 1048576, 10, 32768, 1048576); !errors.Is(
+		err,
+		ErrProjectQuota,
+	) {
 		t.Fatalf("want ErrProjectQuota, got %v", err)
 	}
 }
@@ -76,10 +79,16 @@ func TestProjectQuotaExceeded(t *testing.T) {
 func TestNodeCapacityExceeded(t *testing.T) {
 	m, _ := testManager(t)
 	ctx := context.Background()
-	if err := m.Acquire(ctx, "op-mem", "n1", "dev", 1, 70000, 1, 64, 65536, 1048576, 100, 32768, 1048576); !errors.Is(err, ErrNodeCapacity) {
+	if err := m.Acquire(ctx, "op-mem", "n1", "dev", 1, 70000, 1, 64, 65536, 1048576, 100, 32768, 1048576); !errors.Is(
+		err,
+		ErrNodeCapacity,
+	) {
 		t.Fatalf("want ErrNodeCapacity, got %v", err)
 	}
-	if err := m.Acquire(ctx, "op-cpu", "n1", "dev", 64*4+1, 512, 1, 64, 65536, 1048576, 100, 32768, 1048576); !errors.Is(err, ErrNodeCapacity) {
+	if err := m.Acquire(ctx, "op-cpu", "n1", "dev", 64*4+1, 512, 1, 64, 65536, 1048576, 100, 32768, 1048576); !errors.Is(
+		err,
+		ErrNodeCapacity,
+	) {
 		t.Fatalf("want ErrNodeCapacity for cpu, got %v", err)
 	}
 }
@@ -206,11 +215,17 @@ func TestDiskReservationLimits(t *testing.T) {
 	ctx := context.Background()
 
 	// 节点磁盘容量：pending + req > nodeDiskTotal → ErrNodeCapacity。
-	if err := m.Acquire(ctx, "op-disk-node", "n1", "dev", 1, 512, 11000, 64, 65536, 10240, 100, 32768, 1048576); !errors.Is(err, ErrNodeCapacity) {
+	if err := m.Acquire(ctx, "op-disk-node", "n1", "dev", 1, 512, 11000, 64, 65536, 10240, 100, 32768, 1048576); !errors.Is(
+		err,
+		ErrNodeCapacity,
+	) {
 		t.Fatalf("node disk cap: want ErrNodeCapacity, got %v", err)
 	}
 	// 项目磁盘配额：pending + req > projectDiskQuota → ErrProjectQuota。
-	if err := m.Acquire(ctx, "op-disk-proj", "n1", "dev", 1, 512, 11, 64, 65536, 1048576, 100, 32768, 10); !errors.Is(err, ErrProjectQuota) {
+	if err := m.Acquire(ctx, "op-disk-proj", "n1", "dev", 1, 512, 11, 64, 65536, 1048576, 100, 32768, 10); !errors.Is(
+		err,
+		ErrProjectQuota,
+	) {
 		t.Fatalf("project disk quota: want ErrProjectQuota, got %v", err)
 	}
 	// 正常路径 + 释放幂等。

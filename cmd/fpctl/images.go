@@ -17,7 +17,7 @@ import (
 //	fpctl images unpin <pin_id>
 func runImages(args []string) error {
 	if len(args) < 1 {
-		return errors.New("usage: fpctl images <prewarm|coverage|pin|pins|unpin> ...")
+		return errors.New("usage: fpctl images <prewarm|coverage|pin|pins|unpin>")
 	}
 	switch args[0] {
 	case "prewarm":
@@ -67,7 +67,9 @@ func runImagesPrewarm(args []string) error {
 	nodeTargetFlags(fs, &nodePool, &nodeIDs)
 	_ = fs.Parse(args)
 	if *image == "" || (nodePool == "" && len(nodeIDs) == 0) {
-		return errors.New("usage: fpctl images prewarm --image <registry/app@sha256:...> [--node-pool p | --node id ...] [--project dev]")
+		return errors.New(
+			"usage: fpctl images prewarm --image <registry/app@sha256:...> [--node-pool p | --node id ...] [--project dev]",
+		)
 	}
 	body := map[string]any{"project_id": *project, "image_ref": *image}
 	if nodePool != "" {
@@ -112,10 +114,14 @@ func runImagesPin(args []string) error {
 	nodeTargetFlags(fs, &nodePool, &nodeIDs)
 	_ = fs.Parse(args)
 	if *image == "" || (nodePool == "" && len(nodeIDs) == 0) {
-		return errors.New("usage: fpctl images pin --image <registry/app@sha256:...> [--node-pool p | --node id ...] --ttl 3600 [--reason ...]")
+		return errors.New(
+			"usage: fpctl images pin --image <registry/app@sha256:...> [--node-pool p | --node id ...] --ttl 3600 [--reason ...]",
+		)
 	}
-	body := map[string]any{"project_id": *project, "image_ref": *image,
-		"ttl_seconds": *ttl, "reason": *reason}
+	body := map[string]any{
+		"project_id": *project, "image_ref": *image,
+		"ttl_seconds": *ttl, "reason": *reason,
+	}
 	if nodePool != "" {
 		body["node_pool"] = nodePool
 	}

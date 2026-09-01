@@ -192,8 +192,8 @@ func opKey(opID string) string           { return "resv:op:" + opID }
 // 为 0 表示该维度不限（旧节点/未配置配额的兼容语义）。
 func (m *Manager) Acquire(ctx context.Context, opID, nodeID, projectID string,
 	vcpu, memMib, diskMib uint64, nodeVCPUTotal, nodeMemTotal, nodeDiskTotal uint64,
-	projectQuotaVCPU, projectQuotaMem, projectQuotaDisk uint64, projectMachineQuotaOpt ...uint64) error {
-
+	projectQuotaVCPU, projectQuotaMem, projectQuotaDisk uint64, projectMachineQuotaOpt ...uint64,
+) error {
 	var projectMachineQuota uint64
 	machines := uint64(1)
 	if len(projectMachineQuotaOpt) > 0 {
@@ -333,7 +333,7 @@ func redisInt64(v any) int64 {
 		return t
 	case string:
 		var n int64
-		fmt.Sscanf(t, "%d", &n)
+		_, _ = fmt.Sscanf(t, "%d", &n)
 		return n
 	default:
 		return 0

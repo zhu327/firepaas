@@ -51,7 +51,10 @@ func (p *Policy) Validate(imageRef string) (string, error) {
 	}
 	if p.requireDigest {
 		if _, ok := ref.(reference.Canonical); !ok {
-			return "", fmt.Errorf("image %q: digest-pinned reference required (FIREPAAS_IMAGE_REQUIRE_DIGEST)", imageRef)
+			return "", fmt.Errorf(
+				"image %q: digest-pinned reference required (FIREPAAS_IMAGE_REQUIRE_DIGEST)",
+				imageRef,
+			)
 		}
 	}
 	if canonical, ok := ref.(reference.Canonical); ok {
@@ -64,7 +67,8 @@ func (p *Policy) Validate(imageRef string) (string, error) {
 		domain := reference.Domain(ref)
 		ok := false
 		for _, a := range p.allowlist {
-			if a == "docker.io" && (domain == "docker.io" || domain == "index.docker.io" || domain == "registry-1.docker.io") {
+			if a == "docker.io" &&
+				(domain == "docker.io" || domain == "index.docker.io" || domain == "registry-1.docker.io") {
 				ok = true
 				break
 			}

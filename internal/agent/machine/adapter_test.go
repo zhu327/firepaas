@@ -22,7 +22,10 @@ type fakeInstances struct {
 	err     error
 }
 
-func (f *fakeInstances) CreateInstance(_ context.Context, req instances.CreateInstanceRequest) (*instances.Instance, error) {
+func (f *fakeInstances) CreateInstance(
+	_ context.Context,
+	req instances.CreateInstanceRequest,
+) (*instances.Instance, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -46,7 +49,10 @@ func (f *fakeInstances) CreateInstance(_ context.Context, req instances.CreateIn
 	return inst, nil
 }
 
-func (f *fakeInstances) ListInstances(_ context.Context, _ *instances.ListInstancesFilter) ([]instances.Instance, error) {
+func (f *fakeInstances) ListInstances(
+	_ context.Context,
+	_ *instances.ListInstancesFilter,
+) ([]instances.Instance, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -84,7 +90,11 @@ func (f *fakeInstances) DeleteInstance(_ context.Context, id string) error {
 // 语义对齐 hypeman：Standby/Restore 只接受**内部 ID**（loadMetadata 按目录
 // 名加载，传 name 会 ErrNotFound）——曾经的替身两者都收，把
 // "autoresume 传了 name"的真机 bug 藏到了单测盲区。
-func (f *fakeInstances) StandbyInstance(_ context.Context, id string, _ instances.StandbyInstanceRequest) (*instances.Instance, error) {
+func (f *fakeInstances) StandbyInstance(
+	_ context.Context,
+	id string,
+	_ instances.StandbyInstanceRequest,
+) (*instances.Instance, error) {
 	if f.created == nil || f.created.Id != id {
 		return nil, instances.ErrNotFound
 	}
@@ -128,10 +138,13 @@ func (f *fakeImages) ListImages(context.Context) ([]images.Image, error) {
 	}
 	sz := int64(50 << 20)
 	return []images.Image{
-		{Name: "docker.io/library/nginx:alpine@sha256:" + strings.Repeat("a", 64),
-			Status: images.StatusReady, SizeBytes: &sz},
+		{
+			Name:   "docker.io/library/nginx:alpine@sha256:" + strings.Repeat("a", 64),
+			Status: images.StatusReady, SizeBytes: &sz,
+		},
 	}, nil
 }
+
 func (f *fakeImages) DeleteImage(_ context.Context, name string) error {
 	if f.err != nil {
 		return f.err
@@ -161,7 +174,9 @@ func validCreateRequest() *pb.CreateMachineRequest {
 func TestDeleteImageRejectsLiveInstanceReference(t *testing.T) {
 	ref := "repo/app@sha256:live"
 	ims := &fakeImages{list: []images.Image{{Name: ref, Digest: "sha256:live", Status: images.StatusReady}}}
-	inst := &fakeInstances{listed: []instances.Instance{{StoredMetadata: instances.StoredMetadata{Name: "m1", Image: ref}}}}
+	inst := &fakeInstances{
+		listed: []instances.Instance{{StoredMetadata: instances.StoredMetadata{Name: "m1", Image: ref}}},
+	}
 	err := New(inst, ims, nil, nil).DeleteImage(context.Background(), "sha256:live")
 	if err == nil || !strings.Contains(err.Error(), "referenced by live instance") {
 		t.Fatalf("DeleteImage error = %v, want live reference rejection", err)
@@ -202,9 +217,11 @@ func (f *blockingPullImages) CreateImage(ctx context.Context, _ images.CreateIma
 func TestActivePullHoldsImageDeletionLock(t *testing.T) {
 	ref := "repo/app@sha256:" + strings.Repeat("a", 64)
 	ims := &blockingPullImages{
-		fakeImages: fakeImages{list: []images.Image{{Name: ref, Digest: imageDigestFromName(ref), Status: images.StatusReady}}},
-		started:    make(chan struct{}),
-		release:    make(chan struct{}),
+		fakeImages: fakeImages{
+			list: []images.Image{{Name: ref, Digest: imageDigestFromName(ref), Status: images.StatusReady}},
+		},
+		started: make(chan struct{}),
+		release: make(chan struct{}),
 	}
 	a := New(&fakeInstances{}, ims, nil, nil)
 	pullDone := make(chan error, 1)
@@ -229,7 +246,10 @@ type blockingCreateInstances struct {
 	release chan struct{}
 }
 
-func (f *blockingCreateInstances) CreateInstance(ctx context.Context, req instances.CreateInstanceRequest) (*instances.Instance, error) {
+func (f *blockingCreateInstances) CreateInstance(
+	ctx context.Context,
+	req instances.CreateInstanceRequest,
+) (*instances.Instance, error) {
 	close(f.started)
 	select {
 	case <-f.release:
@@ -260,7 +280,8 @@ func TestCreateHoldsImageDeletionLockUntilReferencePublication(t *testing.T) {
 	if err := <-createDone; err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if err := a.DeleteImage(context.Background(), ref); err == nil || !strings.Contains(err.Error(), "referenced by live instance") {
+	if err := a.DeleteImage(context.Background(), ref); err == nil ||
+		!strings.Contains(err.Error(), "referenced by live instance") {
 		t.Fatalf("delete after create = %v, want live reference rejection", err)
 	}
 	if ims.deleted != "" {
@@ -376,8 +397,24 @@ func TestRedactSecretEnv(t *testing.T) {
 
 func TestAdapterListProjectFilter(t *testing.T) {
 	im := &fakeInstances{listed: []instances.Instance{
-		{StoredMetadata: instances.StoredMetadata{Id: "i1", Name: "m1", Image: "img", Tags: map[string]string{tagProject: "p1", tagExecution: "e1"}}, State: instances.StateRunning},
-		{StoredMetadata: instances.StoredMetadata{Id: "i2", Name: "m2", Image: "img", Tags: map[string]string{tagProject: "p2", tagExecution: "e2"}}, State: instances.StateStopped},
+		{
+			StoredMetadata: instances.StoredMetadata{
+				Id:    "i1",
+				Name:  "m1",
+				Image: "img",
+				Tags:  map[string]string{tagProject: "p1", tagExecution: "e1"},
+			},
+			State: instances.StateRunning,
+		},
+		{
+			StoredMetadata: instances.StoredMetadata{
+				Id:    "i2",
+				Name:  "m2",
+				Image: "img",
+				Tags:  map[string]string{tagProject: "p2", tagExecution: "e2"},
+			},
+			State: instances.StateStopped,
+		},
 	}}
 	a := New(im, &fakeImages{}, nil, nil)
 	got, err := a.List(context.Background(), "p1")
@@ -651,8 +688,11 @@ func TestGetEndpointForPortWhitelist(t *testing.T) {
 func encode(t *testing.T, list []svcJSON) string {
 	t.Helper()
 	tag, err := encodeServicesTag(&pb.MachineSpec{
-		Network:  &pb.NetworkSpec{IngressPort: 80},
-		Services: []*pb.ServiceSpec{{Name: "http", InternalPort: 80}, {Name: list[0].Name, InternalPort: uint32(list[0].Port)}},
+		Network: &pb.NetworkSpec{IngressPort: 80},
+		Services: []*pb.ServiceSpec{
+			{Name: "http", InternalPort: 80},
+			{Name: list[0].Name, InternalPort: uint32(list[0].Port)},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -195,7 +195,11 @@ func newSessionCounter() *sessionCounter { return &sessionCounter{} }
 
 // acquireRuntimeSession 按项目获取 runtime 会话名额（logs/exec/cp）。
 // ok=false 时已写 429。release 必须在会话结束时调用（含错误路径）。
-func (a *API) acquireRuntimeSession(w http.ResponseWriter, r *http.Request, machineID string) (release func(), streamCtx context.Context, ok bool) {
+func (a *API) acquireRuntimeSession(
+	w http.ResponseWriter,
+	r *http.Request,
+	machineID string,
+) (release func(), streamCtx context.Context, ok bool) {
 	if a.sessions == nil || a.store == nil || a.limiter == nil {
 		writeErr(w, 503, "runtime_session_limiter_unavailable")
 		return nil, nil, false

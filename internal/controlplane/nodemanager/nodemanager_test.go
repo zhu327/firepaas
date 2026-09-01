@@ -11,7 +11,12 @@ import (
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 )
 
-func fakeNomad(t *testing.T, nodes []NomadNodeStub, allocs []NomadAllocStub, details map[string]NomadAllocStub) *httptest.Server {
+func fakeNomad(
+	t *testing.T,
+	nodes []NomadNodeStub,
+	allocs []NomadAllocStub,
+	details map[string]NomadAllocStub,
+) *httptest.Server {
 	t.Helper()
 	// P3-5：agentclient 现为 fail-closed mTLS；单测无证书，显式开 dev 明文。
 	t.Setenv("FIREPAAS_AGENT_TLS_ALLOW_INSECURE", "true")
@@ -54,10 +59,14 @@ func alloc(nodeID string, version uint64, running bool, grpcPort, proxyPort int)
 
 func TestDiscoverBuildsNodeViews(t *testing.T) {
 	nodes := []NomadNodeStub{
-		{ID: "n1", Name: "node-1", NodePool: "compute", Status: "ready",
-			SchedulingEligibility: "eligible", HTTPAddr: "10.0.0.1:4646"},
-		{ID: "n2", Name: "node-2", NodePool: "compute", Status: "ready",
-			SchedulingEligibility: "eligible", Drain: true, HTTPAddr: "10.0.0.2:4646"},
+		{
+			ID: "n1", Name: "node-1", NodePool: "compute", Status: "ready",
+			SchedulingEligibility: "eligible", HTTPAddr: "10.0.0.1:4646",
+		},
+		{
+			ID: "n2", Name: "node-2", NodePool: "compute", Status: "ready",
+			SchedulingEligibility: "eligible", Drain: true, HTTPAddr: "10.0.0.2:4646",
+		},
 	}
 	allocs := []NomadAllocStub{alloc("n1", 3, true, 5108, 5107), alloc("n2", 3, true, 5108, 5107)}
 	srv := fakeNomad(t, nodes, allocs, nil)
@@ -99,9 +108,20 @@ func TestDiscoverSelectsRoutableNomadNodeAddress(t *testing.T) {
 	}{
 		{name: "IPv4 Address", address: "10.0.0.1", grpcAddr: "10.0.0.1:5108", proxyAddr: "10.0.0.1:5107"},
 		{name: "IPv6 Address", address: "2001:db8::1", grpcAddr: "[2001:db8::1]:5108", proxyAddr: "[2001:db8::1]:5107"},
-		{name: "Address preferred", address: "10.0.0.2", httpAddr: "10.0.0.1:4646", grpcAddr: "10.0.0.2:5108", proxyAddr: "10.0.0.2:5107"},
+		{
+			name:      "Address preferred",
+			address:   "10.0.0.2",
+			httpAddr:  "10.0.0.1:4646",
+			grpcAddr:  "10.0.0.2:5108",
+			proxyAddr: "10.0.0.2:5107",
+		},
 		{name: "legacy HTTPAddr", httpAddr: "10.0.0.1:4646", grpcAddr: "10.0.0.1:5108", proxyAddr: "10.0.0.1:5107"},
-		{name: "legacy hostname", httpAddr: "compute-1.internal:4646", grpcAddr: "compute-1.internal:5108", proxyAddr: "compute-1.internal:5107"},
+		{
+			name:      "legacy hostname",
+			httpAddr:  "compute-1.internal:4646",
+			grpcAddr:  "compute-1.internal:5108",
+			proxyAddr: "compute-1.internal:5107",
+		},
 		{name: "empty", grpcAddr: "", proxyAddr: ""},
 		{name: "invalid", address: "not an IP", httpAddr: "://bad", grpcAddr: "", proxyAddr: ""},
 		{name: "IPv4 loopback", address: "127.0.0.1", grpcAddr: "", proxyAddr: ""},
@@ -133,8 +153,10 @@ func TestDiscoverSelectsRoutableNomadNodeAddress(t *testing.T) {
 
 func TestDiscoverFillsPortsFromAllocDetail(t *testing.T) {
 	nodes := []NomadNodeStub{
-		{ID: "n1", Name: "node-1", NodePool: "compute", Status: "ready",
-			SchedulingEligibility: "eligible", HTTPAddr: "10.0.0.1:4646"},
+		{
+			ID: "n1", Name: "node-1", NodePool: "compute", Status: "ready",
+			SchedulingEligibility: "eligible", HTTPAddr: "10.0.0.1:4646",
+		},
 	}
 	// 列表接口（Nomad 实际行为）不带 AllocatedResources。
 	stub := alloc("n1", 3, true, 0, 0)
@@ -157,8 +179,10 @@ func TestDiscoverFillsPortsFromAllocDetail(t *testing.T) {
 }
 
 func TestFollowerDiscoveryResolvesAgentClient(t *testing.T) {
-	nodes := []NomadNodeStub{{ID: "nomad-1", Name: "node-1", Status: "ready",
-		SchedulingEligibility: "eligible", HTTPAddr: "10.0.0.1:4646"}}
+	nodes := []NomadNodeStub{{
+		ID: "nomad-1", Name: "node-1", Status: "ready",
+		SchedulingEligibility: "eligible", HTTPAddr: "10.0.0.1:4646",
+	}}
 	srv := fakeNomad(t, nodes, []NomadAllocStub{alloc("nomad-1", 1, true, 5108, 5107)}, nil)
 	m, err := New(Config{NomadAddr: srv.URL, JobName: "firepaas-agentd"})
 	if err != nil {
@@ -175,8 +199,10 @@ func TestFollowerDiscoveryResolvesAgentClient(t *testing.T) {
 }
 
 func TestLeaderHandoverDoesNotClearDiscoveryClients(t *testing.T) {
-	nodes := []NomadNodeStub{{ID: "n1", Name: "node-1", Status: "ready",
-		SchedulingEligibility: "eligible", HTTPAddr: "10.0.0.1:4646"}}
+	nodes := []NomadNodeStub{{
+		ID: "n1", Name: "node-1", Status: "ready",
+		SchedulingEligibility: "eligible", HTTPAddr: "10.0.0.1:4646",
+	}}
 	srv := fakeNomad(t, nodes, []NomadAllocStub{alloc("n1", 1, true, 5108, 5107)}, nil)
 	m, err := New(Config{NomadAddr: srv.URL, JobName: "firepaas-agentd", InfoEvery: time.Hour})
 	if err != nil {
@@ -234,8 +260,10 @@ func TestCombinedStatusMachine(t *testing.T) {
 
 func TestDiscoverFailureMarksUnknown(t *testing.T) {
 	nodes := []NomadNodeStub{
-		{ID: "n1", Name: "node-1", NodePool: "compute", Status: "ready",
-			SchedulingEligibility: "eligible", HTTPAddr: "10.0.0.1:4646"},
+		{
+			ID: "n1", Name: "node-1", NodePool: "compute", Status: "ready",
+			SchedulingEligibility: "eligible", HTTPAddr: "10.0.0.1:4646",
+		},
 	}
 	srv := fakeNomad(t, nodes, nil, nil)
 	m, err := New(Config{NomadAddr: srv.URL, JobName: "firepaas-agentd"})

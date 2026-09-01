@@ -41,7 +41,13 @@ func New(pool *pgxpool.Pool) *Manager { return &Manager{pool: pool} }
 var ValidScopes = []string{"admin", "write", "read"}
 
 // Create 生成新 key：'fp_'+64 hex（32B）。返回（记录, 明文）；明文只有这一次。
-func (m *Manager) Create(ctx context.Context, name string, scopes []string, projectID string, ttl time.Duration) (*Key, string, error) {
+func (m *Manager) Create(
+	ctx context.Context,
+	name string,
+	scopes []string,
+	projectID string,
+	ttl time.Duration,
+) (*Key, string, error) {
 	if name == "" {
 		return nil, "", fmt.Errorf("key name is required")
 	}

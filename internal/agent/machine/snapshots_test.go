@@ -35,12 +35,21 @@ type restoreSnapshotFake struct {
 	stopped     int
 }
 
-func (f *restoreSnapshotFake) CreateSnapshot(context.Context, string, instances.CreateSnapshotRequest) (*instances.Snapshot, error) {
+func (f *restoreSnapshotFake) CreateSnapshot(
+	context.Context,
+	string,
+	instances.CreateSnapshotRequest,
+) (*instances.Snapshot, error) {
 	return nil, instances.ErrNotSupported
 }
-func (f *restoreSnapshotFake) ListSnapshots(context.Context, *instances.ListSnapshotsFilter) ([]instances.Snapshot, error) {
+
+func (f *restoreSnapshotFake) ListSnapshots(
+	context.Context,
+	*instances.ListSnapshotsFilter,
+) ([]instances.Snapshot, error) {
 	return f.snapshots, nil
 }
+
 func (f *restoreSnapshotFake) GetSnapshot(context.Context, string) (*instances.Snapshot, error) {
 	return nil, instances.ErrNotFound
 }
@@ -48,25 +57,50 @@ func (f *restoreSnapshotFake) DeleteSnapshot(context.Context, string) error { re
 func (f *restoreSnapshotFake) StopInstance(_ context.Context, _ string) (*instances.Instance, error) {
 	f.stopped++
 	if f.got == nil {
-		return &instances.Instance{StoredMetadata: instances.StoredMetadata{Id: "internal"}, State: instances.StateStopped}, nil
+		return &instances.Instance{
+			StoredMetadata: instances.StoredMetadata{Id: "internal"},
+			State:          instances.StateStopped,
+		}, nil
 	}
 	f.got.State = instances.StateStopped
 	return f.got, nil
 }
 func (f *restoreSnapshotFake) DeleteInstance(context.Context, string) error { f.deleted++; return nil }
-func (f *restoreSnapshotFake) StartInstance(context.Context, string, instances.StartInstanceRequest) (*instances.Instance, error) {
+
+func (f *restoreSnapshotFake) StartInstance(
+	context.Context,
+	string,
+	instances.StartInstanceRequest,
+) (*instances.Instance, error) {
 	return nil, instances.ErrNotSupported
 }
-func (f *restoreSnapshotFake) ForkSnapshot(_ context.Context, _ string, req instances.ForkSnapshotRequest) (*instances.Instance, error) {
+
+func (f *restoreSnapshotFake) ForkSnapshot(
+	_ context.Context,
+	_ string,
+	req instances.ForkSnapshotRequest,
+) (*instances.Instance, error) {
 	f.forkRequest = &req
-	return &instances.Instance{StoredMetadata: instances.StoredMetadata{Id: "forked", Name: req.Name, Tags: req.Tags}, State: instances.StateRunning}, nil
+	return &instances.Instance{
+		StoredMetadata: instances.StoredMetadata{Id: "forked", Name: req.Name, Tags: req.Tags},
+		State:          instances.StateRunning,
+	}, nil
 }
-func (f *restoreSnapshotFake) RestoreSnapshot(_ context.Context, _ string, _ string, req instances.RestoreSnapshotRequest) (*instances.Instance, error) {
+
+func (f *restoreSnapshotFake) RestoreSnapshot(
+	_ context.Context,
+	_ string,
+	_ string,
+	req instances.RestoreSnapshotRequest,
+) (*instances.Instance, error) {
 	f.requests = append(f.requests, req)
 	if f.restoreErr != nil {
 		return nil, f.restoreErr
 	}
-	return &instances.Instance{StoredMetadata: instances.StoredMetadata{Id: "internal", Name: "m1", Tags: req.Tags}, State: instances.StateRunning}, nil
+	return &instances.Instance{
+		StoredMetadata: instances.StoredMetadata{Id: "internal", Name: "m1", Tags: req.Tags},
+		State:          instances.StateRunning,
+	}, nil
 }
 
 func TestForkSnapshotExplicitlyClearsInheritedVolumes(t *testing.T) {
@@ -99,8 +133,17 @@ func TestForkSnapshotReattachesSlotAndCleansUpOnFailure(t *testing.T) {
 
 func TestRestoreSnapshotReattachesSlotAndStopsReplacementOnFailure(t *testing.T) {
 	f := &restoreSnapshotFake{
-		fakeInstances: fakeInstances{got: &instances.Instance{StoredMetadata: instances.StoredMetadata{Id: "internal", Name: "m1", Tags: tags.Tags{tagExecution: "old"}}, State: instances.StateStopped}},
-		snapshots:     []instances.Snapshot{{Id: "artifact", CompatibilityKey: "same"}},
+		fakeInstances: fakeInstances{
+			got: &instances.Instance{
+				StoredMetadata: instances.StoredMetadata{
+					Id:   "internal",
+					Name: "m1",
+					Tags: tags.Tags{tagExecution: "old"},
+				},
+				State: instances.StateStopped,
+			},
+		},
+		snapshots: []instances.Snapshot{{Id: "artifact", CompatibilityKey: "same"}},
 	}
 	slots := &snapshotSlotFake{attachErr: errors.New("attach failed")}
 	a := New(f, &fakeImages{}, slots, nil)
@@ -115,8 +158,17 @@ func TestRestoreSnapshotReattachesSlotAndStopsReplacementOnFailure(t *testing.T)
 
 func TestRestoreSnapshotAutoFallsBackOnlyForCompatibilityAndReplacesIdentity(t *testing.T) {
 	f := &restoreSnapshotFake{
-		fakeInstances: fakeInstances{got: &instances.Instance{StoredMetadata: instances.StoredMetadata{Id: "internal", Name: "m1", Tags: tags.Tags{tagExecution: "old", tagGeneration: "3"}}, State: instances.StateRunning}},
-		snapshots:     []instances.Snapshot{{Id: "artifact", CompatibilityKey: "source-key"}},
+		fakeInstances: fakeInstances{
+			got: &instances.Instance{
+				StoredMetadata: instances.StoredMetadata{
+					Id:   "internal",
+					Name: "m1",
+					Tags: tags.Tags{tagExecution: "old", tagGeneration: "3"},
+				},
+				State: instances.StateRunning,
+			},
+		},
+		snapshots: []instances.Snapshot{{Id: "artifact", CompatibilityKey: "source-key"}},
 	}
 	a := New(f, &fakeImages{}, nil, nil)
 	m, mode, _, err := a.RestoreSnapshot(context.Background(), &pb.RestoreSnapshotRequest{
@@ -136,9 +188,18 @@ func TestRestoreSnapshotAutoFallsBackOnlyForCompatibilityAndReplacesIdentity(t *
 
 func TestRestoreSnapshotAutoDoesNotFallbackOnRuntimeError(t *testing.T) {
 	f := &restoreSnapshotFake{
-		fakeInstances: fakeInstances{got: &instances.Instance{StoredMetadata: instances.StoredMetadata{Id: "internal", Name: "m1", Tags: tags.Tags{tagExecution: "old"}}, State: instances.StateStopped}},
-		snapshots:     []instances.Snapshot{{Id: "artifact", CompatibilityKey: "same"}},
-		restoreErr:    errors.New("checksum corrupt"),
+		fakeInstances: fakeInstances{
+			got: &instances.Instance{
+				StoredMetadata: instances.StoredMetadata{
+					Id:   "internal",
+					Name: "m1",
+					Tags: tags.Tags{tagExecution: "old"},
+				},
+				State: instances.StateStopped,
+			},
+		},
+		snapshots:  []instances.Snapshot{{Id: "artifact", CompatibilityKey: "same"}},
+		restoreErr: errors.New("checksum corrupt"),
 	}
 	a := New(f, &fakeImages{}, nil, nil)
 	_, _, _, err := a.RestoreSnapshot(context.Background(), &pb.RestoreSnapshotRequest{

@@ -75,12 +75,21 @@ func (c *Controller) reconcileVolumeNodeState(ctx context.Context) {
 // reconcileVolumeIntegrity 对账 PG volume 与 origin-node inventory（v1.4-B）。
 // 旧 agent（complete=false/无能力）只能产生 UNKNOWN，不推导 MISSING；
 // presence 恢复 READY 的既有语义保留（inventory 证明产物存在）。
-func (c *Controller) reconcileVolumeIntegrity(ctx context.Context, n store.Node, inv *pb.ListVolumesResponse, volumes []store.Volume) {
+func (c *Controller) reconcileVolumeIntegrity(
+	ctx context.Context,
+	n store.Node,
+	inv *pb.ListVolumesResponse,
+	volumes []store.Volume,
+) {
 	obs := inv.GetObservation()
 	supported := hasFeature(n.FeatureIDs, capabilities.LocalInventoryV1) && inv.GetComplete() &&
 		obs != nil && obs.GetComplete() && obs.GetEpoch() != "" && obs.GetGeneration() > 0 && obs.GetObservedAtUnix() > 0 &&
 		inv.GetObservationGeneration() == obs.GetGeneration() && inv.GetObservedAtUnix() == obs.GetObservedAtUnix()
-	c.metrics.Set("firepaas_local_inventory_support", map[string]string{"node_id": n.ID, "type": "volume"}, boolU64(supported))
+	c.metrics.Set(
+		"firepaas_local_inventory_support",
+		map[string]string{"node_id": n.ID, "type": "volume"},
+		boolU64(supported),
+	)
 	if !supported {
 		return
 	}
@@ -91,9 +100,26 @@ func (c *Controller) reconcileVolumeIntegrity(ctx context.Context, n store.Node,
 			return
 		}
 		present[item.GetId()] = item
-		items[item.GetId()] = store.VolumeInventoryItem{SizeBytes: int64(item.GetSizeBytes()), Mode: item.GetMode(), ContentDigest: item.GetContentDigest(), Sealed: item.GetSealed(), MetadataHealth: item.GetMetadataHealth()}
+		items[item.GetId()] = store.VolumeInventoryItem{
+			SizeBytes:      int64(item.GetSizeBytes()),
+			Mode:           item.GetMode(),
+			ContentDigest:  item.GetContentDigest(),
+			Sealed:         item.GetSealed(),
+			MetadataHealth: item.GetMetadataHealth(),
+		}
 	}
-	accepted, transitions, err := c.store.ApplyVolumeInventoryObservation(ctx, store.InventoryObservation{NodeID: n.ID, ResourceType: "volume", Epoch: obs.GetEpoch(), Generation: obs.GetGeneration(), AgentObservedAt: time.Unix(obs.GetObservedAtUnix(), 0), ItemCount: len(items)}, items)
+	accepted, transitions, err := c.store.ApplyVolumeInventoryObservation(
+		ctx,
+		store.InventoryObservation{
+			NodeID:          n.ID,
+			ResourceType:    "volume",
+			Epoch:           obs.GetEpoch(),
+			Generation:      obs.GetGeneration(),
+			AgentObservedAt: time.Unix(obs.GetObservedAtUnix(), 0),
+			ItemCount:       len(items),
+		},
+		items,
+	)
 	if err != nil {
 		slog.Warn("apply volume inventory observation", "node", n.ID, "error", err)
 		return
@@ -102,9 +128,20 @@ func (c *Controller) reconcileVolumeIntegrity(ctx context.Context, n store.Node,
 		return
 	}
 	for _, transition := range transitions {
-		c.metrics.Inc("firepaas_local_integrity_transitions_total", map[string]string{"type": "volume", "integrity": transition.To}, 1)
+		c.metrics.Inc(
+			"firepaas_local_integrity_transitions_total",
+			map[string]string{"type": "volume", "integrity": transition.To},
+			1,
+		)
 		if transition.To == "MISSING" {
-			c.userEvent(ctx, transition.ProjectID, "", "", "volume.integrity.missing", map[string]any{"volume_id": transition.ID, "node_id": n.ID})
+			c.userEvent(
+				ctx,
+				transition.ProjectID,
+				"",
+				"",
+				"volume.integrity.missing",
+				map[string]any{"volume_id": transition.ID, "node_id": n.ID},
+			)
 		}
 	}
 	pgIDs := make(map[string]bool, len(volumes))
@@ -129,7 +166,8 @@ func (c *Controller) reconcileVolumeIntegrity(ctx context.Context, n store.Node,
 }
 
 func (c *Controller) refreshIntegrityMetrics(ctx context.Context) {
-	rows, err := c.store.Pool().Query(ctx, `SELECT 'snapshot',integrity,count(*) FROM snapshots WHERE status NOT IN ('DELETED','LOST') GROUP BY integrity
+	rows, err := c.store.Pool().
+		Query(ctx, `SELECT 'snapshot',integrity,count(*) FROM snapshots WHERE status NOT IN ('DELETED','LOST') GROUP BY integrity
 		UNION ALL SELECT 'volume',integrity,count(*) FROM volumes WHERE state<>'DELETED' GROUP BY integrity`)
 	if err != nil {
 		return
@@ -189,9 +227,8 @@ func (c *Controller) processVolumeCreate(ctx context.Context, op store.Operation
 	if err != nil {
 		return fmt.Errorf("agent create volume: %w", err)
 	}
-	if err := c.resv.Commit(ctx, op.ID); err != nil {
-		// Redis projection is rebuildable; PG completion remains authoritative.
-	}
+	// Redis projection is rebuildable; PG completion remains authoritative.
+	_ = c.resv.Commit(ctx, op.ID)
 	if err := c.store.TransitionVolume(ctx, req.GetVolumeId(), "CREATING", "READY"); err != nil {
 		if err := c.store.TransitionVolume(ctx, req.GetVolumeId(), "UNAVAILABLE", "READY"); err != nil {
 			return err
@@ -221,7 +258,8 @@ func (c *Controller) processDatasetImport(ctx context.Context, op store.Operatio
 	if err != nil {
 		// Deterministic validation failures are terminal; retrying the same signed
 		// URL/archive cannot succeed and would leave imports pending forever.
-		if code := status.Code(err); code == codes.InvalidArgument || code == codes.FailedPrecondition || code == codes.PermissionDenied {
+		if code := status.Code(err); code == codes.InvalidArgument || code == codes.FailedPrecondition ||
+			code == codes.PermissionDenied {
 			// The schema has no FAILED volume state. Keep the unsealed artifact in
 			// CREATING with import_status=failed; delete accepts this safe state.
 			if failErr := c.store.FailDatasetImport(ctx, req.GetVolumeId()); failErr != nil {

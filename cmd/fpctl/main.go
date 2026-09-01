@@ -102,7 +102,7 @@ func refsJSON(specs []string) (map[string]any, error) {
 
 func runSecrets(args []string) error {
 	if len(args) < 1 {
-		return errors.New("usage: fpctl secrets <set|ls|rm> ...")
+		return errors.New("usage: fpctl secrets <set|ls|rm>")
 	}
 	fs := flag.NewFlagSet("secrets", flag.ExitOnError)
 	project := fs.String("project", "dev", "project id")
@@ -111,7 +111,12 @@ func runSecrets(args []string) error {
 		setfs := flag.NewFlagSet("set", flag.ExitOnError)
 		var name, value string
 		setfs.StringVar(&name, "name", "", "secret name (required)")
-		setfs.StringVar(&value, "value", "", "secret value; omitted or '-' reads stdin (never echoed; avoids argv/ps leak)")
+		setfs.StringVar(
+			&value,
+			"value",
+			"",
+			"secret value; omitted or '-' reads stdin (never echoed; avoids argv/ps leak)",
+		)
 		setfs.StringVar(project, "project", "dev", "project id")
 		_ = setfs.Parse(args[1:])
 		if name == "" {
@@ -128,8 +133,10 @@ func runSecrets(args []string) error {
 		if value == "" {
 			return errors.New("--value is required (or pipe via stdin)")
 		}
-		body := map[string]any{"project_id": *project, "name": name, "value": value,
-			"created_by": "fpctl"}
+		body := map[string]any{
+			"project_id": *project, "name": name, "value": value,
+			"created_by": "fpctl",
+		}
 		out := map[string]any{}
 		return do("POST", "/v1/secrets", body, out)
 	case "ls":
@@ -150,7 +157,7 @@ func runSecrets(args []string) error {
 
 func runApp(args []string) error {
 	if len(args) < 1 {
-		return errors.New("usage: fpctl app <create|list|status|deploy|scale|rollback|delete> ...")
+		return errors.New("usage: fpctl app <create|list|status|deploy|scale|rollback|delete>")
 	}
 	switch args[0] {
 	case "create":
@@ -176,8 +183,10 @@ func runApp(args []string) error {
 		if hostname == "" || image == "" {
 			return errors.New("--hostname and --image are required")
 		}
-		body := map[string]any{"hostname": hostname, "image": image, "vcpu": vcpu,
-			"mem_mib": mem, "port": port, "replicas": replicas}
+		body := map[string]any{
+			"hostname": hostname, "image": image, "vcpu": vcpu,
+			"mem_mib": mem, "port": port, "replicas": replicas,
+		}
 		if len(services) > 0 {
 			if port != 0 && port != 8080 && port != int64(services[0].InternalPort) {
 				return fmt.Errorf("--port conflicts with first --service")
@@ -227,7 +236,12 @@ func runApp(args []string) error {
 		fs.Var(&secretSpecs, "secret", "secret binding VAR=NAME[@VERSION] (repeatable)")
 		fs.Int64Var(&port, "port", 0, "ingress port (0 = inherit)")
 		fs.StringVar(&strategy, "strategy", "", "rollout strategy: bluegreen (default) | rolling")
-		fs.Int64Var(&standbyIdle, "auto-standby-idle", -1, "auto-standby idle timeout seconds (-1 = inherit, 0 = disable)")
+		fs.Int64Var(
+			&standbyIdle,
+			"auto-standby-idle",
+			-1,
+			"auto-standby idle timeout seconds (-1 = inherit, 0 = disable)",
+		)
 		fs.Var(&services, "service", "service NAME=PORT (repeatable, v1.1 multi-port)")
 		_ = fs.Parse(args[2:])
 		body := map[string]any{}
@@ -334,7 +348,7 @@ func do(method, path string, body, out any) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err

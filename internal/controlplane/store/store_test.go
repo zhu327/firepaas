@@ -7,8 +7,8 @@ import (
 	"os"
 	"testing"
 
-	"github.com/zhu327/firepaas/internal/controlplane/db"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/zhu327/firepaas/internal/controlplane/db"
 )
 
 func TestProjectUsageIncludesAllocatedAndPending(t *testing.T) {
@@ -127,7 +127,8 @@ func TestEnsureCreateRejectsImmutableOwnershipConflict(t *testing.T) {
 			if err != nil || m == nil {
 				t.Fatal(err)
 			}
-			if m.AppID != appID || m.DeploymentID != deploymentID || m.CurrentExecutionID != "exec-1" || m.Generation != 1 {
+			if m.AppID != appID || m.DeploymentID != deploymentID || m.CurrentExecutionID != "exec-1" ||
+				m.Generation != 1 {
 				t.Fatalf("conflict mutated machine: %+v", m)
 			}
 		})
@@ -173,7 +174,12 @@ func TestJSONEqual(t *testing.T) {
 		want bool
 	}{
 		{"same object different key order", []byte(`{"a":1,"b":"2"}`), []byte(`{"b":"2","a":1}`), true},
-		{"protojson 64-bit ints as strings", []byte(`{"generation":"1","vcpu":"2"}`), []byte(`{"vcpu":"2","generation":"1"}`), true},
+		{
+			"protojson 64-bit ints as strings",
+			[]byte(`{"generation":"1","vcpu":"2"}`),
+			[]byte(`{"vcpu":"2","generation":"1"}`),
+			true,
+		},
 		{"different values", []byte(`{"a":1}`), []byte(`{"a":2}`), false},
 		{"different types", []byte(`{"a":1}`), []byte(`{"a":"1"}`), false},
 		{"missing key", []byte(`{"a":1}`), []byte(`{"a":1,"b":2}`), false},
@@ -242,7 +248,13 @@ func TestBeginVolumeDeleteAndEnqueueIsAtomicAndIdempotent(t *testing.T) {
 	if _, err := s.pool.Exec(ctx, `INSERT INTO volumes(id,project_id,name,mode,node_id,size_bytes,state) VALUES($1,$2,$3,'LOCAL_RW','node-1',1048576,'READY')`, volumeID, project, volumeID); err != nil {
 		t.Fatal(err)
 	}
-	p := EnqueueOperationParams{OperationID: opID, ProjectID: project, Kind: "volume_delete", Request: []byte(`{"volume_id":"` + volumeID + `"}`), DispatchNodeID: "node-1"}
+	p := EnqueueOperationParams{
+		OperationID:    opID,
+		ProjectID:      project,
+		Kind:           "volume_delete",
+		Request:        []byte(`{"volume_id":"` + volumeID + `"}`),
+		DispatchNodeID: "node-1",
+	}
 	for i := 0; i < 2; i++ {
 		if _, err := s.BeginVolumeDeleteAndEnqueue(ctx, volumeID, p); err != nil {
 			t.Fatal(err)
@@ -290,7 +302,10 @@ func TestEnqueueDeleteResurrectFailed(t *testing.T) {
 
 	// 不同请求体仍必须拒绝（幂等冲突语义不变）。
 	other := []byte(`{"machine_id":"m1","execution_id":"exec-1","generation":2,"operation_id":"opd-` + sfx + `"}`)
-	if _, err := s.EnqueueDelete(ctx, project, "m1", "exec-1", "opd-1-"+sfx, 1, other); !errors.Is(err, ErrRequestConflict) {
+	if _, err := s.EnqueueDelete(ctx, project, "m1", "exec-1", "opd-1-"+sfx, 1, other); !errors.Is(
+		err,
+		ErrRequestConflict,
+	) {
 		t.Fatalf("want ErrRequestConflict, got %v", err)
 	}
 
@@ -432,7 +447,8 @@ func TestMarkMachineObservedMissingPreservesLastObservation(t *testing.T) {
 	if err != nil || after == nil {
 		t.Fatal(err)
 	}
-	if after.ObservedState != "UNKNOWN" || after.LastObservedAt == nil || !after.LastObservedAt.Equal(*before.LastObservedAt) {
+	if after.ObservedState != "UNKNOWN" || after.LastObservedAt == nil ||
+		!after.LastObservedAt.Equal(*before.LastObservedAt) {
 		t.Fatalf("missing mark must retain last successful observation, before=%+v after=%+v", before, after)
 	}
 }
@@ -481,8 +497,10 @@ func TestEnqueueRescueReplacementAtomic(t *testing.T) {
 		t.Fatal(err)
 	}
 	snapID := "snap-rescue-" + fmt.Sprint(os.Getpid())
-	if _, err := s.CreateSnapshot(ctx, Snapshot{ID: snapID, ProjectID: project, SourceMachineID: machineID,
-		SourceExecutionID: "exec-old", SourceGeneration: 1, Kind: "MEMORY", NodeID: "node-1"}); err != nil {
+	if _, err := s.CreateSnapshot(ctx, Snapshot{
+		ID: snapID, ProjectID: project, SourceMachineID: machineID,
+		SourceExecutionID: "exec-old", SourceGeneration: 1, Kind: "MEMORY", NodeID: "node-1",
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.UpdateSnapshotArtifact(ctx, snapID, 1, "sha256:test", "none", "none", "", nil, true); err != nil {
@@ -498,9 +516,11 @@ func TestEnqueueRescueReplacementAtomic(t *testing.T) {
 	}
 	opID := "op-rescue-" + fmt.Sprint(os.Getpid())
 	raw := []byte(fmt.Sprintf(`{"snapshot_id":%q}`, snapID))
-	op, err := s.EnqueueRescueReplacement(ctx, RescueReplacementParams{ProjectID: project, MachineID: machineID,
+	op, err := s.EnqueueRescueReplacement(ctx, RescueReplacementParams{
+		ProjectID: project, MachineID: machineID,
 		OldExecutionID: "exec-old", OldGeneration: 1, NewExecutionID: "exec-new", OperationID: opID,
-		SnapshotID: snapID, Request: raw, DispatchNodeID: "node-1"})
+		SnapshotID: snapID, Request: raw, DispatchNodeID: "node-1",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -511,16 +531,20 @@ func TestEnqueueRescueReplacementAtomic(t *testing.T) {
 	if err != nil || m == nil {
 		t.Fatal(err)
 	}
-	if m.CurrentExecutionID != "exec-new" || m.Generation != 2 || m.ObservedState != "" || m.ObservedReadiness != "UNKNOWN" {
+	if m.CurrentExecutionID != "exec-new" || m.Generation != 2 || m.ObservedState != "" ||
+		m.ObservedReadiness != "UNKNOWN" {
 		t.Fatalf("unexpected replacement machine: %+v", m)
 	}
 	var backends int
-	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM route_backends WHERE machine_id=$1`, machineID).Scan(&backends); err != nil || backends != 0 {
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM route_backends WHERE machine_id=$1`, machineID).Scan(&backends); err != nil ||
+		backends != 0 {
 		t.Fatalf("route backends after rescue = %d, err=%v", backends, err)
 	}
-	if _, err := s.EnqueueRescueReplacement(ctx, RescueReplacementParams{ProjectID: project, MachineID: machineID,
+	if _, err := s.EnqueueRescueReplacement(ctx, RescueReplacementParams{
+		ProjectID: project, MachineID: machineID,
 		OldExecutionID: "exec-old", OldGeneration: 1, NewExecutionID: "exec-other", OperationID: opID + "-stale",
-		SnapshotID: snapID, Request: raw, DispatchNodeID: "node-1"}); !errors.Is(err, ErrRescueConflict) {
+		SnapshotID: snapID, Request: raw, DispatchNodeID: "node-1",
+	}); !errors.Is(err, ErrRescueConflict) {
 		t.Fatalf("stale rescue CAS error = %v, want ErrRescueConflict", err)
 	}
 }

@@ -89,7 +89,6 @@ type Manager struct {
 	mu     sync.RWMutex
 	nodes  map[string]*Node // key: Nomad node ID
 	conns  map[string]*agentclient.Client
-	tlsCfg func() error // 无证书时返回 nil
 }
 
 // New 构造 Manager。
@@ -202,8 +201,10 @@ func (m *Manager) Discover(ctx context.Context) error {
 	for nomadID, stub := range byNode {
 		seen[nomadID] = true
 		prev, existed := m.nodes[nomadID]
-		n := &Node{NomadNodeID: nomadID, Name: stub.Name, NodePool: stub.NodePool,
-			Ready: stub.Status == "ready", Eligible: stub.SchedulingEligibility == "eligible", Drain: stub.Drain}
+		n := &Node{
+			NomadNodeID: nomadID, Name: stub.Name, NodePool: stub.NodePool,
+			Ready: stub.Status == "ready", Eligible: stub.SchedulingEligibility == "eligible", Drain: stub.Drain,
+		}
 		if existed {
 			n.Info = prev.Info
 			n.LastSeen = prev.LastSeen
@@ -340,7 +341,10 @@ func (m *Manager) ClientForNodeID(nodeID string) *agentclient.Client {
 // AgentRuntimeForMachine 为 API runtime 通道解析 machine 所在 agent 与能力。
 // machine/node projection 仅从 PG 读取，连接来自本副本的只读 discovery；因此
 // follower 可直接服务请求，且不会参与 leader-only observed 同步。
-func (m *Manager) AgentRuntimeForMachine(ctx context.Context, machineID string) (*agentclient.Client, map[string]bool, error) {
+func (m *Manager) AgentRuntimeForMachine(
+	ctx context.Context,
+	machineID string,
+) (*agentclient.Client, map[string]bool, error) {
 	if m.cfg.Store == nil {
 		return nil, nil, fmt.Errorf("node resolver store not configured")
 	}
@@ -422,7 +426,7 @@ func (m *Manager) getJSON(ctx context.Context, path string, out any) error {
 	if err != nil {
 		return fmt.Errorf("nomad %s: %w", path, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("nomad %s: status %d", path, resp.StatusCode)
 	}

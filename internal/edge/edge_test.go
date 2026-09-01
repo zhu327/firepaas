@@ -132,7 +132,7 @@ func tokenServer(t *testing.T, token string, fail *atomic.Bool) *httptest.Server
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"token":%q,"execution_id":"exec-1"}`, token)
+		_, _ = fmt.Fprintf(w, `{"token":%q,"execution_id":"exec-1"}`, token)
 	}))
 	t.Cleanup(srv.Close)
 	return srv
@@ -146,7 +146,7 @@ func TestTokenClientRejectsExecutionMismatchAndRetriesFetch(t *testing.T) {
 		if n > 1 {
 			execution = "exec-1"
 		}
-		fmt.Fprintf(w, `{"token":"tok-%d","execution_id":%q}`, n, execution)
+		_, _ = fmt.Fprintf(w, `{"token":"tok-%d","execution_id":%q}`, n, execution)
 	}))
 	defer srv.Close()
 	tc := NewTokenClient(srv.URL, "bearer", 30*time.Second)
@@ -173,7 +173,7 @@ func TestTokenClientMismatchDoesNotServeStale(t *testing.T) {
 		if mismatch.Load() {
 			execution = "exec-2"
 		}
-		fmt.Fprintf(w, `{"token":"tok","execution_id":%q}`, execution)
+		_, _ = fmt.Fprintf(w, `{"token":"tok","execution_id":%q}`, execution)
 	}))
 	defer srv.Close()
 	tc := NewTokenClient(srv.URL, "bearer", 30*time.Second)
@@ -184,7 +184,8 @@ func TestTokenClientMismatchDoesNotServeStale(t *testing.T) {
 	}
 	now = now.Add(31 * time.Second)
 	mismatch.Store(true)
-	if tok, err := tc.Get(context.Background(), "m1", "exec-1"); !errors.Is(err, errTokenExecutionMismatch) || tok != "" {
+	if tok, err := tc.Get(context.Background(), "m1", "exec-1"); !errors.Is(err, errTokenExecutionMismatch) ||
+		tok != "" {
 		t.Fatalf("mismatch served stale token: token=%q err=%v", tok, err)
 	}
 }
@@ -228,7 +229,7 @@ func TestTokenClientInvalidate(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"token":"tok","execution_id":"exec-1"}`)
+		_, _ = fmt.Fprintf(w, `{"token":"tok","execution_id":"exec-1"}`)
 	}))
 	defer srv.Close()
 	tc := NewTokenClient(srv.URL, "bearer", 30*time.Second)
@@ -266,7 +267,7 @@ func TestTokenClientConcurrentSingleFlight(t *testing.T) {
 		default:
 		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"token":"tok","execution_id":"exec-1"}`)
+		_, _ = fmt.Fprintf(w, `{"token":"tok","execution_id":"exec-1"}`)
 	}))
 	defer srv.Close()
 	close(release)

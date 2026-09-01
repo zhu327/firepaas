@@ -199,8 +199,10 @@ func (a *API) deleteSecret(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slog.Info("secret deleted", "name", name, "versions_removed", n)
-	writeJSON(w, 200, map[string]any{"name": name, "versions_removed": n,
-		"note": "values already injected into running machines are unaffected; later recreations fail until refs updated"})
+	writeJSON(w, 200, map[string]any{
+		"name": name, "versions_removed": n,
+		"note": "values already injected into running machines are unaffected; later recreations fail until refs updated",
+	})
 }
 
 // ---- execution-bound proxy credential（ADR-0006） ----

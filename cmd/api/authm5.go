@@ -334,8 +334,10 @@ func (a *API) auth(next http.HandlerFunc) http.HandlerFunc {
 		} else if a.apiKeys != nil {
 			k, err := a.apiKeys.GetByHash(r.Context(), apikeys.Hash(got))
 			if err == nil {
-				id = identity{Kind: "key", KeyID: k.ID, KeyName: k.Name,
-					ProjectID: k.ProjectID, Scopes: k.Scopes}
+				id = identity{
+					Kind: "key", KeyID: k.ID, KeyName: k.Name,
+					ProjectID: k.ProjectID, Scopes: k.Scopes,
+				}
 				// P3-16：last_used_at 节流写（≥1min 一次），避免每请求一行 UPDATE。
 				if k.LastUsedAt == nil || time.Since(*k.LastUsedAt) > time.Minute {
 					_ = a.apiKeys.Touch(r.Context(), apikeys.Hash(got))

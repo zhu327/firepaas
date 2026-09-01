@@ -149,11 +149,13 @@ func ValidateQuarantineImageRequest(req *pb.QuarantineImageRequest) error {
 	if req == nil {
 		return errors.New("request is required")
 	}
-	if req.GetImageRef() == "" || req.GetClaimId() == "" || req.GetOperationId() == "" || req.GetExpectedRevision() == "" {
+	if req.GetImageRef() == "" || req.GetClaimId() == "" || req.GetOperationId() == "" ||
+		req.GetExpectedRevision() == "" {
 		return errors.New("image_ref, claim_id, operation_id and expected_revision are required")
 	}
 	return nil
 }
+
 func ValidateImageQuarantineActionRequest(req *pb.ImageQuarantineActionRequest) error {
 	if req == nil {
 		return errors.New("request is required")
@@ -163,11 +165,13 @@ func ValidateImageQuarantineActionRequest(req *pb.ImageQuarantineActionRequest) 
 	}
 	return nil
 }
+
 func ValidateQuarantineVolumeRequest(req *pb.QuarantineVolumeRequest) error {
 	if req == nil {
 		return errors.New("request is required")
 	}
-	if req.GetVolumeId() == "" || req.GetClaimId() == "" || req.GetOperationId() == "" || req.GetExpectedRevision() == "" {
+	if req.GetVolumeId() == "" || req.GetClaimId() == "" || req.GetOperationId() == "" ||
+		req.GetExpectedRevision() == "" {
 		return errors.New("volume_id, claim_id, operation_id and expected_revision are required")
 	}
 	if req.GetMode() != "DATASET_RO" || !req.GetRebuildable() {
@@ -175,6 +179,7 @@ func ValidateQuarantineVolumeRequest(req *pb.QuarantineVolumeRequest) error {
 	}
 	return nil
 }
+
 func ValidateVolumeQuarantineActionRequest(req *pb.VolumeQuarantineActionRequest) error {
 	if req == nil {
 		return errors.New("request is required")

@@ -94,7 +94,8 @@ type Rollout struct {
 
 // EnsureApp upsert app 行（apps 表，mvp-plan §5.4 最小模型）。
 func (s *Store) EnsureApp(ctx context.Context, projectID, appID, hostname, imageRef string,
-	vcpu, memMIB int64, port, replicas int) error {
+	vcpu, memMIB int64, port, replicas int,
+) error {
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO apps(id, project_id, hostname, image_ref, vcpu, mem_mib, desired_replicas, generation)
 		VALUES($1,$2,$3,$4,$5,$6,$7,1)
@@ -507,7 +508,8 @@ func (s *Store) CompleteRollout(ctx context.Context, appID string, failed bool) 
 // （P2-3：CUTOVER→COMPLETE 与 deployment ACTIVE/SUPERSEDED 同事务，中途
 // 崩溃不再留下 ACTIVE 指向旧代的不自愈状态）。
 func (s *Store) CompleteRolloutWithStatus(ctx context.Context, appID string, failed bool,
-	toDepID string, toStatus string, fromDepID string, fromStatus string) error {
+	toDepID string, toStatus string, fromDepID string, fromStatus string,
+) error {
 	return s.inTx(ctx, func(tx pgx.Tx) error {
 		var cur string
 		if err := tx.QueryRow(ctx,

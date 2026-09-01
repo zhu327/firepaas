@@ -69,16 +69,32 @@ func egressTableScript(idx int, rs *EgressRuleSet) (string, error) {
 	b.WriteString("add chain ip fp-slot egress-pre { type nat hook prerouting priority dstnat; policy accept; }\n")
 	b.WriteString("add chain ip fp-slot egress-fwd { type filter hook forward priority filter; policy accept; }\n")
 	if rs.ProxyPort80 > 0 {
-		fmt.Fprintf(&b, "add rule ip fp-slot egress-pre tcp dport 80 ip daddr != %s dnat to %s:%d\n", hostAddr, hostAddr, rs.ProxyPort80)
+		fmt.Fprintf(
+			&b,
+			"add rule ip fp-slot egress-pre tcp dport 80 ip daddr != %s dnat to %s:%d\n",
+			hostAddr,
+			hostAddr,
+			rs.ProxyPort80,
+		)
 	}
 	if rs.ProxyPort443 > 0 {
-		fmt.Fprintf(&b, "add rule ip fp-slot egress-pre tcp dport 443 ip daddr != %s dnat to %s:%d\n", hostAddr, hostAddr, rs.ProxyPort443)
+		fmt.Fprintf(
+			&b,
+			"add rule ip fp-slot egress-pre tcp dport 443 ip daddr != %s dnat to %s:%d\n",
+			hostAddr,
+			hostAddr,
+			rs.ProxyPort443,
+		)
 	}
 	b.WriteString("add rule ip fp-slot egress-fwd ct state established,related accept\n")
 	// The limit precedes every new-connection accept, including allowed CIDRs and
 	// proxy DNAT, so neither path can bypass the per-execution cap.
 	if rs.MaxTCPConns > 0 {
-		fmt.Fprintf(&b, "add rule ip fp-slot egress-fwd meta l4proto tcp ct state new ct count over %d counter drop comment \"firepaas-tcp-limit\"\n", rs.MaxTCPConns)
+		fmt.Fprintf(
+			&b,
+			"add rule ip fp-slot egress-fwd meta l4proto tcp ct state new ct count over %d counter drop comment \"firepaas-tcp-limit\"\n",
+			rs.MaxTCPConns,
+		)
 	}
 	fmt.Fprintf(&b, "add rule ip fp-slot egress-fwd ip daddr %s accept\n", hostAddr)
 	b.WriteString("add rule ip fp-slot egress-fwd ip daddr @egress-deny4 drop\n")

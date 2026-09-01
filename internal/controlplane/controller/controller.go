@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	agentv1 "github.com/zhu327/firepaas/internal/contracts/agentv1"
 	"github.com/zhu327/firepaas/internal/controlplane/agentclient"
 	"github.com/zhu327/firepaas/internal/controlplane/catalog"
@@ -31,7 +32,6 @@ import (
 	"github.com/zhu327/firepaas/internal/observability/metrics"
 	"github.com/zhu327/firepaas/internal/scheduler"
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
-	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -106,7 +106,8 @@ type Controller struct {
 
 // New 构造 Controller。
 func New(st *store.Store, cat *catalog.Catalog, nm *nodemanager.Manager,
-	resv *reservations.Manager, placer *scheduler.Placer, reg *metrics.Registry, cfg Config) *Controller {
+	resv *reservations.Manager, placer *scheduler.Placer, reg *metrics.Registry, cfg Config,
+) *Controller {
 	if cfg.OpPollInterval == 0 {
 		cfg.OpPollInterval = time.Second
 	}
@@ -175,13 +176,15 @@ func New(st *store.Store, cat *catalog.Catalog, nm *nodemanager.Manager,
 	if cfg.EvacuateStepTimeout == 0 {
 		cfg.EvacuateStepTimeout = 5 * time.Minute
 	}
-	return &Controller{store: st, nodes: nm, resv: resv, placer: placer,
+	return &Controller{
+		store: st, nodes: nm, resv: resv, placer: placer,
 		placement: placement.New(st, nm, resv, placer, reg, cfg.ReservationCompensationTimeout), metrics: reg,
 		routes: routepublisher.New(st, cat, cfg.DefaultAppPort, cfg.LegacyAgentProxyAddr), cfg: cfg,
 		nodeListFailures:   map[string]int{},
 		prefetchedRollouts: map[string]bool{}, evacuatedNodes: map[string]bool{},
 		reportedOrphans:     map[string]bool{},
-		userEventsRetention: cfg.UserEventsRetention, gc: cfg.GC, scrub: cfg.Scrub}
+		userEventsRetention: cfg.UserEventsRetention, gc: cfg.GC, scrub: cfg.Scrub,
+	}
 }
 
 // Run 启动三个循环：操作 reconcile、observed 同步/决策表、预约与投影重建。
@@ -768,7 +771,8 @@ func (c *Controller) processCreate(ctx context.Context, op store.Operation) erro
 }
 
 func (c *Controller) cleanupUncertainSecretCreate(ctx context.Context, op store.Operation,
-	lease *store.SecretLease, nodeID, cause string) error {
+	lease *store.SecretLease, nodeID, cause string,
+) error {
 	delID := "op-secret-cleanup-" + op.ID
 	del := &pb.DeleteMachineRequest{
 		MachineId: op.MachineID, ExecutionId: op.ExecutionID,
@@ -1144,8 +1148,8 @@ func (c *Controller) processAgentMachine(ctx context.Context, m *pb.Machine, v n
 
 // processPGMachine：PG 视角 → agent（ACK 丢失/节点失联/desired 删除）。
 func (c *Controller) processPGMachine(ctx context.Context, m store.Machine,
-	seen map[string]*pb.Machine, agentByMachine map[string]string) {
-
+	seen map[string]*pb.Machine, agentByMachine map[string]string,
+) {
 	agent, hasAgent := seen[m.ID]
 	nodeID := m.NodeID
 	if nodeID == "" && hasAgent {
@@ -1323,7 +1327,8 @@ func (c *Controller) processPGMachine(ctx context.Context, m store.Machine,
 // 新代 create（否则它永远抢占“pending 操作”名额，R2 无法下单），再入队
 // 旧代 delete；delete 完成后下一轮 sync 走 R3 重建。
 func (c *Controller) supersedePendingCreateAndReap(ctx context.Context, m store.Machine,
-	agent *pb.Machine, nodeID string) {
+	agent *pb.Machine, nodeID string,
+) {
 	pending, err := c.store.PendingOperationForMachine(ctx, m.ID)
 	if err != nil {
 		return
@@ -1565,7 +1570,12 @@ func (c *Controller) enqueueOrphanDelete(ctx context.Context, project string, m 
 	c.metrics.Inc("firepaas_reconcile_actions_total", map[string]string{"kind": "orphan_delete"}, 1)
 }
 
-func (c *Controller) enqueueDelete(ctx context.Context, machineID, executionID string, generation int64, opID, nodeID, reason string) error {
+func (c *Controller) enqueueDelete(
+	ctx context.Context,
+	machineID, executionID string,
+	generation int64,
+	opID, nodeID, reason string,
+) error {
 	req := &pb.DeleteMachineRequest{
 		MachineId:   machineID,
 		ExecutionId: executionID,
@@ -1925,7 +1935,12 @@ func (c *Controller) userEvent(ctx context.Context, project, app, machine, typ s
 // recordEgressAudit（v1.3-A，ADR-0027）：把 agent 上报的 per-execution
 // egress 决策计数聚合成 PG 拒绝摘要。deny_buckets 只保留计数与
 // protocol:port（无 Host/SNI），不构成高基数。
-func (c *Controller) recordEgressAudit(ctx context.Context, pg *store.Machine, m *pb.Machine, ea *pb.EgressAuditStats) error {
+func (c *Controller) recordEgressAudit(
+	ctx context.Context,
+	pg *store.Machine,
+	m *pb.Machine,
+	ea *pb.EgressAuditStats,
+) error {
 	buckets := make([]map[string]any, 0, len(ea.GetDenyBuckets()))
 	for _, b := range ea.GetDenyBuckets() {
 		buckets = append(buckets, map[string]any{

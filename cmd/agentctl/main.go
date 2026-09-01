@@ -39,7 +39,13 @@ func main() {
 	defer cancel()
 
 	var opts []grpc.DialOption
-	certFile, keyFile, caFile := os.Getenv("FIREPAAS_AGENT_TLS_CERT"), os.Getenv("FIREPAAS_AGENT_TLS_KEY"), os.Getenv("FIREPAAS_AGENT_TLS_CA")
+	certFile, keyFile, caFile := os.Getenv(
+		"FIREPAAS_AGENT_TLS_CERT",
+	), os.Getenv(
+		"FIREPAAS_AGENT_TLS_KEY",
+	), os.Getenv(
+		"FIREPAAS_AGENT_TLS_CA",
+	)
 	if certFile != "" && keyFile != "" && caFile != "" {
 		tlsConf, err := mtls.ClientConfig(certFile, keyFile, caFile, "agentd")
 		if err != nil {
@@ -53,7 +59,7 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	switch args[0] {
 	case "info":

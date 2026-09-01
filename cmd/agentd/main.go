@@ -335,7 +335,17 @@ func run() error {
 	}
 	memAllocated := func() uint64 { m, _, _ := listedResources(); return m }
 	vcpuAllocated := func() int { _, _, v := listedResources(); return v }
-	infoProvider := info.New(nodeID, serviceVersion, serviceCommit, nodePool, fcVersion, cfg.Network.SubnetCIDR, cfg.DataDir, memAllocated, vcpuAllocated)
+	infoProvider := info.New(
+		nodeID,
+		serviceVersion,
+		serviceCommit,
+		nodePool,
+		fcVersion,
+		cfg.Network.SubnetCIDR,
+		cfg.DataDir,
+		memAllocated,
+		vcpuAllocated,
+	)
 	// v1.2-E（ADR-0035）：已承诺磁盘上报（节点投影 + 硬准入输入）。
 	infoProvider.SetDiskAllocatedFunc(func() uint64 { _, d, _ := listedResources(); return d })
 	// v1.1（ADR-0018）：镜像缓存 digest 上报（scheduler 镜像亲和输入）。
@@ -348,11 +358,19 @@ func run() error {
 	// 兑现的能力；未完成 one-shot secret 安全通道前绝不上报
 	// secret.oneshot.v1（fail closed）。默认 guest 运维能力（logs/exec/cp）
 	// 由 hypeman guest agent + serial log 提供。
-	infoProvider.SetCapabilities(agentProtocolVersion, agentFeatureIDs(injectionMode, egressFeatureIDs,
-		set.Volumes != nil, adapter.SnapshotScrubAvailable(), adapter.ImageQuarantineAvailable(), adapter.VolumeQuarantineAvailable()),
+	infoProvider.SetCapabilities(agentProtocolVersion, agentFeatureIDs(
+		injectionMode,
+		egressFeatureIDs,
+		set.Volumes != nil,
+		adapter.SnapshotScrubAvailable(),
+		adapter.ImageQuarantineAvailable(),
+		adapter.VolumeQuarantineAvailable(),
+	),
 		instances.SnapshotCompatibilityKey(instances.StoredMetadata{
 			HypervisorType: hypervisor.TypeFirecracker, HypervisorVersion: fcVersion,
-			KernelVersion: string(set.System.GetDefaultKernelVersion()), Platform: goruntime.GOOS + "/" + goruntime.GOARCH,
+			KernelVersion: string(
+				set.System.GetDefaultKernelVersion(),
+			), Platform: goruntime.GOOS + "/" + goruntime.GOARCH,
 		}))
 
 	// M4（ADR-0006 收口）：proxy credential 验证材料（仅 SHA-256 摘要落盘）。
@@ -365,7 +383,8 @@ func run() error {
 	requireCred := strings.ToLower(envOr("FIREPAAS_PROXY_CREDENTIAL_REQUIRED", "true")) != "false"
 	// v1.1（ADR-0018）：PullImage（部署预取）磁盘水位守护（已用比例 ≥ 阈值拒绝）。
 	diskWatermark := 0.9
-	if v, err := strconv.ParseFloat(envOr("FIREPAAS_PREFETCH_DISK_WATERMARK", "0.9"), 64); err == nil && v > 0 && v <= 1 {
+	if v, err := strconv.ParseFloat(envOr("FIREPAAS_PREFETCH_DISK_WATERMARK", "0.9"), 64); err == nil && v > 0 &&
+		v <= 1 {
 		diskWatermark = v
 	}
 	srv := server.New(adapter, ledger, fences, infoProvider,
@@ -581,7 +600,9 @@ func agentServerTLS() (*tls.Config, error) {
 			slog.Warn("agentd running without TLS because FIREPAAS_ALLOW_INSECURE_DEV=true")
 			return nil, nil
 		}
-		return nil, fmt.Errorf("agent mTLS required: set FIREPAAS_AGENT_TLS_CERT/KEY/CA (or FIREPAAS_ALLOW_INSECURE_DEV=true for local development only)")
+		return nil, fmt.Errorf(
+			"agent mTLS required: set FIREPAAS_AGENT_TLS_CERT/KEY/CA (or FIREPAAS_ALLOW_INSECURE_DEV=true for local development only)",
+		)
 	}
 	if certFile == "" || keyFile == "" || caFile == "" {
 		return nil, fmt.Errorf("FIREPAAS_AGENT_TLS_CERT/KEY/CA must be set together")
@@ -607,7 +628,12 @@ func hostnameOr(def string) string {
 //     与代理回流同源段，源段忽略会误伤真实流量——改为精确按连接剔除）。
 //
 // 策略 per-app 默认关闭；controller 对无策略实例零动作。
-func startAutoStandby(ctx context.Context, mgr instances.Manager, probeReg *probeflow.Registry, meter otelmetric.Meter) error {
+func startAutoStandby(
+	ctx context.Context,
+	mgr instances.Manager,
+	probeReg *probeflow.Registry,
+	meter otelmetric.Meter,
+) error {
 	store := standby.NewInstanceStore(mgr)
 	if store == nil {
 		return fmt.Errorf("instance manager lacks auto-standby runtime persistence")

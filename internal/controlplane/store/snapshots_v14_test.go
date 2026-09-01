@@ -13,9 +13,11 @@ import (
 func seedReadySnapshot(t *testing.T, s *Store, project, snapID string) {
 	t.Helper()
 	ctx := context.Background()
-	if _, err := s.CreateSnapshot(ctx, Snapshot{ID: snapID, ProjectID: project,
+	if _, err := s.CreateSnapshot(ctx, Snapshot{
+		ID: snapID, ProjectID: project,
 		SourceMachineID: "m-v14", SourceExecutionID: "exec-v14", SourceGeneration: 1,
-		Kind: "MEMORY", NodeID: "node-v14"}); err != nil {
+		Kind: "MEMORY", NodeID: "node-v14",
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.UpdateSnapshotArtifact(ctx, snapID, 1024, "sha256:v14", "none", "none", "", nil, true); err != nil {
@@ -24,9 +26,11 @@ func seedReadySnapshot(t *testing.T, s *Store, project, snapID string) {
 }
 
 func deleteParams(project, snapID, opID string, raw []byte) EnqueueOperationParams {
-	return EnqueueOperationParams{OperationID: opID, ProjectID: project, MachineID: "m-v14",
+	return EnqueueOperationParams{
+		OperationID: opID, ProjectID: project, MachineID: "m-v14",
 		ExecutionID: "exec-v14", Generation: 1, Kind: "snapshot_delete",
-		Request: raw, DispatchNodeID: "node-v14"}
+		Request: raw, DispatchNodeID: "node-v14",
+	}
 }
 
 // v1.4-A：对已进入 DELETING 的快照重试删除必须幂等收敛，不得因
@@ -63,7 +67,8 @@ func TestBeginSnapshotDeleteIdempotentWhileDeleting(t *testing.T) {
 		t.Fatalf("snapshot status = %q, err=%v", snap.Status, err)
 	}
 	var ops int
-	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM operations WHERE kind='snapshot_delete' AND request::text LIKE '%' || $1 || '%'`, snapID).Scan(&ops); err != nil || ops != 1 {
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM operations WHERE kind='snapshot_delete' AND request::text LIKE '%' || $1 || '%'`, snapID).Scan(&ops); err != nil ||
+		ops != 1 {
 		t.Fatalf("duplicate delete operations created: %d (err=%v)", ops, err)
 	}
 }
@@ -124,8 +129,10 @@ func TestForkAndRescueRejectBlockedIntegrityAtomically(t *testing.T) {
 	}
 	if _, err := s.CreateForkMachineAndEnqueue(ctx, "snap-integrity", ForkMachineParams{
 		ProjectID: project, AppID: "missing-app", MachineID: "m-fork-blocked", ExecutionID: "exec-fork", NodeID: "node-v14",
-	}, EnqueueOperationParams{OperationID: "op-fork-blocked", ProjectID: project, MachineID: "m-fork-blocked",
-		ExecutionID: "exec-fork", Generation: 1, Kind: "fork", Request: []byte(`{}`), DispatchNodeID: "node-v14"}); !errors.Is(err, ErrSnapshotStatusConflict) {
+	}, EnqueueOperationParams{
+		OperationID: "op-fork-blocked", ProjectID: project, MachineID: "m-fork-blocked",
+		ExecutionID: "exec-fork", Generation: 1, Kind: "fork", Request: []byte(`{}`), DispatchNodeID: "node-v14",
+	}); !errors.Is(err, ErrSnapshotStatusConflict) {
 		t.Fatalf("fork corrupt snapshot = %v", err)
 	}
 	var machines, ops int
@@ -150,15 +157,19 @@ func TestRescuePreflightMismatchPreservesExecutionAndRoute(t *testing.T) {
 		1, 0, []byte(`{}`), nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.UpsertNode(ctx, Node{ID: "node-mismatch", NomadNodeID: "nomad-mismatch", Status: "HEALTHY",
-		FeatureIDs: []string{"snapshot.memory.v1"}, SnapshotCompatibilityKey: "target-key"}); err != nil {
+	if err := s.UpsertNode(ctx, Node{
+		ID: "node-mismatch", NomadNodeID: "nomad-mismatch", Status: "HEALTHY",
+		FeatureIDs: []string{"snapshot.memory.v1"}, SnapshotCompatibilityKey: "target-key",
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.UpdateMachineNodeAndObserved(ctx, machineID, "node-mismatch", "exec-old", "RUNNING", "10.0.0.2", "READY"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.CreateSnapshot(ctx, Snapshot{ID: "snap-mismatch", ProjectID: project, SourceMachineID: machineID,
-		SourceExecutionID: "exec-old", SourceGeneration: 1, Kind: "MEMORY", NodeID: "node-mismatch", CompatibilityKey: "source-key"}); err != nil {
+	if _, err := s.CreateSnapshot(ctx, Snapshot{
+		ID: "snap-mismatch", ProjectID: project, SourceMachineID: machineID,
+		SourceExecutionID: "exec-old", SourceGeneration: 1, Kind: "MEMORY", NodeID: "node-mismatch", CompatibilityKey: "source-key",
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.UpdateSnapshotArtifact(ctx, "snap-mismatch", 1, "sha256:test", "none", "none", "", nil, true); err != nil {
@@ -172,10 +183,12 @@ func TestRescuePreflightMismatchPreservesExecutionAndRoute(t *testing.T) {
 		SELECT id,1,$1,'exec-old' FROM routes WHERE app_id='app-rescue-mismatch'`, machineID); err != nil {
 		t.Fatal(err)
 	}
-	_, err := s.EnqueueRescueReplacement(ctx, RescueReplacementParams{ProjectID: project, MachineID: machineID,
+	_, err := s.EnqueueRescueReplacement(ctx, RescueReplacementParams{
+		ProjectID: project, MachineID: machineID,
 		OldExecutionID: "exec-old", OldGeneration: 1, NewExecutionID: "exec-new", OperationID: "op-rescue-mismatch",
 		SnapshotID: "snap-mismatch", Request: []byte(`{}`), DispatchNodeID: "node-mismatch",
-		RequiredFeature: "snapshot.memory.v1", TargetCompatibilityKey: "target-key", RequireMemoryCompatible: true})
+		RequiredFeature: "snapshot.memory.v1", TargetCompatibilityKey: "target-key", RequireMemoryCompatible: true,
+	})
 	if !errors.Is(err, ErrRescueConflict) {
 		t.Fatalf("rescue mismatch = %v, want ErrRescueConflict", err)
 	}
@@ -184,7 +197,8 @@ func TestRescuePreflightMismatchPreservesExecutionAndRoute(t *testing.T) {
 		t.Fatalf("machine changed on mismatch: %+v err=%v", m, err)
 	}
 	var backends, ops int
-	_ = s.pool.QueryRow(ctx, `SELECT count(*) FROM route_backends WHERE machine_id=$1 AND execution_id='exec-old'`, machineID).Scan(&backends)
+	_ = s.pool.QueryRow(ctx, `SELECT count(*) FROM route_backends WHERE machine_id=$1 AND execution_id='exec-old'`, machineID).
+		Scan(&backends)
 	_ = s.pool.QueryRow(ctx, `SELECT count(*) FROM operations WHERE id='op-rescue-mismatch'`).Scan(&ops)
 	if backends != 1 || ops != 0 {
 		t.Fatalf("mismatch changed route/op: backends=%d ops=%d", backends, ops)
@@ -215,7 +229,10 @@ func TestSnapshotReferenceLifecycle(t *testing.T) {
 		t.Fatalf("re-acquire held reference after snapshot left READY: %v", err)
 	}
 	// 其他操作仍不能在非 READY 快照上新建引用。
-	if err := s.AcquireSnapshotReference(ctx, snapID, "op-fork-other", "fork"); !errors.Is(err, ErrSnapshotStatusConflict) {
+	if err := s.AcquireSnapshotReference(ctx, snapID, "op-fork-other", "fork"); !errors.Is(
+		err,
+		ErrSnapshotStatusConflict,
+	) {
 		t.Fatalf("fresh acquire on non-READY snapshot = %v, want conflict", err)
 	}
 

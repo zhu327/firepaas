@@ -42,7 +42,11 @@ func (c *Controller) processPrewarm(ctx context.Context, op store.Operation) err
 	})
 }
 
-func (c *Controller) dispatchPrewarm(ctx context.Context, op store.Operation, resolve func(string) prewarmPuller) error {
+func (c *Controller) dispatchPrewarm(
+	ctx context.Context,
+	op store.Operation,
+	resolve func(string) prewarmPuller,
+) error {
 	var req PrewarmRequest
 	if err := json.Unmarshal(op.Request, &req); err != nil {
 		_ = c.store.CompleteOperation(ctx, op.ID, "FAILED", nil, err.Error())
@@ -68,7 +72,12 @@ func (c *Controller) dispatchPrewarm(ctx context.Context, op store.Operation, re
 			continue
 		}
 		if !target.DeadlineAt.IsZero() && !target.DeadlineAt.After(time.Now()) {
-			terminal, aerr := c.store.RecordPrewarmTargetAttemptFailure(ctx, op.ID, target.NodeID, "prewarm deadline exceeded")
+			terminal, aerr := c.store.RecordPrewarmTargetAttemptFailure(
+				ctx,
+				op.ID,
+				target.NodeID,
+				"prewarm deadline exceeded",
+			)
 			if aerr != nil {
 				return aerr
 			}
@@ -104,7 +113,11 @@ func (c *Controller) dispatchPrewarm(ctx context.Context, op store.Operation, re
 		cancel()
 		if err != nil {
 			switch status.Code(err) {
-			case codes.InvalidArgument, codes.NotFound, codes.Unimplemented, codes.PermissionDenied, codes.Unauthenticated:
+			case codes.InvalidArgument,
+				codes.NotFound,
+				codes.Unimplemented,
+				codes.PermissionDenied,
+				codes.Unauthenticated:
 				// 确定性失败：该节点终态 FAILED，其余节点继续。
 				if serr := c.store.SetPrewarmTargetStatus(ctx, op.ID, target.NodeID, "FAILED", err.Error()); serr != nil {
 					return serr
@@ -146,14 +159,17 @@ func (c *Controller) dispatchPrewarm(ctx context.Context, op store.Operation, re
 	raw, _ := json.Marshal(summary)
 	succeeded, failed := 0, 0
 	for _, t := range targets {
-		if t.Status == "SUCCEEDED" {
+		switch t.Status {
+		case "SUCCEEDED":
 			succeeded++
-		} else if t.Status == "FAILED" {
+		case "FAILED":
 			failed++
 		}
 	}
-	details, _ := json.Marshal(map[string]any{"operation_id": op.ID, "digest": req.Digest,
-		"succeeded": succeeded, "failed": failed})
+	details, _ := json.Marshal(map[string]any{
+		"operation_id": op.ID, "digest": req.Digest,
+		"succeeded": succeeded, "failed": failed,
+	})
 	return c.store.CompletePrewarmWithEvent(ctx, op.ID, raw, store.UserEvent{
 		ProjectID: op.ProjectID, Type: "image.prewarm.completed", Details: details,
 	})

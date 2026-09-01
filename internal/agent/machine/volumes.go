@@ -33,7 +33,11 @@ import (
 // volumeProvider 是 hypeman volumes.Manager 的能力子集。
 type volumeProvider interface {
 	CreateVolume(ctx context.Context, req volumes.CreateVolumeRequest) (*volumes.Volume, error)
-	CreateVolumeFromArchive(ctx context.Context, req volumes.CreateVolumeFromArchiveRequest, archive io.Reader) (*volumes.Volume, error)
+	CreateVolumeFromArchive(
+		ctx context.Context,
+		req volumes.CreateVolumeFromArchiveRequest,
+		archive io.Reader,
+	) (*volumes.Volume, error)
 	GetVolume(ctx context.Context, id string) (*volumes.Volume, error)
 	DeleteVolume(ctx context.Context, id string) error
 	ListVolumes(ctx context.Context) ([]volumes.Volume, error)
@@ -42,7 +46,12 @@ type volumeProvider interface {
 
 // volumeAttacher 是 hypeman instances.Manager 的挂载能力子集。
 type volumeAttacher interface {
-	AttachVolume(ctx context.Context, id string, volumeID string, req instances.AttachVolumeRequest) (*instances.Instance, error)
+	AttachVolume(
+		ctx context.Context,
+		id string,
+		volumeID string,
+		req instances.AttachVolumeRequest,
+	) (*instances.Instance, error)
 	DetachVolume(ctx context.Context, id string, volumeID string) (*instances.Instance, error)
 	StopInstance(ctx context.Context, id string) (*instances.Instance, error)
 	StartInstance(ctx context.Context, id string, req instances.StartInstanceRequest) (*instances.Instance, error)
@@ -50,12 +59,11 @@ type volumeAttacher interface {
 
 // resolveVolumes 返回 hypeman volume/attach 能力（缺失 = 老上游/测试替身）。
 func (a *Adapter) resolveVolumes() (volumeProvider, volumeAttacher, error) {
-	vp, ok1 := a.volumes.(volumeProvider)
-	at, ok2 := a.instances.(volumeAttacher)
-	if !ok1 || !ok2 {
+	at, ok := a.instances.(volumeAttacher)
+	if a.volumes == nil || !ok {
 		return nil, nil, ErrGuestOpsUnsupported
 	}
-	return vp, at, nil
+	return a.volumes, at, nil
 }
 
 // SetVolumes（agentd 装配）注入 hypeman volumes.Manager。
@@ -89,34 +97,41 @@ func (a *Adapter) ImportDataset(ctx context.Context, req *pb.ImportDatasetReques
 		return nil, fmt.Errorf("%w: limits must be positive", ErrDatasetArchive)
 	}
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
-	transport := &http.Transport{Proxy: nil, DialContext: func(c context.Context, network, address string) (net.Conn, error) {
-		host, port, err := net.SplitHostPort(address)
-		if err != nil {
-			return nil, err
-		}
-		ips, err := net.DefaultResolver.LookupNetIP(c, "ip", host)
-		if err != nil || len(ips) == 0 {
-			return nil, ErrDatasetURL
-		}
-		for _, ip := range ips {
-			// resolver 对 IPv4 字面量可能返回 IPv4-mapped IPv6（如
-			// ::ffff:127.0.0.1）；那是解析产物，先 unmap 再按真实地址判。
-			// 未 unmap 的入口（publicDatasetIP / 字面量 host）仍拒绝 4-in-6 形态。
-			if !publicDatasetAddr(ip.Unmap(), req.GetAllowHttpLoopbackForTests()) {
+	transport := &http.Transport{
+		Proxy: nil,
+		DialContext: func(c context.Context, network, address string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(address)
+			if err != nil {
+				return nil, err
+			}
+			ips, err := net.DefaultResolver.LookupNetIP(c, "ip", host)
+			if err != nil || len(ips) == 0 {
 				return nil, ErrDatasetURL
 			}
-		}
-		return dialer.DialContext(c, network, net.JoinHostPort(ips[0].Unmap().String(), port))
-	}}
-	hc := &http.Client{Timeout: 15 * time.Minute, Transport: transport, CheckRedirect: func(next *http.Request, via []*http.Request) error {
-		if err := validateDatasetURL(next.URL.String(), req.GetAllowHttpLoopbackForTests()); err != nil {
-			// net/http's redirect error includes the target URL. Return a stable
-			// sentinel here and replace the outer error below, rather than allowing
-			// either the source or redirect target into logs or operation errors.
-			return ErrDatasetURL
-		}
-		return nil
-	}}
+			for _, ip := range ips {
+				// resolver 对 IPv4 字面量可能返回 IPv4-mapped IPv6（如
+				// ::ffff:127.0.0.1）；那是解析产物，先 unmap 再按真实地址判。
+				// 未 unmap 的入口（字面量 host 等）仍拒绝 4-in-6 形态。
+				if !publicDatasetAddr(ip.Unmap(), req.GetAllowHttpLoopbackForTests()) {
+					return nil, ErrDatasetURL
+				}
+			}
+			return dialer.DialContext(c, network, net.JoinHostPort(ips[0].Unmap().String(), port))
+		},
+	}
+	hc := &http.Client{
+		Timeout:   15 * time.Minute,
+		Transport: transport,
+		CheckRedirect: func(next *http.Request, via []*http.Request) error {
+			if err := validateDatasetURL(next.URL.String(), req.GetAllowHttpLoopbackForTests()); err != nil {
+				// net/http's redirect error includes the target URL. Return a stable
+				// sentinel here and replace the outer error below, rather than allowing
+				// either the source or redirect target into logs or operation errors.
+				return ErrDatasetURL
+			}
+			return nil
+		},
+	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, req.GetSourceUrl(), nil)
 	if err != nil {
 		return nil, ErrDatasetURL
@@ -127,7 +142,7 @@ func (a *Adapter) ImportDataset(ctx context.Context, req *pb.ImportDatasetReques
 		// different redirect host must never escape this boundary.
 		return nil, fmt.Errorf("download dataset: %w", ErrDatasetURL)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("download dataset: unexpected status %d", resp.StatusCode)
 	}
@@ -143,44 +158,57 @@ func (a *Adapter) ImportDataset(ctx context.Context, req *pb.ImportDatasetReques
 	name := f.Name()
 	activeDatasetSpools.Store(name, struct{}{})
 	defer activeDatasetSpools.Delete(name)
-	defer os.Remove(name)
+	defer func() { _ = os.Remove(name) }()
 	h := sha256.New()
 	n, err := io.Copy(io.MultiWriter(f, h), io.LimitReader(resp.Body, int64(req.GetMaxDownloadBytes())+1))
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, fmt.Errorf("download dataset: %w", err)
 	}
 	if n > int64(req.GetMaxDownloadBytes()) {
-		f.Close()
+		_ = f.Close()
 		return nil, fmt.Errorf("%w: compressed size exceeds limit", ErrDatasetArchive)
 	}
 	got := "sha256:" + hex.EncodeToString(h.Sum(nil))
 	if got != strings.ToLower(req.GetExpectedDigest()) {
-		f.Close()
+		_ = f.Close()
 		return nil, fmt.Errorf("%w: got %s", ErrDatasetDigest, got)
 	}
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, err
 	}
 	if err := validateDatasetArchive(f, req.GetMaxExpandedBytes(), req.GetMaxFiles()); err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, err
 	}
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, err
 	}
 	sizeGB := int((req.GetMaxExpandedBytes() + 1024*1024*1024 - 1) / (1024 * 1024 * 1024))
 	if sizeGB < 1 {
 		sizeGB = 1
 	}
-	v, err := vp.CreateVolumeFromArchive(ctx, volumes.CreateVolumeFromArchiveRequest{Id: ptr(req.GetVolumeId()), SizeGb: sizeGB, Tags: tags.Tags{tagDatasetDigest: got, tagDatasetSealed: "true"}}, f)
+	v, err := vp.CreateVolumeFromArchive(
+		ctx,
+		volumes.CreateVolumeFromArchiveRequest{
+			Id:     ptr(req.GetVolumeId()),
+			SizeGb: sizeGB,
+			Tags:   tags.Tags{tagDatasetDigest: got, tagDatasetSealed: "true"},
+		},
+		f,
+	)
 	_ = f.Close()
 	if err != nil {
 		return nil, fmt.Errorf("hypeman import dataset: %w", err)
 	}
-	return &pb.CreateVolumeResponse{VolumeId: v.Id, SizeBytes: uint64(v.SizeGb) * 1024 * 1024 * 1024, ContentDigest: got, Sealed: true}, nil
+	return &pb.CreateVolumeResponse{
+		VolumeId:      v.Id,
+		SizeBytes:     uint64(v.SizeGb) * 1024 * 1024 * 1024,
+		ContentDigest: got,
+		Sealed:        true,
+	}, nil
 }
 
 func ptr(s string) *string { return &s }
@@ -303,15 +331,6 @@ func publicDatasetAddr(addr netip.Addr, allowLoopback bool) bool {
 	return addr.IsGlobalUnicast()
 }
 
-func publicDatasetIP(ip net.IP, allowLoopback bool) bool {
-	if v4 := ip.To4(); v4 != nil {
-		addr, ok := netip.AddrFromSlice(v4)
-		return ok && publicDatasetAddr(addr, allowLoopback)
-	}
-	addr, ok := netip.AddrFromSlice(ip)
-	return ok && publicDatasetAddr(addr, allowLoopback)
-}
-
 const (
 	maxDatasetPathBytes = 4096
 	maxDatasetPathDepth = 256
@@ -322,7 +341,7 @@ func validateDatasetArchive(r io.Reader, maxExpanded uint64, maxFiles uint32) er
 	if err != nil {
 		return fmt.Errorf("%w: gzip: %v", ErrDatasetArchive, err)
 	}
-	defer gz.Close()
+	defer func() { _ = gz.Close() }()
 	tr := tar.NewReader(gz)
 	var expanded uint64
 	var entries uint64
@@ -335,13 +354,14 @@ func validateDatasetArchive(r io.Reader, maxExpanded uint64, maxFiles uint32) er
 			return fmt.Errorf("%w: tar: %v", ErrDatasetArchive, err)
 		}
 		clean := path.Clean(h.Name)
-		if h.Name == "" || len(h.Name) > maxDatasetPathBytes || strings.HasPrefix(h.Name, "/") || clean == ".." || strings.HasPrefix(clean, "../") ||
+		if h.Name == "" || len(h.Name) > maxDatasetPathBytes || strings.HasPrefix(h.Name, "/") || clean == ".." ||
+			strings.HasPrefix(clean, "../") ||
 			len(strings.Split(clean, "/")) > maxDatasetPathDepth {
 			return fmt.Errorf("%w: invalid path", ErrDatasetArchive)
 		}
 		entries++ // directories also consume parser/filesystem work and count
 		switch h.Typeflag {
-		case tar.TypeReg, tar.TypeRegA:
+		case tar.TypeReg:
 		case tar.TypeDir:
 		default:
 			return fmt.Errorf("%w: archive entry type %d rejected", ErrDatasetArchive, h.Typeflag)
@@ -355,7 +375,11 @@ func validateDatasetArchive(r io.Reader, maxExpanded uint64, maxFiles uint32) er
 }
 
 // CreateVolume 创建本地空卷（LOCAL_RW；v1.3-D 不支持 archive 导入）。
-func (a *Adapter) CreateVolume(ctx context.Context, volumeID string, sizeBytes uint64) (*pb.CreateVolumeResponse, error) {
+func (a *Adapter) CreateVolume(
+	ctx context.Context,
+	volumeID string,
+	sizeBytes uint64,
+) (*pb.CreateVolumeResponse, error) {
 	vp, _, err := a.resolveVolumes()
 	if err != nil {
 		return nil, err
@@ -398,12 +422,17 @@ func (a *Adapter) RecoverVolume(ctx context.Context, volumeID string) (*pb.Creat
 			return nil, false, nil
 		}
 	}
-	return &pb.CreateVolumeResponse{VolumeId: v.Id, SizeBytes: uint64(v.SizeGb) * 1024 * 1024 * 1024,
-		ContentDigest: v.Tags[tagDatasetDigest], Sealed: v.Tags[tagDatasetSealed] == "true"}, true, nil
+	return &pb.CreateVolumeResponse{
+		VolumeId: v.Id, SizeBytes: uint64(v.SizeGb) * 1024 * 1024 * 1024,
+		ContentDigest: v.Tags[tagDatasetDigest], Sealed: v.Tags[tagDatasetSealed] == "true",
+	}, true, nil
 }
 
 // VolumeAttachmentState observes attachment state by stable machine/execution/volume identity.
-func (a *Adapter) VolumeAttachmentState(ctx context.Context, machineID, executionID, volumeID string) (*pb.Machine, bool, error) {
+func (a *Adapter) VolumeAttachmentState(
+	ctx context.Context,
+	machineID, executionID, volumeID string,
+) (*pb.Machine, bool, error) {
 	inst, err := a.checkedVolumeInstance(ctx, machineID, executionID)
 	if err != nil {
 		return nil, false, err
@@ -480,19 +509,33 @@ func (a *Adapter) DetachVolume(ctx context.Context, req *pb.DetachVolumeRequest)
 		})
 }
 
-func (a *Adapter) checkedVolumeInstance(ctx context.Context, machineID, executionID string) (*instances.Instance, error) {
+func (a *Adapter) checkedVolumeInstance(
+	ctx context.Context,
+	machineID, executionID string,
+) (*instances.Instance, error) {
 	inst, err := a.instances.GetInstance(ctx, machineID)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrMachineNotFound, machineID)
 	}
 	if inst.Tags[tagExecution] != executionID {
-		return nil, fmt.Errorf("%w: machine %s want %s got %s", ErrStaleExecution, machineID, executionID, inst.Tags[tagExecution])
+		return nil, fmt.Errorf(
+			"%w: machine %s want %s got %s",
+			ErrStaleExecution,
+			machineID,
+			executionID,
+			inst.Tags[tagExecution],
+		)
 	}
 	return inst, nil
 }
 
-func (a *Adapter) coldMutateVolume(ctx context.Context, at volumeAttacher, machineID, executionID, volumeID string,
-	mutate func(context.Context, string) (*instances.Instance, error), rollback func(context.Context, string) error) (*pb.Machine, error) {
+func (a *Adapter) coldMutateVolume(
+	ctx context.Context,
+	at volumeAttacher,
+	machineID, executionID, volumeID string,
+	mutate func(context.Context, string) (*instances.Instance, error),
+	rollback func(context.Context, string) error,
+) (*pb.Machine, error) {
 	inst, err := a.checkedVolumeInstance(ctx, machineID, executionID)
 	if err != nil {
 		return nil, err
@@ -500,8 +543,14 @@ func (a *Adapter) coldMutateVolume(ctx context.Context, at volumeAttacher, machi
 	return a.coldMutateVolumeWithInstance(ctx, at, inst, machineID, volumeID, mutate, rollback)
 }
 
-func (a *Adapter) coldMutateVolumeWithInstance(ctx context.Context, at volumeAttacher, inst *instances.Instance, machineID, volumeID string,
-	mutate func(context.Context, string) (*instances.Instance, error), rollback func(context.Context, string) error) (*pb.Machine, error) {
+func (a *Adapter) coldMutateVolumeWithInstance(
+	ctx context.Context,
+	at volumeAttacher,
+	inst *instances.Instance,
+	machineID, volumeID string,
+	mutate func(context.Context, string) (*instances.Instance, error),
+	rollback func(context.Context, string) error,
+) (*pb.Machine, error) {
 	wasRunning := inst.State == instances.StateRunning || inst.State == instances.StateInitializing
 	if !wasRunning && inst.State != instances.StateStopped {
 		return nil, fmt.Errorf("volume cold restart requires running or stopped instance, got %s", inst.State)
@@ -517,7 +566,10 @@ func (a *Adapter) coldMutateVolumeWithInstance(ctx context.Context, at volumeAtt
 			compCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 			defer cancel()
 			if _, startErr := a.startAndReattachSlot(compCtx, at, machineID, inst.Id); startErr != nil {
-				return nil, errors.Join(fmt.Errorf("change volume %s: %w", volumeID, err), fmt.Errorf("restore source running state: %w", startErr))
+				return nil, errors.Join(
+					fmt.Errorf("change volume %s: %w", volumeID, err),
+					fmt.Errorf("restore source running state: %w", startErr),
+				)
 			}
 		}
 		return nil, fmt.Errorf("change volume %s: %w", volumeID, err)
@@ -542,7 +594,11 @@ func (a *Adapter) coldMutateVolumeWithInstance(ctx context.Context, at volumeAtt
 		wrapVolumeCompensation("restore source running state", restartErr))
 }
 
-func (a *Adapter) startAndReattachSlot(ctx context.Context, at volumeAttacher, machineID, instanceID string) (*instances.Instance, error) {
+func (a *Adapter) startAndReattachSlot(
+	ctx context.Context,
+	at volumeAttacher,
+	machineID, instanceID string,
+) (*instances.Instance, error) {
 	started, err := at.StartInstance(ctx, instanceID, instances.StartInstanceRequest{})
 	if err != nil {
 		return nil, err
@@ -597,15 +653,25 @@ func (a *Adapter) ListVolumes(ctx context.Context) ([]*pb.VolumeInfo, error) {
 			// hypeman stores its instance ID here. firepaas machine IDs are used as
 			// hypeman instance names by the adapter; execution is intentionally left
 			// unknown rather than guessed from another authority.
-			attachments = append(attachments, &pb.VolumeAttachmentInfo{MachineId: att.InstanceID,
-				MountPath: att.MountPath, Readonly: att.Readonly})
+			attachments = append(attachments, &pb.VolumeAttachmentInfo{
+				MachineId: att.InstanceID,
+				MountPath: att.MountPath, Readonly: att.Readonly,
+			})
 		}
-		revisionInput := fmt.Sprintf("%s\x00%d\x00%s\x00%t", v.Id, v.SizeGb, v.Tags[tagDatasetDigest], v.Tags[tagDatasetSealed] == "true")
+		revisionInput := fmt.Sprintf(
+			"%s\x00%d\x00%s\x00%t",
+			v.Id,
+			v.SizeGb,
+			v.Tags[tagDatasetDigest],
+			v.Tags[tagDatasetSealed] == "true",
+		)
 		revision := sha256.Sum256([]byte(revisionInput))
-		out = append(out, &pb.VolumeInfo{Id: v.Id, SizeBytes: uint64(v.SizeGb) * 1024 * 1024 * 1024,
+		out = append(out, &pb.VolumeInfo{
+			Id: v.Id, SizeBytes: uint64(v.SizeGb) * 1024 * 1024 * 1024,
 			ContentDigest: v.Tags[tagDatasetDigest], Sealed: v.Tags[tagDatasetSealed] == "true",
 			Mode: mode, MetadataHealth: "HEALTHY", MaterializationRevision: hex.EncodeToString(revision[:]),
-			Attachments: attachments})
+			Attachments: attachments,
+		})
 	}
 	return out, nil
 }

@@ -101,7 +101,10 @@ type vsockFakeInstances struct {
 	gotReq *instances.CreateInstanceRequest
 }
 
-func (f *vsockFakeInstances) CreateInstance(ctx context.Context, req instances.CreateInstanceRequest) (*instances.Instance, error) {
+func (f *vsockFakeInstances) CreateInstance(
+	ctx context.Context,
+	req instances.CreateInstanceRequest,
+) (*instances.Instance, error) {
 	cp := req
 	f.gotReq = &cp
 	return f.fakeInstances.CreateInstance(ctx, req)
@@ -215,7 +218,10 @@ func TestPauseForbiddenForSecretExecution(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.Pause(context.Background(), m.MachineId, m.ExecutionId); !errors.Is(err, ErrSecretSnapshotForbidden) {
+	if _, err := a.Pause(context.Background(), m.MachineId, m.ExecutionId); !errors.Is(
+		err,
+		ErrSecretSnapshotForbidden,
+	) {
 		t.Fatalf("pause must be forbidden for secret execution, got %v", err)
 	}
 }

@@ -216,10 +216,8 @@ func (s *Store) ProjectQuota(ctx context.Context, projectID string) (vcpu, memMi
 // ProjectUsage 返回项目已分配和在途 create 的资源总量。已分配只计有
 // node_id 的期望存活机器；尚未落到节点的 create 由 operations 计入 pending，
 // 从而避免将同一新机器重复记为 allocated 和 pending。
-// effectiveDiskMib：requested_disk_mib=0（历史行/未声明）按默认 10GiB 计
-// （与 contracts.DefaultDiskMib 对齐；磁盘调度/预约/准入三处同值，ADR-0035）。
-const sqlEffectiveDiskMib = `coalesce(nullif(requested_disk_mib,0), 10240)`
-
+// requested_disk_mib=0（历史行/未声明）按默认 10GiB 计（与
+// contracts.DefaultDiskMib 对齐；磁盘调度/预约/准入三处同值，ADR-0035）。
 func (s *Store) ProjectUsage(ctx context.Context, projectID string) (vcpu, memMib, diskMib int64, err error) {
 	err = s.pool.QueryRow(ctx, `
 		SELECT
@@ -506,13 +504,23 @@ func (s *Store) EnsureAppAndEnqueueCreateWithLifecycle(
 // 区别：终态 FAILED 的 delete 在请求体一致时复活为 PENDING 重试（P1-2）。
 // 清理路径（R2/R5/R6 的确定性 opID）必须收敛，否则 agent 侧残留永远无法
 // 破除，且每轮 sync 都会空转重入队、刷 scheduler_events。
-func (s *Store) EnqueueDelete(ctx context.Context, projectID, machineID, executionID, operationID string, generation int64, requestJSON []byte) (Operation, error) {
+func (s *Store) EnqueueDelete(
+	ctx context.Context,
+	projectID, machineID, executionID, operationID string,
+	generation int64,
+	requestJSON []byte,
+) (Operation, error) {
 	return s.enqueueDeleteKind(ctx, projectID, machineID, executionID, operationID, generation, requestJSON, "delete")
 }
 
 // EnqueueReapDelete 登记 reconcile 清理用 delete（kind=reap）：删的是旧代/
 // 死亡残留，成功后不得把 machines.desired_state 推进为 DELETED（R2/R5 路径）。
-func (s *Store) EnqueueReapDelete(ctx context.Context, projectID, machineID, executionID, operationID string, generation int64, requestJSON []byte) (Operation, error) {
+func (s *Store) EnqueueReapDelete(
+	ctx context.Context,
+	projectID, machineID, executionID, operationID string,
+	generation int64,
+	requestJSON []byte,
+) (Operation, error) {
 	return s.enqueueDeleteKind(ctx, projectID, machineID, executionID, operationID, generation, requestJSON, "reap")
 }
 
@@ -520,8 +528,8 @@ func (s *Store) EnqueueReapDelete(ctx context.Context, projectID, machineID, exe
 // 幂等键 = operationID（调用方用 op-lifecycle-{machine}-{exec}-{n} 形态，
 // 含时间窗序号防与历史 op 冲突）。kind ∈ {pause, resume}。
 func (s *Store) EnqueueLifecycle(ctx context.Context, projectID, machineID, executionID,
-	operationID string, generation int64, kind string, requestJSON []byte) (Operation, error) {
-
+	operationID string, generation int64, kind string, requestJSON []byte,
+) (Operation, error) {
 	var op Operation
 	err := s.inTx(ctx, func(tx pgx.Tx) error {
 		existing, err := selectOperationByKey(ctx, tx, projectID, operationID)
@@ -570,7 +578,13 @@ func (s *Store) EnqueueLifecycle(ctx context.Context, projectID, machineID, exec
 	return op, err
 }
 
-func (s *Store) enqueueDeleteKind(ctx context.Context, projectID, machineID, executionID, operationID string, generation int64, requestJSON []byte, kind string) (Operation, error) {
+func (s *Store) enqueueDeleteKind(
+	ctx context.Context,
+	projectID, machineID, executionID, operationID string,
+	generation int64,
+	requestJSON []byte,
+	kind string,
+) (Operation, error) {
 	var op Operation
 	err := s.inTx(ctx, func(tx pgx.Tx) error {
 		existing, err := selectOperationByKey(ctx, tx, projectID, operationID)
@@ -865,7 +879,8 @@ func (s *Store) SetMachineExpiry(ctx context.Context, id string, expiresAt *time
 
 // SetMachineRestartPolicy 持久化 restart policy（控制面唯一权威）。
 func (s *Store) SetMachineRestartPolicy(ctx context.Context, id, mode string,
-	maxAttempts, backoffSeconds, stableWindowSeconds int) error {
+	maxAttempts, backoffSeconds, stableWindowSeconds int,
+) error {
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE machines SET restart_mode=$2, restart_max_attempts=$3,
 			restart_backoff_seconds=$4, restart_stable_window_seconds=$5,
@@ -944,7 +959,12 @@ func (s *Store) ListExpiredMachines(ctx context.Context, now time.Time) ([]Machi
 // PrepareRestartBackoff durably binds the delay to the complete failed
 // execution before generation changes. Re-observation is idempotent and cannot
 // extend the deadline.
-func (s *Store) PrepareRestartBackoff(ctx context.Context, id, failedExecution string, generation int64, nextAt time.Time) (bool, error) {
+func (s *Store) PrepareRestartBackoff(
+	ctx context.Context,
+	id, failedExecution string,
+	generation int64,
+	nextAt time.Time,
+) (bool, error) {
 	tag, err := s.pool.Exec(ctx, `UPDATE machines SET restart_failed_execution_id=$2,
 		restart_next_attempt_at=$4, updated_at=now()
 		WHERE id=$1 AND current_execution_id=$2 AND generation=$3
@@ -975,7 +995,8 @@ func (s *Store) RestartAttemptNumber(ctx context.Context, id, failedExecution st
 // idempotency key supplied by the caller.
 func (s *Store) EnqueueRestartCAS(ctx context.Context, projectID, machineID,
 	failedExecution, newExecution, operationID string, expectedGeneration int64,
-	requestJSON []byte, nextAt time.Time) (Operation, error) {
+	requestJSON []byte, nextAt time.Time,
+) (Operation, error) {
 	var op Operation
 	err := s.inTx(ctx, func(tx pgx.Tx) error {
 		var attempt int
@@ -1201,6 +1222,7 @@ func (s *Store) ClearEvacuationStep(ctx context.Context, nodeID, machineID strin
 	}
 	return nil
 }
+
 func (s *Store) ListNodes(ctx context.Context) ([]Node, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, nomad_node_id, node_pool, status, labels::text,
@@ -1250,7 +1272,8 @@ func (s *Store) RecordSchedulerEvent(ctx context.Context, ev SchedulerEvent) err
 	}
 	projectID := ev.ProjectID
 	if projectID == "" && ev.MachineID != "" {
-		if err := s.pool.QueryRow(ctx, `SELECT a.project_id FROM machines m JOIN apps a ON a.id=m.app_id WHERE m.id=$1`, ev.MachineID).Scan(&projectID); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		if err := s.pool.QueryRow(ctx, `SELECT a.project_id FROM machines m JOIN apps a ON a.id=m.app_id WHERE m.id=$1`, ev.MachineID).Scan(&projectID); err != nil &&
+			!errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("resolve scheduler event project: %w", err)
 		}
 	}
@@ -1512,7 +1535,10 @@ func (s *Store) ListMachinesOnNode(ctx context.Context, nodeID string) ([]Machin
 
 // UpdateMachineNodeAndObserved 创建成功后记录节点与观测（optimistic add）。
 // execution CAS 防止旧 create 的迟到成功覆盖已换代的 machine。
-func (s *Store) UpdateMachineNodeAndObserved(ctx context.Context, id, nodeID, executionID, state, slotIP, readiness string) error {
+func (s *Store) UpdateMachineNodeAndObserved(
+	ctx context.Context,
+	id, nodeID, executionID, state, slotIP, readiness string,
+) error {
 	_, err := s.pool.Exec(ctx, `
 		UPDATE machines SET node_id=$1, observed_state=$2, observed_slot_ip=$3,
 			observed_readiness=$4, last_observed_at=now(), updated_at=now()
@@ -1888,7 +1914,8 @@ func recordEgressPolicyChangeTx(ctx context.Context, tx pgx.Tx, projectID string
 // RecordEgressPolicyChange remains available for repair/backfill callers. Normal
 // create/deploy paths record this fact in their deployment transaction.
 func (s *Store) RecordEgressPolicyChange(ctx context.Context, projectID, appID, deploymentID string,
-	generation int64, policy json.RawMessage) error {
+	generation int64, policy json.RawMessage,
+) error {
 	return s.inTx(ctx, func(tx pgx.Tx) error {
 		return recordEgressPolicyChangeTx(ctx, tx, projectID, Deployment{
 			ID: deploymentID, AppID: appID, Generation: generation, EgressPolicy: policy,
@@ -1905,7 +1932,8 @@ func (s *Store) ListEgressPolicyChanges(ctx context.Context, appID string) ([]st
 	Generation   int64
 	Policy       json.RawMessage
 	CreatedAt    string
-}, error) {
+}, error,
+) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, project_id, app_id, deployment_id, generation, policy::text, created_at::text
 		FROM egress_policy_changes WHERE app_id=$1 ORDER BY generation DESC`, appID)

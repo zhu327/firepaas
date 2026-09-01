@@ -64,11 +64,20 @@ func (c *Controller) runScrub(ctx context.Context) {
 			}
 			remaining--
 			rpcCtx, cancel := context.WithTimeout(ctx, c.cfg.AgentRPCTimeout)
-			res, err := sc.ScrubSnapshot(rpcCtx, &pb.ScrubSnapshotRequest{SnapshotId: snap.ID, ExpectedRevision: snap.Checksum})
+			res, err := sc.ScrubSnapshot(
+				rpcCtx,
+				&pb.ScrubSnapshotRequest{SnapshotId: snap.ID, ExpectedRevision: snap.Checksum},
+			)
 			cancel()
 			if err != nil {
 				if status.Code(err) == codes.DataLoss {
-					_, _ = c.store.ApplySnapshotScrub(ctx, snap.ID, snap.Checksum, "CORRUPT", "content checksum mismatch")
+					_, _ = c.store.ApplySnapshotScrub(
+						ctx,
+						snap.ID,
+						snap.Checksum,
+						"CORRUPT",
+						"content checksum mismatch",
+					)
 				}
 				continue
 			}

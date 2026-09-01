@@ -13,10 +13,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/zhu327/firepaas/internal/controlplane/secrets"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/zhu327/firepaas/internal/controlplane/secrets"
 )
 
 // SecretMeta secrets 元数据（无值）。审计只记 ID/name/version。
@@ -64,17 +64,6 @@ func ParseSecretRef(s string) (SecretRef, error) {
 
 const secretCols = `id, project_id, name, version, key_version, created_at`
 
-func scanSecret(row pgx.Row) (*SecretMeta, error) {
-	var m SecretMeta
-	if err := row.Scan(&m.ID, &m.ProjectID, &m.Name, &m.Version, &m.KeyVersion, &m.CreatedAt); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	return &m, nil
-}
-
 // NextSecretVersion 返回该 secret 的下一个版本号（写入前的取号；AAD 需要
 // version 先行）。并发同 name 写入靠 UNIQUE(project,name,version) 冲突失败。
 func (s *Store) NextSecretVersion(ctx context.Context, projectID, name string) (int64, error) {
@@ -90,8 +79,8 @@ func (s *Store) NextSecretVersion(ctx context.Context, projectID, name string) (
 // 并发同 name 取到相同版本号时，UNIQUE(project,name,version) 冲突返回
 // ErrSecretVersionConflict（调用方映射 409，客户端重试即取新号）。
 func (s *Store) PutSecretVersion(ctx context.Context, projectID, name string, version int64,
-	ciphertext, wrappedDEK []byte, createdBy string) (SecretMeta, error) {
-
+	ciphertext, wrappedDEK []byte, createdBy string,
+) (SecretMeta, error) {
 	var m SecretMeta
 	err := s.inTx(ctx, func(tx pgx.Tx) error {
 		id := "sec-" + uuid.NewString()[:16]
@@ -106,8 +95,10 @@ func (s *Store) PutSecretVersion(ctx context.Context, projectID, name string, ve
 			}
 			return err
 		}
-		m = SecretMeta{ID: id, ProjectID: projectID, Name: name,
-			Version: version, KeyVersion: secrets.KeyVersion, CreatedAt: time.Now()}
+		m = SecretMeta{
+			ID: id, ProjectID: projectID, Name: name,
+			Version: version, KeyVersion: secrets.KeyVersion, CreatedAt: time.Now(),
+		}
 		return nil
 	})
 	return m, err
@@ -186,8 +177,8 @@ func (s *Store) GetSealedSecret(ctx context.Context, projectID, name string, ver
 
 // ResolveSecretValue 取出并解密单个版本（latest = *nil）。
 func ResolveSecretValue(ctx context.Context, s *Store, cm *secrets.Manager,
-	projectID, name string, version *int64) (string, *SecretMeta, error) {
-
+	projectID, name string, version *int64,
+) (string, *SecretMeta, error) {
 	row, err := s.GetSealedSecret(ctx, projectID, name, version)
 	if err != nil {
 		return "", nil, err
@@ -204,8 +195,8 @@ func ResolveSecretValue(ctx context.Context, s *Store, cm *secrets.Manager,
 // ResolveDeploymentSecretRefs 把 deployment.secret_refs 解析为明文 env。
 // 任一引用缺失即整体失败（create 应终态化，不做部分注入）。
 func ResolveDeploymentSecretRefs(ctx context.Context, s *Store, cm *secrets.Manager,
-	projectID, deploymentID string) (map[string]string, error) {
-
+	projectID, deploymentID string,
+) (map[string]string, error) {
 	refs, err := DeploymentSecretRefs(ctx, s, deploymentID)
 	if err != nil || len(refs) == 0 {
 		return nil, err

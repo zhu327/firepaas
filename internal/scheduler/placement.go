@@ -42,7 +42,16 @@ type BestOfKConfig struct {
 
 // DefaultBestOfKConfig 返回默认参数（对齐 e2b）。
 func DefaultBestOfKConfig() BestOfKConfig {
-	return BestOfKConfig{R: 4, MemR: 1.0, DiskR: 1.0, K: 3, Alpha: 0.5, WeightCPU: 0.5, WeightMem: 0.5, WeightImage: 0.5}
+	return BestOfKConfig{
+		R:           4,
+		MemR:        1.0,
+		DiskR:       1.0,
+		K:           3,
+		Alpha:       0.5,
+		WeightCPU:   0.5,
+		WeightMem:   0.5,
+		WeightImage: 0.5,
+	}
 }
 
 // Options 是 Place 的可观测/可注入选项。
@@ -245,8 +254,12 @@ func (p *Placer) evaluateCandidates(req Request, nodes []Node, opts candidateEva
 	})
 	candidates = filter(candidates, func(n Node) string {
 		if !canFit(n, req, p.cfg) {
-			return fmt.Sprintf("resources: need vcpu=%d mem=%dMiB disk=%dMiB (allocated+pending+req exceeds R*capacity)",
-				req.VCPU, req.MemMib, req.DiskMib)
+			return fmt.Sprintf(
+				"resources: need vcpu=%d mem=%dMiB disk=%dMiB (allocated+pending+req exceeds R*capacity)",
+				req.VCPU,
+				req.MemMib,
+				req.DiskMib,
+			)
 		}
 		return ""
 	})
@@ -375,11 +388,6 @@ func labelsMatch(nodeLabels, want map[string]string) bool {
 		}
 	}
 	return true
-}
-
-// featuresMatch 判断节点是否具备全部启动必需能力（v1.2-A，ADR-0023）。
-func featuresMatch(nodeFeatures map[string]bool, required []string) bool {
-	return len(missingFeatures(nodeFeatures, required)) == 0
 }
 
 // missingFeatures 返回缺失能力名（逗号连接，事件审计用）。

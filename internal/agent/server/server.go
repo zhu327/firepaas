@@ -13,14 +13,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kernel/hypeman/lib/images"
+	"github.com/kernel/hypeman/lib/instances"
 	"github.com/zhu327/firepaas/internal/agent/info"
 	"github.com/zhu327/firepaas/internal/agent/machine"
 	"github.com/zhu327/firepaas/internal/agent/mutation"
 	"github.com/zhu327/firepaas/internal/agent/state"
 	contracts "github.com/zhu327/firepaas/internal/contracts/agentv1"
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
-	"github.com/kernel/hypeman/lib/images"
-	"github.com/kernel/hypeman/lib/instances"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -78,11 +78,19 @@ type Server struct {
 // 变更请求先查 ledger 幂等（重放返回原结果），再校验/推进 generation fence。
 // New 构造 Server。fences 提供 generation 高水位（P0-2）；creds 为 M4 proxy
 // credential 验证材料（可 nil = 不校验，仅测试用）。opts 可选扩展。
-func New(machines *machine.Adapter, ledger *state.Ledger, fences *state.Fences, info *info.Provider, opts ...Option) *Server {
-	s := &Server{machines: machines, ledger: ledger, fences: fences,
+func New(
+	machines *machine.Adapter,
+	ledger *state.Ledger,
+	fences *state.Fences,
+	info *info.Provider,
+	opts ...Option,
+) *Server {
+	s := &Server{
+		machines: machines, ledger: ledger, fences: fences,
 		mutations: mutation.New(ledger, fences), info: info,
 		requireCredential: true, runtimeLimits: defaultRuntimeLimits(),
-		inventoryEpoch: fmt.Sprintf("%d-%p", time.Now().UnixNano(), machines)}
+		inventoryEpoch: fmt.Sprintf("%d-%p", time.Now().UnixNano(), machines),
+	}
 	for _, o := range opts {
 		o(s)
 	}
@@ -137,10 +145,19 @@ func (s *Server) CreateMachine(ctx context.Context, req *pb.CreateMachineRequest
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	if s.creds != nil && s.requireCredential && req.GetProxyCredential() == "" {
-		return nil, status.Error(codes.InvalidArgument, "missing proxy_credential (execution-bound traffic token required)")
+		return nil, status.Error(
+			codes.InvalidArgument,
+			"missing proxy_credential (execution-bound traffic token required)",
+		)
 	}
 	out, err := mutation.RunCreateMachine(s.mutations, mutation.CreateMachine[*pb.CreateMachineResponse]{
-		Identity: mutation.Identity{OperationID: req.GetOperationId(), MachineID: req.GetMachineId(), ExecutionID: req.GetSpec().GetExecutionId(), Generation: req.GetGeneration(), RequestHash: hashRequest(req)},
+		Identity: mutation.Identity{
+			OperationID: req.GetOperationId(),
+			MachineID:   req.GetMachineId(),
+			ExecutionID: req.GetSpec().GetExecutionId(),
+			Generation:  req.GetGeneration(),
+			RequestHash: hashRequest(req),
+		},
 		Prepare: func() (func(), error) {
 			wantVCPU, wantMem, wantDisk := admitSize(req)
 			s.inflightVCPU.Add(int64(wantVCPU))
@@ -163,14 +180,20 @@ func (s *Server) CreateMachine(ctx context.Context, req *pb.CreateMachineRequest
 		},
 		PersistCredential: func() error {
 			if s.creds != nil && req.GetProxyCredential() != "" {
-				return s.creds.Set(req.GetMachineId(), req.GetSpec().GetExecutionId(), state.Digest(req.GetProxyCredential()))
+				return s.creds.Set(
+					req.GetMachineId(),
+					req.GetSpec().GetExecutionId(),
+					state.Digest(req.GetProxyCredential()),
+				)
 			}
 			return nil
 		},
 		Codec: protoCodec(func() *pb.CreateMachineResponse { return &pb.CreateMachineResponse{} }),
 	})
 	if err != nil {
-		if errors.Is(err, machine.ErrImageNotFound) || errors.Is(err, machine.ErrImageTooBig) || errors.Is(err, machine.ErrSecretEnvInjectionUnsupported) || errors.Is(err, machine.ErrSecretSnapshotForbidden) {
+		if errors.Is(err, machine.ErrImageNotFound) || errors.Is(err, machine.ErrImageTooBig) ||
+			errors.Is(err, machine.ErrSecretEnvInjectionUnsupported) ||
+			errors.Is(err, machine.ErrSecretSnapshotForbidden) {
 			return nil, status.Error(codes.InvalidArgument, err.Error())
 		}
 		return nil, mutationError(err)
@@ -196,7 +219,13 @@ func (s *Server) DeleteMachine(ctx context.Context, req *pb.DeleteMachineRequest
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	replayed, err := mutation.RunDeleteMachine(s.mutations, mutation.DeleteMachine{
-		Identity: mutation.Identity{OperationID: req.GetOperationId(), MachineID: req.GetMachineId(), ExecutionID: req.GetExecutionId(), Generation: req.GetGeneration(), RequestHash: hashRequest(req)},
+		Identity: mutation.Identity{
+			OperationID: req.GetOperationId(),
+			MachineID:   req.GetMachineId(),
+			ExecutionID: req.GetExecutionId(),
+			Generation:  req.GetGeneration(),
+			RequestHash: hashRequest(req),
+		},
 		Effect: func() error {
 			if err := s.machines.Delete(ctx, req.GetMachineId(), req.GetExecutionId()); err != nil {
 				if errors.Is(err, instances.ErrNotFound) {
@@ -316,9 +345,25 @@ func hashRequest(msg proto.Message) string {
 func (s *Server) PauseMachine(ctx context.Context, req *pb.PauseMachineRequest) (*pb.Machine, error) {
 	op := req.GetOperation()
 	if op == nil || op.MachineId == "" || op.ExecutionId == "" || op.OperationId == "" {
-		return nil, status.Error(codes.InvalidArgument, "operation with machine_id/execution_id/operation_id is required")
+		return nil, status.Error(
+			codes.InvalidArgument,
+			"operation with machine_id/execution_id/operation_id is required",
+		)
 	}
-	out, err := mutation.RunLifecycle(s.mutations, mutation.Lifecycle[*pb.Machine]{Identity: mutation.Identity{OperationID: op.OperationId, MachineID: op.MachineId, ExecutionID: op.ExecutionId, Generation: op.Generation, RequestHash: hashRequest(req)}, Effect: func() (*pb.Machine, error) { return s.machines.Pause(ctx, op.MachineId, op.ExecutionId) }, Codec: protoCodec(func() *pb.Machine { return &pb.Machine{} })})
+	out, err := mutation.RunLifecycle(
+		s.mutations,
+		mutation.Lifecycle[*pb.Machine]{
+			Identity: mutation.Identity{
+				OperationID: op.OperationId,
+				MachineID:   op.MachineId,
+				ExecutionID: op.ExecutionId,
+				Generation:  op.Generation,
+				RequestHash: hashRequest(req),
+			},
+			Effect: func() (*pb.Machine, error) { return s.machines.Pause(ctx, op.MachineId, op.ExecutionId) },
+			Codec:  protoCodec(func() *pb.Machine { return &pb.Machine{} }),
+		},
+	)
 	if err != nil {
 		if errors.Is(err, machine.ErrSecretSnapshotForbidden) {
 			return nil, status.Error(codes.FailedPrecondition, err.Error())
@@ -331,9 +376,25 @@ func (s *Server) PauseMachine(ctx context.Context, req *pb.PauseMachineRequest) 
 func (s *Server) ResumeMachine(ctx context.Context, req *pb.ResumeMachineRequest) (*pb.Machine, error) {
 	op := req.GetOperation()
 	if op == nil || op.MachineId == "" || op.ExecutionId == "" || op.OperationId == "" {
-		return nil, status.Error(codes.InvalidArgument, "operation with machine_id/execution_id/operation_id is required")
+		return nil, status.Error(
+			codes.InvalidArgument,
+			"operation with machine_id/execution_id/operation_id is required",
+		)
 	}
-	out, err := mutation.RunLifecycle(s.mutations, mutation.Lifecycle[*pb.Machine]{Identity: mutation.Identity{OperationID: op.OperationId, MachineID: op.MachineId, ExecutionID: op.ExecutionId, Generation: op.Generation, RequestHash: hashRequest(req)}, Effect: func() (*pb.Machine, error) { return s.machines.Resume(ctx, op.MachineId, op.ExecutionId) }, Codec: protoCodec(func() *pb.Machine { return &pb.Machine{} })})
+	out, err := mutation.RunLifecycle(
+		s.mutations,
+		mutation.Lifecycle[*pb.Machine]{
+			Identity: mutation.Identity{
+				OperationID: op.OperationId,
+				MachineID:   op.MachineId,
+				ExecutionID: op.ExecutionId,
+				Generation:  op.Generation,
+				RequestHash: hashRequest(req),
+			},
+			Effect: func() (*pb.Machine, error) { return s.machines.Resume(ctx, op.MachineId, op.ExecutionId) },
+			Codec:  protoCodec(func() *pb.Machine { return &pb.Machine{} }),
+		},
+	)
 	if err != nil {
 		if errors.Is(err, mutation.ErrConflict) {
 			return nil, mutationError(err)

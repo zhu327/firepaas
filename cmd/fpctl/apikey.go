@@ -13,7 +13,7 @@ import (
 // fpctl apikey rm <id>
 func runAPIKey(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: fpctl apikey <create|ls|rm> ...")
+		return errors.New("usage: fpctl apikey <create|ls|rm>")
 	}
 	switch args[0] {
 	case "create":

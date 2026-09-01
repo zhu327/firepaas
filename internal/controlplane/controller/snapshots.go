@@ -48,8 +48,13 @@ func (c *Controller) processSnapshotCreate(ctx context.Context, op store.Operati
 		return fmt.Errorf("agent create snapshot: %w", err)
 	}
 	checksum := checksumOf(info)
-	if info.GetCompatibilityKey() != "" && info.GetCompatibilityKey() != snapshotCompatibilityKey(c, op.DispatchNodeID) {
-		err := fmt.Errorf("snapshot compatibility key differs from node: artifact=%q node=%q", info.GetCompatibilityKey(), snapshotCompatibilityKey(c, op.DispatchNodeID))
+	if info.GetCompatibilityKey() != "" &&
+		info.GetCompatibilityKey() != snapshotCompatibilityKey(c, op.DispatchNodeID) {
+		err := fmt.Errorf(
+			"snapshot compatibility key differs from node: artifact=%q node=%q",
+			info.GetCompatibilityKey(),
+			snapshotCompatibilityKey(c, op.DispatchNodeID),
+		)
 		_ = c.store.CompleteOperation(ctx, op.ID, "FAILED", nil, err.Error())
 		return err
 	}
@@ -156,7 +161,8 @@ func (c *Controller) processSnapshotDelete(ctx context.Context, op store.Operati
 // ID，调用方保证稳定）。nodeID 必须已由调度/机器行确定。
 func (c *Controller) EnqueueSnapshotCreate(ctx context.Context, projectID, machineID,
 	executionID string, generation uint64, snapID, kind, name, compression, scheduleID string,
-	level *int, retentionClass string, nodeID string) error {
+	level *int, retentionClass string, nodeID string,
+) error {
 	req := &pb.CreateSnapshotRequest{
 		MachineId:   machineID,
 		ExecutionId: executionID,
@@ -169,7 +175,10 @@ func (c *Controller) EnqueueSnapshotCreate(ctx context.Context, projectID, machi
 	if kind == "FILESYSTEM" {
 		req.Kind = pb.SnapshotKind_SNAPSHOT_FILESYSTEM
 	}
-	req.Compression = &pb.SnapshotCompressionSpec{Algorithm: pb.SnapshotCompressionSpec_ALGORITHM_UNSPECIFIED, Level: -1}
+	req.Compression = &pb.SnapshotCompressionSpec{
+		Algorithm: pb.SnapshotCompressionSpec_ALGORITHM_UNSPECIFIED,
+		Level:     -1,
+	}
 	switch compression {
 	case "zstd":
 		req.Compression.Algorithm = pb.SnapshotCompressionSpec_ZSTD
@@ -208,7 +217,8 @@ func snapshotCompatibilityKey(c *Controller, nodeID string) string {
 
 // EnqueueSnapshotDelete 为 API 构造 snapshot_delete 操作。
 func (c *Controller) EnqueueSnapshotDelete(ctx context.Context, projectID, machineID,
-	executionID string, generation uint64, snapID, nodeID string) error {
+	executionID string, generation uint64, snapID, nodeID string,
+) error {
 	req := &pb.DeleteSnapshotRequest{
 		SnapshotId: snapID, MachineId: machineID, ExecutionId: executionID,
 		Generation: generation, OperationId: "op-snap-del-" + snapID,
@@ -295,7 +305,11 @@ func (c *Controller) reconcileSnapshotRetention(ctx context.Context) error {
 	return nil
 }
 
-func (c *Controller) enqueueSnapshotRetentionDelete(ctx context.Context, sc store.SnapshotSchedule, snap *store.Snapshot) {
+func (c *Controller) enqueueSnapshotRetentionDelete(
+	ctx context.Context,
+	sc store.SnapshotSchedule,
+	snap *store.Snapshot,
+) {
 	if snap.Status != "READY" && snap.Status != "UNAVAILABLE" {
 		return
 	}
@@ -363,7 +377,11 @@ func (c *Controller) reconcileSnapshotIntegrity(ctx context.Context, n store.Nod
 	supported := hasFeature(n.FeatureIDs, capabilities.LocalInventoryV1) && inv.GetComplete() &&
 		obs != nil && obs.GetComplete() && obs.GetEpoch() != "" && obs.GetGeneration() > 0 && obs.GetObservedAtUnix() > 0 &&
 		inv.GetObservationGeneration() == obs.GetGeneration() && inv.GetObservedAtUnix() == obs.GetObservedAtUnix()
-	c.metrics.Set("firepaas_local_inventory_support", map[string]string{"node_id": n.ID, "type": "snapshot"}, boolU64(supported))
+	c.metrics.Set(
+		"firepaas_local_inventory_support",
+		map[string]string{"node_id": n.ID, "type": "snapshot"},
+		boolU64(supported),
+	)
 	if !supported {
 		return
 	}
@@ -375,10 +393,21 @@ func (c *Controller) reconcileSnapshotIntegrity(ctx context.Context, n store.Nod
 		}
 		present[item.GetId()] = item
 		kind := strings.TrimPrefix(item.GetKind().String(), "SNAPSHOT_")
-		items[item.GetId()] = store.SnapshotInventoryItem{SizeBytes: int64(item.GetSizeBytes()), Checksum: item.GetArtifactSha256(), Kind: kind, CompatibilityKey: item.GetCompatibilityKey()}
+		items[item.GetId()] = store.SnapshotInventoryItem{
+			SizeBytes:        int64(item.GetSizeBytes()),
+			Checksum:         item.GetArtifactSha256(),
+			Kind:             kind,
+			CompatibilityKey: item.GetCompatibilityKey(),
+		}
 	}
-	accepted, transitions, err := c.store.ApplySnapshotInventoryObservation(ctx, store.InventoryObservation{NodeID: n.ID,
-		ResourceType: "snapshot", Epoch: obs.GetEpoch(), Generation: obs.GetGeneration(), AgentObservedAt: time.Unix(obs.GetObservedAtUnix(), 0), ItemCount: len(items)}, items)
+	accepted, transitions, err := c.store.ApplySnapshotInventoryObservation(
+		ctx,
+		store.InventoryObservation{
+			NodeID:       n.ID,
+			ResourceType: "snapshot", Epoch: obs.GetEpoch(), Generation: obs.GetGeneration(), AgentObservedAt: time.Unix(obs.GetObservedAtUnix(), 0), ItemCount: len(items),
+		},
+		items,
+	)
 	if err != nil {
 		slog.Warn("apply snapshot inventory observation", "node", n.ID, "error", err)
 		return
@@ -387,9 +416,20 @@ func (c *Controller) reconcileSnapshotIntegrity(ctx context.Context, n store.Nod
 		return
 	}
 	for _, transition := range transitions {
-		c.metrics.Inc("firepaas_local_integrity_transitions_total", map[string]string{"type": "snapshot", "integrity": transition.To}, 1)
+		c.metrics.Inc(
+			"firepaas_local_integrity_transitions_total",
+			map[string]string{"type": "snapshot", "integrity": transition.To},
+			1,
+		)
 		if transition.To == "MISSING" {
-			c.userEvent(ctx, transition.ProjectID, "", transition.MachineID, "snapshot.integrity.missing", map[string]any{"snapshot_id": transition.ID, "node_id": n.ID})
+			c.userEvent(
+				ctx,
+				transition.ProjectID,
+				"",
+				transition.MachineID,
+				"snapshot.integrity.missing",
+				map[string]any{"snapshot_id": transition.ID, "node_id": n.ID},
+			)
 		}
 	}
 	pgIDs := make(map[string]bool, len(pgSnaps))

@@ -9,7 +9,7 @@ import (
 
 func runOps(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: fpctl ops <ls|show> [--machine <id> --kind <k> --status <s>]...")
+		return errors.New("usage: fpctl ops <ls|show> [--machine <id> --kind <k> --status <s>]")
 	}
 	switch args[0] {
 	case "ls":

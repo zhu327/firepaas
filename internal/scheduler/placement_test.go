@@ -159,13 +159,17 @@ func TestAntiAffinitySpreadsReplicas(t *testing.T) {
 	p := New(DefaultBestOfKConfig(), Options{})
 
 	// 第一个副本落点随机；之后强制把已占节点放入排除集。
-	first, err := p.Place(Request{VCPU: 1, MemMib: 512, DeploymentID: "d1", AntiAffinity: true,
-		ExistingDeploymentNodes: map[string]bool{}}, nodes, rand.New(rand.NewSource(7)))
+	first, err := p.Place(Request{
+		VCPU: 1, MemMib: 512, DeploymentID: "d1", AntiAffinity: true,
+		ExistingDeploymentNodes: map[string]bool{},
+	}, nodes, rand.New(rand.NewSource(7)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := p.Place(Request{VCPU: 1, MemMib: 512, DeploymentID: "d1", AntiAffinity: true,
-		ExistingDeploymentNodes: map[string]bool{first.NodeID: true}}, nodes, rand.New(rand.NewSource(7)))
+	second, err := p.Place(Request{
+		VCPU: 1, MemMib: 512, DeploymentID: "d1", AntiAffinity: true,
+		ExistingDeploymentNodes: map[string]bool{first.NodeID: true},
+	}, nodes, rand.New(rand.NewSource(7)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,8 +181,10 @@ func TestAntiAffinitySpreadsReplicas(t *testing.T) {
 func TestAntiAffinityDegradesWhenSingleNode(t *testing.T) {
 	nodes := []Node{healthyNode("only", "compute", 64, 65536)}
 	p := New(DefaultBestOfKConfig(), Options{})
-	pl, err := p.Place(Request{VCPU: 1, MemMib: 512, DeploymentID: "d1", AntiAffinity: true,
-		ExistingDeploymentNodes: map[string]bool{"only": true}}, nodes, rand.New(rand.NewSource(1)))
+	pl, err := p.Place(Request{
+		VCPU: 1, MemMib: 512, DeploymentID: "d1", AntiAffinity: true,
+		ExistingDeploymentNodes: map[string]bool{"only": true},
+	}, nodes, rand.New(rand.NewSource(1)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,8 +231,10 @@ func TestPoolAndLabelsFilter(t *testing.T) {
 		healthyNode("right", "compute", 64, 65536),
 	}
 	p := New(DefaultBestOfKConfig(), Options{})
-	pl, err := p.Place(Request{VCPU: 1, MemMib: 512, Pool: "compute",
-		Labels: map[string]string{"arch": "x86_64"}}, nodes, rand.New(rand.NewSource(1)))
+	pl, err := p.Place(Request{
+		VCPU: 1, MemMib: 512, Pool: "compute",
+		Labels: map[string]string{"arch": "x86_64"},
+	}, nodes, rand.New(rand.NewSource(1)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -393,20 +401,31 @@ func TestPlacementAndPrefetchShareHardCandidatePolicy(t *testing.T) {
 		name string
 		node Node
 	}{
-		{name: "unhealthy", node: func() Node { n := base; n.ID = "unhealthy"; n.Status = StatusUnhealthy; return n }()},
+		{
+			name: "unhealthy",
+			node: func() Node { n := base; n.ID = "unhealthy"; n.Status = StatusUnhealthy; return n }(),
+		},
 		{name: "draining", node: func() Node { n := base; n.ID = "draining"; n.Draining = true; return n }()},
 		{name: "pool", node: func() Node { n := base; n.ID = "pool"; n.Pool = "other"; return n }()},
-		{name: "labels", node: func() Node { n := base; n.ID = "labels"; n.Labels = map[string]string{"arch": "arm64"}; return n }()},
+		{
+			name: "labels",
+			node: func() Node { n := base; n.ID = "labels"; n.Labels = map[string]string{"arch": "arm64"}; return n }(),
+		},
 		{name: "capability", node: func() Node { n := base; n.ID = "capability"; n.FeatureIDs = nil; return n }()},
-		{name: "resources", node: func() Node { n := base; n.ID = "resources"; n.MemAllocated = n.MemTotalMib; return n }()},
+		{
+			name: "resources",
+			node: func() Node { n := base; n.ID = "resources"; n.MemAllocated = n.MemTotalMib; return n }(),
+		},
 		{name: "disk", node: func() Node { n := base; n.ID = "disk"; n.DiskAllocated = n.DiskTotalMib; return n }()},
 		{name: "locality", node: func() Node { n := base; n.ID = "locality"; return n }()},
 	}
 
 	p := New(DefaultBestOfKConfig(), Options{})
-	req := Request{VCPU: 1, MemMib: 512, DiskMib: 512, Pool: "compute",
+	req := Request{
+		VCPU: 1, MemMib: 512, DiskMib: 512, Pool: "compute",
 		Labels: map[string]string{"arch": "x86_64"}, RequiredFeatures: []string{"required"},
-		RequiredNodeID: "eligible"}
+		RequiredNodeID: "eligible",
+	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			nodes := []Node{tt.node, base}
@@ -461,12 +480,28 @@ func TestPrefetchTopKUsesDeploymentHardCandidates(t *testing.T) {
 func TestLocalRWLocalityWinsOverAntiAffinity(t *testing.T) {
 	p := New(DefaultBestOfKConfig(), Options{})
 	nodes := []Node{
-		{ID: "origin", Pool: "compute", Status: StatusHealthy, CPUTotal: 4, MemTotalMib: 4096, FeatureIDs: map[string]bool{"volume.local_rw.v1": true}},
-		{ID: "spread", Pool: "compute", Status: StatusHealthy, CPUTotal: 4, MemTotalMib: 4096, FeatureIDs: map[string]bool{"volume.local_rw.v1": true}},
+		{
+			ID:          "origin",
+			Pool:        "compute",
+			Status:      StatusHealthy,
+			CPUTotal:    4,
+			MemTotalMib: 4096,
+			FeatureIDs:  map[string]bool{"volume.local_rw.v1": true},
+		},
+		{
+			ID:          "spread",
+			Pool:        "compute",
+			Status:      StatusHealthy,
+			CPUTotal:    4,
+			MemTotalMib: 4096,
+			FeatureIDs:  map[string]bool{"volume.local_rw.v1": true},
+		},
 	}
-	pl, err := p.Place(Request{VCPU: 1, MemMib: 512, DeploymentID: "dep", AntiAffinity: true,
+	pl, err := p.Place(Request{
+		VCPU: 1, MemMib: 512, DeploymentID: "dep", AntiAffinity: true,
 		ExistingDeploymentNodes: map[string]bool{"origin": true}, RequiredNodeID: "origin",
-		RequiredFeatures: []string{"volume.local_rw.v1"}}, nodes, rand.New(rand.NewSource(1)))
+		RequiredFeatures: []string{"volume.local_rw.v1"},
+	}, nodes, rand.New(rand.NewSource(1)))
 	if err != nil {
 		t.Fatal(err)
 	}

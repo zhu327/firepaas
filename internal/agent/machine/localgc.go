@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"strings"
 
-	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 	"github.com/kernel/hypeman/lib/images"
 	"github.com/kernel/hypeman/lib/volumes"
+	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 )
 
 func (a *Adapter) ImageQuarantineAvailable() bool {
@@ -29,12 +29,17 @@ func (a *Adapter) QuarantineImage(ctx context.Context, req *pb.QuarantineImageRe
 	if req.GetExpectedRevision() == "" || !strings.Contains(req.GetImageRef(), "@"+req.GetExpectedRevision()) {
 		return nil, fmt.Errorf("image reference must be pinned to expected revision")
 	}
-	claim, err := qm.QuarantineImage(ctx, req.GetImageRef(), req.GetClaimId(), func(ctx context.Context, target images.ImageIdentity) error {
-		if target.Digest != req.GetExpectedRevision() {
-			return images.ErrClaimConflict
-		}
-		return a.guardImageReferences(ctx, target)
-	})
+	claim, err := qm.QuarantineImage(
+		ctx,
+		req.GetImageRef(),
+		req.GetClaimId(),
+		func(ctx context.Context, target images.ImageIdentity) error {
+			if target.Digest != req.GetExpectedRevision() {
+				return images.ErrClaimConflict
+			}
+			return a.guardImageReferences(ctx, target)
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -56,9 +61,18 @@ func (a *Adapter) ListImageQuarantines(ctx context.Context) ([]*pb.ImageQuaranti
 	}
 	return out, nil
 }
+
 func mapImageClaim(c *images.QuarantineClaim) *pb.ImageQuarantine {
-	return &pb.ImageQuarantine{ClaimId: c.ClaimID, Token: c.Token, Repository: c.Image.Repository, Digest: c.Image.Digest, State: c.State, CreatedAtUnix: c.CreatedAt.Unix()}
+	return &pb.ImageQuarantine{
+		ClaimId:       c.ClaimID,
+		Token:         c.Token,
+		Repository:    c.Image.Repository,
+		Digest:        c.Image.Digest,
+		State:         c.State,
+		CreatedAtUnix: c.CreatedAt.Unix(),
+	}
 }
+
 func (a *Adapter) RollbackImageQuarantine(ctx context.Context, id, token string) error {
 	qm, ok := a.images.(images.QuarantineManager)
 	if !ok {
@@ -66,6 +80,7 @@ func (a *Adapter) RollbackImageQuarantine(ctx context.Context, id, token string)
 	}
 	return qm.RollbackImageQuarantine(ctx, id, token)
 }
+
 func (a *Adapter) FinalizeImageQuarantine(ctx context.Context, id, token string) error {
 	qm, ok := a.images.(images.QuarantineManager)
 	if !ok {
@@ -118,15 +133,16 @@ func (a *Adapter) QuarantineVolume(ctx context.Context, req *pb.QuarantineVolume
 	if !ok {
 		return nil, ErrGuestOpsUnsupported
 	}
-	vp, ok := a.volumes.(volumeProvider)
-	if !ok {
+	vp := a.volumes
+	if vp == nil {
 		return nil, ErrGuestOpsUnsupported
 	}
 	v, err := vp.GetVolume(ctx, req.GetVolumeId())
 	if err != nil {
 		return nil, err
 	}
-	if v.Tags[tagDatasetDigest] == "" || v.Tags[tagDatasetSealed] != "true" || req.GetExpectedRevision() == "" || v.Tags[tagDatasetDigest] != req.GetExpectedRevision() {
+	if v.Tags[tagDatasetDigest] == "" || v.Tags[tagDatasetSealed] != "true" || req.GetExpectedRevision() == "" ||
+		v.Tags[tagDatasetDigest] != req.GetExpectedRevision() {
 		return nil, errors.New("dataset revision or sealed metadata mismatch")
 	}
 	claim, err := qm.QuarantineVolume(ctx, req.GetVolumeId(), req.GetClaimId())
@@ -135,9 +151,17 @@ func (a *Adapter) QuarantineVolume(ctx context.Context, req *pb.QuarantineVolume
 	}
 	return mapVolumeClaim(claim), nil
 }
+
 func mapVolumeClaim(c *volumes.QuarantineClaim) *pb.VolumeQuarantine {
-	return &pb.VolumeQuarantine{ClaimId: c.ClaimID, Token: c.Token, VolumeId: c.VolumeID, State: c.State, CreatedAtUnix: c.CreatedAt.Unix()}
+	return &pb.VolumeQuarantine{
+		ClaimId:       c.ClaimID,
+		Token:         c.Token,
+		VolumeId:      c.VolumeID,
+		State:         c.State,
+		CreatedAtUnix: c.CreatedAt.Unix(),
+	}
 }
+
 func (a *Adapter) ListVolumeQuarantines(ctx context.Context) ([]*pb.VolumeQuarantine, error) {
 	qm, ok := a.volumes.(volumes.QuarantineManager)
 	if !ok {
@@ -153,6 +177,7 @@ func (a *Adapter) ListVolumeQuarantines(ctx context.Context) ([]*pb.VolumeQuaran
 	}
 	return out, nil
 }
+
 func (a *Adapter) RollbackVolumeQuarantine(ctx context.Context, id, token string) error {
 	qm, ok := a.volumes.(volumes.QuarantineManager)
 	if !ok {
@@ -160,6 +185,7 @@ func (a *Adapter) RollbackVolumeQuarantine(ctx context.Context, id, token string
 	}
 	return qm.RollbackVolumeQuarantine(ctx, id, token)
 }
+
 func (a *Adapter) FinalizeVolumeQuarantine(ctx context.Context, id, token string) error {
 	qm, ok := a.volumes.(volumes.QuarantineManager)
 	if !ok {

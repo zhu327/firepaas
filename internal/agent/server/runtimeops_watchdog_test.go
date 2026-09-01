@@ -7,12 +7,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kernel/hypeman/lib/hypervisor"
+	"github.com/kernel/hypeman/lib/instances"
 	"github.com/zhu327/firepaas/internal/agent/info"
 	"github.com/zhu327/firepaas/internal/agent/machine"
 	"github.com/zhu327/firepaas/internal/agent/state"
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
-	"github.com/kernel/hypeman/lib/hypervisor"
-	"github.com/kernel/hypeman/lib/instances"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -36,12 +36,20 @@ type vsockFakeInstances struct {
 	listed []instances.Instance
 }
 
-func (f *vsockFakeInstances) CreateInstance(context.Context, instances.CreateInstanceRequest) (*instances.Instance, error) {
+func (f *vsockFakeInstances) CreateInstance(
+	context.Context,
+	instances.CreateInstanceRequest,
+) (*instances.Instance, error) {
 	return nil, errNotImplemented
 }
-func (f *vsockFakeInstances) ListInstances(context.Context, *instances.ListInstancesFilter) ([]instances.Instance, error) {
+
+func (f *vsockFakeInstances) ListInstances(
+	context.Context,
+	*instances.ListInstancesFilter,
+) ([]instances.Instance, error) {
 	return f.listed, nil
 }
+
 func (f *vsockFakeInstances) GetInstance(_ context.Context, idOrName string) (*instances.Instance, error) {
 	for i := range f.listed {
 		if f.listed[i].Id == idOrName || f.listed[i].Name == idOrName {
@@ -52,12 +60,19 @@ func (f *vsockFakeInstances) GetInstance(_ context.Context, idOrName string) (*i
 	return nil, instances.ErrNotFound
 }
 func (f *vsockFakeInstances) DeleteInstance(context.Context, string) error { return nil }
-func (f *vsockFakeInstances) StandbyInstance(context.Context, string, instances.StandbyInstanceRequest) (*instances.Instance, error) {
+
+func (f *vsockFakeInstances) StandbyInstance(
+	context.Context,
+	string,
+	instances.StandbyInstanceRequest,
+) (*instances.Instance, error) {
 	return nil, nil
 }
+
 func (f *vsockFakeInstances) RestoreInstance(context.Context, string) (*instances.Instance, error) {
 	return nil, nil
 }
+
 func (f *vsockFakeInstances) GetVsockDialer(context.Context, string) (hypervisor.VsockDialer, error) {
 	return &blockedDialer{}, nil
 }
@@ -89,11 +104,13 @@ func newVsockTestServer(t *testing.T, opts ...Option) *Server {
 // 终止会话并发送明确错误帧。用极短 idle timeout + 阻塞 dialer。
 func TestExecIdleWatchdog(t *testing.T) {
 	s := newVsockTestServer(t, WithRuntimeLimits(4, 1<<20, 5*time.Second, 50*time.Millisecond))
-	stream := &execFakeStream{ctx: context.Background(),
+	stream := &execFakeStream{
+		ctx: context.Background(),
 		frames: []*pb.ExecInput{{Frame: &pb.ExecInput_Open{Open: &pb.ExecOpen{
 			MachineId: "m1", ExecutionId: "exec-1", OperationId: "op-idle-watchdog",
 			Command: []string{"/bin/sh", "-c", "sleep 999"},
-		}}}}}
+		}}}},
+	}
 	// Exec 会因 dialer 阻塞而走 error path；idle watchdog 也会触发。
 	// 两条路径都在有界时间内结束（不挂 15min maxDuration）。
 	done := make(chan error, 1)
@@ -190,9 +207,12 @@ func TestStreamLogsFollowByteCap(t *testing.T) {
 	ledger, _ := state.Open(dir + "/ledger.json")
 	fences, _ := state.OpenFences(dir + "/fences.json")
 	lf := &logsFakeInstances{
-		listed: []instances.Instance{{StoredMetadata: instances.StoredMetadata{
-			Id: "i-1", Name: "m1", Tags: map[string]string{"firepaas/execution_id": "exec-1"}},
-			State: instances.StateRunning}},
+		listed: []instances.Instance{{
+			StoredMetadata: instances.StoredMetadata{
+				Id: "i-1", Name: "m1", Tags: map[string]string{"firepaas/execution_id": "exec-1"},
+			},
+			State: instances.StateRunning,
+		}},
 		lines: []string{strings.Repeat("x", 2048)},
 	}
 	adapter := machine.New(lf, fakeImages{}, nil, nil)
@@ -220,7 +240,8 @@ func TestExecWriterCumulativeByteCap(t *testing.T) {
 // TestCopyToRejectsSecondOpen 覆盖 CopyTo 的重复 open 帧拒绝。
 func TestCopyToRejectsSecondOpen(t *testing.T) {
 	s := newVsockTestServer(t)
-	stream := &copyToFakeStream{ctx: context.Background(),
+	stream := &copyToFakeStream{
+		ctx: context.Background(),
 		frames: []*pb.CopyToInput{
 			{Frame: &pb.CopyToInput_Open{Open: &pb.CopyToOpen{
 				MachineId: "m1", ExecutionId: "exec-1", Generation: 1, OperationId: "op-copy-a", Path: "/tmp/a.txt",
@@ -228,7 +249,8 @@ func TestCopyToRejectsSecondOpen(t *testing.T) {
 			{Frame: &pb.CopyToInput_Open{Open: &pb.CopyToOpen{
 				MachineId: "m1", ExecutionId: "exec-1", Generation: 1, OperationId: "op-copy-b", Path: "/tmp/b.txt",
 			}}},
-		}}
+		},
+	}
 	// 第二个 open 帧的数据不会被处理（copyToFakeStream 按序发送，
 	// agent 收到第二个 open 后行为取决于实现——此处只断言不崩溃）。
 	_ = s.CopyTo(stream)

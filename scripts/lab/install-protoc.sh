@@ -22,6 +22,7 @@ if [[ ! -x "$PROTOC_ROOT/bin/protoc" ]]; then
   cp -r /tmp/protoc-extract/bin /tmp/protoc-extract/include "$PROTOC_ROOT/"
   rm -rf /tmp/protoc.zip /tmp/protoc-extract
 fi
+mkdir -p "$LAB_ROOT/bin"
 ln -sf "$PROTOC_ROOT/bin/protoc" "$LAB_ROOT/bin/protoc"
 
 echo "==> protoc-gen-go / protoc-gen-go-grpc"

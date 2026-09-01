@@ -66,8 +66,10 @@ func TestLedgerInProgressSurvivesCrashWindowAndCompletesAfterRecovery(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	claim := Record{OperationID: "op-crash", MachineID: "m-1", ExecutionID: "e-1", Generation: 7,
-		Kind: "snapshot.create", Identity: []byte(`{"snapshot_id":"s-1"}`), RequestHash: "hash-1"}
+	claim := Record{
+		OperationID: "op-crash", MachineID: "m-1", ExecutionID: "e-1", Generation: 7,
+		Kind: "snapshot.create", Identity: []byte(`{"snapshot_id":"s-1"}`), RequestHash: "hash-1",
+	}
 	if _, existing, err := l.Begin(claim); err != nil || existing {
 		t.Fatalf("begin: existing=%v err=%v", existing, err)
 	}
@@ -78,7 +80,8 @@ func TestLedgerInProgressSurvivesCrashWindowAndCompletesAfterRecovery(t *testing
 		t.Fatal(err)
 	}
 	rec, existing, err := restarted.Begin(claim)
-	if err != nil || !existing || rec.Status != StatusInProgress || rec.Kind != claim.Kind || !jsonEqual(t, rec.Identity, claim.Identity) {
+	if err != nil || !existing || rec.Status != StatusInProgress || rec.Kind != claim.Kind ||
+		!jsonEqual(t, rec.Identity, claim.Identity) {
 		t.Fatalf("recovered claim = %#v existing=%v err=%v", rec, existing, err)
 	}
 	if _, completed, err := restarted.Check(claim.OperationID, claim.RequestHash); err != nil || completed {

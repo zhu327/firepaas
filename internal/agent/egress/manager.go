@@ -43,7 +43,11 @@ func NewManager(proxy *Proxy, slots SlotApplier) *Manager {
 // Apply stages an invisible proxy generation, commits the nft rules, then
 // publishes policy and IP binding with one swap. Manager serializes the whole
 // protocol so rollback cannot overwrite a concurrent generation.
-func (m *Manager) Apply(ctx context.Context, machineID, executionID, projectID, appID, guestIP string, policy *Policy) error {
+func (m *Manager) Apply(
+	ctx context.Context,
+	machineID, executionID, projectID, appID, guestIP string,
+	policy *Policy,
+) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if policy == nil {
@@ -71,13 +75,6 @@ func (m *Manager) Apply(ctx context.Context, machineID, executionID, projectID, 
 		}
 	}
 	return nil
-}
-
-func (m *Manager) rollbackSlot(ctx context.Context, machineID string, old slot.EgressRuleSet, hadOld bool) error {
-	if m.slots == nil {
-		return nil
-	}
-	return m.slots.RollbackEgressPolicy(ctx, machineID, old, hadOld)
 }
 
 // Remove first clears nft. A failure leaves the proxy registration visible so

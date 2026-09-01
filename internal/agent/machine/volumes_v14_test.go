@@ -58,7 +58,8 @@ func TestCleanupStaleDatasetSpoolReportsStatErrors(t *testing.T) {
 	if err := os.Symlink(filepath.Join(dir, "missing"), dangling); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := CleanupStaleDatasetSpool(time.Hour); err == nil || !strings.Contains(err.Error(), "stat dataset spool") {
+	if _, err := CleanupStaleDatasetSpool(time.Hour); err == nil ||
+		!strings.Contains(err.Error(), "stat dataset spool") {
 		t.Fatalf("cleanup must report stat error, got %v", err)
 	}
 }

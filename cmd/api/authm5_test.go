@@ -16,7 +16,7 @@ func TestAuthWrappedRoutesHaveExplicitScopes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	route := regexp.MustCompile(`mux\.HandleFunc\("([A-Z]+ /v1/[^" ]*(?:\{[^}]+\}[^" ]*)*)", api\.auth\(`)
 	scanner := bufio.NewScanner(file)
@@ -150,8 +150,8 @@ func TestPrewarmCoverageAndPinRoutesRequireAdmin(t *testing.T) {
 }
 
 func TestScopeRankOrdering(t *testing.T) {
-	if !(scopeRank["read"] < scopeRank["debug"] && scopeRank["debug"] <= scopeRank["write"] &&
-		scopeRank["write"] < scopeRank["admin"]) {
+	if scopeRank["read"] >= scopeRank["debug"] || scopeRank["debug"] > scopeRank["write"] ||
+		scopeRank["write"] >= scopeRank["admin"] {
 		t.Fatalf("scope ordering broken: %v", scopeRank)
 	}
 	if maxRank([]string{"read", "write", "bogus"}) != scopeRank["write"] {

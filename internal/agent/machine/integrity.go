@@ -21,7 +21,10 @@ func (a *Adapter) SnapshotScrubAvailable() bool {
 
 // ScrubSnapshot resolves the firepaas stable ID without exposing a local path,
 // then delegates content verification to hypeman under its snapshot lock.
-func (a *Adapter) ScrubSnapshot(ctx context.Context, snapshotID, expectedRevision string) (*pb.ScrubSnapshotResponse, error) {
+func (a *Adapter) ScrubSnapshot(
+	ctx context.Context,
+	snapshotID, expectedRevision string,
+) (*pb.ScrubSnapshotResponse, error) {
 	sp, ok := a.instances.(snapshotProvider)
 	if !ok {
 		return nil, ErrSnapshotUnsupported

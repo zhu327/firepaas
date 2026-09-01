@@ -129,7 +129,11 @@ func (c *Controller) reconcileRollout(ctx context.Context, app *store.App, r *st
 			}
 			c.recordEvent(ctx, "rollout", "", r.ID, "", "cutover: new generation ready, old draining", nil)
 			c.rolloutUserEvent(ctx, r, "cutover", nil)
-			c.metrics.Inc("firepaas_rollout_transitions_total", map[string]string{"from": "PREPARING", "to": "CUTOVER"}, 1)
+			c.metrics.Inc(
+				"firepaas_rollout_transitions_total",
+				map[string]string{"from": "PREPARING", "to": "CUTOVER"},
+				1,
+			)
 		}
 
 	case "CUTOVER":
@@ -192,7 +196,11 @@ func (c *Controller) reconcileRollout(ctx context.Context, app *store.App, r *st
 				return err
 			}
 			c.recordEvent(ctx, "rollout", "", r.ID, "", "rollback complete; previous generation retained", nil)
-			c.metrics.Inc("firepaas_rollout_transitions_total", map[string]string{"from": "ROLLING_BACK", "to": "COMPLETE_FAILED"}, 1)
+			c.metrics.Inc(
+				"firepaas_rollout_transitions_total",
+				map[string]string{"from": "ROLLING_BACK", "to": "COMPLETE_FAILED"},
+				1,
+			)
 		}
 	}
 	return nil
@@ -349,7 +357,12 @@ func (c *Controller) deploymentForGeneration(ctx context.Context, appID string, 
 // enqueueAppMachineCreate 为 (app, deployment, ordinal) 建立 machine + create 操作。
 // execution 稳定性：live 行复用其 current_execution_id；墓碑行/无行换新
 // execution（换代清除逻辑会作废旧 observed，避免 R8 短路）。
-func (c *Controller) enqueueAppMachineCreate(ctx context.Context, app *store.App, dep *store.Deployment, ordinal int) error {
+func (c *Controller) enqueueAppMachineCreate(
+	ctx context.Context,
+	app *store.App,
+	dep *store.Deployment,
+	ordinal int,
+) error {
 	machineID := fmt.Sprintf("%s-r%d-g%d", app.ID, ordinal, dep.Generation)
 	executionID := "exec-" + id.New()
 	if existing, err := c.store.GetMachine(ctx, machineID); err == nil && existing != nil {
@@ -661,7 +674,15 @@ func (c *Controller) prefetchImage(ctx context.Context, rolloutID, imageRef, dig
 				c.metrics.Inc("firepaas_prefetch_total", map[string]string{"result": "failed"}, 1)
 				return
 			}
-			c.recordEvent(ctx, "prefetch", "", rolloutID, n.ID, "prefetch succeeded: image cached for placement affinity", nil)
+			c.recordEvent(
+				ctx,
+				"prefetch",
+				"",
+				rolloutID,
+				n.ID,
+				"prefetch succeeded: image cached for placement affinity",
+				nil,
+			)
 			c.metrics.Inc("firepaas_prefetch_total", map[string]string{"result": "succeeded"}, 1)
 		}(n, client)
 	}
@@ -672,7 +693,10 @@ func (c *Controller) prefetchImage(ctx context.Context, rolloutID, imageRef, dig
 
 // prefetchCandidates builds the exact hard-candidate request used for create
 // placement: pool/labels/resources/deployment anti-affinity and image digest.
-func (c *Controller) prefetchCandidates(ctx context.Context, dep *store.Deployment) ([]scheduler.Node, scheduler.Request, error) {
+func (c *Controller) prefetchCandidates(
+	ctx context.Context,
+	dep *store.Deployment,
+) ([]scheduler.Node, scheduler.Request, error) {
 	nodes := c.schedulerNodes(ctx)
 	var placement pb.PlacementConstraints
 	if len(dep.Placement) > 0 && string(dep.Placement) != "null" {

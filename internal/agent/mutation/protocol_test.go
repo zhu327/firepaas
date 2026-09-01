@@ -27,7 +27,10 @@ func openProtocol(t *testing.T) (*Protocol, string, string) {
 }
 
 func bytesCodec() Codec[json.RawMessage] {
-	return Codec[json.RawMessage]{Encode: func(v json.RawMessage) (json.RawMessage, error) { return v, nil }, Decode: func(v json.RawMessage) (json.RawMessage, error) { return v, nil }}
+	return Codec[json.RawMessage]{
+		Encode: func(v json.RawMessage) (json.RawMessage, error) { return v, nil },
+		Decode: func(v json.RawMessage) (json.RawMessage, error) { return v, nil },
+	}
 }
 
 func TestCreateDeleteCopyAndRecoveryFamilies(t *testing.T) {
@@ -35,12 +38,14 @@ func TestCreateDeleteCopyAndRecoveryFamilies(t *testing.T) {
 		p, _, _ := openProtocol(t)
 		id := Identity{OperationID: "create", MachineID: "m", ExecutionID: "e", Generation: 3, RequestHash: "h"}
 		credential := false
-		out, err := RunCreateMachine(p, CreateMachine[json.RawMessage]{Identity: id,
-			Effect: func() (json.RawMessage, error) { return []byte(`{"created":true}`), nil },
+		out, err := RunCreateMachine(p, CreateMachine[json.RawMessage]{
+			Identity: id,
+			Effect:   func() (json.RawMessage, error) { return []byte(`{"created":true}`), nil },
 			PersistCredential: func() error {
 				credential = true
 				return p.fences.Check("m", 2)
-			}, Codec: bytesCodec()})
+			}, Codec: bytesCodec(),
+		})
 		if !errors.Is(err, ErrStale) || !credential || out != nil {
 			t.Fatalf("create ordering: out=%s credential=%v err=%v", out, credential, err)
 		}
@@ -53,10 +58,12 @@ func TestCreateDeleteCopyAndRecoveryFamilies(t *testing.T) {
 		p, _, _ := openProtocol(t)
 		id := Identity{OperationID: "delete", MachineID: "m", ExecutionID: "e", Generation: 2, RequestHash: "h"}
 		calls := 0
-		if _, err := RunDeleteMachine(p, DeleteMachine{Identity: id, Effect: func() error { calls++; return nil }}); err != nil || calls != 1 {
+		if _, err := RunDeleteMachine(p, DeleteMachine{Identity: id, Effect: func() error { calls++; return nil }}); err != nil ||
+			calls != 1 {
 			t.Fatalf("delete calls=%d err=%v", calls, err)
 		}
-		if _, err := RunDeleteMachine(p, DeleteMachine{Identity: id, Effect: func() error { calls++; return nil }}); err != nil || calls != 1 {
+		if _, err := RunDeleteMachine(p, DeleteMachine{Identity: id, Effect: func() error { calls++; return nil }}); err != nil ||
+			calls != 1 {
 			t.Fatalf("delete replay calls=%d err=%v", calls, err)
 		}
 		resourceID := Identity{OperationID: "resource-delete", MachineID: "v", RequestHash: "vh"}
@@ -72,7 +79,13 @@ func TestCreateDeleteCopyAndRecoveryFamilies(t *testing.T) {
 		p, _, _ := openProtocol(t)
 		id := Identity{OperationID: "copy", MachineID: "m", ExecutionID: "e", Generation: 4, RequestHash: "h"}
 		calls := 0
-		op := CopyTo[json.RawMessage]{Lifecycle: Lifecycle[json.RawMessage]{Identity: id, Effect: func() (json.RawMessage, error) { calls++; return []byte(`{"copied":true}`), nil }, Codec: bytesCodec()}}
+		op := CopyTo[json.RawMessage]{
+			Lifecycle: Lifecycle[json.RawMessage]{
+				Identity: id,
+				Effect:   func() (json.RawMessage, error) { calls++; return []byte(`{"copied":true}`), nil },
+				Codec:    bytesCodec(),
+			},
+		}
 		if _, err := RunCopyTo(p, op); err != nil {
 			t.Fatal(err)
 		}
@@ -89,9 +102,11 @@ func TestReplacementCredentialFailureLeavesClaimRecoverable(t *testing.T) {
 	p, lp, fp := openProtocol(t)
 	id := Identity{OperationID: "replace-fail", MachineID: "m", ExecutionID: "e", Generation: 5, RequestHash: "h"}
 	credentialErr := errors.New("credential persistence failed")
-	_, err := RunReplacement(p, Replacement[json.RawMessage]{Identity: id,
+	_, err := RunReplacement(p, Replacement[json.RawMessage]{
+		Identity:          id,
 		Effect:            func() (json.RawMessage, error) { return []byte(`{"ok":true}`), nil },
-		PersistCredential: func() error { return credentialErr }, Codec: bytesCodec()})
+		PersistCredential: func() error { return credentialErr }, Codec: bytesCodec(),
+	})
 	if !errors.Is(err, credentialErr) {
 		t.Fatalf("credential error=%v", err)
 	}
@@ -103,11 +118,13 @@ func TestReplacementCredentialFailureLeavesClaimRecoverable(t *testing.T) {
 	if err := fences.Check("m", 4); !errors.Is(err, ErrStale) {
 		t.Fatalf("fence was not durable: %v", err)
 	}
-	_, err = RunReplacement(New(ledger, fences), Replacement[json.RawMessage]{Identity: id,
+	_, err = RunReplacement(New(ledger, fences), Replacement[json.RawMessage]{
+		Identity: id,
 		Recover: func() (Recovery[json.RawMessage], error) {
 			return Recovery[json.RawMessage]{Value: []byte(`{"ok":true}`), Found: true}, nil
 		},
-		PersistCredential: func() error { return nil }, Codec: bytesCodec()})
+		PersistCredential: func() error { return nil }, Codec: bytesCodec(),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +133,8 @@ func TestReplacementCredentialFailureLeavesClaimRecoverable(t *testing.T) {
 func TestClaimedMutationCompletionFailureIsReturned(t *testing.T) {
 	p, lp, _ := openProtocol(t)
 	id := Identity{OperationID: "complete-fail", MachineID: "resource", RequestHash: "h"}
-	_, err := RunResourceMutation(p, ClaimedMutation[json.RawMessage]{Identity: id,
+	_, err := RunResourceMutation(p, ClaimedMutation[json.RawMessage]{
+		Identity: id,
 		Effect: func() (json.RawMessage, error) {
 			if err := os.Remove(lp); err != nil {
 				return nil, err
@@ -125,7 +143,8 @@ func TestClaimedMutationCompletionFailureIsReturned(t *testing.T) {
 				return nil, err
 			}
 			return []byte(`{"ok":true}`), nil
-		}, Codec: bytesCodec()})
+		}, Codec: bytesCodec(),
+	})
 	if err == nil {
 		t.Fatal("completion persistence failure was ignored")
 	}
@@ -135,11 +154,25 @@ func TestLifecycleReplayConflictAndFence(t *testing.T) {
 	p, _, _ := openProtocol(t)
 	calls := 0
 	id := Identity{OperationID: "op", MachineID: "m", ExecutionID: "e", Generation: 2, RequestHash: "hash"}
-	out, err := RunLifecycle(p, Lifecycle[json.RawMessage]{Identity: id, Effect: func() (json.RawMessage, error) { calls++; return []byte(`{"ok":true}`), nil }, Codec: bytesCodec()})
+	out, err := RunLifecycle(
+		p,
+		Lifecycle[json.RawMessage]{
+			Identity: id,
+			Effect:   func() (json.RawMessage, error) { calls++; return []byte(`{"ok":true}`), nil },
+			Codec:    bytesCodec(),
+		},
+	)
 	if err != nil || calls != 1 || !json.Valid(out) {
 		t.Fatalf("first: %s %d %v", out, calls, err)
 	}
-	_, err = RunLifecycle(p, Lifecycle[json.RawMessage]{Identity: id, Effect: func() (json.RawMessage, error) { calls++; return nil, nil }, Codec: bytesCodec()})
+	_, err = RunLifecycle(
+		p,
+		Lifecycle[json.RawMessage]{
+			Identity: id,
+			Effect:   func() (json.RawMessage, error) { calls++; return nil, nil },
+			Codec:    bytesCodec(),
+		},
+	)
 	if err != nil || calls != 1 {
 		t.Fatalf("replay reran effect: %d %v", calls, err)
 	}
@@ -152,9 +185,24 @@ func TestLifecycleReplayConflictAndFence(t *testing.T) {
 
 func TestClaimedMutationPersistsCompatibleClaimAndRecovers(t *testing.T) {
 	p, lp, fp := openProtocol(t)
-	id := Identity{OperationID: "op", MachineID: "m", ExecutionID: "e", Generation: 7, Kind: "snapshot.create", Coordinates: []byte(`{"snapshot_id":"s"}`), RequestHash: "hash"}
+	id := Identity{
+		OperationID: "op",
+		MachineID:   "m",
+		ExecutionID: "e",
+		Generation:  7,
+		Kind:        "snapshot.create",
+		Coordinates: []byte(`{"snapshot_id":"s"}`),
+		RequestHash: "hash",
+	}
 	effectErr := errors.New("crash window")
-	_, err := RunResourceMutation(p, ClaimedMutation[json.RawMessage]{Identity: id, Effect: func() (json.RawMessage, error) { return nil, effectErr }, Codec: bytesCodec()})
+	_, err := RunResourceMutation(
+		p,
+		ClaimedMutation[json.RawMessage]{
+			Identity: id,
+			Effect:   func() (json.RawMessage, error) { return nil, effectErr },
+			Codec:    bytesCodec(),
+		},
+	)
 	if !errors.Is(err, effectErr) {
 		t.Fatalf("effect=%v", err)
 	}
@@ -166,9 +214,12 @@ func TestClaimedMutationPersistsCompatibleClaimAndRecovers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := RunResourceMutation(New(l, f), ClaimedMutation[json.RawMessage]{Identity: id, Recover: func() (Recovery[json.RawMessage], error) {
-		return Recovery[json.RawMessage]{Value: []byte(`{"done":true}`), Found: true}, nil
-	}, Codec: bytesCodec()})
+	got, err := RunResourceMutation(
+		New(l, f),
+		ClaimedMutation[json.RawMessage]{Identity: id, Recover: func() (Recovery[json.RawMessage], error) {
+			return Recovery[json.RawMessage]{Value: []byte(`{"done":true}`), Found: true}, nil
+		}, Codec: bytesCodec()},
+	)
 	if err != nil || string(got) != `{"done":true}` {
 		t.Fatalf("recover=%s %v", got, err)
 	}
@@ -186,10 +237,19 @@ func TestClaimedMutationPersistsCompatibleClaimAndRecovers(t *testing.T) {
 
 func TestReplacementRecoveryAfterReopenAdvancesFenceBeforeCredentialAndCompletion(t *testing.T) {
 	p, lp, fp := openProtocol(t)
-	id := Identity{OperationID: "replace", MachineID: "m", ExecutionID: "new-exec", Generation: 9, Kind: "snapshot.restore", RequestHash: "hash"}
+	id := Identity{
+		OperationID: "replace",
+		MachineID:   "m",
+		ExecutionID: "new-exec",
+		Generation:  9,
+		Kind:        "snapshot.restore",
+		RequestHash: "hash",
+	}
 	crash := errors.New("crash after replacement")
-	_, err := RunReplacement(p, Replacement[json.RawMessage]{Identity: id,
-		Effect: func() (json.RawMessage, error) { return nil, crash }, Codec: bytesCodec()})
+	_, err := RunReplacement(p, Replacement[json.RawMessage]{
+		Identity: id,
+		Effect:   func() (json.RawMessage, error) { return nil, crash }, Codec: bytesCodec(),
+	})
 	if !errors.Is(err, crash) {
 		t.Fatalf("first effect: %v", err)
 	}
@@ -203,7 +263,8 @@ func TestReplacementRecoveryAfterReopenAdvancesFenceBeforeCredentialAndCompletio
 		t.Fatal(err)
 	}
 	credentialCalled := false
-	got, err := RunReplacement(New(ledger, fences), Replacement[json.RawMessage]{Identity: id,
+	got, err := RunReplacement(New(ledger, fences), Replacement[json.RawMessage]{
+		Identity: id,
 		Recover: func() (Recovery[json.RawMessage], error) {
 			return Recovery[json.RawMessage]{Value: []byte(`{"recovered":true}`), Found: true}, nil
 		},
@@ -224,7 +285,8 @@ func TestReplacementRecoveryAfterReopenAdvancesFenceBeforeCredentialAndCompletio
 				t.Fatalf("ledger completed before credential: complete=%v err=%v", complete, err)
 			}
 			return nil
-		}, Codec: bytesCodec()})
+		}, Codec: bytesCodec(),
+	})
 	if err != nil || !credentialCalled || string(got) != `{"recovered":true}` {
 		t.Fatalf("recovery=%s credential=%v err=%v", got, credentialCalled, err)
 	}
@@ -237,13 +299,20 @@ func TestLegacyCompletedLedgerReplaysWithoutMigration(t *testing.T) {
 	d := t.TempDir()
 	lp := filepath.Join(d, "ledger.json")
 	legacy := `{"old":{"operation_id":"old","machine_id":"m","request_hash":"hash","result":{"legacy":true},"created_at":"2026-08-01T00:00:00Z"}}`
-	if err := os.WriteFile(lp, []byte(legacy), 0600); err != nil {
+	if err := os.WriteFile(lp, []byte(legacy), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	l, _ := state.Open(lp)
 	f, _ := state.OpenFences(filepath.Join(d, "fences.json"))
 	calls := 0
-	out, err := RunLifecycle(New(l, f), Lifecycle[json.RawMessage]{Identity: Identity{OperationID: "old", MachineID: "m", RequestHash: "hash"}, Effect: func() (json.RawMessage, error) { calls++; return nil, nil }, Codec: bytesCodec()})
+	out, err := RunLifecycle(
+		New(l, f),
+		Lifecycle[json.RawMessage]{
+			Identity: Identity{OperationID: "old", MachineID: "m", RequestHash: "hash"},
+			Effect:   func() (json.RawMessage, error) { calls++; return nil, nil },
+			Codec:    bytesCodec(),
+		},
+	)
 	if err != nil || calls != 0 || string(out) != `{"legacy":true}` {
 		t.Fatalf("legacy=%s calls=%d err=%v", out, calls, err)
 	}

@@ -9,12 +9,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kernel/hypeman/lib/images"
+	"github.com/kernel/hypeman/lib/instances"
 	"github.com/zhu327/firepaas/internal/agent/info"
 	"github.com/zhu327/firepaas/internal/agent/machine"
 	"github.com/zhu327/firepaas/internal/agent/state"
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
-	"github.com/kernel/hypeman/lib/images"
-	"github.com/kernel/hypeman/lib/instances"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -27,7 +27,10 @@ type fakeInstances struct {
 	nextID int
 }
 
-func (f *fakeInstances) CreateInstance(_ context.Context, req instances.CreateInstanceRequest) (*instances.Instance, error) {
+func (f *fakeInstances) CreateInstance(
+	_ context.Context,
+	req instances.CreateInstanceRequest,
+) (*instances.Instance, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.nextID++
@@ -50,7 +53,10 @@ func (f *fakeInstances) CreateInstance(_ context.Context, req instances.CreateIn
 	return inst, nil
 }
 
-func (f *fakeInstances) ListInstances(_ context.Context, _ *instances.ListInstancesFilter) ([]instances.Instance, error) {
+func (f *fakeInstances) ListInstances(
+	_ context.Context,
+	_ *instances.ListInstancesFilter,
+) ([]instances.Instance, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := make([]instances.Instance, 0, len(f.byName))
@@ -73,7 +79,11 @@ func (f *fakeInstances) GetInstance(_ context.Context, idOrName string) (*instan
 }
 
 // M4.5：standby/restore 替身（记录调用并按状态机迁移）。
-func (f *fakeInstances) StandbyInstance(_ context.Context, id string, _ instances.StandbyInstanceRequest) (*instances.Instance, error) {
+func (f *fakeInstances) StandbyInstance(
+	_ context.Context,
+	id string,
+	_ instances.StandbyInstanceRequest,
+) (*instances.Instance, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	inst := f.byID(id)
@@ -179,7 +189,11 @@ func TestDeleteImageRejectsLiveReference(t *testing.T) {
 	ledger, _ := state.Open(filepath.Join(dir, "ledger.json"))
 	fences, _ := state.OpenFences(filepath.Join(dir, "fences.json"))
 	ref := "docker.io/library/nginx:alpine@sha256:" + strings.Repeat("a", 64)
-	inst := &fakeInstances{byName: map[string]*instances.Instance{"m1": {StoredMetadata: instances.StoredMetadata{Name: "m1", Image: ref}}}}
+	inst := &fakeInstances{
+		byName: map[string]*instances.Instance{
+			"m1": {StoredMetadata: instances.StoredMetadata{Name: "m1", Image: ref}},
+		},
+	}
 	srv := New(machine.New(inst, fakeImages{}, nil, nil), ledger, fences,
 		info.New("node", "test", "test", "compute", "v1", "", dir, nil, nil))
 	_, err := srv.DeleteImage(context.Background(), &pb.DeleteImageRequest{ImageRef: ref})
@@ -242,7 +256,9 @@ func TestDeleteRejectsStaleExecution(t *testing.T) {
 	if _, err := srv.CreateMachine(ctx, createReq("m-exec", 1, "op-create")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := srv.DeleteMachine(ctx, deleteReq("m-exec", 1, "op-delete", "wrong-execution")); status.Code(err) != codes.Internal {
+	if _, err := srv.DeleteMachine(ctx, deleteReq("m-exec", 1, "op-delete", "wrong-execution")); status.Code(
+		err,
+	) != codes.Internal {
 		t.Fatalf("stale execution delete: want Internal, got %v", err)
 	}
 	list, err := srv.ListMachines(ctx, &pb.ListMachinesRequest{})
@@ -260,7 +276,9 @@ func TestGenerationFencing(t *testing.T) {
 		t.Fatalf("create gen=2: %v", err)
 	}
 	// 旧 generation delete 被拒绝。
-	if _, err := srv.DeleteMachine(ctx, deleteReq("m-fence", 1, "op-b", "exec-op-a")); status.Code(err) != codes.FailedPrecondition {
+	if _, err := srv.DeleteMachine(ctx, deleteReq("m-fence", 1, "op-b", "exec-op-a")); status.Code(
+		err,
+	) != codes.FailedPrecondition {
 		t.Fatalf("stale delete: want FailedPrecondition, got %v", err)
 	}
 	// machine 存活期间，已记录操作的重放不受 fence 影响（幂等性优先）。
@@ -295,7 +313,9 @@ func TestStaleCreateHasNoSideEffects(t *testing.T) {
 	if _, err := srv.CreateMachine(ctx, createReq("m-se", 2, "op-se-1")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := srv.CreateMachine(ctx, createReq("m-se", 1, "op-se-stale")); status.Code(err) != codes.FailedPrecondition {
+	if _, err := srv.CreateMachine(ctx, createReq("m-se", 1, "op-se-stale")); status.Code(
+		err,
+	) != codes.FailedPrecondition {
 		t.Fatalf("want FailedPrecondition, got %v", err)
 	}
 	// 被拒的 stale 操作不留 ledger 记录（重试继续被 fence 拒绝）。

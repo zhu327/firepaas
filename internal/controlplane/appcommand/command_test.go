@@ -26,12 +26,14 @@ func (f *fakeStore) GetApp(context.Context, string) (*store.App, error) { return
 func (f *fakeStore) ActiveDeploymentForApp(context.Context, string) (*store.Deployment, error) {
 	return f.active, nil
 }
+
 func (f *fakeStore) GetSecretMeta(context.Context, string, string, *int64) (*store.SecretMeta, error) {
 	if f.secretErr != nil {
 		return nil, f.secretErr
 	}
 	return &store.SecretMeta{}, nil
 }
+
 func (f *fakeStore) DeployApp(_ context.Context, d store.Deployment, r store.Rollout, _ int64) error {
 	f.deployed, f.rollout = &d, &r
 	return f.deployErr
@@ -54,15 +56,22 @@ func TestExecuteInheritsAndInitiatesDeployment(t *testing.T) {
 		t.Fatal(err)
 	}
 	refs := map[string]store.SecretRef{"TOKEN": {Secret: "api-token"}}
-	active := &store.Deployment{Generation: 4, ImageRef: "old", VCPU: 2, MemMIB: 1024, Port: 8080,
+	active := &store.Deployment{
+		Generation: 4, ImageRef: "old", VCPU: 2, MemMIB: 1024, Port: 8080,
 		Services: []store.ServiceSpec{{Name: "http", InternalPort: 8080}, {Name: "grpc", InternalPort: 9090}},
-		Env:      map[string]string{"MODE": "prod"}, SecretRefs: refs, Placement: json.RawMessage(`{"nodePool":"critical"}`),
-		HealthCheck: hc, AutoStandby: auto, Strategy: "rolling", EgressPolicy: egress}
+		Env: map[string]string{
+			"MODE": "prod",
+		}, SecretRefs: refs, Placement: json.RawMessage(`{"nodePool":"critical"}`),
+		HealthCheck: hc, AutoStandby: auto, Strategy: "rolling", EgressPolicy: egress,
+	}
 	st := &fakeStore{app: &store.App{ID: "app-1", Generation: 4}, active: active}
 	cmd := New(st, fakeImages{})
 	cmd.newID = func() string { return "fixed" }
 
-	got, err := cmd.Execute(context.Background(), Intent{AppID: "app-1", ProjectID: "dev", SecretRefs: refs, InheritAll: true})
+	got, err := cmd.Execute(
+		context.Background(),
+		Intent{AppID: "app-1", ProjectID: "dev", SecretRefs: refs, InheritAll: true},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,10 +82,12 @@ func TestExecuteInheritsAndInitiatesDeployment(t *testing.T) {
 	if d.ImageRef != "old" || d.VCPU != 2 || d.MemMIB != 1024 || d.Port != 8080 || d.Strategy != "rolling" {
 		t.Fatalf("scalars = %+v", d)
 	}
-	if !reflect.DeepEqual(d.Services, active.Services) || !reflect.DeepEqual(d.Env, active.Env) || !reflect.DeepEqual(d.SecretRefs, refs) {
+	if !reflect.DeepEqual(d.Services, active.Services) || !reflect.DeepEqual(d.Env, active.Env) ||
+		!reflect.DeepEqual(d.SecretRefs, refs) {
 		t.Fatalf("collections = %+v", d)
 	}
-	if string(d.Placement) != string(active.Placement) || string(d.HealthCheck) != string(active.HealthCheck) || string(d.AutoStandby) != string(active.AutoStandby) {
+	if string(d.Placement) != string(active.Placement) || string(d.HealthCheck) != string(active.HealthCheck) ||
+		string(d.AutoStandby) != string(active.AutoStandby) {
 		t.Fatalf("policies = %+v", d)
 	}
 	if !reflect.DeepEqual(d.RequiredFeatures, []string{capabilities.SecretOneShotV1}) {
@@ -86,14 +97,17 @@ func TestExecuteInheritsAndInitiatesDeployment(t *testing.T) {
 	if err := protojson.Unmarshal(d.EgressPolicy, &policy); err != nil {
 		t.Fatal(err)
 	}
-	if policy.GetPolicyGeneration() != 5 || !reflect.DeepEqual(policy.GetAllowedDomains(), []string{"api.example.com"}) {
+	if policy.GetPolicyGeneration() != 5 ||
+		!reflect.DeepEqual(policy.GetAllowedDomains(), []string{"api.example.com"}) {
 		t.Fatalf("egress = %s", d.EgressPolicy)
 	}
 }
 
 func TestExecuteRegularDeployPreservesDefaults(t *testing.T) {
-	active := &store.Deployment{Generation: 1, ImageRef: "old", VCPU: 2, MemMIB: 1024, Port: 8080,
-		Env: map[string]string{"A": "1"}, Placement: json.RawMessage(`{"nodePool":"old"}`), Strategy: "rolling"}
+	active := &store.Deployment{
+		Generation: 1, ImageRef: "old", VCPU: 2, MemMIB: 1024, Port: 8080,
+		Env: map[string]string{"A": "1"}, Placement: json.RawMessage(`{"nodePool":"old"}`), Strategy: "rolling",
+	}
 	st := &fakeStore{app: &store.App{ID: "app-1", Generation: 1}, active: active}
 	cmd := New(st, fakeImages{})
 	cmd.newID = func() string { return "fixed" }
@@ -111,13 +125,19 @@ func TestExecuteMapsDomainErrors(t *testing.T) {
 		t.Fatalf("missing app: %v", err)
 	}
 	st := &fakeStore{app: &store.App{ID: "app"}}
-	if _, err := New(st, fakeImages{}).Execute(context.Background(), Intent{AppID: "app"}); !errors.Is(err, ErrNoActiveDeployment) {
+	if _, err := New(st, fakeImages{}).Execute(context.Background(), Intent{AppID: "app"}); !errors.Is(
+		err,
+		ErrNoActiveDeployment,
+	) {
 		t.Fatalf("missing active: %v", err)
 	}
 	st.active = &store.Deployment{Generation: 1, ImageRef: "old"}
 	st.app.Generation = 1
 	st.deployErr = store.ErrRolloutBusy
-	if _, err := New(st, fakeImages{}).Execute(context.Background(), Intent{AppID: "app"}); !errors.Is(err, ErrRolloutBusy) {
+	if _, err := New(st, fakeImages{}).Execute(context.Background(), Intent{AppID: "app"}); !errors.Is(
+		err,
+		ErrRolloutBusy,
+	) {
 		t.Fatalf("busy: %v", err)
 	}
 }

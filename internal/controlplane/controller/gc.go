@@ -30,7 +30,14 @@ type GCConfig struct {
 func DefaultGCConfig() GCConfig {
 	// Destructive behavior is opt-in. Operators must first inspect dry-run
 	// evidence and complete a quarantine/rollback rehearsal.
-	return GCConfig{Mode: "off", MinAge: time.Hour, HighWater: 0.85, LowWater: 0.70, Interval: 5 * time.Minute, Grace: 10 * time.Minute}
+	return GCConfig{
+		Mode:      "off",
+		MinAge:    time.Hour,
+		HighWater: 0.85,
+		LowWater:  0.70,
+		Interval:  5 * time.Minute,
+		Grace:     10 * time.Minute,
+	}
 }
 
 func validGCConfig(cfg GCConfig) bool {
@@ -165,7 +172,8 @@ func (c *Controller) reconcileImageQuarantines(ctx context.Context, n store.Node
 			_ = c.store.MarkLocalGCQuarantined(ctx, claim.ID, q.GetToken())
 			continue
 		}
-		if (claim.Status != "QUARANTINED" && claim.Status != "FINALIZING") || !store.VerifyLocalGCToken(claim, q.GetToken()) {
+		if (claim.Status != "QUARANTINED" && claim.Status != "FINALIZING") ||
+			!store.VerifyLocalGCToken(claim, q.GetToken()) {
 			continue
 		}
 		// ACK loss/crash recovery: remote terminal state is authoritative only
@@ -196,7 +204,11 @@ func (c *Controller) reconcileImageQuarantines(ctx context.Context, n store.Node
 		for d := range pinned {
 			live[d] = true
 		}
-		action := &pb.ImageQuarantineActionRequest{ClaimId: claim.ID, Token: q.GetToken(), OperationId: claim.ID + "-finalize"}
+		action := &pb.ImageQuarantineActionRequest{
+			ClaimId:     claim.ID,
+			Token:       q.GetToken(),
+			OperationId: claim.ID + "-finalize",
+		}
 		if live[claim.ArtifactKey] {
 			action.OperationId = claim.ID + "-rollback"
 			if client.RollbackImageQuarantine(ctx, action) == nil {
@@ -355,7 +367,15 @@ func gcConsumeBudgetMib(budget, observedSizeMib int64) int64 {
 
 // gcSweepNode re-confirms both PG and live-agent roots immediately before every
 // destructive call. A failed confirmation aborts the node sweep.
-func (c *Controller) gcSweepNode(ctx context.Context, n store.Node, candidates []string, cache map[string]gcCachedImage, frac float64, cfg GCConfig, client *agentclient.Client) {
+func (c *Controller) gcSweepNode(
+	ctx context.Context,
+	n store.Node,
+	candidates []string,
+	cache map[string]gcCachedImage,
+	frac float64,
+	cfg GCConfig,
+	client *agentclient.Client,
+) {
 	dry := cfg.Mode != "delete" || !nodeHasFeature(n, capabilities.ImageQuarantineV1)
 	c.metrics.Inc("firepaas_gc_candidates", map[string]string{"node": n.ID}, uint64(len(candidates)))
 	if dry {
@@ -401,18 +421,36 @@ func (c *Controller) gcSweepNode(ctx context.Context, n store.Node, candidates [
 		confirmed, ok := confirmedCache[digest]
 		original, originallyKnown := cache[digest]
 		if !ok || !originallyKnown || confirmed != original || confirmed.ref == "" || confirmed.sizeMib <= 0 {
-			slog.Error("gc delete confirmation failed", "node", n.ID, "digest", digest, "error", "sized cache reference unavailable")
+			slog.Error(
+				"gc delete confirmation failed",
+				"node",
+				n.ID,
+				"digest",
+				digest,
+				"error",
+				"sized cache reference unavailable",
+			)
 			break
 		}
 		claimID := fmt.Sprintf("gc-%s-%d", n.ID, time.Now().UnixNano())
 		claimToken := fmt.Sprintf("%s:%s:%d", n.ID, digest, time.Now().UnixNano())
-		claim := store.LocalGCClaim{ID: claimID, NodeID: n.ID, ArtifactType: "image", ArtifactKey: digest,
-			Revision: digest, SizeBytes: confirmed.sizeMib * 1024 * 1024, GraceUntil: time.Now().Add(cfg.Grace), Reason: "image cache high watermark"}
+		claim := store.LocalGCClaim{
+			ID: claimID, NodeID: n.ID, ArtifactType: "image", ArtifactKey: digest,
+			Revision: digest, SizeBytes: confirmed.sizeMib * 1024 * 1024, GraceUntil: time.Now().Add(cfg.Grace), Reason: "image cache high watermark",
+		}
 		if err := c.store.ClaimImageForGC(ctx, claim, claimToken); err != nil {
 			c.recordEvent(ctx, "gc", "", "", n.ID, fmt.Sprintf("claim image %s blocked", digest), nil)
 			continue
 		}
-		q, err := client.QuarantineImage(ctx, &pb.QuarantineImageRequest{ImageRef: confirmed.ref, ClaimId: claimID, OperationId: claimID + "-quarantine", ExpectedRevision: digest})
+		q, err := client.QuarantineImage(
+			ctx,
+			&pb.QuarantineImageRequest{
+				ImageRef:         confirmed.ref,
+				ClaimId:          claimID,
+				OperationId:      claimID + "-quarantine",
+				ExpectedRevision: digest,
+			},
+		)
 		if err != nil {
 			// RPC failure is ambiguous: the agent may have durably renamed before
 			// its ACK was lost. Keep CLAIMED so ListImageQuarantines can adopt or
@@ -424,7 +462,14 @@ func (c *Controller) gcSweepNode(ctx context.Context, n store.Node, candidates [
 			continue
 		}
 		if err := c.store.MarkLocalGCQuarantined(ctx, claimID, q.GetToken()); err != nil {
-			_ = client.RollbackImageQuarantine(ctx, &pb.ImageQuarantineActionRequest{ClaimId: claimID, Token: q.GetToken(), OperationId: claimID + "-rollback"})
+			_ = client.RollbackImageQuarantine(
+				ctx,
+				&pb.ImageQuarantineActionRequest{
+					ClaimId:     claimID,
+					Token:       q.GetToken(),
+					OperationId: claimID + "-rollback",
+				},
+			)
 			continue
 		}
 		budget = gcConsumeBudgetMib(budget, confirmed.sizeMib)

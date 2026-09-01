@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/zhu327/firepaas/internal/controlplane/db"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/zhu327/firepaas/internal/controlplane/db"
 )
 
 func testManager(t *testing.T) *Manager {

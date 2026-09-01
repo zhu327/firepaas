@@ -173,12 +173,22 @@ func (c *Command) Execute(ctx context.Context, in Intent) (Result, error) {
 		}
 		return Result{}, err
 	}
-	return Result{AppID: app.ID, DeploymentID: deployment.ID, Generation: generation, RolloutID: rolloutID, Status: "PREPARING"}, nil
+	return Result{
+		AppID:        app.ID,
+		DeploymentID: deployment.ID,
+		Generation:   generation,
+		RolloutID:    rolloutID,
+		Status:       "PREPARING",
+	}, nil
 }
 
 func invalid(err error) error { return fmt.Errorf("%w: %v", ErrInvalidIntent, err) }
 
-func (c *Command) validateSecretRefs(ctx context.Context, projectID string, refs map[string]store.SecretRef) (map[string]store.SecretRef, error) {
+func (c *Command) validateSecretRefs(
+	ctx context.Context,
+	projectID string,
+	refs map[string]store.SecretRef,
+) (map[string]store.SecretRef, error) {
 	out := make(map[string]store.SecretRef, len(refs))
 	for varName, ref := range refs {
 		if varName == "" {
@@ -252,7 +262,11 @@ func prepare(active *store.Deployment, in Intent, generation int64) (store.Deplo
 		return store.Deployment{}, err
 	}
 	if len(in.SecretRefs) > 0 && auto != nil && auto.Enabled {
-		return store.Deployment{}, invalid(errors.New("secret_refs cannot be combined with enabled auto_standby: secret executions forbid memory snapshots (ADR-0024)"))
+		return store.Deployment{}, invalid(
+			errors.New(
+				"secret_refs cannot be combined with enabled auto_standby: secret executions forbid memory snapshots (ADR-0024)",
+			),
+		)
 	}
 	egress, err := resolveEgress(in.Egress, active.EgressPolicy)
 	if err != nil {
@@ -263,10 +277,12 @@ func prepare(active *store.Deployment, in Intent, generation int64) (store.Deplo
 		return store.Deployment{}, invalid(err)
 	}
 
-	return store.Deployment{Generation: generation, ImageRef: in.Image, VCPU: in.VCPU, MemMIB: in.MemMIB,
+	return store.Deployment{
+		Generation: generation, ImageRef: in.Image, VCPU: in.VCPU, MemMIB: in.MemMIB,
 		Port: port, Services: services, Strategy: strategy, Env: in.Env, SecretRefs: in.SecretRefs,
 		Placement: placement, HealthCheck: healthCheck, AutoStandby: autoJSON,
-		RequiredFeatures: requiredFeatures(in.SecretRefs), EgressPolicy: egressJSON}, nil
+		RequiredFeatures: requiredFeatures(in.SecretRefs), EgressPolicy: egressJSON,
+	}, nil
 }
 
 func resolveServices(services []Service, port int) ([]store.ServiceSpec, int, error) {
@@ -331,9 +347,11 @@ func marshalHealthCheck(check *HealthCheck) (json.RawMessage, error) {
 	default:
 		return nil, errors.New("health_check.type must be http or tcp")
 	}
-	raw, err := protojson.Marshal(&pb.HealthCheckSpec{Type: typ, Target: check.Target,
+	raw, err := protojson.Marshal(&pb.HealthCheckSpec{
+		Type: typ, Target: check.Target,
 		IntervalSeconds: check.IntervalSeconds, TimeoutSeconds: check.TimeoutSeconds,
-		UnhealthyThreshold: check.UnhealthyThreshold})
+		UnhealthyThreshold: check.UnhealthyThreshold,
+	})
 	return json.RawMessage(raw), err
 }
 
@@ -358,7 +376,13 @@ func marshalAutoStandby(policy *AutoStandby) (json.RawMessage, error) {
 			return nil, fmt.Errorf("auto_standby.ignore_destination_ports entry %d out of range", p)
 		}
 	}
-	raw, err := protojson.Marshal(&pb.AutoStandbyPolicy{Enabled: true, IdleTimeoutSeconds: policy.IdleTimeoutSeconds, IgnoreDestinationPorts: policy.IgnoreDestinationPorts})
+	raw, err := protojson.Marshal(
+		&pb.AutoStandbyPolicy{
+			Enabled:                true,
+			IdleTimeoutSeconds:     policy.IdleTimeoutSeconds,
+			IgnoreDestinationPorts: policy.IgnoreDestinationPorts,
+		},
+	)
 	return json.RawMessage(raw), err
 }
 
@@ -380,7 +404,13 @@ func resolveAutoStandby(policy *AutoStandby, raw json.RawMessage, strict bool) (
 		}
 		return nil, nil, nil
 	}
-	return append(json.RawMessage(nil), raw...), &AutoStandby{Enabled: inherited.GetEnabled(), IdleTimeoutSeconds: inherited.GetIdleTimeoutSeconds(), IgnoreDestinationPorts: append([]uint32(nil), inherited.GetIgnoreDestinationPorts()...)}, nil
+	return append(
+			json.RawMessage(nil),
+			raw...), &AutoStandby{
+			Enabled:                inherited.GetEnabled(),
+			IdleTimeoutSeconds:     inherited.GetIdleTimeoutSeconds(),
+			IgnoreDestinationPorts: append([]uint32(nil), inherited.GetIgnoreDestinationPorts()...),
+		}, nil
 }
 
 func resolveEgress(policy *EgressPolicy, raw json.RawMessage) (*EgressPolicy, error) {
@@ -394,7 +424,14 @@ func resolveEgress(policy *EgressPolicy, raw json.RawMessage) (*EgressPolicy, er
 	if err := agentv1.ValidateEgressPolicy(&inherited); err != nil {
 		return nil, fmt.Errorf("%w: active deployment has invalid egress policy", ErrInvalidActiveDeployment)
 	}
-	return &EgressPolicy{Mode: strings.ToLower(strings.TrimPrefix(inherited.GetMode().String(), "MODE_")), AllowedCIDRs: append([]string(nil), inherited.GetAllowedCidrs()...), DeniedCIDRs: append([]string(nil), inherited.GetDeniedCidrs()...), AllowedDomains: append([]string(nil), inherited.GetAllowedDomains()...), MaxTCPConnections: inherited.GetMaxTcpConnections(), AuditAll: inherited.GetAuditAll()}, nil
+	return &EgressPolicy{
+		Mode:              strings.ToLower(strings.TrimPrefix(inherited.GetMode().String(), "MODE_")),
+		AllowedCIDRs:      append([]string(nil), inherited.GetAllowedCidrs()...),
+		DeniedCIDRs:       append([]string(nil), inherited.GetDeniedCidrs()...),
+		AllowedDomains:    append([]string(nil), inherited.GetAllowedDomains()...),
+		MaxTCPConnections: inherited.GetMaxTcpConnections(),
+		AuditAll:          inherited.GetAuditAll(),
+	}, nil
 }
 
 func marshalEgress(policy *EgressPolicy, generation int64) (json.RawMessage, error) {
@@ -423,7 +460,15 @@ func marshalEgress(policy *EgressPolicy, generation int64) (json.RawMessage, err
 		}
 		domains = append(domains, normalized)
 	}
-	spec := &pb.EgressPolicySpec{Mode: mode, AllowedCidrs: policy.AllowedCIDRs, DeniedCidrs: policy.DeniedCIDRs, AllowedDomains: domains, MaxTcpConnections: policy.MaxTCPConnections, PolicyGeneration: uint64(generation), AuditAll: policy.AuditAll}
+	spec := &pb.EgressPolicySpec{
+		Mode:              mode,
+		AllowedCidrs:      policy.AllowedCIDRs,
+		DeniedCidrs:       policy.DeniedCIDRs,
+		AllowedDomains:    domains,
+		MaxTcpConnections: policy.MaxTCPConnections,
+		PolicyGeneration:  uint64(generation),
+		AuditAll:          policy.AuditAll,
+	}
 	if err := agentv1.ValidateEgressPolicy(spec); err != nil {
 		return nil, err
 	}

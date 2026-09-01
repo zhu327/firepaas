@@ -28,12 +28,22 @@ func TestMutationErrorMappingPreservesFamilyCodes(t *testing.T) {
 		{"snapshot unsupported", mapSnapshotError, machine.ErrSnapshotUnsupported, codes.Unimplemented},
 		{"snapshot stale", mapSnapshotError, state.ErrStaleGeneration, codes.FailedPrecondition},
 		{"snapshot conflict", mapSnapshotError, mutation.ErrConflict, codes.AlreadyExists},
-		{"snapshot status preserved", mapSnapshotError, status.Error(codes.PermissionDenied, "denied"), codes.PermissionDenied},
+		{
+			"snapshot status preserved",
+			mapSnapshotError,
+			status.Error(codes.PermissionDenied, "denied"),
+			codes.PermissionDenied,
+		},
 		{"volume machine missing", mapVolumeMutationError, machine.ErrMachineNotFound, codes.NotFound},
 		{"volume stale execution", mapVolumeMutationError, machine.ErrStaleExecution, codes.FailedPrecondition},
 		{"volume stale generation", mapVolumeMutationError, state.ErrStaleGeneration, codes.FailedPrecondition},
 		{"volume conflict", mapVolumeMutationError, mutation.ErrConflict, codes.AlreadyExists},
-		{"volume status preserved", mapVolumeMutationError, status.Error(codes.ResourceExhausted, "full"), codes.ResourceExhausted},
+		{
+			"volume status preserved",
+			mapVolumeMutationError,
+			status.Error(codes.ResourceExhausted, "full"),
+			codes.ResourceExhausted,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -42,7 +52,8 @@ func TestMutationErrorMappingPreservesFamilyCodes(t *testing.T) {
 			}
 		})
 	}
-	if status.Code(mapSnapshotError(errors.New("raw"))) != codes.Internal || status.Code(mapVolumeMutationError(errors.New("raw"))) != codes.Internal {
+	if status.Code(mapSnapshotError(errors.New("raw"))) != codes.Internal ||
+		status.Code(mapVolumeMutationError(errors.New("raw"))) != codes.Internal {
 		t.Fatal("unknown raw errors must map to Internal")
 	}
 }

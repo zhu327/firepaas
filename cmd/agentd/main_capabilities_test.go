@@ -19,7 +19,10 @@ func TestAgentFeatureIDsSecretCapabilityFollowsSafeMode(t *testing.T) {
 	}
 
 	t.Setenv("FIREPAAS_AGENT_FEATURE_IDS", "")
-	if got := agentFeatureIDs(machine.SecretInjectionOneShot, nil); !slices.Contains(got, capabilities.SecretOneShotV1) {
+	if got := agentFeatureIDs(machine.SecretInjectionOneShot, nil); !slices.Contains(
+		got,
+		capabilities.SecretOneShotV1,
+	) {
 		t.Fatalf("safe one-shot mode must advertise %s: %v", capabilities.SecretOneShotV1, got)
 	}
 }
@@ -47,7 +50,8 @@ func TestAgentFeatureIDsVolumeRequiresAssembly(t *testing.T) {
 	if slices.Contains(got, capabilities.VolumeDatasetOverlayV1) {
 		t.Fatal("dataset overlay capability must not be advertised until CoW passes acceptance")
 	}
-	if !slices.Contains(got, capabilities.SnapshotMemoryV1) || !slices.Contains(got, capabilities.SnapshotFilesystemV1) {
+	if !slices.Contains(got, capabilities.SnapshotMemoryV1) ||
+		!slices.Contains(got, capabilities.SnapshotFilesystemV1) {
 		t.Fatal("agent must advertise hypeman snapshot capabilities")
 	}
 }
@@ -62,7 +66,10 @@ func TestAgentFeatureIDsEgressRequiresAssembly(t *testing.T) {
 	}
 	// 装配后可报告，且仍受环境变量减法约束。
 	t.Setenv("FIREPAAS_AGENT_FEATURE_IDS", capabilities.EgressCidrV1)
-	got := agentFeatureIDs(machine.SecretInjectionOneShot, []string{capabilities.EgressCidrV1, capabilities.EgressDomainV1})
+	got := agentFeatureIDs(
+		machine.SecretInjectionOneShot,
+		[]string{capabilities.EgressCidrV1, capabilities.EgressDomainV1},
+	)
 	if !slices.Contains(got, capabilities.EgressCidrV1) || slices.Contains(got, capabilities.EgressDomainV1) {
 		t.Fatalf("egress capabilities mismatch: %v", got)
 	}

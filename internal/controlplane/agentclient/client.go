@@ -31,7 +31,13 @@ type Client struct {
 // 明文连接，避免环境遗漏时静默降级为无认证 RPC。
 func Dial(addr string) (*Client, error) {
 	var opts []grpc.DialOption
-	certFile, keyFile, caFile := os.Getenv("FIREPAAS_AGENT_TLS_CERT"), os.Getenv("FIREPAAS_AGENT_TLS_KEY"), os.Getenv("FIREPAAS_AGENT_TLS_CA")
+	certFile, keyFile, caFile := os.Getenv(
+		"FIREPAAS_AGENT_TLS_CERT",
+	), os.Getenv(
+		"FIREPAAS_AGENT_TLS_KEY",
+	), os.Getenv(
+		"FIREPAAS_AGENT_TLS_CA",
+	)
 	if certFile != "" && keyFile != "" && caFile != "" {
 		tlsConf, err := mtls.ClientConfig(certFile, keyFile, caFile, "agentd")
 		if err != nil {
@@ -119,6 +125,7 @@ func (c *Client) DeleteImage(ctx context.Context, imageRef string) error {
 func (c *Client) QuarantineImage(ctx context.Context, req *pb.QuarantineImageRequest) (*pb.ImageQuarantine, error) {
 	return c.Images.QuarantineImage(ctx, req)
 }
+
 func (c *Client) ListImageQuarantines(ctx context.Context) ([]*pb.ImageQuarantine, error) {
 	resp, err := c.Images.ListImageQuarantines(ctx, &pb.ListImageQuarantinesRequest{})
 	if err != nil {
@@ -126,17 +133,24 @@ func (c *Client) ListImageQuarantines(ctx context.Context) ([]*pb.ImageQuarantin
 	}
 	return resp.GetQuarantines(), nil
 }
+
 func (c *Client) RollbackImageQuarantine(ctx context.Context, req *pb.ImageQuarantineActionRequest) error {
 	_, err := c.Images.RollbackImageQuarantine(ctx, req)
 	return err
 }
+
 func (c *Client) FinalizeImageQuarantine(ctx context.Context, req *pb.ImageQuarantineActionRequest) error {
 	_, err := c.Images.FinalizeImageQuarantine(ctx, req)
 	return err
 }
 
 // Pause 调用 PauseMachine（M4.5 scale-to-zero）。
-func (c *Client) Pause(ctx context.Context, machineID, executionID string, generation uint64, opID string) (*pb.Machine, error) {
+func (c *Client) Pause(
+	ctx context.Context,
+	machineID, executionID string,
+	generation uint64,
+	opID string,
+) (*pb.Machine, error) {
 	return c.Machines.PauseMachine(ctx, &pb.PauseMachineRequest{Operation: &pb.MachineOperationRequest{
 		MachineId: machineID, ExecutionId: executionID, Generation: generation,
 		OperationId: opID, ExpectedState: pb.MachineState_RUNNING,
@@ -144,7 +158,12 @@ func (c *Client) Pause(ctx context.Context, machineID, executionID string, gener
 }
 
 // Resume 调用 ResumeMachine。
-func (c *Client) Resume(ctx context.Context, machineID, executionID string, generation uint64, opID string) (*pb.Machine, error) {
+func (c *Client) Resume(
+	ctx context.Context,
+	machineID, executionID string,
+	generation uint64,
+	opID string,
+) (*pb.Machine, error) {
 	return c.Machines.ResumeMachine(ctx, &pb.ResumeMachineRequest{Operation: &pb.MachineOperationRequest{
 		MachineId: machineID, ExecutionId: executionID, Generation: generation,
 		OperationId: opID, ExpectedState: pb.MachineState_PAUSED,
@@ -178,20 +197,33 @@ func (s *SnapshotClient) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnaps
 
 // ListSnapshots 调用 agent 列出本地快照。返回完整响应以暴露 v1.4-B
 // inventory 观测元数据（complete/generation/observed_at）。
-func (s *SnapshotClient) ListSnapshots(ctx context.Context, machineID, snapshotID string) (*pb.ListSnapshotsResponse, error) {
+func (s *SnapshotClient) ListSnapshots(
+	ctx context.Context,
+	machineID, snapshotID string,
+) (*pb.ListSnapshotsResponse, error) {
 	return s.client.ListSnapshots(ctx, &pb.ListSnapshotsRequest{MachineId: machineID, SnapshotId: snapshotID})
 }
 
 // ForkSnapshot 调用 agent fork 快照（v1.3-C）。
-func (s *SnapshotClient) ForkSnapshot(ctx context.Context, req *pb.ForkSnapshotRequest) (*pb.ForkSnapshotResponse, error) {
+func (s *SnapshotClient) ForkSnapshot(
+	ctx context.Context,
+	req *pb.ForkSnapshotRequest,
+) (*pb.ForkSnapshotResponse, error) {
 	return s.client.ForkSnapshot(ctx, req)
 }
 
 // RestoreSnapshot 调用 agent restore 快照（v1.3-C rescue）。
-func (s *SnapshotClient) RestoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotRequest) (*pb.RestoreSnapshotResponse, error) {
+func (s *SnapshotClient) RestoreSnapshot(
+	ctx context.Context,
+	req *pb.RestoreSnapshotRequest,
+) (*pb.RestoreSnapshotResponse, error) {
 	return s.client.RestoreSnapshot(ctx, req)
 }
-func (s *SnapshotClient) ScrubSnapshot(ctx context.Context, req *pb.ScrubSnapshotRequest) (*pb.ScrubSnapshotResponse, error) {
+
+func (s *SnapshotClient) ScrubSnapshot(
+	ctx context.Context,
+	req *pb.ScrubSnapshotRequest,
+) (*pb.ScrubSnapshotResponse, error) {
 	return s.client.ScrubSnapshot(ctx, req)
 }
 
@@ -206,12 +238,18 @@ func NewVolumeClient(conn *grpc.ClientConn) *VolumeClient {
 }
 
 // CreateVolume 创建本地空卷。
-func (v *VolumeClient) CreateVolume(ctx context.Context, req *pb.CreateVolumeRequest) (*pb.CreateVolumeResponse, error) {
+func (v *VolumeClient) CreateVolume(
+	ctx context.Context,
+	req *pb.CreateVolumeRequest,
+) (*pb.CreateVolumeResponse, error) {
 	return v.client.CreateVolume(ctx, req)
 }
 
 // ImportDataset asks the agent to fetch an archive directly from object storage.
-func (v *VolumeClient) ImportDataset(ctx context.Context, req *pb.ImportDatasetRequest) (*pb.CreateVolumeResponse, error) {
+func (v *VolumeClient) ImportDataset(
+	ctx context.Context,
+	req *pb.ImportDatasetRequest,
+) (*pb.CreateVolumeResponse, error) {
 	return v.client.ImportDataset(ctx, req)
 }
 
@@ -226,9 +264,14 @@ func (v *VolumeClient) DeleteVolume(ctx context.Context, req *pb.DeleteVolumeReq
 	_, err := v.client.DeleteVolume(ctx, req)
 	return err
 }
-func (v *VolumeClient) QuarantineVolume(ctx context.Context, req *pb.QuarantineVolumeRequest) (*pb.VolumeQuarantine, error) {
+
+func (v *VolumeClient) QuarantineVolume(
+	ctx context.Context,
+	req *pb.QuarantineVolumeRequest,
+) (*pb.VolumeQuarantine, error) {
 	return v.client.QuarantineVolume(ctx, req)
 }
+
 func (v *VolumeClient) ListVolumeQuarantines(ctx context.Context) ([]*pb.VolumeQuarantine, error) {
 	r, e := v.client.ListVolumeQuarantines(ctx, &pb.ListVolumeQuarantinesRequest{})
 	if e != nil {
@@ -236,10 +279,12 @@ func (v *VolumeClient) ListVolumeQuarantines(ctx context.Context) ([]*pb.VolumeQ
 	}
 	return r.GetQuarantines(), nil
 }
+
 func (v *VolumeClient) RollbackVolumeQuarantine(ctx context.Context, req *pb.VolumeQuarantineActionRequest) error {
 	_, e := v.client.RollbackVolumeQuarantine(ctx, req)
 	return e
 }
+
 func (v *VolumeClient) FinalizeVolumeQuarantine(ctx context.Context, req *pb.VolumeQuarantineActionRequest) error {
 	_, e := v.client.FinalizeVolumeQuarantine(ctx, req)
 	return e

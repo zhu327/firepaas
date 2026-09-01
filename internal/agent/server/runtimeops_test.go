@@ -10,12 +10,12 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kernel/hypeman/lib/hypervisor"
+	"github.com/kernel/hypeman/lib/instances"
 	"github.com/zhu327/firepaas/internal/agent/info"
 	"github.com/zhu327/firepaas/internal/agent/machine"
 	"github.com/zhu327/firepaas/internal/agent/state"
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
-	"github.com/kernel/hypeman/lib/hypervisor"
-	"github.com/kernel/hypeman/lib/instances"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -27,12 +27,20 @@ type logsFakeInstances struct {
 	lines  []string
 }
 
-func (f *logsFakeInstances) CreateInstance(context.Context, instances.CreateInstanceRequest) (*instances.Instance, error) {
+func (f *logsFakeInstances) CreateInstance(
+	context.Context,
+	instances.CreateInstanceRequest,
+) (*instances.Instance, error) {
 	return nil, errors.New("not implemented")
 }
-func (f *logsFakeInstances) ListInstances(context.Context, *instances.ListInstancesFilter) ([]instances.Instance, error) {
+
+func (f *logsFakeInstances) ListInstances(
+	context.Context,
+	*instances.ListInstancesFilter,
+) ([]instances.Instance, error) {
 	return f.listed, nil
 }
+
 func (f *logsFakeInstances) GetInstance(_ context.Context, idOrName string) (*instances.Instance, error) {
 	for i := range f.listed {
 		if f.listed[i].Id == idOrName || f.listed[i].Name == idOrName {
@@ -43,13 +51,26 @@ func (f *logsFakeInstances) GetInstance(_ context.Context, idOrName string) (*in
 	return nil, instances.ErrNotFound
 }
 func (f *logsFakeInstances) DeleteInstance(context.Context, string) error { return nil }
-func (f *logsFakeInstances) StandbyInstance(context.Context, string, instances.StandbyInstanceRequest) (*instances.Instance, error) {
+
+func (f *logsFakeInstances) StandbyInstance(
+	context.Context,
+	string,
+	instances.StandbyInstanceRequest,
+) (*instances.Instance, error) {
 	return nil, nil
 }
+
 func (f *logsFakeInstances) RestoreInstance(context.Context, string) (*instances.Instance, error) {
 	return nil, nil
 }
-func (f *logsFakeInstances) StreamInstanceLogs(context.Context, string, int, bool, instances.LogSource) (<-chan string, error) {
+
+func (f *logsFakeInstances) StreamInstanceLogs(
+	context.Context,
+	string,
+	int,
+	bool,
+	instances.LogSource,
+) (<-chan string, error) {
 	ch := make(chan string, len(f.lines))
 	for _, l := range f.lines {
 		ch <- l
@@ -57,6 +78,7 @@ func (f *logsFakeInstances) StreamInstanceLogs(context.Context, string, int, boo
 	close(ch)
 	return ch, nil
 }
+
 func (f *logsFakeInstances) GetVsockDialer(context.Context, string) (hypervisor.VsockDialer, error) {
 	return nil, errors.New("no vsock")
 }
@@ -185,9 +207,12 @@ func (s *execFakeStream) RecvMsg(any) error            { return nil }
 
 func TestExecRequiresOperationID(t *testing.T) {
 	s := runtimeServer(t)
-	stream := &execFakeStream{ctx: context.Background(), frames: []*pb.ExecInput{{Frame: &pb.ExecInput_Open{Open: &pb.ExecOpen{
-		MachineId: "m1", ExecutionId: "exec-1", Command: []string{"true"},
-	}}}}}
+	stream := &execFakeStream{
+		ctx: context.Background(),
+		frames: []*pb.ExecInput{{Frame: &pb.ExecInput_Open{Open: &pb.ExecOpen{
+			MachineId: "m1", ExecutionId: "exec-1", Command: []string{"true"},
+		}}}},
+	}
 	if err := s.Exec(stream); status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("want InvalidArgument for missing operation_id, got %v", err)
 	}
@@ -200,7 +225,10 @@ func TestExecRejectsReusedOperationIDBeforeDial(t *testing.T) {
 	if err := s.ledger.Put(open.OperationId, open.MachineId, hashRequest(open), raw); err != nil {
 		t.Fatal(err)
 	}
-	stream := &execFakeStream{ctx: context.Background(), frames: []*pb.ExecInput{{Frame: &pb.ExecInput_Open{Open: open}}}}
+	stream := &execFakeStream{
+		ctx:    context.Background(),
+		frames: []*pb.ExecInput{{Frame: &pb.ExecInput_Open{Open: open}}},
+	}
 	if err := s.Exec(stream); status.Code(err) != codes.AlreadyExists {
 		t.Fatalf("want AlreadyExists for reused operation_id, got %v", err)
 	}
@@ -208,8 +236,10 @@ func TestExecRejectsReusedOperationIDBeforeDial(t *testing.T) {
 
 func TestExecRequiresOpenFirstFrame(t *testing.T) {
 	s := runtimeServer(t)
-	stream := &execFakeStream{ctx: context.Background(),
-		frames: []*pb.ExecInput{{Frame: &pb.ExecInput_Stdin{Stdin: []byte("x")}}}}
+	stream := &execFakeStream{
+		ctx:    context.Background(),
+		frames: []*pb.ExecInput{{Frame: &pb.ExecInput_Stdin{Stdin: []byte("x")}}},
+	}
 	err := s.Exec(stream)
 	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("want InvalidArgument, got %v", err)
@@ -242,10 +272,12 @@ func (s *copyToFakeStream) RecvMsg(any) error                          { return 
 
 func TestCopyToRejectsPathTraversal(t *testing.T) {
 	s := runtimeServer(t)
-	stream := &copyToFakeStream{ctx: context.Background(),
+	stream := &copyToFakeStream{
+		ctx: context.Background(),
 		frames: []*pb.CopyToInput{{Frame: &pb.CopyToInput_Open{Open: &pb.CopyToOpen{
 			MachineId: "m1", ExecutionId: "exec-1", Generation: 1, OperationId: "op-copy-path", Path: "/etc/../../etc/passwd",
-		}}}}}
+		}}}},
+	}
 	err := s.CopyTo(stream)
 	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("want InvalidArgument for traversal, got %v", err)
@@ -254,9 +286,12 @@ func TestCopyToRejectsPathTraversal(t *testing.T) {
 
 func TestCopyToRequiresMutationFence(t *testing.T) {
 	s := runtimeServer(t)
-	stream := &copyToFakeStream{ctx: context.Background(), frames: []*pb.CopyToInput{{Frame: &pb.CopyToInput_Open{Open: &pb.CopyToOpen{
-		MachineId: "m1", ExecutionId: "exec-1", Path: "/tmp/file",
-	}}}}}
+	stream := &copyToFakeStream{
+		ctx: context.Background(),
+		frames: []*pb.CopyToInput{{Frame: &pb.CopyToInput_Open{Open: &pb.CopyToOpen{
+			MachineId: "m1", ExecutionId: "exec-1", Path: "/tmp/file",
+		}}}},
+	}
 	if err := s.CopyTo(stream); status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("want InvalidArgument for missing generation/operation_id, got %v", err)
 	}
@@ -268,7 +303,17 @@ func TestCopyToRejectsStaleGenerationBeforeGuestWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	stream := &copyToFakeStream{ctx: context.Background(), frames: []*pb.CopyToInput{
-		{Frame: &pb.CopyToInput_Open{Open: &pb.CopyToOpen{MachineId: "m1", ExecutionId: "exec-1", Generation: 1, OperationId: "op-stale", Path: "/tmp/file"}}},
+		{
+			Frame: &pb.CopyToInput_Open{
+				Open: &pb.CopyToOpen{
+					MachineId:   "m1",
+					ExecutionId: "exec-1",
+					Generation:  1,
+					OperationId: "op-stale",
+					Path:        "/tmp/file",
+				},
+			},
+		},
 		{Frame: &pb.CopyToInput_Data{Data: []byte("content")}},
 	}}
 	if err := s.CopyTo(stream); status.Code(err) != codes.FailedPrecondition {
@@ -278,7 +323,13 @@ func TestCopyToRejectsStaleGenerationBeforeGuestWrite(t *testing.T) {
 
 func TestCopyToRejectsRequestHashConflict(t *testing.T) {
 	s := runtimeServer(t)
-	open := &pb.CopyToOpen{MachineId: "m1", ExecutionId: "exec-1", Generation: 1, OperationId: "op-copy", Path: "/tmp/file"}
+	open := &pb.CopyToOpen{
+		MachineId:   "m1",
+		ExecutionId: "exec-1",
+		Generation:  1,
+		OperationId: "op-copy",
+		Path:        "/tmp/file",
+	}
 	digest := sha256.New()
 	_, _ = digest.Write([]byte(hashRequest(open)))
 	_, _ = digest.Write([]byte("old"))

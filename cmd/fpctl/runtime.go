@@ -22,7 +22,7 @@ import (
 // runRuntime 分发 fpctl logs / exec / cp。
 func runRuntime(args []string) error {
 	if len(args) < 1 {
-		return errors.New("usage: fpctl logs|exec|cp ...")
+		return errors.New("usage: fpctl logs|exec|cp")
 	}
 	switch args[0] {
 	case "logs":
@@ -59,7 +59,7 @@ type execOutputEvent struct {
 func runExec(args []string) error {
 	// 分离 flags 与命令：fpctl exec <machine> [flags] -- cmd [args...]
 	var machineID string
-	flags := []string{}
+	var flags []string
 	cmd := []string{}
 	sep := -1
 	for i, a := range args {
@@ -77,7 +77,9 @@ func runExec(args []string) error {
 		flags = args[1:]
 	}
 	if machineID == "" || len(cmd) == 0 {
-		return errors.New("usage: fpctl exec <machine_id> [--cwd DIR] [--env K=V] [--tty] [--rows N --cols N] -- cmd [args...]")
+		return errors.New(
+			"usage: fpctl exec <machine_id> [--cwd DIR] [--env K=V] [--tty] [--rows N --cols N] -- cmd [args...]",
+		)
 	}
 	fs := flag.NewFlagSet("exec", flag.ExitOnError)
 	cwd := fs.String("cwd", "", "working directory")
@@ -104,8 +106,10 @@ func runExec(args []string) error {
 			stdinB64 = base64.StdEncoding.EncodeToString(raw)
 		}
 	}
-	body := map[string]any{"operation_id": newOperationID(), "command": cmd, "cwd": *cwd, "env": env,
-		"tty": *tty, "rows": *rows, "cols": *cols, "stdin": stdinB64}
+	body := map[string]any{
+		"operation_id": newOperationID(), "command": cmd, "cwd": *cwd, "env": env,
+		"tty": *tty, "rows": *rows, "cols": *cols, "stdin": stdinB64,
+	}
 	rawBody, err := json.Marshal(body)
 	if err != nil {
 		return err
@@ -115,7 +119,7 @@ func runExec(args []string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("POST exec: %s (%s)", resp.Status, strings.TrimSpace(string(raw)))
@@ -156,7 +160,9 @@ func (e exitError) Error() string { return fmt.Sprintf("exit status %d", e.code)
 
 func runCP(args []string) error {
 	if len(args) < 4 {
-		return errors.New("usage: fpctl cp <machine_id> up <local_file> <guest_path> [operation_id] | fpctl cp <machine_id> down <guest_path> <local_file>")
+		return errors.New(
+			"usage: fpctl cp <machine_id> up <local_file> <guest_path> [operation_id] | fpctl cp <machine_id> down <guest_path> <local_file>",
+		)
 	}
 	machineID := args[0]
 	switch args[1] {
@@ -169,16 +175,21 @@ func runCP(args []string) error {
 		if err != nil {
 			return err
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		operationID := newOperationID()
 		if len(args) == 5 {
 			operationID = args[4]
 		}
-		resp, err := rawRequest("PUT", "/v1/machines/"+machineID+"/files?path="+urlQuery(remote)+"&operation_id="+urlQuery(operationID), f, "application/octet-stream")
+		resp, err := rawRequest(
+			"PUT",
+			"/v1/machines/"+machineID+"/files?path="+urlQuery(remote)+"&operation_id="+urlQuery(operationID),
+			f,
+			"application/octet-stream",
+		)
 		if err != nil {
 			return err
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		raw, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode >= 300 {
 			return fmt.Errorf("PUT files: %s (%s)", resp.Status, strings.TrimSpace(string(raw)))
@@ -194,7 +205,7 @@ func runCP(args []string) error {
 		if err != nil {
 			return err
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode >= 300 {
 			raw, _ := io.ReadAll(resp.Body)
 			return fmt.Errorf("GET files: %s (%s)", resp.Status, strings.TrimSpace(string(raw)))
@@ -236,7 +247,7 @@ func doRawStream(method, path string, body io.Reader, w io.Writer, headers map[s
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("%s %s: %s (%s)", method, path, resp.Status, strings.TrimSpace(string(raw)))
@@ -255,7 +266,7 @@ func downloadAtomically(resp *http.Response, local string) error {
 		return err
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
+	defer func() { _ = os.Remove(tmpName) }()
 	n, copyErr := io.Copy(tmp, io.LimitReader(resp.Body, runtimeMaxDownload+1))
 	closeErr := tmp.Close()
 	if copyErr != nil {

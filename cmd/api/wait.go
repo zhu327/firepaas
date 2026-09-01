@@ -72,33 +72,43 @@ func (a *API) waitMachine(w http.ResponseWriter, r *http.Request) {
 		}
 		switch {
 		case m.DesiredState == "DELETED":
-			writeJSON(w, 200, map[string]any{"outcome": "terminal", "status": "terminal",
+			writeJSON(w, 200, map[string]any{
+				"outcome": "terminal", "status": "terminal",
 				"terminal_reason": "deleted", "execution_id": m.CurrentExecutionID,
-				"generation": m.Generation})
+				"generation": m.Generation,
+			})
 			return
 		case m.RestartBlocked:
-			writeJSON(w, 200, map[string]any{"outcome": "terminal", "status": "terminal",
+			writeJSON(w, 200, map[string]any{
+				"outcome": "terminal", "status": "terminal",
 				"terminal_reason": "restart_blocked", "execution_id": m.CurrentExecutionID,
-				"generation": m.Generation})
+				"generation": m.Generation,
+			})
 			return
 		case m.ObservedState == "STOPPED" && m.RestartMode == "NEVER":
-			writeJSON(w, 200, map[string]any{"outcome": "terminal", "status": "terminal",
+			writeJSON(w, 200, map[string]any{
+				"outcome": "terminal", "status": "terminal",
 				"terminal_reason": "stopped", "execution_id": m.CurrentExecutionID,
-				"generation": m.Generation})
+				"generation": m.Generation,
+			})
 			return
 		case machineReady(m):
 			// 目标语义是“execution X ready”（ADR-0026 §10）：RUNNING 但未
 			// READY 的 machine 不能提前返回 reached；UNCONFIGURED 等价
 			// READY（与 route 发布判定对齐，ADR-0008）。
-			writeJSON(w, 200, map[string]any{"outcome": "reached", "status": "reached",
+			writeJSON(w, 200, map[string]any{
+				"outcome": "reached", "status": "reached",
 				"execution_id": m.CurrentExecutionID, "generation": m.Generation,
-				"observed_state": m.ObservedState, "readiness": m.ObservedReadiness})
+				"observed_state": m.ObservedState, "readiness": m.ObservedReadiness,
+			})
 			return
 		}
 		if time.Now().After(deadline) {
-			writeJSON(w, 200, map[string]any{"outcome": "timed_out", "status": "timed_out",
+			writeJSON(w, 200, map[string]any{
+				"outcome": "timed_out", "status": "timed_out",
 				"execution_id": m.CurrentExecutionID, "generation": m.Generation,
-				"observed_state": m.ObservedState})
+				"observed_state": m.ObservedState,
+			})
 			return
 		}
 		select {
@@ -140,14 +150,18 @@ func (a *API) waitOperation(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if operationTerminal(op.Status) {
-			writeJSON(w, 200, map[string]any{"outcome": "terminal", "status": "terminal",
+			writeJSON(w, 200, map[string]any{
+				"outcome": "terminal", "status": "terminal",
 				"operation_status": op.Status, "error": redact.RedactText(op.Error),
-				"machine_id": op.MachineID, "execution_id": op.ExecutionID})
+				"machine_id": op.MachineID, "execution_id": op.ExecutionID,
+			})
 			return
 		}
 		if time.Now().After(deadline) {
-			writeJSON(w, 200, map[string]any{"outcome": "timed_out", "status": "timed_out",
-				"operation_status": op.Status, "machine_id": op.MachineID})
+			writeJSON(w, 200, map[string]any{
+				"outcome": "timed_out", "status": "timed_out",
+				"operation_status": op.Status, "machine_id": op.MachineID,
+			})
 			return
 		}
 		select {
@@ -194,19 +208,25 @@ func (a *API) waitRollout(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if rl.ToGeneration != wantGen {
-			writeJSON(w, 200, map[string]any{"outcome": "superseded", "status": "superseded",
-				"to_generation": rl.ToGeneration, "rollout_status": rl.Status})
+			writeJSON(w, 200, map[string]any{
+				"outcome": "superseded", "status": "superseded",
+				"to_generation": rl.ToGeneration, "rollout_status": rl.Status,
+			})
 			return
 		}
 		if rolloutTerminal(rl.Status) {
-			writeJSON(w, 200, map[string]any{"outcome": "terminal", "status": "terminal",
+			writeJSON(w, 200, map[string]any{
+				"outcome": "terminal", "status": "terminal",
 				"rollout_status": rl.Status, "failed": rl.Failed,
-				"to_generation": rl.ToGeneration})
+				"to_generation": rl.ToGeneration,
+			})
 			return
 		}
 		if time.Now().After(deadline) {
-			writeJSON(w, 200, map[string]any{"outcome": "timed_out", "status": "timed_out",
-				"rollout_status": rl.Status, "to_generation": rl.ToGeneration})
+			writeJSON(w, 200, map[string]any{
+				"outcome": "timed_out", "status": "timed_out",
+				"rollout_status": rl.Status, "to_generation": rl.ToGeneration,
+			})
 			return
 		}
 		select {

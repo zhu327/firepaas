@@ -148,7 +148,10 @@ func (l *Ledger) Put(operationID, machineID, requestHash string, result json.Raw
 			return nil
 		}
 		old := rec
-		rec.Status, rec.Result, rec.UpdatedAt = StatusCompleted, append(json.RawMessage(nil), result...), time.Now().UTC()
+		rec.Status, rec.Result, rec.UpdatedAt = StatusCompleted, append(
+			json.RawMessage(nil),
+			result...), time.Now().
+			UTC()
 		l.records[operationID] = rec
 		if err := l.persistLocked(); err != nil {
 			l.records[operationID] = old
@@ -157,8 +160,10 @@ func (l *Ledger) Put(operationID, machineID, requestHash string, result json.Raw
 		return nil
 	}
 	now := time.Now().UTC()
-	l.records[operationID] = Record{OperationID: operationID, MachineID: machineID,
-		RequestHash: requestHash, Status: StatusCompleted, Result: result, CreatedAt: now, UpdatedAt: now}
+	l.records[operationID] = Record{
+		OperationID: operationID, MachineID: machineID,
+		RequestHash: requestHash, Status: StatusCompleted, Result: result, CreatedAt: now, UpdatedAt: now,
+	}
 	if err := l.persistLocked(); err != nil {
 		delete(l.records, operationID)
 		return err
@@ -178,8 +183,10 @@ func (l *Ledger) Claim(operationID, machineID, requestHash string, result json.R
 		return false, nil
 	}
 	now := time.Now().UTC()
-	l.records[operationID] = Record{OperationID: operationID, MachineID: machineID,
-		RequestHash: requestHash, Status: StatusCompleted, Result: result, CreatedAt: now, UpdatedAt: now}
+	l.records[operationID] = Record{
+		OperationID: operationID, MachineID: machineID,
+		RequestHash: requestHash, Status: StatusCompleted, Result: result, CreatedAt: now, UpdatedAt: now,
+	}
 	if err := l.persistLocked(); err != nil {
 		delete(l.records, operationID)
 		return false, err
@@ -264,7 +271,7 @@ func (l *Ledger) persistLocked() error {
 	if err != nil {
 		return fmt.Errorf("open ledger dir: %w", err)
 	}
-	defer d.Close()
+	defer func() { _ = d.Close() }()
 	if err := d.Sync(); err != nil {
 		return fmt.Errorf("fsync ledger dir: %w", err)
 	}
