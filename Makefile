@@ -28,9 +28,12 @@ check-lab: build vet ## 实验室全量检查：含需要 PG/Redis 的测试（m
 		go test -count=1 ./...
 	go run ./tools/sim -n 100000
 
-tidy-check: ## 验证 go.mod/go.sum 已 tidy（评审 P2-7）
-	go mod tidy
-	@git diff --exit-code go.mod go.sum || { echo "go.mod/go.sum not tidy: run 'go mod tidy' and commit"; exit 1; }
+tidy-check: ## 验证 go.mod/go.sum 已 tidy（不改工作树）
+	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+	  cp go.mod "$$tmp/check.mod"; cp go.sum "$$tmp/check.sum"; \
+	  GOWORK=off go mod tidy -modfile="$$tmp/check.mod"; \
+	  diff -u go.mod "$$tmp/check.mod"; \
+	  diff -u go.sum "$$tmp/check.sum" || { echo "go.mod/go.sum not tidy: run 'go mod tidy' and commit"; exit 1; }
 
 LAB_ROOT ?= $(HOME)/.local/firepaas-lab
 PROTOC ?= $(LAB_ROOT)/bin/protoc

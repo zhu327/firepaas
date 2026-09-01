@@ -1,8 +1,6 @@
 go 1.25.4
 
-// 本地联调：firepaas（根 module）与同级 hypeman checkout。
-// CI/release 用 GOWORK=off + 根 go.mod 的 replace（见 README 工程策略）。
-use (
-	.
-	../hypeman
-)
+// Local development can use the root module directly. To test an unpublished
+// hypeman change, developers may create a local go.work.local outside version
+// control; CI and releases always use GOWORK=off.
+use .

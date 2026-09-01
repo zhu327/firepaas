@@ -1,19 +1,24 @@
 # firepaas
 
-基于 Firecracker 的私有 PaaS 平台(目标形态:私有化 Fly.io)。
+基于 Firecracker 的私有 PaaS 平台（目标形态：私有化 Fly.io）。
 
-- 数据面复用 [hypeman](https://github.com/kernel/hypeman) 的 VM/镜像/快照能力
-- 管控面与调度模式参考 [e2b-dev/infra](https://github.com/e2b-dev/infra):控制面/数据面分离、Best-of-K 自研调度、Nomad 只编排基础设施作业
-- 当前状态:**M0 验证准备阶段（MVP 开发尚未开始）**；在真实 Nomad job、自动基准与 hypeman adapter spike 通过前，不进入 M1
+- 数据面复用 [hypeman](https://github.com/zhu327/hypeman) 的 VM/镜像/快照能力（`firepaas-lib` 分支，tag `v0.4.0-firepaas`，作为 Go module 直接消费）
+- 管控面与调度模式参考 [e2b-dev/infra](https://github.com/e2b-dev/infra)：控制面/数据面分离、Best-of-K 自研调度、Nomad 只编排基础设施作业
+- 当前状态：MVP 主体（M1–M5）与 v1.1–v1.4 增量（自动待机、镜像亲和、drain 驱离、多端口 service、one-shot secret、运行时交互、checkpoint/fork、node-local volume、镜像治理）已实现并通过对应 e2e 验收；v2（durable artifact、microVM build、多集群）规划中
 
 ## 文档
 
 | 文档 | 说明 |
 |---|---|
-| [docs/mvp-plan.md](docs/mvp-plan.md) | **修订 MVP 计划**：范围、阶段、出口和降级策略 |
 | [docs/architecture.md](docs/architecture.md) | 目标架构、状态权威、路由与 fencing 契约 |
-| [docs/adr/](docs/adr/) | 关键决策：Nomad、调度、状态、网络、route catalog、内部身份、写者数量演进、readiness 信号、放置约束/反亲和、secret 路径、edge 入口 |
-| [../docs/paas-feasibility-analysis.md](../docs/paas-feasibility-analysis.md) | 基于 hypeman 与 e2b-dev/infra 的完整可行性分析 |
+| [docs/adr/](docs/adr/) | 关键设计决策（Nomad 边界、调度、状态分层、网络、route catalog、内部身份、secret 路径、edge 入口等 37 篇） |
+| [docs/mvp-plan.md](docs/mvp-plan.md) | MVP 计划：范围、阶段、出口和降级策略 |
+| [docs/v1.1-plan.md](docs/v1.1-plan.md) | v1.1：scale-to-zero 完整化、镜像亲和/预取、edge 流量语义、drain 驱离、多端口 services |
+| [docs/v1.2-plan.md](docs/v1.2-plan.md) | v1.2：one-shot secret、运行时交互、生命周期与资源治理 |
+| [docs/v1.3-plan.md](docs/v1.3-plan.md) | v1.3：域名 egress、checkpoint/fork、node-local volume/dataset |
+| [docs/v1.4-plan.md](docs/v1.4-plan.md) | v1.4：磁盘配额、API 治理与镜像 prewarm |
+| [docs/v2-plan.md](docs/v2-plan.md) | v2：durable artifact、microVM build、可移植 template 与多集群 |
+| [docs/runbook-*.md](docs/runbook-*.md) | 运维流程：soak、备份恢复、容量、HA 验证、节点替换等 |
 
 ## 仓库布局
 
@@ -22,74 +27,77 @@ firepaas/
 ├── cmd/agentd/          # 每节点 gRPC agent（VM/镜像/网络数据面）
 ├── cmd/api/             # 控制面 API + 调度器 + 节点管理 + 预约
 ├── cmd/edge-proxy/      # 边缘路由（TLS + catalog 路由 + 自动唤醒）
-├── cmd/m0-spike/        # M0.4 agent adapter spike（实际调用 hypeman lib）
+├── cmd/fpctl/           # 运维 CLI
+├── cmd/agentctl/        # agent 侧运维 CLI
 ├── internal/agent/      # agent 实现（server/machine/network/proxy/state）
 ├── internal/controlplane/ # 控制面实现（api/db/store/controllers/...）
 ├── internal/edge/       # edge 实现（router/catalog/autoresume/tls）
 ├── internal/scheduler/  # Best-of-K 放置算法
 ├── shared/pkg/          # ID/错误等公共库
-├── shared/gen/          # proto 生成代码（make proto，不提交）
+├── shared/gen/          # proto 生成代码（make proto 重新生成并提交）
 ├── protos/agent/v1/     # agent gRPC 契约（唯一数据面契约）
-├── iac/                 # Nomad jobs + Terraform（参考 e2b-dev/infra 裁剪）
-├── scripts/             # 实验室搭建、基准测试脚本
-└── docs/                # 架构、MVP 方案、ADR
+├── iac/                 # Nomad jobs + Terraform + 可观测性配置
+├── scripts/             # 实验室搭建、e2e/混沌/soak 脚本
+└── docs/                # 架构、计划、ADR、runbook
 ```
 
-## 快速开始(实验室)
+## 快速开始
+
+依赖：Go 1.25、Linux（KVM）、Nomad 1.10+、PostgreSQL、Redis、容器 registry。
 
 ```bash
-# 1. 准备 3 台 server(兼任 control 池)+ 2 台 compute 节点(Ubuntu 24.04,KVM 必需)
+git clone https://github.com/zhu327/firepaas.git
+cd firepaas
+make build   # go build ./...（hypeman 作为远程 module 经 go.mod replace 拉取）
+make test    # go test ./...
+make check   # build + vet + test + tidy-check（本地 CI 等价）
+```
+
+### 单机实验室（ADR-0012）
+
+只有一台机器时，使用折叠版实验室（不写 /etc、不启巨页，可与 k8s 共存）：
+
+```bash
+# 开发依赖（PG/Redis/MinIO/registry）
+docker compose -f iac/dev/docker-compose.yaml up -d
+
+source scripts/lab/env.sh
+bash scripts/lab/start.sh             # 单节点 Nomad + compute 池
+sudo bash scripts/lab/root-setup.sh   # root 准备并切换 Nomad 到 root 运行
+sudo bash scripts/lab/run-agentd.sh   # 部署 agentd system job
+sudo bash scripts/lab/e2e-m1.sh       # M1 一键验证（API→agent→edge→VM→HTTP 200）
+```
+
+完整验收矩阵与脚本说明见 [scripts/lab/README.md](scripts/lab/README.md)。
+
+### 多节点实验室
+
+```bash
+# 3 台 server（兼任 control 池）+ 2 台 compute 节点（Ubuntu 24.04，KVM 必需）
 sudo bash scripts/bootstrap-lab.sh server                 # 在 3 台 server 节点执行
 sudo bash scripts/bootstrap-lab.sh compute <server-ip>    # 在 2 台 compute 节点执行
 
-# 2. 集群就绪后创建节点池(任一 server)
+# 集群就绪后创建节点池（任一 server）
 nomad node pool create iac/nomad/pools/control.hcl
 nomad node pool create iac/nomad/pools/compute.hcl
-
-# 3. 阅读 iac/README.md；P0 使用 iac/nomad/hypeman-p0.hcl，不能使用未来 agentd job
-
-# 4. 构建各组件(要求 firepaas 与 hypeman 同级 checkout,见 go.work)
-make build
-
-# 5. 从 P0 验证开始,详见 docs/mvp-plan.md
 ```
-
-### 单机实验室(当前开发基准,ADR-0012)
-
-只有一台机器时,使用折叠版实验室(不写 /etc、不启巨页,与 k8s 共存):
-
-```bash
-source scripts/lab/env.sh
-bash scripts/lab/build-hypeman.sh     # 构建嵌有 Firecracker 的 hypeman
-bash scripts/lab/start.sh             # 单节点 Nomad + compute 池
-sudo bash scripts/lab/root-setup.sh   # root 准备并切换 Nomad 到 root 运行
-sudo bash scripts/lab/run-p0.sh       # 部署 P0 job 并等 /health
-sudo bash scripts/lab/smoke-p0.sh     # P0 冒烟
-sudo bash scripts/lab/e2e-m1.sh       # M1 一键验证（API→agent→edge→VM→HTTP 200）
-sudo bash scripts/lab/e2e-m2.sh       # M2 一键验证（并发幂等/调度/20 轮无泄漏）
-sudo bash scripts/lab/chaos-m2.sh     # M2 混沌验收（crash/ACK 丢失/Redis 清空收敛）
-sudo bash scripts/lab/e2e-m3.sh       # M3 一键验收（slot 网络/发布/回滚/隔离/无泄漏）
-sudo bash scripts/lab/e2e-m5.sh       # M5 一键验收（安全/时钟/指标/备份/重投影/升级/零泄漏）
-sudo bash scripts/lab/soak-m5.sh --duration 72h   # 72h 浸泡 runner（后台运行）
-```
-
-开发依赖（PG/Redis/MinIO/registry）：受限网络先经 `docker.m.daocloud.io` 拉取并
-retag，再 `docker compose -f iac/dev/docker-compose.yaml up -d`。
-
-详见 [scripts/lab/README.md](scripts/lab/README.md) 与 [docs/plans/2026-08-25-single-node-m0.md](docs/plans/2026-08-25-single-node-m0.md)。
 
 ## Go 工程策略
 
-当前为**单根 module**（`github.com/example/firepaas`，占位组织路径，正式建仓时替换）：
-`go.mod` + 多个 `cmd/*` + `internal/*`。如确有独立版本/依赖隔离需求再拆 module，并以 ADR 记录。
+单根 module（`github.com/zhu327/firepaas`）：`go.mod` + 多个 `cmd/*` + `internal/*`。
 
-本地根 `go.work` 引用同级 `../hypeman` 做联调；CI/release 必须 pin 具体 commit/tag，
-并以 `GOWORK=off` 走根 `go.mod` 的 replace 构建，避免发布结果随工作区漂移。
+hypeman 依赖经 `go.mod` replace 指向公开 fork 的 `v0.4.0-firepaas` tag（`github.com/zhu327/hypeman`，`firepaas-lib` 分支）：该 tag 提交了 go:embed 必需的 firecracker/guest-agent/init 二进制，可远程作为 module 消费，clone 后无需 sibling checkout。上游 [kernel/hypeman](https://github.com/kernel/hypeman) 发布包含所需 API 的正式 tag 后，可切换 require 并删除 replace。
 
-## 核心原则(来自可行性分析)
+本地如需联调未发布的 hypeman 改动，可创建不入库的 `go.work.local` 覆盖 replace；CI 与 release 始终以 `GOWORK=off` 走根 `go.mod`。
 
-1. **Nomad 不调度用户 VM**。它只部署基础设施作业(agent system job 等)、提供服务发现、对齐作业副本与节点池。
-2. **VM 放置由控制面自研 Best-of-K 调度器决定**,API 决定"放哪",agent 决定"怎么跑"。
-3. **流量永不经过控制面**：M1 起固定为 edge → Redis routing catalog → 节点 agent proxy → VM；edge/catalog 不感知 slot IP。
-4. **状态分层**:Postgres 是期望状态/业务事实，agent 是观测运行态，Redis 是可重建 route/lease 投影。
+## 核心原则
+
+1. **Nomad 不调度用户 VM**。它只部署基础设施作业（agent system job 等）、提供服务发现、对齐作业副本与节点池。
+2. **VM 放置由控制面自研 Best-of-K 调度器决定**，API 决定"放哪"，agent 决定"怎么跑"。
+3. **流量永不经过控制面**：固定为 edge → Redis routing catalog → 节点 agent proxy → VM；edge/catalog 不感知 slot IP。
+4. **状态分层**：PostgreSQL 是期望状态/业务事实的唯一权威，agent 是观测运行态，Redis 是可重建 route/lease 投影。
 5. **hostname 路由到版本化 backend set**，而不是直接路由单台 machine；所有 VM 操作均由 execution/generation/operation fencing。
+
+## License
+
+[MIT](LICENSE)

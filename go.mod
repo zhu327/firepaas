@@ -1,23 +1,20 @@
-module github.com/example/firepaas
+module github.com/zhu327/firepaas
 
 go 1.25.4
-
-// 占位组织路径：正式建仓时替换（见 README 工程策略）。
-//
-// hypeman 依赖策略：
-//   - 本地开发：go.work use ../hypeman（根 go.work）
-//   - 独立构建/CI：GOWORK=off 时走下面的 replace 指向同级 checkout
-//   - 发布：必须 pin 具体 commit/tag 并删除 replace（CI 检查）
-replace github.com/kernel/hypeman => ../hypeman
 
 require (
 	github.com/c2h5oh/datasize v0.0.0-20231215233829-aa82cc1e6500
 	github.com/distribution/reference v0.6.0
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.10.0
-	github.com/kernel/hypeman v0.3.0
+	github.com/kernel/hypeman v0.0.0-00010101000000-000000000000
+	github.com/miekg/dns v1.1.68
+	github.com/prometheus/client_golang v1.23.0
 	github.com/redis/go-redis/v9 v9.22.0
 	go.opentelemetry.io/otel v1.38.0
+	go.opentelemetry.io/otel/exporters/prometheus v0.60.0
+	go.opentelemetry.io/otel/metric v1.38.0
+	go.opentelemetry.io/otel/sdk/metric v1.38.0
 	google.golang.org/grpc v1.77.0
 	google.golang.org/protobuf v1.36.10
 )
@@ -64,7 +61,6 @@ require (
 	github.com/knadh/koanf/providers/structs v1.0.0 // indirect
 	github.com/knadh/koanf/v2 v2.3.2 // indirect
 	github.com/mailru/easyjson v0.7.7 // indirect
-	github.com/miekg/dns v1.1.68 // indirect
 	github.com/mitchellh/copystructure v1.2.0 // indirect
 	github.com/mitchellh/go-homedir v1.1.0 // indirect
 	github.com/mitchellh/reflectwalk v1.0.2 // indirect
@@ -82,7 +78,6 @@ require (
 	github.com/perimeterx/marshmallow v1.1.5 // indirect
 	github.com/pierrec/lz4/v4 v4.1.22 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
-	github.com/prometheus/client_golang v1.23.0 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.65.0 // indirect
 	github.com/prometheus/otlptranslator v0.0.2 // indirect
@@ -103,12 +98,9 @@ require (
 	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc v1.38.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.38.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.38.0 // indirect
-	go.opentelemetry.io/otel/exporters/prometheus v0.60.0 // indirect
 	go.opentelemetry.io/otel/log v0.14.0 // indirect
-	go.opentelemetry.io/otel/metric v1.38.0 // indirect
 	go.opentelemetry.io/otel/sdk v1.38.0 // indirect
 	go.opentelemetry.io/otel/sdk/log v0.14.0 // indirect
-	go.opentelemetry.io/otel/sdk/metric v1.38.0 // indirect
 	go.opentelemetry.io/otel/trace v1.38.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.7.1 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
@@ -125,3 +117,9 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	gvisor.dev/gvisor v0.0.0-20251125014920-fc40e232ff54 // indirect
 )
+
+// hypeman：firepaas 依赖的 lib 扩展（quarantine/integrity/snapshot artifact 等）
+// 发布在公开 fork 的 firepaas-lib 分支 tag v0.4.0-firepaas；该 tag 提交了
+// go:embed 必需的 firecracker/guest-agent/init 二进制，可远程作为 module 消费。
+// 上游 kernel/hypeman 发布包含所需 API 的正式 tag 后，可切换 require 并删除本 replace。
+replace github.com/kernel/hypeman => github.com/zhu327/hypeman v0.4.0-firepaas

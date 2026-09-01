@@ -18,7 +18,8 @@ vendor/
 *.out
 
 # Codegen
-shared/gen/
+# Generated protobuf code is committed: CI diffs it to enforce contract generation.
+# Do not ignore shared/gen/.
 
 # Terraform
 iac/terraform/**/.terraform/
@@ -35,3 +36,14 @@ iac/terraform/**/*.tfvars
 /api
 /edge-proxy
 /m0-spike
+
+# Local lab caches, benchmark/e2e output and non-versioned acceptance logs
+scripts/lab/.cache/
+scripts/lab/__pycache__/
+scripts/lab/results/
+scripts/results/
+
+# Local agent workflow config (kept out of the published repository)
+.agents/
+.pi/
+AGENTS.md
