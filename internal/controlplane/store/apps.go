@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -78,7 +79,9 @@ func (d *Deployment) EffectiveStrategy() string {
 	return "bluegreen"
 }
 
-// Rollout 是 rollouts 表行。
+// Rollout 是 rollouts 表行。时间列均为 timestamptz（迁移 0006），直接扫描为
+// time.Time——不再走文本解析中间层（旧实现解析失败会得到零时间并令 S3
+// PREPARING 超时判定静默失效）。
 type Rollout struct {
 	ID             string
 	AppID          string
@@ -86,10 +89,10 @@ type Rollout struct {
 	ToGeneration   int64
 	Status         string // PREPARING|CUTOVER|ROLLING_BACK|COMPLETE
 	Failed         bool
-	CutoverAt      *string
-	DrainDeadline  *string
-	StartedAt      string
-	CompletedAt    *string
+	CutoverAt      *time.Time
+	DrainDeadline  *time.Time
+	StartedAt      time.Time
+	CompletedAt    *time.Time
 }
 
 // EnsureApp upsert app 行（apps 表，mvp-plan §5.4 最小模型）。
@@ -368,24 +371,16 @@ func (s *Store) CreateRollout(ctx context.Context, r Rollout) error {
 func (s *Store) GetRollout(ctx context.Context, id string) (*Rollout, error) {
 	row := s.pool.QueryRow(ctx, `
 		SELECT id, app_id, from_generation, to_generation, status, failed,
-			coalesce(cutover_at::text,''), coalesce(drain_deadline::text,''),
-			started_at::text, coalesce(completed_at::text,'')
+			cutover_at, drain_deadline, started_at, completed_at
 		FROM rollouts WHERE id=$1`, id)
 	var r Rollout
-	var cutover, drain string
 	err := row.Scan(&r.ID, &r.AppID, &r.FromGeneration, &r.ToGeneration, &r.Status,
-		&r.Failed, &cutover, &drain, &r.StartedAt, &r.CompletedAt)
+		&r.Failed, &r.CutoverAt, &r.DrainDeadline, &r.StartedAt, &r.CompletedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("get rollout: %w", err)
-	}
-	if cutover != "" {
-		r.CutoverAt = &cutover
-	}
-	if drain != "" {
-		r.DrainDeadline = &drain
 	}
 	return &r, nil
 }
@@ -394,25 +389,17 @@ func (s *Store) GetRollout(ctx context.Context, id string) (*Rollout, error) {
 func (s *Store) ActiveRolloutForApp(ctx context.Context, appID string) (*Rollout, error) {
 	row := s.pool.QueryRow(ctx, `
 		SELECT id, app_id, from_generation, to_generation, status, failed,
-			coalesce(cutover_at::text,''), coalesce(drain_deadline::text,''),
-			started_at::text, coalesce(completed_at::text,'')
+			cutover_at, drain_deadline, started_at, completed_at
 		FROM rollouts WHERE app_id=$1 AND status IN ('PREPARING','CUTOVER','ROLLING_BACK')`,
 		appID)
 	var r Rollout
-	var cutover, drain string
 	err := row.Scan(&r.ID, &r.AppID, &r.FromGeneration, &r.ToGeneration, &r.Status,
-		&r.Failed, &cutover, &drain, &r.StartedAt, &r.CompletedAt)
+		&r.Failed, &r.CutoverAt, &r.DrainDeadline, &r.StartedAt, &r.CompletedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("active rollout: %w", err)
-	}
-	if cutover != "" {
-		r.CutoverAt = &cutover
-	}
-	if drain != "" {
-		r.DrainDeadline = &drain
 	}
 	return &r, nil
 }
@@ -421,8 +408,7 @@ func (s *Store) ActiveRolloutForApp(ctx context.Context, appID string) (*Rollout
 func (s *Store) ListActiveRollouts(ctx context.Context) ([]Rollout, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, app_id, from_generation, to_generation, status, failed,
-			coalesce(cutover_at::text,''), coalesce(drain_deadline::text,''),
-			started_at::text, coalesce(completed_at::text,'')
+			cutover_at, drain_deadline, started_at, completed_at
 		FROM rollouts WHERE status IN ('PREPARING','CUTOVER','ROLLING_BACK') ORDER BY started_at`)
 	if err != nil {
 		return nil, fmt.Errorf("list active rollouts: %w", err)
@@ -431,16 +417,9 @@ func (s *Store) ListActiveRollouts(ctx context.Context) ([]Rollout, error) {
 	var out []Rollout
 	for rows.Next() {
 		var r Rollout
-		var cutover, drain string
 		if err := rows.Scan(&r.ID, &r.AppID, &r.FromGeneration, &r.ToGeneration, &r.Status,
-			&r.Failed, &cutover, &drain, &r.StartedAt, &r.CompletedAt); err != nil {
+			&r.Failed, &r.CutoverAt, &r.DrainDeadline, &r.StartedAt, &r.CompletedAt); err != nil {
 			return nil, fmt.Errorf("scan rollout: %w", err)
-		}
-		if cutover != "" {
-			r.CutoverAt = &cutover
-		}
-		if drain != "" {
-			r.DrainDeadline = &drain
 		}
 		out = append(out, r)
 	}
@@ -448,7 +427,7 @@ func (s *Store) ListActiveRollouts(ctx context.Context) ([]Rollout, error) {
 }
 
 // RolloutToCutover 事务推进 PREPARING→CUTOVER 并写 drain_deadline。
-func (s *Store) RolloutToCutover(ctx context.Context, appID, deadline string) error {
+func (s *Store) RolloutToCutover(ctx context.Context, appID string, deadline time.Time) error {
 	return s.inTx(ctx, func(tx pgx.Tx) error {
 		var cur string
 		if err := tx.QueryRow(ctx,
@@ -461,7 +440,7 @@ func (s *Store) RolloutToCutover(ctx context.Context, appID, deadline string) er
 			return nil // 已被并发推进
 		}
 		_, err := tx.Exec(ctx, `UPDATE rollouts SET status='CUTOVER',
-			cutover_at=now(), drain_deadline=$2::timestamptz, updated_at=now()
+			cutover_at=now(), drain_deadline=$2, updated_at=now()
 			WHERE app_id=$1 AND status='PREPARING'`, appID, deadline)
 		return err
 	})
@@ -609,6 +588,9 @@ func (s *Store) DeployApp(ctx context.Context, d Deployment, r Rollout, appGener
 // SoftDeleteApp 事务标记 app 删除（P0-1）：deleted_at 置位 + 终结活跃
 // rollout（failed=true）+ ACTIVE deployment 置 SUPERSEDED。副本的机器删除
 // 由调用方经 operation outbox 下发（FK 级联会绕过 outbox）。
+//
+// 注意：API 删除路径已改用 SoftDeleteAppAndEnqueueDeletes（墓碑与入队同事务），
+// 本方法保留给只需要墓碑的调用方。
 func (s *Store) SoftDeleteApp(ctx context.Context, appID string) error {
 	return s.inTx(ctx, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `UPDATE apps SET deleted_at=now(), desired_replicas=0,
@@ -630,6 +612,97 @@ func (s *Store) SoftDeleteApp(ctx context.Context, appID string) error {
 		}
 		return nil
 	})
+}
+
+// AppDeleteOp 是 app 删除时单个副本的 delete 入队载荷（幂等键 = OperationID）。
+type AppDeleteOp struct {
+	MachineID   string
+	ExecutionID string
+	Generation  int64
+	OperationID string
+	Request     []byte
+}
+
+// AppDeleteResult 汇报删除收敛视图：AlreadyDeleted = 墓碑此前已存在；
+// Pending = 提交后仍待收敛（desired != DELETED）的机器数。
+type AppDeleteResult struct {
+	AlreadyDeleted bool
+	Pending        int
+}
+
+// SoftDeleteAppAndEnqueueDeletes（R2 评审 P1，app 删除原子化）：墓碑化与
+// 全部未收敛副本的 delete 入队在同一 PG 事务提交——不再存在“墓碑已提交但
+// 部分 delete 未入队”的崩溃窗口。buildOp 由调用方（API 层构造 proto 请求）
+// 按 machine 行（事务内加锁后的同一快照）生成幂等入队载荷。
+//
+// 幂等/崩溃恢复语义：
+//   - 首次删除：墓碑 + 全部 delete 原子提交；任一环节失败整体回滚。
+//   - 重复删除（已墓碑）：跳过墓碑写，但仍扫描未收敛机器并补发 delete。
+//     历史实现（墓碑与工作队列分离提交）中途崩溃留下的“墓碑在、delete
+//     缺失/部分”状态由此自愈；幂等键（UserDeleteOpID）与原设计一致，
+//     重复补发不产生新请求冲突。
+//   - 已收敛（desired=DELETED）的机器不再入队。
+func (s *Store) SoftDeleteAppAndEnqueueDeletes(
+	ctx context.Context, appID string,
+	buildOp func(m Machine) AppDeleteOp,
+) (AppDeleteResult, error) {
+	var result AppDeleteResult
+	err := s.inTx(ctx, func(tx pgx.Tx) error {
+		// 锁 app 行：与并发 delete/对账串行，墓碑状态在事务内一致。
+		var deleted bool
+		var projectID string
+		switch err := tx.QueryRow(ctx, `SELECT deleted_at IS NOT NULL, project_id
+			FROM apps WHERE id=$1 FOR UPDATE`, appID).Scan(&deleted, &projectID); {
+		case errors.Is(err, pgx.ErrNoRows):
+			return ErrNotFound
+		case err != nil:
+			return fmt.Errorf("lock app: %w", err)
+		}
+		result.AlreadyDeleted = deleted
+		if !deleted {
+			if _, err := tx.Exec(ctx, `UPDATE apps SET deleted_at=now(), desired_replicas=0,
+				updated_at=now() WHERE id=$1 AND deleted_at IS NULL`, appID); err != nil {
+				return fmt.Errorf("soft delete app: %w", err)
+			}
+			if _, err := tx.Exec(ctx, `UPDATE rollouts SET status='COMPLETE', failed=true,
+				completed_at=now(), updated_at=now()
+				WHERE app_id=$1 AND status IN ('PREPARING','CUTOVER','ROLLING_BACK')`, appID); err != nil {
+				return fmt.Errorf("complete active rollouts: %w", err)
+			}
+			if _, err := tx.Exec(ctx, `UPDATE deployments SET status='SUPERSEDED', updated_at=now()
+				WHERE app_id=$1 AND status='ACTIVE'`, appID); err != nil {
+				return fmt.Errorf("supersede deployments: %w", err)
+			}
+		}
+		// 事务内快照扫描未收敛机器（墓碑已置位，并发 create 由复活守卫拒绝）。
+		rows, err := tx.Query(ctx, `SELECT `+machineColumns+`
+			FROM machines WHERE app_id=$1 AND desired_state != 'DELETED'
+			ORDER BY replica_ordinal, generation`, appID)
+		if err != nil {
+			return fmt.Errorf("list app machines: %w", err)
+		}
+		machines, err := scanMachines(rows)
+		if err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+		result.Pending = len(machines)
+		for _, m := range machines {
+			spec := buildOp(m)
+			if _, err := enqueueOperationIdempotentTx(ctx, tx, projectID, spec.MachineID,
+				spec.ExecutionID, spec.OperationID, spec.Generation, spec.Request, "delete", true); err != nil {
+				// 历史脏数据（旧版裸 op-del-{id}）才可能撞键冲突：重复 delete 的
+				// 请求体必一致。冲突回滚全事务更安全（不静默误跳一台机器）。
+				return fmt.Errorf("enqueue delete for %s: %w", spec.MachineID, err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return AppDeleteResult{}, err
+	}
+	return result, nil
 }
 
 // LatestCreateAttempt 返回 machine 最近一次 create 操作的 claim 次数与状态

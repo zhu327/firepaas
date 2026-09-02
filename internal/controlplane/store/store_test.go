@@ -595,3 +595,88 @@ func TestEnsureCreateExecutionChangeClearsObserved(t *testing.T) {
 		t.Fatalf("same-execution retry must keep observed, got %+v", m)
 	}
 }
+
+// P0：GetOperation 仅在确证 not-found 时返回 ErrNotFound 哨兵，API 层据此
+// 区分 404 与 5xx（此前所有错误都被映射成 404）。
+func TestGetOperationNotFoundSentinel(t *testing.T) {
+	s := testStore(t)
+	op, err := s.GetOperation(context.Background(), "dev", "op-does-not-exist")
+	if op != nil || !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetOperation = %+v, %v; want nil, ErrNotFound", op, err)
+	}
+}
+
+// P0：GetProjectQuotaDetail 同上（此前治理端点用 err 文本匹配 "no rows" 判 404）。
+func TestGetProjectQuotaDetailNotFoundSentinel(t *testing.T) {
+	s := testStore(t)
+	d, err := s.GetProjectQuotaDetail(context.Background(), "proj-does-not-exist")
+	if d != nil || !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetProjectQuotaDetail = %+v, %v; want nil, ErrNotFound", d, err)
+	}
+}
+
+// 验收回归：CreateDispatchedToAgent 只在 create 带 dispatch_node 时为真——
+// 不确定 secret 创建的 delete 收敛依赖这个判定（badmode 拒绝场景机器从未
+// 派发，delete 必须收敛而非等待节点，见真机验收）。
+func TestCreateDispatchedToAgent(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	const project = "p-disp"
+	if err := st.EnsureProject(ctx, project, project); err != nil {
+		t.Fatal(err)
+	}
+	_, err := st.EnqueueReapDelete(ctx, project, "m-disp", "exec-x", "op-disp-x", 1, []byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ok, err := st.CreateDispatchedToAgent(ctx, "m-disp", "exec-x")
+	if err != nil || ok {
+		t.Fatalf("only reap exists: ok=%v err=%v", ok, err)
+	}
+	// 带 dispatch node 的 create
+	_, err = st.EnsureAppAndEnqueueCreate(ctx, project, "app-disp", "app-disp.local",
+		"img", 1, 512, 0, 80, "m-disp", "dep-disp", "exec-x", "op-disp-c1", 1, 0,
+		[]byte(`{}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ok, _ = st.CreateDispatchedToAgent(ctx, "m-disp", "exec-x")
+	if ok {
+		t.Fatal("no dispatch node yet: must be false")
+	}
+	if err = st.UpdateOperationDispatchNode(ctx, "op-disp-c1", "node-x"); err != nil {
+		t.Fatal(err)
+	}
+	ok, _ = st.CreateDispatchedToAgent(ctx, "m-disp", "exec-x")
+	if !ok {
+		t.Fatal("with dispatch node: must be true")
+	}
+}
+
+func TestSecretCleanupDischarged(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	const project = "p-scd"
+	if err := st.EnsureProject(ctx, project, project); err != nil {
+		t.Fatal(err)
+	}
+	ok, err := st.SecretCleanupDischarged(ctx, "op-create-x")
+	if err != nil || ok {
+		t.Fatalf("no cleanup op: ok=%v err=%v", ok, err)
+	}
+	if _, err = st.EnqueueReapDelete(ctx, project, "m-scd", "exec-x",
+		"op-secret-cleanup-op-create-x", 1, []byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	ok, _ = st.SecretCleanupDischarged(ctx, "op-create-x")
+	if ok {
+		t.Fatal("pending cleanup: must be false")
+	}
+	if err = st.CompleteOperation(ctx, "op-secret-cleanup-op-create-x", "SUCCEEDED", nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	ok, _ = st.SecretCleanupDischarged(ctx, "op-create-x")
+	if !ok {
+		t.Fatal("succeeded cleanup: must be true")
+	}
+}

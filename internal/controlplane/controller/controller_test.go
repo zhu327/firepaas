@@ -1,10 +1,15 @@
 package controller
 
 import (
+	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/zhu327/firepaas/internal/controlplane/agentclient"
 	"github.com/zhu327/firepaas/internal/controlplane/store"
+	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -112,6 +117,21 @@ func TestRecreateAction(t *testing.T) {
 }
 
 // P1-3：退避序列 base·2^(n-1) 封顶 max，首次重派不放大（不影Ⅱ 2 分钟验收）。
+func TestNewNodeStaleAfterDefaultsToThreeSyncIntervals(t *testing.T) {
+	c := New(nil, nil, nil, nil, nil, nil, Config{SyncInterval: 7 * time.Second})
+	if got, want := c.cfg.NodeStaleAfter, 21*time.Second; got != want {
+		t.Fatalf("NodeStaleAfter=%v, want %v", got, want)
+	}
+
+	c = New(nil, nil, nil, nil, nil, nil, Config{
+		SyncInterval:   7 * time.Second,
+		NodeStaleAfter: time.Minute,
+	})
+	if got := c.cfg.NodeStaleAfter; got != time.Minute {
+		t.Fatalf("explicit NodeStaleAfter=%v, want 1m", got)
+	}
+}
+
 func TestCreateRetryDelay(t *testing.T) {
 	c := &Controller{cfg: Config{CreateRetryBase: 10 * time.Second, CreateRetryMax: 5 * time.Minute}}
 	cases := []struct {
@@ -219,3 +239,105 @@ func TestRolloutOwnsReplacement(t *testing.T) {
 		}
 	}
 }
+
+// P1#10：失联/挂起节点不再串行饿死整轮 observed sync——有界并发抓取使
+// N 个挂起节点的整轮开销 ≈ 单节点超时（旧串行为 ~timeout×N），且不阻断
+// 健康节点观测的合并（per-node failure isolation）。
+func TestFetchNodeObservationsIsolatesHangingNodes(t *testing.T) {
+	views := []nodeView{
+		{agentID: "hang-1", nomadID: "hang-1"},
+		{agentID: "ok-1", nomadID: "ok-1"},
+		{agentID: "hang-2", nomadID: "hang-2"},
+		{agentID: "ok-2", nomadID: "ok-2"},
+		{agentID: "no-client", nomadID: "no-client"},
+	}
+	hanging := map[string]bool{"hang-1": true, "hang-2": true}
+	const timeout = 300 * time.Millisecond
+	start := time.Now()
+	outcomes := fetchNodeObservations(context.Background(), views,
+		func(v nodeView) *agentclient.Client {
+			if v.agentID == "no-client" {
+				return nil
+			}
+			return &agentclient.Client{}
+		},
+		func(ctx context.Context, v nodeView, _ *agentclient.Client) ([]*pb.Machine, error) {
+			if hanging[v.agentID] {
+				<-ctx.Done() // 模拟挂起节点：直到自己的 10s 超时
+				return nil, ctx.Err()
+			}
+			return []*pb.Machine{{MachineId: "m-" + v.agentID}}, nil
+		},
+		timeout, nodeObservedListParallel)
+	elapsed := time.Since(start)
+
+	// 串行实现 ≥ 2×timeout（两个挂起节点依次各耗一个超时）；有界并发 ≈ timeout。
+	if elapsed >= 2*timeout {
+		t.Fatalf("concurrent fetch took %v; serial behaviour would be >= %v", elapsed, 2*timeout)
+	}
+	if len(outcomes) != len(views) {
+		t.Fatalf("outcomes = %d, want %d", len(outcomes), len(views))
+	}
+	// 结果按 view 原序合并；健康节点的观测保留，挂起节点各自隔离为失败。
+	for i, want := range []struct {
+		id        string
+		machines  int
+		err       bool
+		noClientH bool
+	}{
+		{"hang-1", 0, true, false},
+		{"ok-1", 1, false, false},
+		{"hang-2", 0, true, false},
+		{"ok-2", 1, false, false},
+		{"no-client", 0, false, true},
+	} {
+		o := outcomes[i]
+		if o.view.agentID != want.id {
+			t.Fatalf("outcome %d view = %s, want %s (order must be preserved)", i, o.view.agentID, want.id)
+		}
+		if len(o.machines) != want.machines || (o.err != nil) != want.err || o.noClient != want.noClientH {
+			t.Fatalf("outcome %d (%s) = machines %d, err %v, noClient %v",
+				i, want.id, len(o.machines), o.err, o.noClient)
+		}
+		if want.machines == 1 && o.machines[0].MachineId != "m-"+want.id {
+			t.Fatalf("outcome %d machine = %s", i, o.machines[0].MachineId)
+		}
+	}
+}
+
+// P1#10：并发上限必须生效（信号量约束），节点数超过上限时按批推进。
+func TestFetchNodeObservationsBoundsParallelism(t *testing.T) {
+	const nodeCount, maxParallel = 12, 4
+	views := make([]nodeView, nodeCount)
+	for i := range views {
+		views[i] = nodeView{agentID: fmt.Sprintf("n-%02d", i), nomadID: fmt.Sprintf("n-%02d", i)}
+	}
+	var mu sync.Mutex
+	active, maxActive := 0, 0
+	outcomes := fetchNodeObservations(context.Background(), views,
+		func(nodeView) *agentclient.Client { return &agentclient.Client{} },
+		func(ctx context.Context, v nodeView, _ *agentclient.Client) ([]*pb.Machine, error) {
+			mu.Lock()
+			active++
+			if active > maxActive {
+				maxActive = active
+			}
+			mu.Unlock()
+			time.Sleep(20 * time.Millisecond)
+			mu.Lock()
+			active--
+			mu.Unlock()
+			return nil, nil
+		},
+		timeoutForTest, maxParallel)
+	mu.Lock()
+	defer mu.Unlock()
+	if maxActive > maxParallel {
+		t.Fatalf("max concurrent lists = %d, want <= %d", maxActive, maxParallel)
+	}
+	if len(outcomes) != nodeCount {
+		t.Fatalf("outcomes = %d, want %d", len(outcomes), nodeCount)
+	}
+}
+
+const timeoutForTest = time.Second

@@ -49,7 +49,7 @@ M2b 多写创建路径推迟到真实多实例部署出现时（ADR-0007 的表�
 
 ### 6. reconcile 决策表
 
-R1–R8（详见 plans/2026-08-25-m2-single-node.md）。所有纠正动作写
+R1–R8（历史执行记录见 [M2 单机记录](../archive/milestones/2026-08-25-m2-single-node.md)）。所有纠正动作写
 operations（幂等键）或 scheduler_events（只读观测），保证审计可解释；
 Redis miss 靠全量重建 route 投影收敛。
 

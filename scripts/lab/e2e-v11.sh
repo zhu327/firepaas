@@ -101,7 +101,7 @@ log "0.5) 预清理历史验收机"
 for _ in $(seq 1 10); do
   curl -s -m 10 -H "Authorization: Bearer $API_TOKEN" "http://127.0.0.1:$API_PORT/v1/nodes" |
     python3 -c 'import json,sys
-for n in json.load(sys.stdin).get("nodes",[]):
+for n in json.load(sys.stdin).get("nodes") or []:
     print(n.get("id",n.get("ID","")))' |
     while read -r nid; do
       [[ -n "$nid" ]] && curl -s -m 10 -H "Authorization: Bearer $API_TOKEN" -X POST \
@@ -443,7 +443,10 @@ for _ in $(seq 1 40); do
   sleep 3
 done
 NODE_ID=$(curl -s -m 10 -H "Authorization: Bearer $API_TOKEN" "http://127.0.0.1:$API_PORT/v1/nodes" |
-  python3 -c 'import json,sys; ns=json.load(sys.stdin).get("nodes", []); print((ns[0].get("ID") or ns[0].get("id")) if ns else "")')
+  python3 -c 'import json,sys
+ns=json.load(sys.stdin).get("nodes") or []
+n=next((n for n in ns if n.get("Status")=="HEALTHY" and not n.get("Draining", False)), None)
+print((n.get("ID") or n.get("id")) if n else "")')
 [[ -n "$NODE_ID" ]] || fail "D: 无注册节点"
 ds=$(cur -H "Authorization: Bearer $API_TOKEN" -o /tmp/v11-d.json -w '%{http_code}' \
   -X POST -H 'Content-Type: application/json' -d '{"evacuate": true}' \

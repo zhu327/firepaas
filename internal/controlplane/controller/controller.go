@@ -15,7 +15,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -44,6 +46,7 @@ type Config struct {
 	OpPollInterval                 time.Duration    // 默认 1s
 	SyncInterval                   time.Duration    // 默认 5s
 	RebuildInterval                time.Duration    // 预约/投影重建，默认 30s
+	NodeStaleAfter                 time.Duration    // 节点 observed 投影过期阈值，默认 3×SyncInterval
 	ReservationCompensationTimeout time.Duration    // PG 派发提交失败后的 Redis 释放上限，默认 5s
 	ReconcileGrace                 time.Duration    // ACK 丢失判定宽限，默认 30s
 	MaxPlacementAttempts           int              // ResourceExhausted 换节点上限，默认 3
@@ -66,6 +69,12 @@ type Config struct {
 	EvacuateStepTimeout time.Duration
 	// UserEventsRetention（v1.2-F）：租户事件保留期，默认 168h，上限 720h。
 	UserEventsRetention time.Duration
+	// DispatchWorkers（R2 评审 P1）：operation 派发的工作池大小，默认 4。
+	// 串行派发会让一个挂死 agent 的 AgentRPCTimeout 拖倍整批（20 ops × 2m）。
+	DispatchWorkers int
+	// OperationRetention（R2 加固）：终态 operations 的在表保留期，默认 7d。
+	// 幂等键重放只保证在保留窗内同一键命中同一操作；窗口外重试按新 op 处理。
+	OperationRetention time.Duration
 	// GC（v1.2-F）：引用感知镜像 GC；零值 = DefaultGCConfig()（dry-run）。
 	GC    GCConfig
 	Scrub ScrubConfig
@@ -97,6 +106,12 @@ type Controller struct {
 	//（node:type:id），避免每周期重复记事件；orphan bytes 指标每周期重算。
 	reportedOrphans map[string]bool
 
+	// machineLocks（R2 评审 P1）：派发路径的进程内 per-machine 互斥——
+	// 有界并发下同一批（或跨批 claim）的、面向同一台 machine 的 op 必须串行，
+	// 否则两个 worker 会并行派发同机的 pause/resume 或 create+delete。
+	machineLocksMu sync.Mutex
+	machineLocks   map[string]*machineDispatchLock
+
 	// userEventsRetention 在 New 里从 cfg 归一（Config 已含注释）。
 	userEventsRetention time.Duration
 	// gc（v1.2-F）：引用感知镜像 GC 配置。
@@ -116,6 +131,9 @@ func New(st *store.Store, cat *catalog.Catalog, nm *nodemanager.Manager,
 	}
 	if cfg.RebuildInterval == 0 {
 		cfg.RebuildInterval = 30 * time.Second
+	}
+	if cfg.NodeStaleAfter <= 0 {
+		cfg.NodeStaleAfter = 3 * cfg.SyncInterval
 	}
 	if cfg.ReservationCompensationTimeout <= 0 {
 		cfg.ReservationCompensationTimeout = 5 * time.Second
@@ -176,13 +194,19 @@ func New(st *store.Store, cat *catalog.Catalog, nm *nodemanager.Manager,
 	if cfg.EvacuateStepTimeout == 0 {
 		cfg.EvacuateStepTimeout = 5 * time.Minute
 	}
+	if cfg.DispatchWorkers <= 0 {
+		cfg.DispatchWorkers = 4
+	}
+	if cfg.OperationRetention <= 0 {
+		cfg.OperationRetention = 7 * 24 * time.Hour
+	}
 	return &Controller{
 		store: st, nodes: nm, resv: resv, placer: placer,
 		placement: placement.New(st, nm, resv, placer, reg, cfg.ReservationCompensationTimeout), metrics: reg,
 		routes: routepublisher.New(st, cat, cfg.DefaultAppPort, cfg.LegacyAgentProxyAddr), cfg: cfg,
 		nodeListFailures:   map[string]int{},
 		prefetchedRollouts: map[string]bool{}, evacuatedNodes: map[string]bool{},
-		reportedOrphans:     map[string]bool{},
+		reportedOrphans: map[string]bool{}, machineLocks: map[string]*machineDispatchLock{},
 		userEventsRetention: cfg.UserEventsRetention, gc: cfg.GC, scrub: cfg.Scrub,
 	}
 }
@@ -215,6 +239,9 @@ func (c *Controller) Run(ctx context.Context) error {
 	}
 	if c.reportedOrphans == nil {
 		c.reportedOrphans = map[string]bool{}
+	}
+	if c.machineLocks == nil { // 防御：测试可直接构造
+		c.machineLocks = map[string]*machineDispatchLock{}
 	}
 	// 有界去重表：超限重置（孤儿事件可重复上报，但不会无限增长）。
 	if len(c.reportedOrphans) > 4096 {
@@ -314,6 +341,15 @@ func (c *Controller) Run(ctx context.Context) error {
 				slog.Error("delete expired image pins", "error", err)
 			} else if n > 0 {
 				c.metrics.Inc("firepaas_image_pins_expired_total", nil, uint64(n))
+			}
+			// R2 加固：终态 operations 保留窗清理（默认 7d；幂等键重放只保证
+			// 在保留窗内命中原操作，见 store.DeleteTerminalOperationsOlderThan）。
+			if n, err := c.store.DeleteTerminalOperationsOlderThan(ctx,
+				time.Now().Add(-c.cfg.OperationRetention)); err != nil {
+				slog.Error("operations retention purge", "error", err)
+			} else if n > 0 {
+				c.metrics.Inc("firepaas_operations_retention_purged_total", nil, uint64(n))
+				slog.Info("purged terminal operations past retention window", "count", n)
 			}
 		case <-gcTicker.C:
 			// v1.2-F（v1.2-plan §9）：引用感知镜像 GC（默认 dry-run；错误内部已记日志）。
@@ -435,23 +471,99 @@ func (c *Controller) reconcileOperations(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	for _, op := range ops {
-		if err := c.processOperation(ctx, op); err != nil {
-			c.metrics.Inc("firepaas_operation_requeues_total", nil, 1)
-			slog.Error("process operation", "operation_id", op.ID, "machine_id", op.MachineID,
-				"kind", op.Kind, "error", err)
-			// RequeueOperation 只回退仍在 CLAIMED 的操作；已终态不会被复活。
-			// P1-1：错误路径可能发生在 ctx 取消之后（leader 切换），必须用
-			// 不受取消影响的连接写回，否则操作永久滞留 CLAIMED，只能靠
-			// RequeueStaleClaimed 在 ClaimStaleAfter 后兜底。
-			detached := context.WithoutCancel(ctx)
-			_ = c.store.RequeueOperation(detached, op.ID, err.Error())
-		}
-	}
+	// R2 评审 P1（有界并发派发）：串行派发意味着一个挂死的 agent 会把
+	// 整批 20 个 op 拖到 20×AgentRPCTimeout（理论上 40 分钟才轮到下一轮
+	// tick）。改为有界工作池（默认 4）；同一台 machine 的 op 经 per-machine
+	// 锁串行；账本语义不变（每 op 仍是本进程的单写者：claim→process→
+	// complete/requeue 都只在持有 machine 锁的一个 worker 里发生）。
+	// buildRoutes 等全部 worker 完成后统一执行（路由按批次末尾的一致
+	// 状态构建，与串行时代一致）。
 	if len(ops) > 0 {
+		dispatchBounded(ctx, ops, c.cfg.DispatchWorkers, c.lockMachine, c.dispatchOne)
 		return c.buildRoutes(ctx)
 	}
 	return nil
+}
+
+// dispatchBounded：把 ops 分发给固定个数的 worker，process 在持有
+// per-machine 锁的状态下串行执行同机 op。workers<=1 退化为串行（与原语义
+// 完全一致）。本函数只为测试与生层复用，不含记账（由 process 回调负责）。
+func dispatchBounded(ctx context.Context, ops []store.Operation, workers int,
+	lock func(machineID string) func(), process func(ctx context.Context, op store.Operation),
+) {
+	if workers <= 1 || len(ops) <= 1 {
+		for _, op := range ops {
+			unlock := lock(op.MachineID)
+			process(ctx, op)
+			unlock()
+		}
+		return
+	}
+	ch := make(chan store.Operation)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for op := range ch {
+				unlock := lock(op.MachineID)
+				process(ctx, op)
+				unlock()
+			}
+		}()
+	}
+	for _, op := range ops {
+		ch <- op
+	}
+	close(ch)
+	wg.Wait()
+}
+
+// machineDispatchLock 是 per-machine 派发互斥 + 引用计数（在途持锁/等待
+// 者数），供使用后安全摘除：只有 refs==0 才从 map 删除，摘除时必有
+// machineLocksMu，与 refs++ 同临界区，不存在“摘除后仍有人持有旧锁”
+// 的窗口（评审 R2 P2：机器 map 不能只增不减）。
+type machineDispatchLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// lockMachine 获取该 machine 的派发互斥（进程内；不同机互不阻塞）。
+// 返回的 unlock 同时归还引用并在无人使用时回收条目。
+func (c *Controller) lockMachine(machineID string) func() {
+	c.machineLocksMu.Lock()
+	m, ok := c.machineLocks[machineID]
+	if !ok {
+		m = &machineDispatchLock{}
+		c.machineLocks[machineID] = m
+	}
+	m.refs++
+	c.machineLocksMu.Unlock()
+	m.mu.Lock()
+	return func() {
+		m.mu.Unlock()
+		c.machineLocksMu.Lock()
+		m.refs--
+		if m.refs == 0 && c.machineLocks[machineID] == m {
+			delete(c.machineLocks, machineID)
+		}
+		c.machineLocksMu.Unlock()
+	}
+}
+
+// dispatchOne 处理单个已 CLAIMED 的操作（在 per-machine 锁内被调用）。
+func (c *Controller) dispatchOne(ctx context.Context, op store.Operation) {
+	if err := c.processOperation(ctx, op); err != nil {
+		c.metrics.Inc("firepaas_operation_requeues_total", nil, 1)
+		slog.Error("process operation", "operation_id", op.ID, "machine_id", op.MachineID,
+			"kind", op.Kind, "error", err)
+		// RequeueOperation 只回退仍在 CLAIMED 的操作；已终态不会被复活。
+		// P1-1：错误路径可能发生在 ctx 取消之后（leader 切换），必须用
+		// 不受取消影响的连接写回，否则操作永久滞留 CLAIMED，只能靠
+		// RequeueStaleClaimed 在 ClaimStaleAfter 后兜底。
+		detached := context.WithoutCancel(ctx)
+		_ = c.store.RequeueOperation(detached, op.ID, err.Error())
+	}
 }
 
 // processLifecycle 执行 pause/resume 操作（M4.5）。
@@ -459,6 +571,13 @@ func (c *Controller) reconcileOperations(ctx context.Context) error {
 // 失败（无快照等 FailedPrecondition）：pause 可安全重试；resume 视为
 // 快照不可用 → 将机器转 R3 重建路径（observed 清空 + desired CREATED，
 // 生成新 execution 走 cold-start），本 op 终态 FAILED。
+//
+// R2 评审 P0#3（fenced 派发）：本 op 只能作用于入队时的 (execution,
+// generation)——两个固定点校验：
+//  1. 派发前：机器当前 fence 与 op 不一致 → SUPERSEDED 终态（不发起 RPC。
+//     旧 pause 作用于新 execution 会快照到不该被睡眠的新代 VM）。
+//  2. 落账时：observed 写回按同一 fence 对 CAS；CAS 失败不记 SUCCEEDED
+//     （op 置 SUPERSEDED；agent 侧效果由新代的对账路径接管）。
 func (c *Controller) processLifecycle(ctx context.Context, op store.Operation) error {
 	var req pb.MachineOperationRequest
 	if err := protojson.Unmarshal(op.Request, &req); err != nil {
@@ -466,12 +585,25 @@ func (c *Controller) processLifecycle(ctx context.Context, op store.Operation) e
 		return err
 	}
 	m, err := c.store.GetMachine(ctx, op.MachineID)
-	if err != nil || m == nil {
-		_ = c.store.CompleteOperation(ctx, op.ID, "FAILED", nil, "machine gone")
-		return err
+	if err != nil {
+		return err // PG 抖动：requeue 重试（不能误判终态）
 	}
-	gen := uint64(m.Generation)
-	exec := m.CurrentExecutionID
+	if m == nil {
+		_ = c.store.CompleteOperation(ctx, op.ID, "FAILED", nil, "machine gone")
+		return nil
+	}
+	exec, gen := op.ExecutionID, op.Generation
+	if m.CurrentExecutionID != exec || m.Generation != gen {
+		c.metrics.Inc("firepaas_operations_total",
+			map[string]string{"kind": op.Kind, "result": "superseded"}, 1)
+		slog.Warn("lifecycle op superseded by fence drift",
+			"operation_id", op.ID, "kind", op.Kind, "machine_id", op.MachineID,
+			"op_execution", exec, "op_generation", gen,
+			"current_execution", m.CurrentExecutionID, "current_generation", m.Generation)
+		_ = c.store.CompleteOperation(ctx, op.ID, "SUPERSEDED", nil,
+			"machine fence moved past this operation (no dispatch)")
+		return nil
+	}
 
 	client := c.nodes.ClientFor(m.NodeID)
 	if client == nil {
@@ -488,9 +620,9 @@ func (c *Controller) processLifecycle(ctx context.Context, op store.Operation) e
 	// 又把 observed 回写为 RUNNING，e2e 50 循环在第 N 次撞输竞态（真机
 	/// 验收发现）。
 	if op.Kind == "pause" {
-		pbm, err = client.Pause(rpcCtx, op.MachineID, exec, gen, op.ID)
+		pbm, err = client.Pause(rpcCtx, op.MachineID, exec, uint64(gen), op.ID)
 	} else {
-		pbm, err = client.Resume(rpcCtx, op.MachineID, exec, gen, op.ID)
+		pbm, err = client.Resume(rpcCtx, op.MachineID, exec, uint64(gen), op.ID)
 	}
 	if err != nil {
 		if status.Code(err) == codes.FailedPrecondition && op.Kind == "resume" {
@@ -519,9 +651,22 @@ func (c *Controller) processLifecycle(ctx context.Context, op store.Operation) e
 	case pb.MachineState_RUNNING:
 		want = "RUNNING"
 	}
-	if err := c.store.UpdateMachineNodeAndObserved(ctx, op.MachineID, m.NodeID,
-		m.CurrentExecutionID, want, m.ObservedSlotIP, m.ObservedReadiness); err != nil {
+	okCAS, err := c.store.UpdateMachineObservedWithFenceCAS(ctx, op.MachineID, m.NodeID,
+		exec, gen, want, m.ObservedSlotIP, m.ObservedReadiness)
+	if err != nil {
 		return err
+	}
+	if !okCAS {
+		// RPC 与落账之间机器换代（fence 漂移）：绝不记 SUCCEEDED。RPC 已
+		// 对旧代执行完毕，按 SUPERSEDED 收敛；新代的观测由 syncObserved 接管。
+		c.metrics.Inc("firepaas_operations_total",
+			map[string]string{"kind": op.Kind, "result": "superseded"}, 1)
+		slog.Warn("lifecycle op result discarded by fence CAS",
+			"operation_id", op.ID, "kind", op.Kind, "machine_id", op.MachineID,
+			"op_execution", exec, "op_generation", gen)
+		_ = c.store.CompleteOperation(ctx, op.ID, "SUPERSEDED", nil,
+			"machine fence drifted during dispatch; result discarded")
+		return nil
 	}
 	result, _ := protojson.Marshal(pbm)
 	c.metrics.Inc("firepaas_operations_total",
@@ -594,6 +739,31 @@ func (c *Controller) processCreate(ctx context.Context, op store.Operation) erro
 		return err
 	}
 
+	// P0（R2 评审）：secrets 主密钥 fail-closed。deployment 带了 secret_refs而
+	// 控制面未配置 master key（cfg.Secrets==nil）时，绝不能继续派发——跳过
+	// 校验的 VM 会以"缺 secret"的形态上线，运维侧察觉之前流量已受损。
+	// 在任何 placement/RPC 之前终止：op FAILED + 高亮日志 + 指标 + 用户事件。
+	if c.cfg.Secrets == nil && req.Spec.GetDeploymentId() != "" {
+		refs, refsErr := store.DeploymentSecretRefs(ctx, c.store, req.Spec.GetDeploymentId())
+		if refsErr != nil {
+			return fmt.Errorf("load deployment secret refs: %w", refsErr) // 暂态：requeue
+		}
+		if len(refs) > 0 {
+			reason := "deployment has secret_refs but FIREPAAS_SECRETS_MASTER_KEY is not configured; " +
+				"refusing to create a VM without its secrets (fail-closed)"
+			slog.Error("create dispatch fail-closed: secrets master key missing",
+				"operation_id", op.ID, "machine_id", op.MachineID,
+				"deployment_id", req.Spec.GetDeploymentId())
+			c.metrics.Inc("firepaas_secret_create_failclosed_total", nil, 1)
+			c.userEvent(ctx, op.ProjectID, req.Spec.GetAppId(), op.MachineID,
+				store.UserEventSecretCreateRejected, map[string]any{
+					"reason": "secrets master key missing; dispatch fail-closed",
+				})
+			_ = c.store.CompleteOperation(ctx, op.ID, "FAILED", nil, reason)
+			return nil // 终态：不重试（配置不变不会改变结果）
+		}
+	}
+
 	// R8：ACK 丢失补账。普通 create 可由 execution-bound RUNNING 证明成功；
 	// secret create 还必须有同绑定且已 DELIVERED/ACKED 的 lease，不能仅凭 VM
 	// 运行态把“不确定是否投递”误判为成功。
@@ -612,12 +782,20 @@ func (c *Controller) processCreate(ctx context.Context, op store.Operation) erro
 		if !secretCreate {
 			c.metrics.Inc("firepaas_reconcile_actions_total", map[string]string{"kind": "ack_lost_reconcile"}, 1)
 			_ = c.resv.Release(ctx, op.ID)
+			c.userEvent(ctx, op.ProjectID, req.Spec.GetAppId(), op.MachineID, store.UserEventMachineCreated,
+				map[string]any{"generation": op.Generation, "node_id": m.NodeID, "recovered": true})
 			return c.store.CompleteOperation(ctx, op.ID, "SUCCEEDED", nil, "")
 		}
 		lease, leaseErr := c.store.SecretLeaseForExecution(ctx, op.MachineID, op.ExecutionID)
 		if leaseErr == nil && secretLeaseConfirmsCreate(lease, op, time.Now()) {
 			c.metrics.Inc("firepaas_reconcile_actions_total", map[string]string{"kind": "ack_lost_reconcile"}, 1)
 			_ = c.resv.Release(ctx, op.ID)
+			c.userEvent(ctx, op.ProjectID, req.Spec.GetAppId(), op.MachineID, store.UserEventMachineCreated,
+				map[string]any{"generation": op.Generation, "node_id": m.NodeID, "recovered": true})
+			if lease.State == store.SecretLeaseAcked {
+				c.userEvent(ctx, op.ProjectID, req.Spec.GetAppId(), op.MachineID, store.UserEventSecretDelivered,
+					map[string]any{"generation": op.Generation, "recovered": true})
+			}
 			return c.store.CompleteOperation(ctx, op.ID, "SUCCEEDED", nil, "")
 		}
 		if leaseErr == nil {
@@ -813,23 +991,49 @@ func (c *Controller) processDelete(ctx context.Context, op store.Operation, mark
 	}
 
 	m, _ := c.store.GetMachine(ctx, del.MachineId)
-	nodeID := ""
-	if m != nil {
+	// Pinned reap/delete 必须优先使用 operation.dispatch_node_id：该节点是
+	// 观察到目标 execution 的位置。若先取 PG machine.node_id，failover 后
+	// 旧 execution 的 reap 会被发往新 execution 所在节点，围栏拒绝后又被
+	// 收敛为 SUCCEEDED，形成“证据显示已清理、实例名仍泄漏”的假成功。
+	nodeID := op.DispatchNodeID
+	if nodeID == "" && m != nil {
 		nodeID = m.NodeID
-	}
-	if nodeID == "" {
-		nodeID = op.DispatchNodeID
 	}
 	client := (*agentclient.Client)(nil)
 	if nodeID != "" {
 		client = c.clientForNodeID(nodeID)
 	}
+	mismatchConverged := false
 	if client == nil {
 		// Secret create 的不确定 execution 不能按“节点失联即已删除”收敛；
 		// 必须等 fenced delete 获得确定结果，之后才允许换代并签发新 lease。
 		if lease, err := c.store.SecretLeaseForExecution(ctx, del.MachineId, del.ExecutionId); err == nil &&
 			lease.State == store.SecretLeaseUncertain {
-			return fmt.Errorf("secret cleanup waiting for node %s", nodeID)
+			// 但“不确定”只在 create 确实发到过 agent 才成立：机器从未分配
+			// 过节点（create 在 placement/即时拒绝阶段失败）时，任何 agent 都不可能
+			// 有该 execution 的工件——继续等节点等于永久活锁（真机验收复现：
+			// badmode 注入拒绝场景机器行无 node_id，cleanup 永远无法完成删除）。
+			// 另一充分收敛条件：uncertain-cleanup reap 已 SUCCEEDED（意味着确定
+			// delete RPC 已在目标 agent 得到应答）——lease 遍历为终态的全部证据
+			// 为节点重启/失联而清理代理退避。
+			discharged, derr := c.store.SecretCleanupDischarged(ctx, lease.OperationID)
+			if derr != nil {
+				return derr
+			}
+			if !discharged {
+				dispatched, derr := c.store.CreateDispatchedToAgent(ctx, del.MachineId, del.ExecutionId)
+				if derr != nil {
+					return fmt.Errorf("secret cleanup dispatch lookup: %w", derr)
+				}
+				if dispatched {
+					return fmt.Errorf("secret cleanup waiting for node %s", nodeID)
+				}
+				slog.Info("uncertain secret create never dispatched; converging delete",
+					"machine_id", del.MachineId, "execution_id", del.ExecutionId)
+			} else {
+				slog.Info("uncertain secret create cleanup discharged; converging delete",
+					"machine_id", del.MachineId, "execution_id", del.ExecutionId)
+			}
 		}
 		// 普通清理维持既有语义：agent 侧残留由 orphan 决策表在节点恢复后处理。
 		c.recordEvent(ctx, "reconcile", del.MachineId, op.ID, nodeID,
@@ -841,6 +1045,20 @@ func (c *Controller) processDelete(ctx context.Context, op store.Operation, mark
 		if err != nil {
 			c.metrics.Inc("firepaas_agent_rpc_errors_total", map[string]string{"kind": "delete"}, 1)
 			switch {
+			case deleteErrorConverges(err, m, op.ExecutionID):
+				// 目标 execution 已换代（机器行当前 execution 已迁移）且机器整体
+				// desired=DELETED：name 作用域的所有可清资材归当前 execution 的
+				// 删除链接所有，旧代 delete 无独立残留可清——收敛而非无限重试
+				// （真机验收发现的 reap 活锁：generation 屏障拒绝旧 fenced delete）。
+				slog.Info("delete of superseded execution converges (machine moved on)",
+					"machine_id", del.MachineId, "execution_id", del.ExecutionId,
+					"operation_id", op.ID)
+				c.recordEvent(ctx, "reconcile", del.MachineId, op.ID, nodeID,
+					"superseded execution delete converged", nil)
+				// 机器仍存活的 mismatch 收敛只证明“该节点无此 execution”：
+				// attachment 释放（下文中）只对终删语义安全；分歧副本可能仍在
+				// 其他节点挂载，释放留给真实删除成功/NotFound 的路径（评审 P1）。
+				mismatchConverged = m != nil && m.DesiredState != "DELETED"
 			case status.Code(err) == codes.NotFound:
 				// agent 侧已不存在（节点数据被清理）：幂等成功收敛。
 				slog.Warn("delete target missing at agent; converging as deleted",
@@ -864,8 +1082,12 @@ func (c *Controller) processDelete(ctx context.Context, op store.Operation, mark
 	// gone under the documented orphan-cleanup path), so its attachment claims
 	// can no longer protect or consume volume quota. Scope by execution to avoid
 	// an old delete releasing a replacement execution's mounts.
-	if _, err := c.store.ReleaseTerminalExecutionAttachments(ctx, del.MachineId, del.ExecutionId); err != nil {
-		return err
+	// 例外：存活机器的 fencing-mismatch 收敛（可能仍有分歧副本挂载在别的节点）
+	// 不放配额——真实删除/NotFound 的 op 才释放（评审 P1 双挂载风险）。
+	if !mismatchConverged {
+		if _, err := c.store.ReleaseTerminalExecutionAttachments(ctx, del.MachineId, del.ExecutionId); err != nil {
+			return err
+		}
 	}
 	c.metrics.Inc("firepaas_operations_total", map[string]string{"kind": "delete", "result": "succeeded"}, 1)
 	return c.store.CompleteOperation(ctx, op.ID, "SUCCEEDED", []byte(`{}`), "")
@@ -936,6 +1158,64 @@ func machineQuotaExceeded(usage, limit int64) bool {
 // observed 同步与决策表（R1–R7）
 // ---------------------------------------------------------------------------
 
+const (
+	// nodeObservedListTimeout 是单节点 observed List 的上限（保持既有 10s）。
+	nodeObservedListTimeout = 10 * time.Second
+	// nodeObservedListParallel 是 observed List 的并发上限（P1#10）：串行
+	// 抓取时 N 个失联节点会把主 select 循环堵住 ~10N 秒，饿死 op 派发/
+	// rollout/TTL 处理；有界并发后整轮开销 ≈ ⌈N/并发⌉×单节点超时。
+	nodeObservedListParallel = 8
+)
+
+// nodeListOutcome 是单节点 List 抓取结果。fetch 阶段各元素只由对应
+// goroutine 写，合并阶段单线程消费（单写者不变量不受影响）。
+type nodeListOutcome struct {
+	view     nodeView
+	machines []*pb.Machine
+	err      error // List RPC 失败（含超时）
+	noClient bool  // 无 agent client（nodemanager 尚未建好连接）
+}
+
+// fetchNodeObservations 有界并发地抓取各节点 List：每节点独立超时，失联/
+// 挂起节点只影响自己的 outcome（per-node failure isolation），不再串行
+// 拖住整轮。结果按 views 原序返回，合并与决策由调用方单线程执行。
+// clientFor/list 为依赖注入 seam（生产走 agent gRPC，测试注入 fake agent）。
+func fetchNodeObservations(ctx context.Context, views []nodeView,
+	clientFor func(nodeView) *agentclient.Client,
+	list func(ctx context.Context, v nodeView, client *agentclient.Client) ([]*pb.Machine, error),
+	timeout time.Duration, maxParallel int,
+) []nodeListOutcome {
+	outcomes := make([]nodeListOutcome, len(views))
+	if maxParallel > len(views) {
+		maxParallel = len(views)
+	}
+	if maxParallel < 1 {
+		maxParallel = 1
+	}
+	sem := make(chan struct{}, maxParallel)
+	var wg sync.WaitGroup
+	for i, v := range views {
+		outcomes[i].view = v
+		client := clientFor(v)
+		if client == nil {
+			outcomes[i].noClient = true
+			continue
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, v nodeView, client *agentclient.Client) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			listCtx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			machines, err := list(listCtx, v, client)
+			outcomes[i].machines, outcomes[i].err = machines, err
+		}(i, v, client)
+	}
+	wg.Wait()
+	return outcomes
+}
+
 func (c *Controller) syncObserved(ctx context.Context) error {
 	// v1.2-D（ADR-0026）：TTL 到期先摘 route（desired→DELETED，buildRoutes
 	// 立即排除），再下发 fenced delete。controller 停机跨过到期点后，恢复
@@ -944,12 +1224,24 @@ func (c *Controller) syncObserved(ctx context.Context) error {
 		slog.Error("expire machines", "error", err)
 	}
 	views := c.nodeViews()
-	seen := map[string]*pb.Machine{}
-	agentByMachine := map[string]string{} // machine → agent node id
+	// P1#10：抓取阶段有界并发（失联节点不串行堵整轮）；合并阶段维持
+	// 单线程决策，节点顺序与失败处理语义与原串行实现一致。
+	outcomes := fetchNodeObservations(ctx, views,
+		func(v nodeView) *agentclient.Client { return c.nodes.ClientFor(v.nomadID) },
+		func(ctx context.Context, _ nodeView, client *agentclient.Client) ([]*pb.Machine, error) {
+			return client.List(ctx, "")
+		},
+		nodeObservedListTimeout, nodeObservedListParallel)
+	// D3/D5 验收发现：failover+旧节点恢复会让同一 machine id 同时出现在两个
+	// 节点（旧代/新代副本并存）。按机器 id 单槽位去重会随机丢掉一个副本，且
+	// R2 清理会用 PG node_id 把 reap 派发到错误节点（无限重试活锁）。改为
+	// 按（machine, 节点）保留全部副本：旧代/外来代副本的 reap 一律 pin 在
+	// 观察到它的节点。
+	copies := map[string]map[string]*pb.Machine{} // machine → agent node id → 观测副本
 
-	for _, v := range views {
-		client := c.nodes.ClientFor(v.nomadID)
-		if client == nil {
+	for _, o := range outcomes {
+		v := o.view
+		if o.noClient {
 			// M5 诊断：之前静默跳过掩盖了 node client 未建立的问题。
 			c.nodeListFailures[v.agentID]++
 			if c.nodeListFailures[v.agentID]%5 == 1 {
@@ -958,10 +1250,7 @@ func (c *Controller) syncObserved(ctx context.Context) error {
 			}
 			continue
 		}
-		listCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		machines, err := client.List(listCtx, "")
-		cancel()
-		if err != nil {
+		if o.err != nil {
 			c.metrics.Inc("firepaas_agent_rpc_errors_total", map[string]string{"kind": "list"}, 1)
 			// P3-9：单次失败只可能是瞬时抖动（agent 重启/网络闪断）；连续
 			// NodeMissingThreshold 次失败才把节点上的 machine 摘路由，避免
@@ -970,7 +1259,7 @@ func (c *Controller) syncObserved(ctx context.Context) error {
 			c.nodeListFailures[v.agentID]++
 			if c.nodeListFailures[v.agentID] < c.cfg.NodeMissingThreshold {
 				slog.Warn("agent list failed (transient)", "node", v.agentID,
-					"consecutive", c.nodeListFailures[v.agentID], "error", err)
+					"consecutive", c.nodeListFailures[v.agentID], "error", o.err)
 				continue
 			}
 			// 节点持续失联：把该节点上的 machine 保守置 UNKNOWN（摘路由）。
@@ -982,9 +1271,11 @@ func (c *Controller) syncObserved(ctx context.Context) error {
 			continue
 		}
 		delete(c.nodeListFailures, v.agentID)
-		for _, m := range machines {
-			seen[m.MachineId] = m
-			agentByMachine[m.MachineId] = v.agentID
+		for _, m := range o.machines {
+			if copies[m.MachineId] == nil {
+				copies[m.MachineId] = map[string]*pb.Machine{}
+			}
+			copies[m.MachineId][v.agentID] = m
 			c.processAgentMachine(ctx, m, v)
 		}
 	}
@@ -994,7 +1285,7 @@ func (c *Controller) syncObserved(ctx context.Context) error {
 		return err
 	}
 	for _, m := range pgMachines {
-		c.processPGMachine(ctx, m, seen, agentByMachine)
+		c.processPGMachine(ctx, m, copies[m.ID])
 	}
 	if err := c.buildRoutes(ctx); err != nil {
 		return err
@@ -1069,16 +1360,26 @@ func (c *Controller) processAgentMachine(ctx context.Context, m *pb.Machine, v n
 		if err != nil || hasPending {
 			return
 		}
-		c.enqueueOrphanDelete(ctx, project, m)
+		c.enqueueOrphanDelete(ctx, project, m, v.agentID, 1)
 		return
 	}
 
 	if pg.CurrentExecutionID != m.ExecutionId {
-		// R2 由 PG 视角统一处理（见 processPGMachine）：这里只记观测，
-		// 不污染当前 observed，也不在此下单（避免与在途 create 竞争）。
+		// 非当前 execution 的副本一律按节点 pin reap（D3/D5/D6 + 复验修正）：
+		// 存活副本有双脑风险；UNSPECIFIED/DELETED 死条目虽不转发流量，仍占
+		// 实例名/slot 网络分配，同节点同名重建会永久撞名。二者都必须靠
+		// re-arm 到真实删除。这里不查 per-machine pending：目标 execution
+		// 与当前 create/delete 不同，若等在途 create 先收敛会形成“create
+		// 等腾名、reap 等 create”的死锁；machine dispatch lock+op 幂等仍
+		// 保证串行派发与账本安全。
 		c.recordEvent(ctx, "reconcile", m.MachineId, "", v.agentID,
 			"agent holds stale execution", nil)
 		c.metrics.Inc("firepaas_reconcile_actions_total", map[string]string{"kind": "stale_execution_seen"}, 1)
+		project := "dev"
+		if m.GetSpec() != nil && m.GetSpec().ProjectId != "" {
+			project = m.GetSpec().ProjectId
+		}
+		c.enqueueOrphanDelete(ctx, project, m, v.agentID, pg.Generation)
 		return
 	}
 
@@ -1147,32 +1448,85 @@ func (c *Controller) processAgentMachine(ctx context.Context, m *pb.Machine, v n
 }
 
 // processPGMachine：PG 视角 → agent（ACK 丢失/节点失联/desired 删除）。
+// copies 为 (machine, 节点) 的全量观测副本：failover+旧节点恢复、第二写者
+// 等会让同一 machine id 在多节点并存不同 execution。清理动作必须 pin 在
+// 持有副本的节点（D3）；当前 execution 的生存判定优先 home 节点、任意节点
+// 的存活副本都算数（防止误换代）；非当前代副本（foreign）的下单由
+// processAgentMachine 按节点 pin 完成，本函数不重复。
 func (c *Controller) processPGMachine(ctx context.Context, m store.Machine,
-	seen map[string]*pb.Machine, agentByMachine map[string]string,
+	copies map[string]*pb.Machine,
 ) {
-	agent, hasAgent := seen[m.ID]
+	agentIDs := make([]string, 0, len(copies))
+	for id := range copies {
+		agentIDs = append(agentIDs, id)
+	}
+	sort.Strings(agentIDs) // 决策确定性：同状态不同遍历顺序产出一致动作
+	var homeCopy, liveCopy *pb.Machine
+	liveNodeID := ""
+	foreignCount := 0
+	for _, id := range agentIDs {
+		cp := copies[id]
+		if id == m.NodeID {
+			homeCopy = cp
+		}
+		if cp.ExecutionId == m.CurrentExecutionID {
+			if liveCopy == nil || id == m.NodeID {
+				liveCopy, liveNodeID = cp, id
+			}
+			continue
+		}
+		if agentStateUsable(cp) {
+			// 只有存活的外来副本才阻塞换代重建；崩溃恢复账本的死条目由
+			// agent 保留（dedup/fence），清不掉也不应卡死 R3（验收复验的
+			// evacuate wedge 根因）。
+			foreignCount++
+		}
+	}
+	hasAgent := len(copies) > 0
 	nodeID := m.NodeID
-	if nodeID == "" && hasAgent {
-		nodeID = agentByMachine[m.ID]
+	if nodeID == "" && liveCopy != nil {
+		// 只从“当前 execution 的存活副本”回填节点视图；外来/死条目的节点
+		// 不是本代的节点，错误回填会让 R4 误判节点失联而永久挂起重建。
+		nodeID = liveNodeID
 	}
 
 	if m.DesiredState == "DELETED" {
 		if !hasAgent {
 			return // 已收敛；route 由 buildRoutes 清理
 		}
-		// R5：desired 已删除但 agent 残留 → 补 delete 操作。
+		// R5：desired 已删除但 agent 残留 → 按副本所在节点 pin delete。当前代
+		// 副本优先；外来/分歧代副本同样下单（D6：否则 delete 对 PG 记录的旧
+		// execution 幂等成功，真实在跑的 execution 被泄漏）。一轮最多一个
+		// op（pending 守卫），opID 按 execution 区分，下轮继续清下一副本。
 		hasPending, err := c.store.HasPendingOperationForMachine(ctx, m.ID)
 		if err != nil || hasPending {
 			return
 		}
-		exec := m.CurrentExecutionID
-		if exec == "" {
-			exec = agent.ExecutionId
-		}
 		c.recordEvent(ctx, "reconcile", m.ID, "", nodeID, "desired DELETED but agent has machine", nil)
 		c.metrics.Inc("firepaas_reconcile_actions_total", map[string]string{"kind": "desired_deleted"}, 1)
-		_ = c.enqueueDelete(ctx, m.ID, exec, m.Generation,
-			"op-reap-"+m.ID+"-"+exec, nodeID, "desired deleted")
+		if liveCopy != nil {
+			_ = c.enqueueDelete(ctx, m.ID, m.CurrentExecutionID, m.Generation,
+				"op-reap-"+m.ID+"-"+m.CurrentExecutionID, liveNodeID, "desired deleted")
+			return
+		}
+		for _, id := range agentIDs {
+			cp, ok := copies[id]
+			if !ok || cp.ExecutionId == m.CurrentExecutionID {
+				continue
+			}
+			// opID 与 R6/R2 同按 (machine, execution, node) 作用域；generation
+			// 取副本观测值、回退 PG 代际，与 enqueueOrphanDelete 同一规则。
+			gen := int64(cp.GetGeneration())
+			if gen == 0 {
+				gen = m.Generation
+			}
+			if gen == 0 {
+				gen = 1
+			}
+			_ = c.enqueueDelete(ctx, m.ID, cp.ExecutionId, gen,
+				"op-orphan-"+m.ID+"-"+cp.ExecutionId+"-"+id, id, "desired deleted: foreign execution")
+			return
+		}
 		return
 	}
 
@@ -1180,22 +1534,33 @@ func (c *Controller) processPGMachine(ctx context.Context, m store.Machine,
 		return
 	}
 
-	// R2：agent 持有旧 execution → 先清理旧代（必要时作废在途 create），
-	// 待 delete 完成后下一轮再重建。
-	if hasAgent && agent.ExecutionId != m.CurrentExecutionID {
-		c.supersedePendingCreateAndReap(ctx, m, agent, nodeID)
+	// R2：home（PG 登记）节点持旧 execution → 先清理旧代（必要时作废在途
+	// create），待 delete 完成后下一轮再重建；非 home 节点副本已由
+	// processAgentMachine 按节点 pin 下单，不在此重复。
+	if homeCopy != nil && homeCopy.ExecutionId != m.CurrentExecutionID {
+		c.supersedePendingCreateAndReap(ctx, m, homeCopy, m.NodeID)
 		return
 	}
 
-	// 同 execution 但本地实例已死（agentd 重启带走 VM 的已知行为）：
-	// 先删掉同代残留，delete 完成后下一轮 R3 重建。若已有在途 create
-	// （它必然撞“实例名已存在”），先作废它，否则 reap 永远排不上。
-	if hasAgent && agent.ExecutionId == m.CurrentExecutionID && !agentStateUsable(agent) {
+	if liveCopy == nil {
+		// 当前 execution 无处存活：外来副本的 pinned reap 由 processAgentMachine
+		// 已下单或将有 pending 占位，不能边清边建（同节点撞名与换代乒乓）；
+		// 等清理收敛后的无副本轮次走 R4/R3 尾部。
+		if foreignCount > 0 {
+			return
+		}
+	} else if !agentStateUsable(liveCopy) {
 		pending, err := c.store.PendingOperationForMachine(ctx, m.ID)
 		if err != nil {
 			return
 		}
 		if pending != nil {
+			// 只作废在途 create（换代的那个）：在途 delete/reap 正是清理
+			// 死实例的动作，误杀会造成 FAILED→重启→FAILED 乒乓（P1-2 在
+			// supersedePendingCreateAndReap 的同一教训；评审 P3）。
+			if pending.Kind != "create" {
+				return
+			}
 			_ = c.store.CompleteOperation(ctx, pending.ID, "FAILED", nil,
 				"superseded: dead instance of current execution, reap first")
 			_ = c.resv.Release(ctx, pending.ID)
@@ -1204,17 +1569,16 @@ func (c *Controller) processPGMachine(ctx context.Context, m store.Machine,
 			c.metrics.Inc("firepaas_reconcile_actions_total", map[string]string{"kind": "supersede_pending_dead"}, 1)
 			return
 		}
-		c.recordEvent(ctx, "reconcile", m.ID, "", nodeID,
+		c.recordEvent(ctx, "reconcile", m.ID, "", liveNodeID,
 			"agent holds dead instance of current execution, reap first", nil)
 		_ = c.enqueueDelete(ctx, m.ID, m.CurrentExecutionID, m.Generation,
-			"op-reap-"+m.ID+"-"+m.CurrentExecutionID, nodeID, "dead instance")
+			"op-reap-"+m.ID+"-"+m.CurrentExecutionID, liveNodeID, "dead instance")
 		return
-	}
-	if hasAgent {
+	} else {
 		// v1.2-D（ADR-0026）：agent 观测到 STOPPED = 本 execution 已退出。
 		// 只有符合 restart policy 的“意外退出”才换代重启；TTL/manual delete
 		// 的 machine 到不了这里（desired 已 DELETED 走 R5）。
-		if agent.ExecutionId == m.CurrentExecutionID && agent.State == pb.MachineState_STOPPED {
+		if liveCopy.State == pb.MachineState_STOPPED {
 			if c.rolloutRepairsMachine(ctx, m) {
 				// The rollout owner must do real repair, not merely suppress restart.
 				// Reap the stopped execution first; after it disappears the rollout
@@ -1223,14 +1587,14 @@ func (c *Controller) processPGMachine(ctx context.Context, m store.Machine,
 				if err == nil && !hasPending {
 					_ = c.enqueueDelete(ctx, m.ID, m.CurrentExecutionID, m.Generation,
 						"op-rollout-reap-"+m.ID+"-"+m.CurrentExecutionID,
-						nodeID, "rollout target stopped; reap before replacement")
+						liveNodeID, "rollout target stopped; reap before replacement")
 				}
 				return
 			}
 			if c.rolloutHoldsRecreate(ctx, m) {
 				return // draining/removal generation: rollout intentionally does not repair
 			}
-			if c.maybeRestartMachine(ctx, m, agent) {
+			if c.maybeRestartMachine(ctx, m, liveCopy) {
 				return
 			}
 		}
@@ -1351,7 +1715,7 @@ func (c *Controller) supersedePendingCreateAndReap(ctx context.Context, m store.
 		"agent holds stale execution, enqueue delete", nil)
 	c.metrics.Inc("firepaas_reconcile_actions_total", map[string]string{"kind": "stale_execution"}, 1)
 	_ = c.enqueueDelete(ctx, m.ID, agent.ExecutionId, m.Generation,
-		"op-orphan-"+m.ID+"-"+agent.ExecutionId, nodeID, "stale execution")
+		"op-orphan-"+m.ID+"-"+agent.ExecutionId+"-"+nodeID, nodeID, "stale execution")
 }
 
 // agentStateUsable 判断 agent 侧的实例状态是否仍算“活着”。
@@ -1364,6 +1728,28 @@ func agentStateUsable(m *pb.Machine) bool {
 	default: // UNSPECIFIED（agent 重启后失联）/ DELETED / DELETING
 		return false
 	}
+}
+
+// deleteErrorConverges 判定 delete/reap 的 FailedPrecondition 是否按
+// “目标不在此节点”收敛（决策纯函数，表驱动测试）。agent fencing 是确定性的：
+// execution mismatch / stale generation 都证明派发节点上没有这个
+// (machine, execution) 的账本；op 对该节点无事可做，继续重试只会活锁
+// （多节点验收 finding D3：误派发 reap 无限重试并阻塞 evacuate）。
+//   - op 目标非机器当前 execution：旧代/外来代清理，收敛；当前代不受影响，
+//     其他节点若持副本由按节点 pin 的 orphan reaps 另行清理。
+//   - machine 行已 purge（m==nil）：op 是唯一剩余证据，同样收敛。
+//
+// 不收敛的例外：op 目标正是机器当前 execution（fencing 污染信号，必须
+// 重试由 person 介入检查，不能装作删掉了在跑的机器）。
+// 该函数不判断 NotFound（幂等收敛，调用点单独处理）。
+func deleteErrorConverges(err error, m *store.Machine, opExecution string) bool {
+	if status.Code(err) != codes.FailedPrecondition {
+		return false
+	}
+	if m == nil {
+		return true
+	}
+	return m.CurrentExecutionID != "" && m.CurrentExecutionID != opExecution
 }
 
 // recreate 尾部动作常量（P1-3，决策纯函数便于表驱动测试）。
@@ -1539,13 +1925,27 @@ func (c *Controller) recreateMachine(ctx context.Context, m store.Machine, bump 
 		"operation_id", opID, "generation", gen, "bump_generation", bump)
 }
 
-// enqueueOrphanDelete / enqueueDelete 补 delete 操作。
-func (c *Controller) enqueueOrphanDelete(ctx context.Context, project string, m *pb.Machine) {
+// enqueueOrphanDelete / enqueueDelete 补 delete 操作。nodeID 必传观测节点——
+// machine 行已消失是 orphan 的常态，沒有 dispatch_node 时 processDelete 会
+// 走“节点不可达”伪装成功分支，不发起任何删除 RPC（真机验收复现：ops
+// SUCCEEDED 但 VM 照旧运行）。
+func (c *Controller) enqueueOrphanDelete(
+	ctx context.Context,
+	project string,
+	m *pb.Machine,
+	nodeID string,
+	genFallback int64,
+) {
 	// R6 的 fence 安全 generation：优先用 agent 观测值（mapMachine 从
-	// instance tag 回读）；缺失时回退 1（agent 无 fence 记录的 machine
-	// 任意 generation 均放行）。旧代码固定 1，对已换代（gen≥2）的残留
-	// 必然 FailedPrecondition → FAILED → 永远无法清理（P1-2）。
+	// instance tag 回读）；缺失时回退调用方给的 PG 代际，再回退 1（agent
+	// 无 fence 记录的 machine 任意 generation 均放行）。opID 按
+	// (machine, execution, node) 作用域（评审 P1）：多节点并存副本需要
+	// 每个节点独立的 reap，且被围栏拒绝后收敛的 op 不能永久占用幂等键
+	// 阻断对正确节点的派发。
 	gen := m.GetGeneration()
+	if gen == 0 {
+		gen = uint64(genFallback)
+	}
 	if gen == 0 {
 		gen = 1
 	}
@@ -1553,19 +1953,41 @@ func (c *Controller) enqueueOrphanDelete(ctx context.Context, project string, m 
 		MachineId:   m.MachineId,
 		ExecutionId: m.ExecutionId,
 		Generation:  gen,
-		OperationId: "op-orphan-" + m.MachineId + "-" + m.ExecutionId,
+		OperationId: "op-orphan-" + m.MachineId + "-" + m.ExecutionId + "-" + nodeID,
 	}
 	raw, err := protojson.Marshal(req)
 	if err != nil {
 		return
 	}
-	_, err = c.store.EnqueueReapDelete(ctx, project, m.MachineId, m.ExecutionId,
+	op, err := c.store.EnqueueReapDelete(ctx, project, m.MachineId, m.ExecutionId,
 		req.OperationId, int64(req.Generation), raw)
 	if err != nil {
 		slog.Error("enqueue orphan delete", "machine_id", m.MachineId, "error", err)
 		return
 	}
-	c.recordEvent(ctx, "reconcile", m.MachineId, req.OperationId, "",
+	if op.Status != "PENDING" && op.Status != "CLAIMED" {
+		// 复验发现：agent 恢复窗口内 delete 会在运行时视图未装齐时返回成功
+		//（实例“尚未出现”按阶段完成收敛），实例随后恢复列出——同名实例名
+		// 网络分配被永久占用，重建撞名循环。终态 op 的幂等键命中不能的；
+		// 副本仍被观测 = 上次效果落空，必须派生新 op 重执（按分钟分桶限流）。
+		req.OperationId = req.OperationId + "-re" + time.Now().Format("0601021504")
+		raw2, err := protojson.Marshal(req)
+		if err != nil {
+			return
+		}
+		op, err = c.store.EnqueueReapDelete(ctx, project, m.MachineId, m.ExecutionId,
+			req.OperationId, int64(req.Generation), raw2)
+		if err != nil {
+			slog.Error("re-arm orphan delete", "machine_id", m.MachineId, "error", err)
+			return
+		}
+		c.recordEvent(ctx, "reconcile", m.MachineId, req.OperationId, nodeID,
+			"orphan still observed after terminal op; re-armed delete", nil)
+	}
+	if nodeID != "" {
+		_ = c.store.UpdateOperationDispatchNode(ctx, op.ID, nodeID)
+	}
+	c.recordEvent(ctx, "reconcile", m.MachineId, req.OperationId, nodeID,
 		"orphan at agent, enqueue delete", nil)
 	c.metrics.Inc("firepaas_reconcile_actions_total", map[string]string{"kind": "orphan_delete"}, 1)
 }
@@ -1595,6 +2017,25 @@ func (c *Controller) enqueueDelete(
 	op, err := c.store.EnqueueReapDelete(ctx, project, machineID, executionID, opID, generation, raw)
 	if err != nil {
 		return err
+	}
+	if op.Status != "PENDING" && op.Status != "CLAIMED" {
+		// 与 enqueueOrphanDelete 同一效应检查（评审复验的“恢复窗口假成功”）：
+		// 终态命中说明上次已无效果终止而副本仍被观测 → 派生新 op 重执。
+		opID = opID + "-re" + time.Now().Format("0601021504")
+		req = &pb.DeleteMachineRequest{
+			MachineId:   machineID,
+			ExecutionId: executionID,
+			Generation:  uint64(generation),
+			OperationId: opID,
+		}
+		raw, err = protojson.Marshal(req)
+		if err != nil {
+			return err
+		}
+		op, err = c.store.EnqueueReapDelete(ctx, project, machineID, executionID, opID, generation, raw)
+		if err != nil {
+			return err
+		}
 	}
 	if nodeID != "" {
 		// delete 派发走 dispatch_node_id（machine 行可能还没有 node_id）。
@@ -1881,9 +2322,10 @@ func (c *Controller) rebuildLeases(ctx context.Context) error {
 		c.metrics.Inc("firepaas_reservation_rebuilds_total", nil, 1)
 	}
 
-	// P3-6c：节点从 Nomad 消失后 PG 投影永远保留旧状态；按 SyncInterval 的
-	// 3 倍作为 stale 阈值（容忍两轮同步失败）。
-	if n, err := c.store.MarkStaleNodes(ctx, 3*c.cfg.SyncInterval); err != nil {
+	// P3-6c：节点从 Nomad 消失后 PG 投影永远保留旧状态。阈值必须覆盖
+	// nodemanager 的 ServiceInfo 心跳周期；否则心跳间隔大于 controller sync
+	// 间隔时，健康节点会在两次心跳之间被周期性误标 UNKNOWN。
+	if n, err := c.store.MarkStaleNodes(ctx, c.cfg.NodeStaleAfter); err != nil {
 		slog.Warn("mark stale nodes", "error", err)
 	} else if n > 0 {
 		slog.Warn("marked stale nodes UNKNOWN", "count", n)

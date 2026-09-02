@@ -305,6 +305,25 @@ func (s *Store) EnsureAppAndEnqueueCreate(
 		generation, replicaOrdinal, requestJSON, placementJSON, nil, "NEVER", 3, 10, 300)
 }
 
+// EnsureAppAndEnqueueCreateResurrect 是 app 对账（controller scale up）的显式
+// 墓碑复活通道：v1.2-D 守卫拒绝 create upsert 复活 DELETED 行（防快照决策与
+// 用户 delete 竞争），但 scale down→up 是 owner 自己的生命周期决策——controller
+// 已判定该 ordinal 属于目标代且有意重建。复活时换新 execution、清 observed
+// 与 node_id，generation 保持 GREATEST 不回退（墓碑可能已换代，降低会让
+// agent 拒绝后续合法 create）。
+func (s *Store) EnsureAppAndEnqueueCreateResurrect(
+	ctx context.Context,
+	projectID, appID, hostname, imageRef string,
+	vcpu, memMIB, diskMIB int64, ingressPort int,
+	machineID, deploymentID, executionID, operationID string,
+	generation int64, replicaOrdinal int,
+	requestJSON, placementJSON []byte,
+) (Operation, error) {
+	return s.ensureAppAndEnqueueCreate(ctx, projectID, appID, hostname, imageRef,
+		vcpu, memMIB, diskMIB, ingressPort, machineID, deploymentID, executionID, operationID,
+		generation, replicaOrdinal, requestJSON, placementJSON, nil, "NEVER", 3, 10, 300, true)
+}
+
 // EnsureAppAndEnqueueCreateWithLifecycle atomically persists the initial TTL and
 // restart policy with the machine and create outbox row. An idempotent replay
 // returns before touching lifecycle fields, so a relative TTL is never extended.
@@ -316,6 +335,22 @@ func (s *Store) EnsureAppAndEnqueueCreateWithLifecycle(
 	generation int64, replicaOrdinal int,
 	requestJSON, placementJSON []byte, expiresAt *time.Time,
 	restartMode string, restartMaxAttempts, restartBackoffSeconds, restartStableWindowSeconds int,
+) (Operation, error) {
+	return s.ensureAppAndEnqueueCreate(ctx, projectID, appID, hostname, imageRef,
+		vcpu, memMIB, diskMIB, ingressPort, machineID, deploymentID, executionID, operationID,
+		generation, replicaOrdinal, requestJSON, placementJSON, expiresAt,
+		restartMode, restartMaxAttempts, restartBackoffSeconds, restartStableWindowSeconds, false)
+}
+
+func (s *Store) ensureAppAndEnqueueCreate(
+	ctx context.Context,
+	projectID, appID, hostname, imageRef string,
+	vcpu, memMIB, diskMIB int64, ingressPort int,
+	machineID, deploymentID, executionID, operationID string,
+	generation int64, replicaOrdinal int,
+	requestJSON, placementJSON []byte, expiresAt *time.Time,
+	restartMode string, restartMaxAttempts, restartBackoffSeconds, restartStableWindowSeconds int,
+	allowResurrect bool,
 ) (Operation, error) {
 	var op Operation
 	err := s.inTx(ctx, func(tx pgx.Tx) error {
@@ -408,40 +443,40 @@ func (s *Store) EnsureAppAndEnqueueCreateWithLifecycle(
 				-- 用户 delete / TTL mark。已删除的 machine 不允许被 create upsert
 				-- 复活：整行保持原样（含 desired/generation/execution/observed），
 				-- 由事务后置检查报错；restart 与 R3/app 重建共用本函数。
-				desired_state = CASE WHEN machines.desired_state='DELETED' THEN machines.desired_state ELSE 'CREATED' END,
-				generation = CASE WHEN machines.desired_state='DELETED' THEN machines.generation ELSE GREATEST(machines.generation, EXCLUDED.generation) END,
-				current_execution_id = CASE WHEN machines.desired_state='DELETED' THEN machines.current_execution_id ELSE EXCLUDED.current_execution_id END,
-				replica_ordinal = CASE WHEN machines.desired_state='DELETED' THEN machines.replica_ordinal ELSE EXCLUDED.replica_ordinal END,
-				ingress_port = CASE WHEN machines.desired_state='DELETED' THEN machines.ingress_port ELSE EXCLUDED.ingress_port END,
-				placement = CASE WHEN machines.desired_state='DELETED' THEN machines.placement ELSE EXCLUDED.placement END,
+				desired_state = CASE WHEN machines.desired_state='DELETED' AND NOT $19 THEN machines.desired_state ELSE 'CREATED' END,
+				generation = CASE WHEN machines.desired_state='DELETED' AND NOT $19 THEN machines.generation ELSE GREATEST(machines.generation, EXCLUDED.generation) END,
+				current_execution_id = CASE WHEN machines.desired_state='DELETED' AND NOT $19 THEN machines.current_execution_id ELSE EXCLUDED.current_execution_id END,
+				replica_ordinal = CASE WHEN machines.desired_state='DELETED' AND NOT $19 THEN machines.replica_ordinal ELSE EXCLUDED.replica_ordinal END,
+				ingress_port = CASE WHEN machines.desired_state='DELETED' AND NOT $19 THEN machines.ingress_port ELSE EXCLUDED.ingress_port END,
+				placement = CASE WHEN machines.desired_state='DELETED' AND NOT $19 THEN machines.placement ELSE EXCLUDED.placement END,
 				-- generation 单调不回退（P1-3）：换代重建后用户携旧默认值重试
 				-- 不得拉低 fence 水位，否则 agent 会拒绝后续合法 create。
 				observed_state = CASE
-					WHEN machines.desired_state='DELETED' THEN machines.observed_state
-					WHEN machines.current_execution_id IS DISTINCT FROM EXCLUDED.current_execution_id THEN ''
+					WHEN machines.desired_state='DELETED' AND NOT $19 THEN machines.observed_state
+					WHEN machines.desired_state='DELETED' OR machines.current_execution_id IS DISTINCT FROM EXCLUDED.current_execution_id THEN ''
 					ELSE machines.observed_state END,
 				observed_slot_ip = CASE
-					WHEN machines.desired_state='DELETED' THEN machines.observed_slot_ip
-					WHEN machines.current_execution_id IS DISTINCT FROM EXCLUDED.current_execution_id THEN ''
+					WHEN machines.desired_state='DELETED' AND NOT $19 THEN machines.observed_slot_ip
+					WHEN machines.desired_state='DELETED' OR machines.current_execution_id IS DISTINCT FROM EXCLUDED.current_execution_id THEN ''
 					ELSE machines.observed_slot_ip END,
 				observed_readiness = CASE
-					WHEN machines.desired_state='DELETED' THEN machines.observed_readiness
-					WHEN machines.current_execution_id IS DISTINCT FROM EXCLUDED.current_execution_id THEN 'UNKNOWN'
+					WHEN machines.desired_state='DELETED' AND NOT $19 THEN machines.observed_readiness
+					WHEN machines.desired_state='DELETED' OR machines.current_execution_id IS DISTINCT FROM EXCLUDED.current_execution_id THEN 'UNKNOWN'
 					ELSE machines.observed_readiness END,
 				last_observed_at = CASE
-					WHEN machines.desired_state='DELETED' THEN machines.last_observed_at
-					WHEN machines.current_execution_id IS DISTINCT FROM EXCLUDED.current_execution_id THEN NULL
+					WHEN machines.desired_state='DELETED' AND NOT $19 THEN machines.last_observed_at
+					WHEN machines.desired_state='DELETED' OR machines.current_execution_id IS DISTINCT FROM EXCLUDED.current_execution_id THEN NULL
 					ELSE machines.last_observed_at END,
 				node_id = CASE
-					WHEN machines.desired_state='DELETED' THEN machines.node_id
-					WHEN machines.current_execution_id IS DISTINCT FROM EXCLUDED.current_execution_id THEN ''
+					WHEN machines.desired_state='DELETED' AND NOT $19 THEN machines.node_id
+					WHEN machines.desired_state='DELETED' OR machines.current_execution_id IS DISTINCT FROM EXCLUDED.current_execution_id THEN ''
 					ELSE machines.node_id END,
 				updated_at = now()
 			WHERE machines.app_id=EXCLUDED.app_id
 			  AND machines.deployment_id=EXCLUDED.deployment_id
 			RETURNING desired_state`,
 			machineID, appID, deploymentID, replicaOrdinal, hostname, generation, executionID, vcpu, memMIB, diskMIB, imageRef, ingressPort, placementJSONOrEmpty(placementJSON),
-			expiresArg, restartMode, restartMaxAttempts, restartBackoffSeconds, restartStableWindowSeconds).Scan(&desiredAfter); err != nil {
+			expiresArg, restartMode, restartMaxAttempts, restartBackoffSeconds, restartStableWindowSeconds, allowResurrect).Scan(&desiredAfter); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				if scanErr := tx.QueryRow(ctx, `SELECT app_id, deployment_id FROM machines WHERE id=$1`, machineID).
 					Scan(&machineApp, &machineDeployment); scanErr != nil {
@@ -587,48 +622,60 @@ func (s *Store) enqueueDeleteKind(
 ) (Operation, error) {
 	var op Operation
 	err := s.inTx(ctx, func(tx pgx.Tx) error {
-		existing, err := selectOperationByKey(ctx, tx, projectID, operationID)
-		if err != nil {
-			return err
-		}
-		if existing != nil {
-			if !jsonEqual(existing.Request, requestJSON) {
-				return ErrRequestConflict
-			}
-			if existing.Status == "FAILED" {
-				if err := resurrectOperation(ctx, tx, existing.ID); err != nil {
-					return err
-				}
-				existing.Status = "PENDING"
-				existing.Error = ""
-			}
-			op = *existing
-			return nil
-		}
-
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO operations(id, project_id, machine_id, execution_id, generation,
-				kind, idempotency_key, status, request)
-			VALUES($1,$2,$3,$4,$5,$6,$1,'PENDING',$7::jsonb)
-			ON CONFLICT (project_id, idempotency_key) DO NOTHING`,
-			operationID, projectID, machineID, executionID, generation, kind, string(requestJSON)); err != nil {
-			return fmt.Errorf("enqueue %s: %w", kind, err)
-		}
-
-		created, err := selectOperationByKey(ctx, tx, projectID, operationID)
-		if err != nil {
-			return err
-		}
-		if created == nil {
-			return fmt.Errorf("operation %s disappeared after insert", operationID)
-		}
-		op = *created
-		return nil
+		var err error
+		op, err = enqueueOperationIdempotentTx(ctx, tx, projectID, machineID,
+			executionID, operationID, generation, requestJSON, kind, true)
+		return err
 	})
 	if err != nil {
 		return Operation{}, err
 	}
 	return op, nil
+}
+
+// enqueueOperationIdempotentTx 是幂等 operation 入队的 tx 内联实现（供
+// enqueueDeleteKind 与 SoftDeleteAppAndEnqueueDeletes 复用）；resurrectFailed
+// 控制 FAILED 终态是否在请求体一致时复活为 PENDING（delete/reap 为 true）。
+func enqueueOperationIdempotentTx(
+	ctx context.Context, tx pgx.Tx,
+	projectID, machineID, executionID, operationID string,
+	generation int64, requestJSON []byte, kind string, resurrectFailed bool,
+) (Operation, error) {
+	existing, err := selectOperationByKey(ctx, tx, projectID, operationID)
+	if err != nil {
+		return Operation{}, err
+	}
+	if existing != nil {
+		if !jsonEqual(existing.Request, requestJSON) {
+			return Operation{}, ErrRequestConflict
+		}
+		if resurrectFailed && existing.Status == "FAILED" {
+			if err := resurrectOperation(ctx, tx, existing.ID); err != nil {
+				return Operation{}, err
+			}
+			existing.Status = "PENDING"
+			existing.Error = ""
+		}
+		return *existing, nil
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO operations(id, project_id, machine_id, execution_id, generation,
+			kind, idempotency_key, status, request)
+		VALUES($1,$2,$3,$4,$5,$6,$1,'PENDING',$7::jsonb)
+		ON CONFLICT (project_id, idempotency_key) DO NOTHING`,
+		operationID, projectID, machineID, executionID, generation, kind, string(requestJSON)); err != nil {
+		return Operation{}, fmt.Errorf("enqueue %s: %w", kind, err)
+	}
+
+	created, err := selectOperationByKey(ctx, tx, projectID, operationID)
+	if err != nil {
+		return Operation{}, err
+	}
+	if created == nil {
+		return Operation{}, fmt.Errorf("operation %s disappeared after insert", operationID)
+	}
+	return *created, nil
 }
 
 // ClaimPendingOperations 领取最多 limit 个 PENDING 操作。
@@ -1359,6 +1406,37 @@ func (s *Store) HasPendingOperationForMachine(ctx context.Context, machineID str
 	return exists, nil
 }
 
+// SecretCleanupDischarged 判定某 lease 的确定清理（uncertain-cleanup reap）
+// 是否已成功——这是 delete 可以在 UNCERTAIN 状态下收敛的充分条件。
+func (s *Store) SecretCleanupDischarged(ctx context.Context, createOperationID string) (bool, error) {
+	var status string
+	err := s.pool.QueryRow(ctx,
+		`SELECT status FROM operations WHERE id=$1`, "op-secret-cleanup-"+createOperationID).Scan(&status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("secret cleanup lookup: %w", err)
+	}
+	return status == "SUCCEEDED", nil
+}
+
+// CreateDispatchedToAgent 判定某 execution 的 create 是否真实发到过 agent
+// （存在携带 dispatch_node 的 create 派发）。不确定 secret 创建只在“可能已落
+// agent”时才有不确定语义：若从未派发，任何 agent 都不可能有该 execution 的
+// 工件，delete 可以安全按“节点失联”收敛而不是无限等待。
+func (s *Store) CreateDispatchedToAgent(ctx context.Context, machineID, executionID string) (bool, error) {
+	var exists bool
+	if err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM operations
+			WHERE machine_id=$1 AND execution_id=$2 AND kind='create'
+			  AND coalesce(dispatch_node_id,'')<>'')`,
+		machineID, executionID).Scan(&exists); err != nil {
+		return false, fmt.Errorf("create dispatched to agent: %w", err)
+	}
+	return exists, nil
+}
+
 // PendingOperationForMachine 返回该 machine 当前未完成的操作（无则 nil）。
 func (s *Store) PendingOperationForMachine(ctx context.Context, machineID string) (*Operation, error) {
 	row := s.pool.QueryRow(ctx, `
@@ -1446,7 +1524,13 @@ func (s *Store) PendingUsageByNode(ctx context.Context) ([]PendingUsage, error) 
 }
 
 // MachineNodesByDeployment 返回 deployment → 已占节点集合（反亲和排除集）。
+// 除已提交 machine 的 node_id，还必须计入在途 create 的 dispatch node：
+// 并发（有界 worker）同 tick 初版部署时，第二个放置读取时第一个 machine
+// 行尚未写入 node_id，只靠 machines 会让两副本看到同一个“空”集合而落
+// 同节点（多节点真机验收复现）。在途 = PENDING/CLAIMED 且已定派发节点；
+// 终态 op 与 delete 的 dispatch 不占用（终态 create 已由 machines 覆盖）。
 func (s *Store) MachineNodesByDeployment(ctx context.Context) (map[string]map[string]bool, error) {
+	out := map[string]map[string]bool{}
 	rows, err := s.pool.Query(ctx, `
 		SELECT deployment_id, node_id FROM machines
 		WHERE desired_state IN ('CREATED','RUNNING') AND node_id<>''`)
@@ -1454,7 +1538,6 @@ func (s *Store) MachineNodesByDeployment(ctx context.Context) (map[string]map[st
 		return nil, fmt.Errorf("machine nodes by deployment: %w", err)
 	}
 	defer rows.Close()
-	out := map[string]map[string]bool{}
 	for rows.Next() {
 		var dep, node string
 		if err := rows.Scan(&dep, &node); err != nil {
@@ -1465,7 +1548,29 @@ func (s *Store) MachineNodesByDeployment(ctx context.Context) (map[string]map[st
 		}
 		out[dep][node] = true
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	opRows, err := s.pool.Query(ctx, `
+		SELECT m.deployment_id, o.dispatch_node_id
+		FROM operations o JOIN machines m ON m.id = o.machine_id
+		WHERE o.kind='create' AND o.status IN ('PENDING','CLAIMED')
+			AND o.dispatch_node_id IS NOT NULL AND o.dispatch_node_id<>''`)
+	if err != nil {
+		return nil, fmt.Errorf("inflight create dispatch nodes: %w", err)
+	}
+	defer opRows.Close()
+	for opRows.Next() {
+		var dep, node string
+		if err := opRows.Scan(&dep, &node); err != nil {
+			return nil, fmt.Errorf("scan inflight dispatch node: %w", err)
+		}
+		if out[dep] == nil {
+			out[dep] = map[string]bool{}
+		}
+		out[dep][node] = true
+	}
+	return out, opRows.Err()
 }
 
 // AllocatedByNode 汇总每个节点上期望存活 machine 的资源承诺。
@@ -1550,6 +1655,27 @@ func (s *Store) UpdateMachineNodeAndObserved(
 	return nil
 }
 
+// UpdateMachineObservedWithFenceCAS（R2 评审 P0#3）：以 (current_execution_id,
+// generation) 为 CAS 条件写 observed。lifecycle 派发完成后经由本方法落账——
+// 在 RPC 与落账之间若机器换代（fence 漂移），更新静默不生效，controller
+// 据此不记 SUCCEEDED（绝不把旧代作用的结果量账记到新代头上）。
+// 返回 ok=false 说明 fence 已漂移，行未被修改。
+func (s *Store) UpdateMachineObservedWithFenceCAS(
+	ctx context.Context,
+	id, nodeID, executionID string, generation int64,
+	state, slotIP, readiness string,
+) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE machines SET node_id=$1, observed_state=$2, observed_slot_ip=$3,
+			observed_readiness=$4, last_observed_at=now(), updated_at=now()
+		WHERE id=$5 AND current_execution_id=$6 AND generation=$7`,
+		nodeID, state, slotIP, readiness, id, executionID, generation)
+	if err != nil {
+		return false, fmt.Errorf("update observed fence-CAS %s: %w", id, err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
 // MarkMachineObservedMissing 标记节点失联/agent 缺失（保守 UNKNOWN，摘路由）。
 // last_observed_at 是最后一次成功从 agent 获得观测的时间；它绝不能在每轮
 // missing 同步时刷新，否则节点丢失重建的超时窗口会被永久重置。
@@ -1609,8 +1735,17 @@ func (s *Store) ActiveRouteMachines(ctx context.Context) ([]Machine, error) {
 // （ADR-0005：PG 是 route generation/backend 生命周期的权威；Redis 只是投影）。
 // 单事务完成：删除不再活跃的 route，替换活跃 route 的 backend set。
 // M1 评审 P2-6 之前这两张表是死 schema，无人读写。
-func (s *Store) SyncRoutes(ctx context.Context, active []RouteRow) error {
-	return s.inTx(ctx, func(tx pgx.Tx) error {
+//
+// D-2（R2 加固）：同一事务内为每个活跃 hostname 分配单调递增的发布 revision
+// （route_publication_revisions 表 insert-on-conflict-increment RETURNING），
+// 作为 Redis 投影乱序/重放守卫的高水位来源；leader 换届时新进程从本表继续
+// 分配，绝不回退。返回值是 hostname → 本次分配的 revision；每次发布（重建
+// 周期）都递增，与 route 内容是否变化无关——revision 只表达"新旧"，不表达
+// "是否改了"。已被整体删除的 hostname 不再递增，但表中记录保留：其未来重建
+// 必然拿到大于所有历史发布的 revision。
+func (s *Store) SyncRoutes(ctx context.Context, active []RouteRow) (map[string]int64, error) {
+	revisions := make(map[string]int64)
+	err := s.inTx(ctx, func(tx pgx.Tx) error {
 		activeIDs := make(map[string]bool, len(active))
 		for _, r := range active {
 			activeIDs[routeRowID(r.Hostname, r.Port)] = true
@@ -1672,8 +1807,36 @@ func (s *Store) SyncRoutes(ctx context.Context, active []RouteRow) error {
 				}
 			}
 		}
+
+		// 3) D-2：同一事务分配每个 hostname 的发布 revision（monotone，
+		// RETURNING 原子带回）。与 backend 写入同事务保证"权威状态与 revision
+		// 同生同灭"：进程崩溃在中间时不存在已分配 revision 却未提交内容（或
+		// 反之）的窗口。
+		hostnames := make([]string, 0, len(active))
+		seen := make(map[string]bool, len(active))
+		for _, r := range active {
+			if !seen[r.Hostname] {
+				seen[r.Hostname] = true
+				hostnames = append(hostnames, r.Hostname)
+			}
+		}
+		for _, hostname := range hostnames {
+			var rev int64
+			if err := tx.QueryRow(ctx, `
+				INSERT INTO route_publication_revisions(hostname, revision) VALUES($1, 1)
+				ON CONFLICT (hostname) DO UPDATE
+				SET revision = route_publication_revisions.revision + 1
+				RETURNING revision`, hostname).Scan(&rev); err != nil {
+				return fmt.Errorf("allocate publication revision for %s: %w", hostname, err)
+			}
+			revisions[hostname] = rev
+		}
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	return revisions, nil
 }
 
 func placementJSONOrEmpty(b []byte) string {

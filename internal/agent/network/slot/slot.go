@@ -17,6 +17,15 @@
 //   - FORWARD: 放行 established/related；drop 私网/组播目标；其余放行（公网 egress）
 //   - POSTROUTING: 10.12.0.0/16 → masquerade（二级 NAT 的出口半段）
 //
+// R2 IPv6 默认拒绝：nft 的 ip family 根本看不到 IPv6 报文，而 slot veth
+// 会随内核 auto-config 获得 link-local 地址——不防护则 guest 的 v6 可达
+// host 上 ::: 监听的服务。选择同构的 ip6 family 表做 slot veth 入向/转发
+// 默认全拒（fail closed），而非逐接口 sysctl disable_ipv6：两者效果等价
+// （slot 数据面是纯 IPv4——guest 无 v6 地址与路由，v6 没有管理放行面），
+// 但 nft 路径与既有 v4 隔离共享同一实现与审计面，且「表存在即可启动校验」，
+// disable_ipv6 还要逐接口 + netns default 配合。
+// 私网/保留目标集合统一来自 internal/agent/netpolicy（canonical CIDR）。
+//
 // slot 内另有一级 NAT（postrouting：非代理回流方向 masquerade 到 veth 地址），
 // 保证 guest 真实 IP 不泄漏到 root ns 转发面，同时代理连接（daddr=host veth
 // 地址）不被改写、conntrack 可逆。
@@ -37,11 +46,13 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/zhu327/firepaas/internal/agent/netpolicy"
+	"github.com/zhu327/firepaas/shared/pkg/durablewrite"
 )
 
 const (
@@ -51,8 +62,6 @@ const (
 	// VethRange 是 root↔netns 点对点链路的地址池（10.12.0.0/16）。
 	// 导出：agentd 的 egress 保留段检查需要把它列为平台保留段。
 	VethRange = "10.12.0.0/16"
-	// 私有目标集合：guest 永远不可达（host/私网/组播）。
-	privateDst = "{ 10.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4 }"
 )
 
 // Config 是 slot manager 配置。
@@ -256,7 +265,7 @@ func (m *Manager) Reconcile(ctx context.Context, live []LiveInstance) error {
 	for id, s := range m.slots {
 		exists, err := netnsExists(s.Index)
 		if err != nil {
-			logf("slot: reconcile netns check %s: %v", id, err)
+			logf(slog.LevelWarn, "slot: reconcile netns check %s: %v", id, err)
 			continue
 		}
 		if !exists {
@@ -265,20 +274,20 @@ func (m *Manager) Reconcile(ctx context.Context, live []LiveInstance) error {
 		}
 		if l, ok := liveByID[id]; ok && l.Tap == s.Tap {
 			if err := m.ensureKernel(ctx, s, l.Tap, l.GuestIP); err != nil {
-				logf("slot: re-ensure %s (degraded): %v", id, err)
+				logf(slog.LevelWarn, "slot: re-ensure %s (degraded): %v", id, err)
 			}
 			// v1.3-A（ADR-0027）：重启后重放持久化 egress 规则。
 			if s.Egress.Mode != "" {
 				// Reconcile already owns m.mu; call the lock-free helper to avoid
 				// self-deadlocking through RestoreEgress.
 				if err := ensureSlotEgress(ctx, s.Index, s.Egress); err != nil {
-					logf("slot: restore egress %s (degraded): %v", id, err)
+					logf(slog.LevelWarn, "slot: restore egress %s (degraded): %v", id, err)
 				}
 			}
 			continue
 		}
 		if err := m.releaseLocked(ctx, s.Index); err != nil {
-			logf("slot: reconcile release %s (degraded): %v", id, err)
+			logf(slog.LevelWarn, "slot: reconcile release %s (degraded): %v", id, err)
 			continue
 		}
 		delete(m.slots, id)
@@ -287,7 +296,7 @@ func (m *Manager) Reconcile(ctx context.Context, live []LiveInstance) error {
 	// 内核残留 netns（状态里没有的）。
 	strays, err := listStrayNetns()
 	if err != nil {
-		logf("slot: list stray netns: %v", err)
+		logf(slog.LevelWarn, "slot: list stray netns: %v", err)
 	}
 	for _, idx := range strays {
 		// 只回收不在状态里的；正在 attach 的窗口由本包串行锁排除。
@@ -315,10 +324,12 @@ func (m *Manager) Reconcile(ctx context.Context, live []LiveInstance) error {
 		if err := m.setupLocked(ctx, s); err != nil {
 			_ = m.releaseLocked(ctx, s.Index)
 			delete(m.slots, id)
-			logf("slot: reconcile attach %s failed (degraded): %v", id, err)
+			logf(slog.LevelWarn, "slot: reconcile attach %s failed (degraded): %v", id, err)
 			continue
 		}
 		m.slots[id] = s
+		// 降级后自愈：live VM 曾因创建后崩溃窗口丢了 slot，此处重新接线。
+		logf(slog.LevelInfo, "slot: reconcile re-attached live machine %s (self-healed)", id)
 	}
 	return m.persistLocked()
 }
@@ -428,8 +439,10 @@ func (m *Manager) RestoreEgress(ctx context.Context, machineID string) error {
 }
 
 // logf 是包内日志出口（避免 slot 包依赖 slog 的全局 handler 配置）。
-func logf(format string, args ...any) {
-	slog.Error(fmt.Sprintf(format, args...))
+// 级别语义：降级但继续的事件用 Warn，自愈成功的可观事件用 Info，只有
+// 真正不可恢复的错误才用 Error。
+func logf(level slog.Level, format string, args ...any) {
+	slog.Log(context.Background(), level, fmt.Sprintf(format, args...))
 }
 
 // Count 返回当前 slot 数（测试/观测用）。
@@ -472,6 +485,9 @@ func (m *Manager) hasIndexLocked(idx int) bool {
 	return false
 }
 
+// persistLocked 使用崩溃安全序列（shared/pkg/durablewrite：temp 0600 →
+// fsync(temp) → rename → fsync(dir)）。含 egress 域名规则，按 0600 处理；
+// rename 前不 fsync 可能掉电后剩空文件，重启时整份 slot 状态作废。
 func (m *Manager) persistLocked() error {
 	list := make([]Slot, 0, len(m.slots))
 	for _, s := range m.slots {
@@ -482,14 +498,7 @@ func (m *Manager) persistLocked() error {
 	if err != nil {
 		return fmt.Errorf("slot: marshal state: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(m.cfg.StatePath), 0o755); err != nil {
-		return fmt.Errorf("slot: mkdir state dir: %w", err)
-	}
-	tmp := m.cfg.StatePath + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
-		return fmt.Errorf("slot: write state: %w", err)
-	}
-	return os.Rename(tmp, m.cfg.StatePath)
+	return durablewrite.WriteFileAtomic(m.cfg.StatePath, "slot state", raw)
 }
 
 func (m *Manager) setupLocked(ctx context.Context, s Slot) error {
@@ -628,8 +637,10 @@ func (m *Manager) ensureKernel(ctx context.Context, s Slot, tap, guestIP string)
 func (m *Manager) releaseLocked(ctx context.Context, idx int) error {
 	vh, _ := vethNames(idx)
 	// netns 删除会连带销毁 veth/TAP/bridge，root 侧 /32 路由随设备自动消失；
-	// nft 集合元素摘除是 best-effort（表可能从未建过）。
+	// nft 集合元素摘除是 best-effort（表可能从未建过）。ip/ip6 两个
+	// family 的集合都要摘除。
 	_ = exec.Command("nft", "delete", "element", "ip", "fp-isolation", "slot-veths", "{", vh, "}").Run()
+	_ = exec.Command("nft", "delete", "element", "ip6", "fp-isolation", "slot-veths", "{", vh, "}").Run()
 	if err := deleteNetns(idx); err != nil {
 		return err
 	}
@@ -765,122 +776,92 @@ func tapExistsInRoot(tap string) bool {
 	return err == nil
 }
 
+// isolationStepsIPv4 生成 fp-isolation（ip family）的幂等建表步骤。纯函数——
+// 规则文本可调试、可单测断言（R2：nft 变更的最低验证是脚本/规则生成级）。
+// 私网目标集合来自 netpolicy 的 canonical 集合（Go matcher 与规则文本同源）。
+func (m *Manager) isolationStepsIPv4() [][]string {
+	return [][]string{
+		{"nft", "add", "table", "ip", "fp-isolation"},
+		{"nft", "add", "set", "ip", "fp-isolation", "slot-veths", "{", "type", "ifname;", "}"},
+		{
+			"nft", "add", "chain", "ip", "fp-isolation", "in",
+			"{", "type", "filter", "hook", "input", "priority", "filter;", "}",
+		},
+		{
+			"nft", "add", "chain", "ip", "fp-isolation", "fwdchain",
+			"{", "type", "filter", "hook", "forward", "priority", "filter;", "}",
+		},
+		{
+			"nft", "add", "chain", "ip", "fp-isolation", "post",
+			"{", "type", "nat", "hook", "postrouting", "priority", "srcnat;", "}",
+		},
+		{
+			"nft", "add", "rule", "ip", "fp-isolation", "in", "iifname", "@slot-veths",
+			"ct", "state", "established,related", "accept",
+		},
+		{
+			"nft", "add", "rule", "ip", "fp-isolation", "in", "iifname", "@slot-veths",
+			"tcp", "dport", "{", fmt.Sprintf("%d,%d", m.cfg.EgressProxyPort80, m.cfg.EgressProxyPort443), "}", "accept",
+		},
+		{"nft", "add", "rule", "ip", "fp-isolation", "in", "iifname", "@slot-veths", "drop"},
+		{
+			"nft", "add", "rule", "ip", "fp-isolation", "fwdchain", "iifname", "@slot-veths",
+			"ct", "state", "established,related", "accept",
+		},
+		{
+			"nft", "add", "rule", "ip", "fp-isolation", "fwdchain", "iifname", "@slot-veths",
+			"ip", "daddr", netpolicy.IPv4NftSetText(), "drop",
+		},
+		{"nft", "add", "rule", "ip", "fp-isolation", "fwdchain", "iifname", "@slot-veths", "accept"},
+		{"nft", "add", "rule", "ip", "fp-isolation", "post", "ip", "saddr", VethRange, "masquerade"},
+	}
+}
+
+// ip6IsolationSteps 生成 fp-isolation（ip6 family）的默认拒绝步骤（R2 IPv6
+// 默认拒绝，选择理由见包注释）：slot veth 入向/转发一律 drop，无 established
+// 放行——slot 数据面是纯 IPv4，v6 上没有应当存在的流量，全拒即正确语义。
+func ip6IsolationSteps() [][]string {
+	return [][]string{
+		{"nft", "add", "table", "ip6", "fp-isolation"},
+		{"nft", "add", "set", "ip6", "fp-isolation", "slot-veths", "{", "type", "ifname;", "}"},
+		{
+			"nft", "add", "chain", "ip6", "fp-isolation", "in",
+			"{", "type", "filter", "hook", "input", "priority", "filter;", "}",
+		},
+		{
+			"nft", "add", "chain", "ip6", "fp-isolation", "fwdchain",
+			"{", "type", "filter", "hook", "forward", "priority", "filter;", "}",
+		},
+		{"nft", "add", "rule", "ip6", "fp-isolation", "in", "iifname", "@slot-veths", "drop"},
+		{"nft", "add", "rule", "ip6", "fp-isolation", "fwdchain", "iifname", "@slot-veths", "drop"},
+	}
+}
+
 // ensureIsolationTable 幂等创建 root 侧 nftables 隔离表并把 veth 加入集合。
 func (m *Manager) ensureIsolationTable(ctx context.Context, veth string) error {
 	// 表已存在则跳过（检查 exit code：nft list 不存在时非零）。
 	if err := exec.Command("nft", "list", "table", "ip", "fp-isolation").Run(); err != nil {
-		steps := [][]string{
-			{"nft", "add", "table", "ip", "fp-isolation"},
-			{"nft", "add", "set", "ip", "fp-isolation", "slot-veths", "{", "type", "ifname;", "}"},
-			{
-				"nft",
-				"add",
-				"chain",
-				"ip",
-				"fp-isolation",
-				"in",
-				"{",
-				"type",
-				"filter",
-				"hook",
-				"input",
-				"priority",
-				"filter;",
-				"}",
-			},
-			{
-				"nft",
-				"add",
-				"chain",
-				"ip",
-				"fp-isolation",
-				"fwdchain",
-				"{",
-				"type",
-				"filter",
-				"hook",
-				"forward",
-				"priority",
-				"filter;",
-				"}",
-			},
-			{
-				"nft",
-				"add",
-				"chain",
-				"ip",
-				"fp-isolation",
-				"post",
-				"{",
-				"type",
-				"nat",
-				"hook",
-				"postrouting",
-				"priority",
-				"srcnat;",
-				"}",
-			},
-			{
-				"nft",
-				"add",
-				"rule",
-				"ip",
-				"fp-isolation",
-				"in",
-				"iifname",
-				"@slot-veths",
-				"ct",
-				"state",
-				"established,related",
-				"accept",
-			},
-			{
-				"nft", "add", "rule", "ip", "fp-isolation", "in", "iifname", "@slot-veths",
-				"tcp", "dport", "{", fmt.Sprintf("%d,%d", m.cfg.EgressProxyPort80, m.cfg.EgressProxyPort443), "}", "accept",
-			},
-			{"nft", "add", "rule", "ip", "fp-isolation", "in", "iifname", "@slot-veths", "drop"},
-			{
-				"nft",
-				"add",
-				"rule",
-				"ip",
-				"fp-isolation",
-				"fwdchain",
-				"iifname",
-				"@slot-veths",
-				"ct",
-				"state",
-				"established,related",
-				"accept",
-			},
-			{
-				"nft",
-				"add",
-				"rule",
-				"ip",
-				"fp-isolation",
-				"fwdchain",
-				"iifname",
-				"@slot-veths",
-				"ip",
-				"daddr",
-				privateDst,
-				"drop",
-			},
-			{"nft", "add", "rule", "ip", "fp-isolation", "fwdchain", "iifname", "@slot-veths", "accept"},
-			{"nft", "add", "rule", "ip", "fp-isolation", "post", "ip", "saddr", VethRange, "masquerade"},
-		}
-		for _, args := range steps {
+		for _, args := range m.isolationStepsIPv4() {
 			if err := execCmd(ctx, args[0], args[1:]...); err != nil {
 				return fmt.Errorf("slot: nft setup (%s): %w", strings.Join(args, " "), err)
 			}
 		}
 	}
-	// 集合元素幂等：EEXIST 可忽略。
-	out, err := exec.Command("nft", "add", "element", "ip", "fp-isolation", "slot-veths", "{", veth, "}").
-		CombinedOutput()
-	if err != nil && !strings.Contains(string(out), "exists") {
-		return fmt.Errorf("slot: nft add veth %s: %w (%s)", veth, err, strings.TrimSpace(string(out)))
+	// ip6 family 独立检查：升级场景（ip 表已存在、ip6 未建）必须补齐。
+	if err := exec.Command("nft", "list", "table", "ip6", "fp-isolation").Run(); err != nil {
+		for _, args := range ip6IsolationSteps() {
+			if err := execCmd(ctx, args[0], args[1:]...); err != nil {
+				return fmt.Errorf("slot: nft6 setup (%s): %w", strings.Join(args, " "), err)
+			}
+		}
+	}
+	// 集合元素幂等：EEXIST 可忽略。两个 family 都要登记（v6 默认拒绝集合）。
+	for _, family := range []string{"ip", "ip6"} {
+		out, err := exec.Command("nft", "add", "element", family, "fp-isolation", "slot-veths", "{", veth, "}").
+			CombinedOutput()
+		if err != nil && !strings.Contains(string(out), "exists") {
+			return fmt.Errorf("slot: nft add veth %s (%s): %w (%s)", veth, family, err, strings.TrimSpace(string(out)))
+		}
 	}
 	// v1.3-A：升级场景下表已存在但没有 egress 代理 INPUT accept 规则时补齐
 	//（必须插在 drop 之前，否则 SYN 被截断）。

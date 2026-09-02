@@ -427,6 +427,10 @@ func mapSnapshotInfo(snap *instances.Snapshot, req *pb.CreateSnapshotRequest) *p
 			kind = pb.SnapshotKind_SNAPSHOT_FILESYSTEM
 		}
 	}
+	compressionState := snap.CompressionState
+	if compressionState == "" {
+		compressionState = "none"
+	}
 	info := &pb.SnapshotInfo{
 		Id:               req.GetSnapshotId(),
 		ArtifactId:       snap.Id,
@@ -434,13 +438,15 @@ func mapSnapshotInfo(snap *instances.Snapshot, req *pb.CreateSnapshotRequest) *p
 		ExecutionId:      req.GetExecutionId(),
 		Kind:             kind,
 		SizeBytes:        uint64(snap.SizeBytes),
-		CompressionState: snap.CompressionState,
+		CompressionState: compressionState,
 		CreatedAtUnix:    snap.CreatedAt.Unix(),
 		ArtifactSha256:   snap.ArtifactSHA256,
 		CompatibilityKey: snap.CompatibilityKey,
 	}
 	if snap.Compression != nil {
 		info.CompressionAlgorithm = string(snap.Compression.Algorithm)
+	} else {
+		info.CompressionAlgorithm = "none"
 	}
 	if snap.CompressedSizeBytes != nil {
 		info.SizeBytes = uint64(*snap.CompressedSizeBytes)

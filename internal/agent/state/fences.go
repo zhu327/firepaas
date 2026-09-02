@@ -123,11 +123,24 @@ func (f *Fences) Advance(machineID string, generation uint64, executionID string
 
 // PruneBefore 删除 UpdatedAt 早于 cutoff 的条目（与 ledger 共享 GC 窗口），
 // 返回删除条数。machine 已删除且高水位在其保留窗口内仍拒绝旧请求。
+// 无存活判定的调用方使用此纯年龄语义。
 func (f *Fences) PruneBefore(cutoff time.Time) (int, error) {
+	return f.PruneBeforeUnlessLive(cutoff, nil)
+}
+
+// PruneBeforeUnlessLive 同 PruneBefore，但 live(machineID) 为 true 的条目
+// 不论年龄一律保留（R2-6）：活 machine 的高水位被年龄 GC 回收后，早于
+// 保留窗口的过期 change 请求会重新通过 Check——fence 对运行中的 machine
+// 必须随 machine 存活。live==nil 表示无存活信息（全部按年龄回收；实例
+// 清单不可得时调用方应跳过本轮 GC，而不是传 nil 强行回收）。
+func (f *Fences) PruneBeforeUnlessLive(cutoff time.Time, live func(machineID string) bool) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	removed := 0
 	for id, e := range f.entries {
+		if live != nil && live(id) {
+			continue
+		}
 		if e.UpdatedAt.Before(cutoff) {
 			delete(f.entries, id)
 			removed++

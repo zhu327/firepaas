@@ -13,7 +13,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 )
@@ -57,6 +56,21 @@ func Digest(raw string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// Ensure 仅在本机缺少该 (machine, execution, digest) 材料时写入；已存同值
+// 摘要时不重写（重放路径每次都会调用，避免无意义 fsync）；已有不同值
+// （execution 换代）时覆盖。
+func (c *Creds) Ensure(machineID, executionID, digest string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e, ok := c.entries[machineID]; ok && e.ExecutionID == executionID && e.Digest == digest {
+		return nil
+	}
+	c.entries[machineID] = CredEntry{
+		ExecutionID: executionID, Digest: digest, UpdatedAt: time.Now().UTC(),
+	}
+	return c.persistLocked()
+}
+
 // Set 记录/替换 machine 的验证材料（create 成功或换代重发时调用）。
 func (c *Creds) Set(machineID, executionID, digest string) error {
 	c.mu.Lock()
@@ -95,17 +109,12 @@ func (c *Creds) Verify(machineID, executionID, rawCredential string) bool {
 	return hmac.Equal(want, got[:])
 }
 
+// persistLocked 使用崩溃安全序列（temp+fsync+rename+fsync(dir)，0600）——
+// 与 ledger persistLocked 同一纪律：验证材料丢一半 = 存活 machine 永久 403。
 func (c *Creds) persistLocked() error {
-	if err := os.MkdirAll(filepath.Dir(c.path), 0o700); err != nil {
-		return err
-	}
 	b, err := json.MarshalIndent(c.entries, "", " ")
 	if err != nil {
 		return err
 	}
-	tmp := c.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, c.path)
+	return writeFileDurable(c.path, "creds", b)
 }

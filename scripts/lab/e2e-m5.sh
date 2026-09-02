@@ -90,7 +90,7 @@ log "0.5) 预清理历史验收机"
 for _ in $(seq 1 10); do
   curl -s -m 10 -H "Authorization: Bearer $API_TOKEN" "http://127.0.0.1:$API_PORT/v1/nodes" |
     python3 -c 'import json,sys
-for n in json.load(sys.stdin).get("nodes",[]):
+for n in json.load(sys.stdin).get("nodes") or []:
     print(n.get("id",n.get("ID","")))' |
     while read -r nid; do
       [[ -n "$nid" ]] && curl -s -m 10 -H "Authorization: Bearer $API_TOKEN" -X POST \
@@ -172,46 +172,111 @@ create_status=$(cur -H "Authorization: Bearer $API_TOKEN" -o /tmp/m5-app.json -w
        \"image\":\"$ONTIME_REF\",\"port\":80,\"replicas\":1,
        \"secret_refs\":{\"MARKER\":{\"secret\":\"e2e-marker\"}}}")
 [[ "$create_status" == "201" ]] || fail "secret-ref app create request: $create_status $(cat /tmp/m5-app.json)"
-for _ in $(seq 1 90); do
-  failed=$(pg "SELECT count(*) FROM operations o JOIN machines m ON m.id=o.machine_id WHERE m.app_id='$APP5' AND o.kind='create' AND o.status='FAILED'")
-  [[ "$failed" == "1" ]] && break
-  sleep 3
-done
-[[ "$failed" == "1" ]] || fail "secret-ref workload did not fail closed"
-running=$(pg "SELECT count(*) FROM machines WHERE app_id='$APP5' AND observed_state='RUNNING' AND desired_state!='DELETED'")
-[[ "$running" == "0" ]] || fail "secret-ref workload unexpectedly became ready"
-mark "B1 默认 fail-closed OK（带 secret_refs 的 create 终态 FAILED）"
-cur -H "Authorization: Bearer $API_TOKEN" -o /dev/null -X DELETE "http://127.0.0.1:$API_PORT/v1/apps/$APP5" || true
-
-# B2：opt-in 注入——渲染带 FIREPAAS_SECRET_INJECTION 的 job 副本重启 agentd，
-# 同样的 secret_refs 必须 RUNNING（M4 语义在受信环境可用）。
-sed 's|^\(\s*\)# FIREPAAS_SECRET_INJECTION|\1FIREPAAS_SECRET_INJECTION|' \
-  "$ROOT_DIR/iac/nomad/agentd-single.hcl" > "$RUN_DIR/agentd-optin.hcl"
-grep -q '^\s*FIREPAAS_SECRET_INJECTION' "$RUN_DIR/agentd-optin.hcl" || fail "opt-in 渲染失败"
-nomad job run -var "repo_root=$ROOT_DIR" -var "lab_bin=$(dirname \"$BIN\")" "$RUN_DIR/agentd-optin.hcl" >/dev/null || fail "opt-in job run 失败"
-for _ in $(seq 1 40); do (echo > /dev/tcp/127.0.0.1/5108) 2>/dev/null && break; sleep 2; done
-(echo > /dev/tcp/127.0.0.1/5108) 2>/dev/null || fail "opt-in agentd 未就绪"
-mark "B2 opt-in agentd 就绪"
-
-APP5="app-clock-$RUN_ID-inj"
-HN5="$APP5.$DOMAIN"
-create_status=$(cur -H "Authorization: Bearer $API_TOKEN" -o /tmp/m5-app.json -w '%{http_code}' \
-  -X POST "http://127.0.0.1:$API_PORT/v1/apps" -H 'Content-Type: application/json' \
-  -d "{\"app_id\":\"$APP5\",\"project_id\":\"dev\",\"hostname\":\"$HN5\",
-       \"image\":\"$ONTIME_REF\",\"port\":80,\"replicas\":1,
-       \"secret_refs\":{\"MARKER\":{\"secret\":\"e2e-marker\"}}}")
-[[ "$create_status" == "201" ]] || fail "opt-in secret-ref app create: $create_status $(cat /tmp/m5-app.json)"
+# B1( v1.2-B 语义 )：one-shot 是默认交付模式——agentd 默认 FIREPAAS_SECRET_INJECTION=oneshot
+# 并上报 secret.oneshot.v1能力；带 secret_refs 的 create 必须 RUNNING 且 canary 经路由可见、
+# lease ACKED。早期「默认 fail-closed」断言已过期（v1.2 后默认交付、agentd-single.hcl
+# 的 opt-in 注释同样为失效的 M4 语义）。
 for _ in $(seq 1 90); do
   running=$(pg "SELECT count(*) FROM machines WHERE app_id='$APP5' AND observed_state='RUNNING' AND desired_state!='DELETED'")
   [[ "$running" == "1" ]] && break
   sleep 3
 done
-[[ "$running" == "1" ]] || fail "opt-in 注入机器未 RUNNING"
-mark "B2 opt-in 注入 RUNNING OK"
-M5=$(pg "SELECT id FROM machines WHERE app_id='$APP5' AND desired_state!='DELETED' LIMIT 1")
+[[ "$running" == "1" ]] || fail "secret-ref workload 未 RUNNING（oneshot 默认交付应成功）"
+B1M=$(pg "SELECT id FROM machines WHERE app_id='$APP5' AND desired_state!='DELETED' LIMIT 1")
+for _ in $(seq 1 30); do
+  acked=$(pg "SELECT count(*) FROM secret_delivery_leases WHERE machine_id='$B1M' AND state='ACKED'")
+  [[ "${acked:-0}" == "1" ]] && break
+  sleep 2
+done
+[[ "${acked:-0}" == "1" ]] || fail "oneshot lease 未 ACKED"
+mark "B1 oneshot 默认交付 RUNNING + lease ACKED OK"
+# canary：entrypoint 进程读到 secret（经 edge 路由）；exec 会话环境隔离。
+edge_curl() { local h=$1; shift; curl -s -m 15 --resolve "$h:$EDGE_TLS:127.0.0.1" --cacert "$CERT_DIR/ca.crt" "$@"; }
+env_val=$(edge_curl "$HN5" "https://$HN5:$EDGE_TLS/env?k=MARKER" || true)
+echo "$env_val" | grep -q "s3cr3t-e2e-marker-value" || fail "entrypoint 未读到 secret: $env_val"
+# pause（memory snapshot）对 secret execution 必须 409（ADR-0024 §9）。
+pause_code=$(cur -H "Authorization: Bearer $API_TOKEN" -o /dev/null -w '%{http_code}' -X POST \
+  "http://127.0.0.1:$API_PORT/v1/machines/$B1M/pause")
+[[ "$pause_code" == "409" ]] || fail "secret machine pause 应 409，got $pause_code"
+mark "B1 canary 路由读取 + pause 409 OK"
+
+# B2：非法 FIREPAAS_SECRET_INJECTION 模式 = fail-closed（product 默认路径下 secret-bearing
+# create 必须 InvalidArgument 终态，绝不创建无 secret 的 VM）。用 job 副本重启。
+python3 - "$ROOT_DIR/iac/nomad/agentd-single.hcl" > "$RUN_DIR/agentd-badmode.hcl" <<'PY' || fail "badmode 渲染脚本缺执行权限"
+import sys
+src = open(sys.argv[1]).read()
+marker = "FIREPAAS_IMAGE_MAX_UNPACK_MIB"
+assert marker in src
+src = src.replace(marker, 'FIREPAAS_SECRET_INJECTION = "bogus-mode"\n        ' + marker)
+print(src, end="")
+PY
+grep -q 'FIREPAAS_SECRET_INJECTION = "bogus-mode"' "$RUN_DIR/agentd-badmode.hcl" || fail "badmode 渲染失败"
+if ! nomad job run -detach -var "repo_root=$ROOT_DIR" -var "lab_bin=$LAB_BIN" \
+  -var "agentd_binary_sha256=$(sha256sum "$LAB_BIN/agentd" | awk '{print $1}')-secret-badmode" \
+  "$RUN_DIR/agentd-badmode.hcl" > "$RUN_DIR/badmode-run.log" 2>&1; then
+  tail -5 "$RUN_DIR/badmode-run.log"
+  fail "badmode job run 失败"
+fi
+for _ in $(seq 1 40); do (echo > /dev/tcp/127.0.0.1/5108) 2>/dev/null && break; sleep 2; done
+(echo > /dev/tcp/127.0.0.1/5108) 2>/dev/null || fail "badmode agentd 未就绪"
+# TCP 已监听但能力是“ agentd 已重注册并同步能力予控制面”——不然 create 会
+# 撞 Unavailable（验收实测的 B2 抖动）。
+for _ in $(seq 1 40); do
+  ndh=$(curl -s -m 5 -H "Authorization: Bearer $API_TOKEN" "http://127.0.0.1:$API_PORT/v1/nodes" \
+    | python3 -c 'import json,sys; print(sum(1 for n in (json.load(sys.stdin).get("nodes") or []) if n.get("Status")=="HEALTHY"))' || true)
+  [[ "${ndh:-0}" -ge 1 ]] && break
+  sleep 2
+done
+[[ "${ndh:-0}" -ge 1 ]] || fail "badmode agent 未注册 HEALTHY"
+mark "B2 badmode agentd 就绪"
+APP5B="app-clock-$RUN_ID-badmode"
+create_status=$(cur -H "Authorization: Bearer $API_TOKEN" -o /tmp/m5-app.json -w '%{http_code}' \
+  -X POST "http://127.0.0.1:$API_PORT/v1/apps" -H 'Content-Type: application/json' \
+  -d "{\"app_id\":\"$APP5B\",\"project_id\":\"dev\",\"hostname\":\"$APP5B.$DOMAIN\",
+       \"image\":\"$ONTIME_REF\",\"port\":80,\"replicas\":1,
+       \"secret_refs\":{\"MARKER\":{\"secret\":\"e2e-marker\"}}}")
+[[ "$create_status" == "201" ]] || fail "badmode secret-ref app create: $create_status $(cat /tmp/m5-app.json)"
+for _ in $(seq 1 90); do
+  failed=$(pg "SELECT count(*) FROM operations o JOIN machines m ON m.id=o.machine_id WHERE m.app_id='$APP5B' AND o.kind='create' AND o.status='FAILED'")
+  [[ "$failed" == "1" ]] && break
+  sleep 3
+done
+[[ "$failed" == "1" ]] || fail "badmode secret-ref workload did not fail closed"
+running=$(pg "SELECT count(*) FROM machines WHERE app_id='$APP5B' AND observed_state='RUNNING' AND desired_state!='DELETED'")
+[[ "$running" == "0" ]] || fail "badmode secret-ref workload unexpectedly became ready"
+mark "B2 未知注入模式 fail-closed OK"
+# B2 实验机 cleanup：否则 E 段 evacuate 会拖入该 machine（它创建已终态失败）。
+cur -H "Authorization: Bearer $API_TOKEN" -o /dev/null -X DELETE "http://127.0.0.1:$API_PORT/v1/apps/$APP5B" || true
+for _ in $(seq 1 30); do
+  left=$(pg "SELECT count(*) FROM machines WHERE app_id='$APP5B' AND desired_state != 'DELETED'")
+  [[ "${left:-0}" == "0" ]] && break
+  sleep 2
+done
+[[ "${left:-0}" == "0" ]] || fail "badmode app 未清除"
+# 还原正常 agentd，供后续 B3 pause/resume 与 C/D 段使用。
+"$HERE/run-agentd.sh" >/dev/null || fail "agentd 恢复失败"
+for _ in $(seq 1 40); do (echo > /dev/tcp/127.0.0.1/5108) 2>/dev/null && break; sleep 2; done
+(echo > /dev/tcp/127.0.0.1/5108) 2>/dev/null || fail "还原后的 agentd 未就绪"
+mark "B2 后 agentd 已还原"
+
+# B3：pause/resume 漂移验证必须使用非 secret 机器。
+APP6="app-plain-$RUN_ID"
+HN6="$APP6.$DOMAIN"
+create_status=$(cur -H "Authorization: Bearer $API_TOKEN" -o /tmp/m5-app2.json -w '%{http_code}' \
+  -X POST "http://127.0.0.1:$API_PORT/v1/apps" -H 'Content-Type: application/json' \
+  -d "{\"app_id\":\"$APP6\",\"project_id\":\"dev\",\"hostname\":\"$HN6\",
+       \"image\":\"$ONTIME_REF\",\"port\":80,\"replicas\":1}")
+[[ "$create_status" == "201" ]] || fail "B3 非 secret app create: $create_status $(cat /tmp/m5-app2.json)"
+for _ in $(seq 1 90); do
+  running=$(pg "SELECT count(*) FROM machines WHERE app_id='$APP6' AND observed_state='RUNNING' AND desired_state!='DELETED'")
+  [[ "$running" == "1" ]] && break
+  sleep 3
+done
+[[ "$running" == "1" ]] || fail "B3 非 secret 机器未 RUNNING"
+M5=$(pg "SELECT id FROM machines WHERE app_id='$APP6' AND desired_state!='DELETED' LIMIT 1")
 
 edge_curl() { local h=$1; shift; curl -s -m 15 --resolve "$h:$EDGE_TLS:127.0.0.1" --cacert "$CERT_DIR/ca.crt" "$@"; }
-guest_ms() { edge_curl "$HN5" "https://$HN5:$EDGE_TLS/" | python3 -c 'import json,sys; print(json.load(sys.stdin)["epoch_ms"])'; }
+guest_ms() { edge_curl "$HN6" "https://$HN6:$EDGE_TLS/" | python3 -c 'import json,sys; print(json.load(sys.stdin)["epoch_ms"])'; }
 host_ms() { date +%s%3N; }
 g0=$(guest_ms); h0=$(host_ms)
 [[ -n "$g0" && -n "$h0" ]] || fail "guests clock read: g=$g0 h=$h0"

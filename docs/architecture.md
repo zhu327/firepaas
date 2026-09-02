@@ -1,7 +1,7 @@
 # firepaas 目标架构
 
 > 本文冻结首个**内部生产 MVP**的架构契约；实施顺序见 [mvp-plan.md](mvp-plan.md)。
-> 参考：[可行性分析](../../docs/paas-feasibility-analysis.md) 与 ADR。
+> 参考：本仓库 [ADR](adr/)；早期仓库外可行性分析不属于可移植架构证据。
 
 ## 1. 一句话
 
@@ -73,7 +73,7 @@ route_backends(route_id, generation, machine_id, execution_id, port, weight,
 
 关键约束：
 
-- `UNIQUE(deployment_id, replica_ordinal)`：一个副本槽位只有一个逻辑 machine；
+- `UNIQUE(deployment_id, replica_ordinal)`：一个副本槽位只有一个逻辑 machine。实现现状：迁移 0006 将唯一键放宽为 `(app_id, replica_ordinal, generation)` 形态，发布窗口内新旧 generation 的同 ordinal machine 共存（见 `internal/controlplane/controller/apps.go` 头注释）；同一代内槽位唯一语义不变；
 - `UNIQUE(project_id, idempotency_key)`：客户端重复提交同一操作返回同一结果；
 - slot 是 agent 本地资源；若需要持久记录，仅可 `UNIQUE(node_id, slot_index)`，不做全局唯一；
 - domain/hostname 由 PG 全局唯一约束分配；vsock CID 由 agent 在节点范围安全分配并报告。
@@ -81,16 +81,26 @@ route_backends(route_id, generation, machine_id, execution_id, port, weight,
 ### 4.3 Redis 投影
 
 ```text
-route:{hostname}:{port} -> {route_generation, backends[]}
+route:{hostname}:{port} -> {route_generation, revision, backends[]}
+routerev:{hostname} -> 高水位 revision（墓碑记忆，不随投影删除）
 machine:location:{machine_id}:{execution_id} -> {node_proxy_endpoint, app_port, credential_ref}
-reservation:{machine_id}:{execution_id} -> TTL lease
+resv:active -> 当前 reservation epoch 指针
+resv:{epoch}:... -> epoch 命名空间内的预约键（node/project/op 承诺与索引）
 operation:result:{operation_id} -> TTL cache
 node:metrics:{node_id} -> latest sample
 ```
 
+route 投影携带控制面分配的 hostname 级**单调 revision**：PG 表 `route_publication_revisions` 在与 route 发布相同的事务内 insert-on-conflict-increment 分配（leader 换届时新进程从本表继续，绝不回退）；catalog 的 `ReplaceHostRoutes` 用 Lua 以 `routerev:{hostname}` 高水位做 CAS，仅当 incoming revision 更高才整体生效（miss 视为 0）；edge RouteCache 回源取到比缓存更低 revision 的投影时拒绝回写（计 `firepaas_edge_route_revision_rejects_total`），继续服务缓存的 last-known-good。乱序发布或重放的旧快照因此不能覆盖或复活陈旧 backend（ADR-0038）。
+
+reservation 键空间按 epoch 命名（`resv:{epoch}:...`），active epoch 由 `resv:active` 指针键经 Lua 原子读写；重建先写新 epoch 再切指针，旧 epoch 键靠 TTL 自然过期，全程不使用 KEYS/SCAN 全库扫描（ADR-0038）。`Acquire` 在脚本内先读 active epoch 决定承诺落在哪个命名空间；对外 API 签名不变。
+
+**edge↔控制面 traffic token 耦合 SLA（R2 评审裁决：维持现状，仅文档化断流预算）**：edge 的 TokenClient 以 `(machine, execution)` 为键缓存 execution-bound credential，fresh TTL 30s；回源失败（控制面/PG 不可达）时，若缓存条目仍在 serve-stale 窗口内（默认 120s，`FIREPAAS_EDGE_STALE_WINDOW`，与 route 缓存同源）且 execution 匹配，降级复用 last-known-good，否则 fail-closed。因此控制面/PG 中断不超过该窗口时，已缓存的 `(machine, execution)` 继续服务；中断超过窗口后，edge 无法为冷（未缓存）的 `(machine, execution)` 对签发新凭证，而窗口内已缓存条目不受影响。该 serve-stale 窗口即数据面已文档化的控制面断流预算。
+
 `route` 的 backend 只包含 readiness=true 且非 draining 的 execution；每次发布带 generation。edge 拒绝 execution 不匹配的 location，catalog miss 只触发受限查询/恢复，不自行猜测后端。`slot_ip`、netns 名称和 TAP 等均属于 agent 内部实现，不进入 edge/Redis 契约；edge 只能访问 `node_proxy_endpoint`。
 
 **Redis 故障语义（可用性，非仅数据）**：Redis 不可用不改变业务结论（ADR-0003），数据面可用性由 edge 的 route generation 本地缓存承担——TTL 窗口内 serve-stale，超窗受控失败；恢复后由 controller 在声明的时限内重建投影。MVP 接受 Redis 单实例（AOF）；是否引入 sentinel 依据 M4 验收决定（mvp-plan §8）。
+
+写路径不享受同等弹性：API 的 mutation/stream 限流（read 分类仍 fail-open）与运行时会话在 Redis 不可用时按设计 fail-closed（503）；即 Redis 中断时数据面继续 serve-stale，但写路径可用性降级，不得把上述语义误读为"Redis 丢失对写者免费"。
 
 ## 5. 多副本与滚动发布
 
@@ -105,13 +115,13 @@ client → edge(hostname) → route generation → healthy backends
 
 1. 为新 deployment 创建所需 replica ordinal；
 2. agent 观测到 VM `RUNNING`，健康检查通过；
-3. 在一个事务中发布新的 route generation；
+3. 在一个事务中发布新的 route generation（同事务递增 `route_publication_revisions` 的 hostname 级单调 revision；catalog 与 edge 按 revision 拒绝乱序/重放的旧快照，见 §4.3）；
 4. edge 按 generation 转发；旧 backend 标记 draining；
 5. 到连接排空期限后停止/删除旧 execution；失败则保留旧 route generation。
 
 readiness 的唯一来源是 agent 在 host 侧经内部 workload endpoint 执行的探针（M1 bridge guest IP、M3 slot IP，ADR-0008），随 observed state 上报；edge 不做应用层健康检查，不猜测后端。
 
-MVP 采用简单 round-robin；会话粘性、灰度权重和 WebSocket 长连接迁移是后续能力。发布与 scale/节点故障/再次发布的**组合场景决策表在 M3 冻结**（mvp-plan §7）：MVP 至少实现同一 app 同时只允许一个 rollout 的互斥。
+MVP 最初以 round-robin 为基线；当前 edge 已按 ADR-0020 使用 least-inflight，并在并列时轮转。会话粘性、灰度权重和 WebSocket 长连接迁移仍是后续能力。发布与 scale/节点故障/再次发布的**组合场景决策表在 M3 冻结**（mvp-plan §7）：MVP 至少实现同一 app 同时只允许一个 rollout 的互斥。
 
 ## 6. agent 契约与内部信任边界
 
@@ -126,6 +136,8 @@ MVP 采用简单 round-robin；会话粘性、灰度权重和 WebSocket 长连�
 - secret 值与引用分离（ADR-0010）：`secret_refs` 引用、值仅在 `CreateMachine.secret_env` 一次性下发；observed state（agent 重启扫描重建的 `Machine`）不携带秘密。
 - execution-bound proxy credential 仅在 `CreateMachine.proxy_credential` 单向下发；不得进入会被返回的 `MachineSpec`、Redis、日志或 operation result，agent 只保存验证材料/摘要。
 - 运行时交互（logs/exec）属于 agent 契约：`StreamLogs`/`Exec` 流式 RPC 同样受 mTLS 身份与 execution fencing 约束，由控制面代理 CLI/用户调用（属运维通道，不是 app 流量）；`Machine.log_url` 仅指向归档日志，不承担实时通道。MVP 的 Exec 断线即终止，只保证会话创建幂等，不承诺输出续传或重新 attach。
+
+mTLS workload identity 的实现现状（2026-09）：静态证书 + 调用方 CN 白名单 + `internal/security/mtls` CertManager 热重载（契约 C-1；agentd、edge-proxy、agentclient 均接入），各进程导出 `firepaas_tls_cert_not_after_seconds` 并配 30d/7d 到期告警（`iac/observability/prometheus-alerts.yml`）。证书轮换、per-node 身份与吊销仍为延期项，见 ADR-0006 后果更新。
 
 ## 7. 放置与恢复
 

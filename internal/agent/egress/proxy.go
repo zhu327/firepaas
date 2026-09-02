@@ -103,10 +103,12 @@ type Proxy struct {
 	reserved *ReservedChecker
 	sink     AuditSink
 
-	mu      sync.RWMutex
-	byIP    map[netip.Addr]*Entry // guest IP → entry
-	byMach  map[string]*Entry     // machineID → entry
-	entries []*Entry
+	mu     sync.RWMutex
+	byIP   map[netip.Addr]*Entry // guest IP → entry
+	byMach map[string]*Entry     // machineID → entry
+	// 历史实现还有一个只 append、从不读取、Unregister 也不摘除的 entries
+	// 切片（死切片，随 swap 次数无界增长）；R2 已移除——byIP/byMach 是唯一
+	// 索引，删除/换代在两个 map 上都有确定的回收路径。
 
 	listeners []net.Listener
 	closed    atomic.Bool
@@ -245,7 +247,6 @@ func (p *Proxy) swap(staged *stagedEntry) error {
 	if staged.guestIP.IsValid() {
 		p.byIP[staged.guestIP] = e
 	}
-	p.entries = append(p.entries, e)
 	return nil
 }
 

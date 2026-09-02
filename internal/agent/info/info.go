@@ -37,6 +37,9 @@ type Provider struct {
 	memAllocatedMib  func() uint64 // 已承诺给 machine 的内存（M1：实例 Size 之和）
 	vcpuAllocated    func() int    // 已承诺给 machine 的 vcpu（实例 Vcpus 之和）
 	diskAllocatedMib func() uint64 // 已承诺磁盘（实例 OverlaySize 之和，MiB；v1.2-E）
+	// resourcesValid（R2，契约 D-1）：资源采集有效性判定（live 样本或 ≤60s
+	// last-known-good）。nil = 总是有效（单测/装配前）。
+	resourcesValid func() bool
 	// cachedImageDigests（v1.1，ADR-0018）：节点本地镜像缓存 digest 列表
 	//（LRU/创建序，截断上限 512）；nil = 未装配（不上报）。
 	cachedImageDigests func() []string
@@ -91,11 +94,18 @@ func (p *Provider) SetCapabilities(protocolVersion string, featureIDs []string, 
 // 由 agentd 装配：从 hypeman ListImages 派生 ready 镜像的 digest 集合。
 func (p *Provider) SetImageDigestsFunc(f func() []string) { p.cachedImageDigests = f }
 
-// AdmissionSnapshot 返回本机硬准入所需的容量/已承诺量（M2.2）。
+// SetResourcesValidFunc 注入资源采集有效性判定（R2，契约 D-1）：inventory
+// 采集失败且没有 ≤60s 新鲜的 last-known-good 时返回 false。agentd 装配；
+// 未注入 = 总是有效。
+func (p *Provider) SetResourcesValidFunc(f func() bool) { p.resourcesValid = f }
+
+// AdmissionSnapshot 返回本机硬准入所需的容量/已承诺量与资源采集有效性（M2.2）。
 // 调度器是软决策，这里是与真实 cgroup/进程状态对齐的硬校验双保险（ADR-0002）。
-// memTotalMib 已扣除 host 保留（P3-8）。
-func (p *Provider) AdmissionSnapshot() (vcpuTotal, memTotalMib, vcpuAllocated, memAllocatedMib uint64) {
-	vcpuTotal = uint64(runtime.NumCPU())
+// memTotalMib 已扣除 host 保留（P3-8）。resourcesValid=false 时调用方必须
+// fail closed（R2：采集失败被当 0 占用会让硬准入放行 ghost 超售），不得
+// 继续消费其余返回值。
+func (p *Provider) AdmissionSnapshot() (vcpuTotal, memTotalMib, vcpuAllocated, memAllocatedMib uint64, resourcesValid bool) {
+	vcpuTotal = effectiveVCPU()
 	memTotalMib = sellableMemMib(memTotal())
 	if p.vcpuAllocated != nil {
 		vcpuAllocated = uint64(p.vcpuAllocated())
@@ -103,7 +113,11 @@ func (p *Provider) AdmissionSnapshot() (vcpuTotal, memTotalMib, vcpuAllocated, m
 	if p.memAllocatedMib != nil {
 		memAllocatedMib = p.memAllocatedMib()
 	}
-	return vcpuTotal, memTotalMib, vcpuAllocated, memAllocatedMib
+	resourcesValid = true
+	if p.resourcesValid != nil {
+		resourcesValid = p.resourcesValid()
+	}
+	return vcpuTotal, memTotalMib, vcpuAllocated, memAllocatedMib, resourcesValid
 }
 
 // DiskAdmissionSnapshot（v1.2-E，ADR-0035）：磁盘维度硬准入输入。
@@ -142,7 +156,7 @@ func (p *Provider) Response() *pb.ServiceInfoResponse {
 		Status:            p.status,
 		StatusChangedAt:   timestamppb.New(p.statusChangedAt),
 		Capacity: &pb.NodeCapacity{
-			VcpuTotal:    uint64(runtime.NumCPU()),
+			VcpuTotal:    effectiveVCPU(),
 			MemTotalMib:  sellableMemMib(totalMem), // P3-8：扣除 host 保留
 			DiskTotalMib: diskTotal,
 		},
@@ -187,6 +201,54 @@ func memTotal() uint64 {
 		return cg
 	}
 	return host
+}
+
+// effectiveVCPU 返回准入/上报可用的 vcpu 总量：host CPU 数与 cgroup v2
+// CPU 配额的较小值（与 memTotal 的 cgroup 扣减同哲学——agentd 与
+// firecracker 子进程共享 Nomad task 的 cpu.max 限额，按 host 核数准入会在
+// 受限 task 里超售 CPU）。
+func effectiveVCPU() uint64 {
+	host := uint64(runtime.NumCPU())
+	if cg := readCgroupCPUMax(); cg > 0 && cg < host {
+		return cg
+	}
+	return host
+}
+
+// readCgroupCPUMax 读取当前 cgroup v2 的 cpu.max 配额，返回等效 vcpu 数；
+// 无限制或不可读返回 0。Nomad raw_exec 任务在自身 cgroup 中运行。
+func readCgroupCPUMax() uint64 {
+	data, err := os.ReadFile("/sys/fs/cgroup/cpu.max")
+	if err != nil {
+		return 0
+	}
+	return parseCPUMax(string(data))
+}
+
+// parseCPUMax 解析 cpu.max 内容（"<quota> <period>" 微秒对，"max" 表无限制），
+// 返回 quota/period 向下取整的 vcpu 数（亚核配额钳到 1：硬准入是最后防线，
+// 宁少勿超）；非法输入返回 0（视为无 limit，与 readCgroupMemMax 同策略）。
+func parseCPUMax(s string) uint64 {
+	fields := strings.Fields(s)
+	if len(fields) != 2 || fields[0] == "max" {
+		return 0
+	}
+	quota, err := strconv.ParseInt(fields[0], 10, 64)
+	if err != nil || quota <= 0 {
+		return 0
+	}
+	period, err := strconv.ParseUint(fields[1], 10, 64)
+	if err != nil || period == 0 {
+		return 0
+	}
+	v := uint64(quota) / period
+	if v == 0 {
+		// 亚核配额（如 0.5 core）整除得 0；准入单位是整数 vCPU，向上收敛为 1
+		// 会在亚核 cgroup 下超售。agent 宿主按多核假设部署（hypeman 要求），
+		// 若未来支持亚核节点，此处需改为调度器可表达的毫核准入。
+		v = 1
+	}
+	return v
 }
 
 // readCgroupMemMax 读取当前 cgroup v2 的 memory.max（字节）；无限制或不可读

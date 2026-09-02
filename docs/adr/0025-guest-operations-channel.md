@@ -16,7 +16,7 @@ logs/exec/cp，不替代断连、背压、资源泄漏和多节点故障矩阵�
 1. 路径固定为 `client/CLI → control-plane → mTLS agent → vsock guest agent`；客户端不得直连 agent 或 guest。
 2. v1.2 稳定能力为 logs、单会话 exec 和单文件 cp；不移植完整 envd process/filesystem API。
 3. 每个请求绑定 project、machine、execution；旧 execution 立即拒绝。建立后的 stream 在 execution 替换时终止。
-4. exec 支持 argv、cwd、非敏感 env、TTY、resize、stdin、signal 和 exit code。客户端断开即终止会话，不支持 reattach 或输出续传。
+4. exec 支持 argv、cwd、非敏感 env、TTY、resize、stdin 和 exit code。通用 signal 帧在当前 hypeman guest 通道中不受支持，必须明确返回 unsupported；客户端断开即终止会话，不支持 reattach 或输出续传。
 5. cp 只允许普通文件，默认不跟随 symlink；guest agent 做路径 clean、根目录约束和最终文件类型检查。
 6. project/session 并发、frame、总字节、速率、空闲时间和总时长均有限制。
 7. 审计记录 caller、目标 identity、命令/路径摘要、字节、耗时和退出结果；不记录内容、stdin/stdout 或环境变量。

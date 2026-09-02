@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 )
 
 // M3.3：app/deployment/rollout 基础 CRUD + 单 rollout 互斥（ADR-0015）。
@@ -89,14 +90,15 @@ func TestAppDeploymentRolloutLifecycle(t *testing.T) {
 	}
 
 	// 状态机推进：PREPARING → CUTOVER（幂等）→ COMPLETE。
-	if err := s.RolloutToCutover(ctx, appID, "2099-01-01T00:00:00Z"); err != nil {
+	deadline := time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC)
+	if err := s.RolloutToCutover(ctx, appID, deadline); err != nil {
 		t.Fatal(err)
 	}
 	rl, err := s.ActiveRolloutForApp(ctx, appID)
 	if err != nil || rl == nil || rl.Status != "CUTOVER" {
 		t.Fatalf("rollout = %+v err %v", rl, err)
 	}
-	if err := s.RolloutToCutover(ctx, appID, "2099-01-01T00:00:00Z"); err != nil {
+	if err := s.RolloutToCutover(ctx, appID, deadline); err != nil {
 		t.Fatalf("idempotent cutover: %v", err)
 	}
 	if err := s.CompleteRollout(ctx, appID, false); err != nil {
@@ -344,5 +346,62 @@ func TestUserDeleteOpID(t *testing.T) {
 	d := UserDeleteOpID("m-2", "")
 	if c == "" || c == d {
 		t.Fatalf("empty execution must still produce unique suffix: %q %q", c, d)
+	}
+}
+
+// P1：rollout 时间列是 timestamptz（迁移 0006），store 直接扫描为 time.Time，
+// 不再有文本解析失败→零时间的路径（S3 PREPARING 超时判定不可能被静默跳过）。
+func TestRolloutTimeColumnsScanAsTime(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	project := "test-rollout-time"
+	cleanupProject(t, s, project)
+	if err := s.EnsureProject(ctx, project, "t"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cleanupProject(t, s, project) })
+	appID := "app-rollout-time"
+	if err := s.CreateAppAndDeployment(ctx, project, App{
+		ID: appID, Hostname: "rl-time.local", ImageRef: "img:1",
+		VCPU: 1, MemMIB: 512, DesiredReplicas: 1,
+	}, Deployment{ID: "dep-rl-time-1", AppID: appID, Generation: 1, ImageRef: "img:1", Status: "ACTIVE"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateDeployment(ctx, Deployment{
+		ID: "dep-rl-time-2", AppID: appID, Generation: 2, ImageRef: "img:2", Status: "PREPARING",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateRollout(ctx, Rollout{ID: "rl-time-1", AppID: appID, FromGeneration: 1, ToGeneration: 2}); err != nil {
+		t.Fatal(err)
+	}
+	rl, err := s.ActiveRolloutForApp(ctx, appID)
+	if err != nil || rl == nil {
+		t.Fatalf("active rollout = %+v, %v", rl, err)
+	}
+	if rl.StartedAt.IsZero() {
+		t.Fatal("started_at (timestamptz NOT NULL) must scan to non-zero time.Time")
+	}
+	if time.Since(rl.StartedAt) > time.Minute {
+		t.Fatalf("started_at = %v, want near-now", rl.StartedAt)
+	}
+	if rl.CutoverAt != nil || rl.DrainDeadline != nil || rl.CompletedAt != nil {
+		t.Fatalf("nullable time columns must scan to nil pointers, got %+v", rl)
+	}
+
+	// CUTOVER 写 drain_deadline 后可扫描回等值时间戳。
+	deadline := time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC)
+	if err := s.RolloutToCutover(ctx, appID, deadline); err != nil {
+		t.Fatal(err)
+	}
+	rl, err = s.ActiveRolloutForApp(ctx, appID)
+	if err != nil || rl == nil {
+		t.Fatal(err)
+	}
+	if rl.DrainDeadline == nil || !rl.DrainDeadline.Equal(deadline) {
+		t.Fatalf("drain_deadline = %v, want %v", rl.DrainDeadline, deadline)
+	}
+	if rl.CutoverAt == nil {
+		t.Fatal("cutover_at must be set after cutover")
 	}
 }

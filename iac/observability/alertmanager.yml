@@ -1,0 +1,40 @@
+# alertmanager.yml：告警通知面（生产就绪 P2#21）。
+#
+# Prometheus 侧在 prometheus.yml 的 alerting 段注册本服务；本文件只负责
+# 路由收敛与降噪，不承载业务判定（阈值只改 prometheus-alerts.yml）。
+# 部署：Alertmanager 不作为单点——实验/生产均按"通知丢失可接受、规则计算在
+# Prometheus"的模型使用；验收时 amtool check-config 本文件。
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: default-webhook
+  group_by: [alertname, severity]
+  # 30s 收敛同类告警，避免控制器抖动脉冲串；4h 内不重复轰炸。
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    # critical：尽快首报（10s），1h 重复直至人工确认；不再回落默认 receiver。
+    - matchers: [severity="critical"]
+      receiver: oncall-webhook
+      group_wait: 10s
+      repeat_interval: 1h
+
+# critical 存在时抑制同告警名的 warning，避免同一故障双渠道。
+inhibit_rules:
+  - source_matchers: [severity="critical"]
+    target_matchers: [severity="warning"]
+    equal: [alertname]
+
+receivers:
+  # 内部 IM 机器人网关（飞书/钉钉/企业微信任一）示例：把本仓库告警格式接到
+  # 群通知 Webhook。url 按部署环境替换，禁止把含凭证的地址提交进仓库。
+  - name: default-webhook
+    webhook_configs:
+      - url: http://alert-webhook.internal:8080/alertmanager
+        send_resolved: true
+  - name: oncall-webhook
+    webhook_configs:
+      - url: http://alert-webhook.internal:8080/alertmanager/oncall
+        send_resolved: true

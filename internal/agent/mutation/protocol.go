@@ -4,6 +4,7 @@ package mutation
 
 import (
 	"encoding/json"
+	"log/slog"
 
 	"github.com/zhu327/firepaas/internal/agent/state"
 )
@@ -40,19 +41,69 @@ type Codec[T any] struct {
 type CreateMachine[T any] struct {
 	Identity
 	Prepare           func() (release func(), err error)
+	Recover           func() (Recovery[T], error)
 	Effect            func() (T, error)
 	PersistCredential func() error
 	Codec             Codec[T]
 }
 
-// RunCreateMachine preserves the legacy ordering: replay; lock; fence; runtime
-// create; fence advance; unlock; credential digest; completed result.
+// RunCreateMachine 是 create 的 durable-claim 协议（与 runClaimed 同一模型）：
+// 已完成重放；generation fence；Effect 前持久化 claim（含 request_hash）；
+// 未完成 claim 的重试经 hypeman inventory 恢复——实例存在则认领并走正常
+// 完成序列，不存在则在同一 claim 下重跑 Effect（不再二次撞同名拒绝）；
+// fence advance → credential → durable Complete。重放路径同时补写可能在
+// 崩溃窗口丢失的 credential。fence 高水位语义与 legacy 一致：stale 拒绝、
+// 同代放行、完成重放不碰 fence、claim 本身不推进高水位。
 func RunCreateMachine[T any](p *Protocol, op CreateMachine[T]) (T, error) {
 	var zero T
+	unlock := p.fences.LockMachine(op.MachineID)
+	defer unlock()
+	// 已完成重放：按记录返回结果，不碰 fence（幂等性优先）。同时补写
+	// credential——首次完成在 ledger 落盘、creds 落盘之前崩溃（或 creds.json
+	// 损坏）时，重放必须恢复 :5107 可用，否则该 machine 永久 403。
 	if raw, ok, err := p.ledger.Check(op.OperationID, op.RequestHash); err != nil {
 		return zero, err
 	} else if ok {
+		if op.PersistCredential != nil {
+			if err := op.PersistCredential(); err != nil {
+				return zero, err
+			}
+		}
 		return op.Codec.Decode(raw)
+	}
+	// generation fence 先于 claim：被拒的 stale 请求不留 ledger 记录。
+	if err := p.fences.Check(op.MachineID, op.Generation); err != nil {
+		return zero, err
+	}
+	rec, existed, err := p.ledger.Begin(state.Record{
+		OperationID: op.OperationID, MachineID: op.MachineID, ExecutionID: op.ExecutionID,
+		Generation: op.Generation, Kind: op.Kind, Identity: op.Coordinates, RequestHash: op.RequestHash,
+	})
+	if err != nil {
+		return zero, err
+	}
+	// machine 锁下没有并发完成者；Begin 返回 completed 只可能是防御性分支
+	//（上面的 Check 已拦截正常重放）。按同一补写语义处理。
+	if rec.Completed() {
+		if op.PersistCredential != nil {
+			if err := op.PersistCredential(); err != nil {
+				return zero, err
+			}
+		}
+		return op.Codec.Decode(rec.Result)
+	}
+	// 崩溃窗口重试（claim 未完成）：先查 hypeman inventory。实例存在 = 上次
+	// Effect 已生效只是完成没落盘——认领实例并按正常完成序列收尾（等于幂等
+	// 成功，返回真实 machine 状态）；不存在 = Effect 从未生效或实例已被回收，
+	// 直接在同一 claim 下重跑 Effect。
+	if existed && op.Recover != nil {
+		recovered, err := op.Recover()
+		if err != nil {
+			return zero, err
+		}
+		if recovered.Found {
+			return completeCreate(p, op, recovered.Value)
+		}
 	}
 	if op.Prepare != nil {
 		release, err := op.Prepare()
@@ -63,17 +114,19 @@ func RunCreateMachine[T any](p *Protocol, op CreateMachine[T]) (T, error) {
 			defer release()
 		}
 	}
-	unlock := p.fences.LockMachine(op.MachineID)
-	if err := p.fences.Check(op.MachineID, op.Generation); err != nil {
-		unlock()
+	out, err := op.Effect()
+	if err != nil {
 		return zero, err
 	}
-	out, err := op.Effect()
-	if err == nil {
-		err = p.fences.Advance(op.MachineID, op.Generation, op.ExecutionID)
-	}
-	unlock()
-	if err != nil {
+	return completeCreate(p, op, out)
+}
+
+// completeCreate 完成 create：fence 推进 → credential → durable 完成。顺序
+// 与 legacy 一致——credential 失败时留下可恢复的未完成 claim，完成记录
+// 永远最后落盘。
+func completeCreate[T any](p *Protocol, op CreateMachine[T], out T) (T, error) {
+	var zero T
+	if err := p.fences.Advance(op.MachineID, op.Generation, op.ExecutionID); err != nil {
 		return zero, err
 	}
 	if op.PersistCredential != nil {
@@ -85,7 +138,7 @@ func RunCreateMachine[T any](p *Protocol, op CreateMachine[T]) (T, error) {
 	if err != nil {
 		return zero, err
 	}
-	if err := p.ledger.Put(op.OperationID, op.MachineID, op.RequestHash, raw); err != nil {
+	if err := p.ledger.Complete(op.OperationID, op.RequestHash, raw); err != nil {
 		return zero, err
 	}
 	return out, nil
@@ -118,7 +171,11 @@ func RunDeleteMachine(p *Protocol, op DeleteMachine) (bool, error) {
 	if err := p.ledger.Put(op.OperationID, op.MachineID, op.RequestHash, []byte(`{}`)); err != nil {
 		return false, err
 	}
-	_, _ = p.ledger.PruneMachineExcept(op.MachineID, op.OperationID)
+	if _, err := p.ledger.PruneMachineExcept(op.MachineID, op.OperationID); err != nil {
+		// prune 失败不阻断 delete 语义：冗余的去重/fence 记录由保留窗口 GC 兜底。
+		slog.Warn("ledger prune after delete failed; stale records linger until retention gc",
+			"machine_id", op.MachineID, "operation_id", op.OperationID, "error", err)
+	}
 	if err := p.fences.Advance(op.MachineID, op.Generation, op.ExecutionID); err != nil {
 		return false, err
 	}
@@ -127,34 +184,24 @@ func RunDeleteMachine(p *Protocol, op DeleteMachine) (bool, error) {
 
 type Lifecycle[T any] struct {
 	Identity
-	Effect func() (T, error)
-	Codec  Codec[T]
+	// Recover 为 nil 时等同于无恢复（Effect 总是重跑）。
+	Recover func() (Recovery[T], error)
+	Effect  func() (T, error)
+	Codec   Codec[T]
 }
 
-// RunLifecycle preserves pause/resume's intentionally unlocked, non-advancing
-// post-effect protocol.
+// RunLifecycle 是 pause/resume 的 claimed mutation（R2：不再是“intentionally
+// unlocked, non-advancing”）。与 create/delete 共享 LockMachine 串行化：
+// Effect 前持久化 claim；未完成 claim 的重试经 Recover 从实例实际状态
+// 收敛（已处目标态即认领成功），未收敛则在同一 claim 下重跑幂等 Effect；
+// fence 通过后推进高水位（Advance）再 durable Complete。legacy 已完成记录
+// （无 status 字段）照常按结果重放，无需迁移。
 func RunLifecycle[T any](p *Protocol, op Lifecycle[T]) (T, error) {
-	var zero T
-	if raw, ok, err := p.ledger.Check(op.OperationID, op.RequestHash); err != nil {
-		return zero, err
-	} else if ok {
-		return op.Codec.Decode(raw)
+	claimed := ClaimedMutation[T]{
+		Identity: op.Identity, Recover: op.Recover, Effect: op.Effect, Codec: op.Codec,
 	}
-	if err := p.fences.Check(op.MachineID, op.Generation); err != nil {
-		return zero, err
-	}
-	out, err := op.Effect()
-	if err != nil {
-		return zero, err
-	}
-	raw, err := op.Codec.Encode(out)
-	if err != nil {
-		return zero, err
-	}
-	if err := p.ledger.Put(op.OperationID, op.MachineID, op.RequestHash, raw); err != nil {
-		return zero, err
-	}
-	return out, nil
+	advance := func() error { return p.fences.Advance(op.MachineID, op.Generation, op.ExecutionID) }
+	return runClaimed(p, claimed, true, advance, nil)
 }
 
 type Recovery[T any] struct {
@@ -195,6 +242,21 @@ func runClaimed[T any](
 	}
 	unlock := p.fences.LockMachine(key)
 	defer unlock()
+	// 顺序与 RunCreateMachine 一致：已完成重放 → fence → Begin。
+	// Begin 前先看已完成记录（重放不受 fence 约束——结果已提交，高水位
+	// 可能已推进）；新请求则先过 fence 再写 claim，避免 stale 请求留下
+	// 孤儿 PENDING claim（R2 审查 P3）。LockMachine 已串行化同 machine，
+	// Get 与 Begin 之间不产生窗口。
+	if rec, ok, err := p.ledger.Get(op.OperationID, op.RequestHash); err != nil {
+		return zero, err
+	} else if ok && rec.Completed() {
+		return op.Codec.Decode(rec.Result)
+	}
+	if checkFence {
+		if err := p.fences.Check(op.MachineID, op.Generation); err != nil {
+			return zero, err
+		}
+	}
 	rec, existed, err := p.ledger.Begin(state.Record{
 		OperationID: op.OperationID, MachineID: op.MachineID, ExecutionID: op.ExecutionID,
 		Generation: op.Generation, Kind: op.Kind, Identity: op.Coordinates, RequestHash: op.RequestHash,
@@ -203,12 +265,8 @@ func runClaimed[T any](
 		return zero, err
 	}
 	if rec.Completed() {
+		// 防御：同 key 已串行化，开始重放检查后不应再有新完成记录。
 		return op.Codec.Decode(rec.Result)
-	}
-	if checkFence {
-		if err := p.fences.Check(op.MachineID, op.Generation); err != nil {
-			return zero, err
-		}
 	}
 	var out T
 	if existed && op.Recover != nil {

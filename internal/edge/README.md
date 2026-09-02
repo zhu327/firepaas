@@ -4,6 +4,7 @@
 cmd/edge-proxy/          # 进程装配：配置、Redis、TLS、listeners、shutdown
 internal/edge/handler.go # 完整请求生命周期：route/cache、选择/并发、token、转发、一次安全重试
 internal/edge/edge.go    # route/token 本地缓存与 hostname 限流
+internal/edge/lru.go     # 三处缓存共享的容量有界 LRU 原语（非并发安全，调用方锁内使用）
 ```
 
 `internal/edge.Handler` 是数据面行为所有者。命令包不参与 backend eligibility、

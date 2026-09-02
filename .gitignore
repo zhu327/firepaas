@@ -47,3 +47,5 @@ scripts/results/
 .agents/
 .pi/
 AGENTS.md
+# go build 直接把 cmd/api 目录作为包输出时落在 cmd/api/api（不误入库）
+cmd/api/api

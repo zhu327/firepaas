@@ -51,17 +51,16 @@ func startTestDNS(t *testing.T) (upstreams []string) {
 		_ = w.WriteMsg(m)
 	}
 	mux.HandleFunc(".", handler)
-	srv := &dns.Server{Addr: "127.0.0.1:0", Net: "udp", Handler: mux}
-	go func() { _ = srv.ListenAndServe() }()
+	// 同 proxy_test.go 的 fakeDNSServer：自建 UDP conn + ActivateAndServe，
+	// 避免对 dns.Server.PacketConn 的数据竞争轮询。
+	pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatalf("listen dns: %v", err)
+	}
+	srv := &dns.Server{Handler: mux, PacketConn: pc}
+	go func() { _ = srv.ActivateAndServe() }()
 	t.Cleanup(func() { _ = srv.Shutdown() })
-	deadline := time.Now().Add(3 * time.Second)
-	for srv.PacketConn == nil && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if srv.PacketConn == nil {
-		t.Fatal("test dns server did not start")
-	}
-	port := srv.PacketConn.LocalAddr().(*net.UDPAddr).Port
+	port := pc.LocalAddr().(*net.UDPAddr).Port
 	return []string{net.JoinHostPort("127.0.0.1", strconv.Itoa(port))}
 }
 

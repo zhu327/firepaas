@@ -27,6 +27,8 @@ func (s *Server) CreateVolume(ctx context.Context, req *pb.CreateVolumeRequest) 
 		hashRequest(req),
 		"volume.create",
 		func() (*pb.CreateVolumeResponse, error) {
+			release := s.registerVolumeInflight(req.GetSizeBytes())
+			defer release()
 			if err := s.admitVolume(req.GetSizeBytes()); err != nil {
 				return nil, err
 			}
@@ -57,9 +59,25 @@ func (s *Server) createVolumeClaimed(
 		Codec:  protoCodec(func() *pb.CreateVolumeResponse { return &pb.CreateVolumeResponse{} }),
 	})
 	if err != nil {
+		if kind == "volume.import" && errors.Is(err, machine.ErrDatasetArchive) {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
 		return nil, mutationError(err)
 	}
 	return out, nil
+}
+
+// registerVolumeInflight 登记在途 volume 磁盘预算（MiB 向上取整，预算单位
+// 与 admit 一致），返回释放函数。R2-8：节点级准入把并发 create volume /
+// dataset import / overlay attach 的预算核算串行化——先加后查（与 create
+// 的 P3-7 同型），同一 admit 视野里的请求必然互见。
+func (s *Server) registerVolumeInflight(sizeBytes uint64) func() {
+	wantMib := int64((sizeBytes + 1024*1024 - 1) / (1024 * 1024))
+	if wantMib < 1 {
+		wantMib = 1
+	}
+	s.inflightVolumeDisk.Add(wantMib)
+	return func() { s.inflightVolumeDisk.Add(-wantMib) }
 }
 
 func (s *Server) admitVolume(sizeBytes uint64) error {
@@ -68,11 +86,15 @@ func (s *Server) admitVolume(sizeBytes uint64) error {
 	if diskTotal == 0 {
 		return status.Error(codes.Unavailable, "node disk capacity not available yet")
 	}
-	if diskAllocated+wantMib > diskTotal {
+	// 调用方必须先用 registerVolumeInflight 登记本请求（先加后查）；inflight
+	// 已含本请求的预算，这里不重复加 sizeBytes（仅用于错误报告）。
+	inflight := uint64(s.inflightVolumeDisk.Load())
+	if diskAllocated+inflight > diskTotal {
 		return status.Errorf(
 			codes.ResourceExhausted,
-			"volume disk admission: allocated %dMiB + requested %dMiB exceeds %dMiB",
+			"volume disk admission: allocated %dMiB + inflight %dMiB (want %dMiB) exceeds %dMiB",
 			diskAllocated,
+			inflight,
 			wantMib,
 			diskTotal,
 		)
@@ -112,6 +134,10 @@ func (s *Server) ImportDataset(ctx context.Context, req *pb.ImportDatasetRequest
 					"dataset import authorization expired or exceeds maximum TTL",
 				)
 			}
+			// import 下载+落盘全程持有 inflight 预算（最长 15 分钟授权窗口），
+			// 正是要关闭并发窗口间的预算盲区。
+			release := s.registerVolumeInflight(req.GetMaxExpandedBytes())
+			defer release()
 			if err := s.admitVolume(req.GetMaxExpandedBytes()); err != nil {
 				return nil, err
 			}
@@ -136,6 +162,8 @@ func (s *Server) AttachVolume(ctx context.Context, req *pb.AttachVolumeRequest) 
 		if !req.GetOverlay() || !req.GetReadonly() {
 			return nil, status.Error(codes.InvalidArgument, "dataset overlay requires overlay=true and readonly=true")
 		}
+		release := s.registerVolumeInflight(req.GetOverlaySizeBytes())
+		defer release()
 		if err := s.admitVolume(req.GetOverlaySizeBytes()); err != nil {
 			return nil, err
 		}

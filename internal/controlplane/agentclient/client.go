@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"time"
 
 	"github.com/zhu327/firepaas/internal/security/mtls"
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
@@ -20,10 +21,17 @@ import (
 type Client struct {
 	conn     *grpc.ClientConn
 	addr     string
+	certMgr  *mtls.CertManager
 	Machines pb.MachineServiceClient
 	Info     pb.InfoServiceClient
 	Images   pb.ImageServiceClient
 }
+
+// NotAfterHook 在客户端证书每次成功加载（含热重载）后被调用，进程级
+// 观测汇（契约 C-1）：cmd/api 把它接到 metrics registry 导出
+// firepaas_tls_cert_not_after_seconds。只在进程装配期设置一次，
+// 运行期不得改写（多个拨出的 Client 共享同一汇，语义等同）。
+var NotAfterHook func(expiry time.Time)
 
 // Dial 连接单节点 agent。mTLS 是唯一正式形态（ADR-0006/0014）：必须设置
 // FIREPAAS_AGENT_TLS_CERT/KEY/CA，缺失即失败（fail-closed，P3-5）；仅
@@ -38,12 +46,20 @@ func Dial(addr string) (*Client, error) {
 	), os.Getenv(
 		"FIREPAAS_AGENT_TLS_CA",
 	)
+	var clientCertMgr *mtls.CertManager
 	if certFile != "" && keyFile != "" && caFile != "" {
-		tlsConf, err := mtls.ClientConfig(certFile, keyFile, caFile, "agentd")
+		cm, err := mtls.NewCertManager(certFile, keyFile,
+			certReloadInterval(), slog.Default().With("component", "agentclient"), NotAfterHook)
 		if err != nil {
+			return nil, fmt.Errorf("agent mTLS cert: %w", err)
+		}
+		tlsConf, err := cm.ClientTLSConfig(caFile, "agentd")
+		if err != nil {
+			cm.Close()
 			return nil, fmt.Errorf("agent mTLS config: %w", err)
 		}
 		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(tlsConf)))
+		clientCertMgr = cm
 	} else if os.Getenv("FIREPAAS_AGENT_TLS_ALLOW_INSECURE") == "true" {
 		slog.Warn("agent connection running WITHOUT mTLS (dev only)")
 		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -52,11 +68,15 @@ func Dial(addr string) (*Client, error) {
 	}
 	conn, err := grpc.NewClient(addr, opts...)
 	if err != nil {
+		if clientCertMgr != nil {
+			clientCertMgr.Close()
+		}
 		return nil, fmt.Errorf("dial agent %s: %w", addr, err)
 	}
 	return &Client{
 		conn:     conn,
 		addr:     addr,
+		certMgr:  clientCertMgr,
 		Machines: pb.NewMachineServiceClient(conn),
 		Info:     pb.NewInfoServiceClient(conn),
 		Images:   pb.NewImageServiceClient(conn),
@@ -69,8 +89,29 @@ func (c *Client) Addr() string { return c.addr }
 // RawConn 返回底层 gRPC 连接（派生 snapshot 等附属服务客户端用）。
 func (c *Client) RawConn() *grpc.ClientConn { return c.conn }
 
-// Close 关闭连接。
-func (c *Client) Close() error { return c.conn.Close() }
+// Close 关闭连接并停止证书热重载。
+func (c *Client) Close() error {
+	err := c.conn.Close()
+	if c.certMgr != nil {
+		c.certMgr.Close()
+	}
+	return err
+}
+
+// certReloadInterval 读取证书热重载周期（默认 1m；<=0 关闭热重载，仅用
+// 启动时加载的证书）。非法值回退默认并告警。
+func certReloadInterval() time.Duration {
+	raw := os.Getenv("FIREPAAS_AGENT_TLS_CERT_RELOAD_INTERVAL")
+	if raw == "" {
+		return time.Minute
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		slog.Warn("invalid FIREPAAS_AGENT_TLS_CERT_RELOAD_INTERVAL, keeping default", "value", raw)
+		return time.Minute
+	}
+	return d
+}
 
 // Create 调用 CreateMachine。
 func (c *Client) Create(ctx context.Context, req *pb.CreateMachineRequest) (*pb.Machine, error) {

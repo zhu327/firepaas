@@ -40,15 +40,9 @@ authed_raw() { curl -sS -m 20 -H "Authorization: Bearer $API_TOKEN" "$@"; }
 pg() { $PG "$1"; }
 mark() { log "    (累计 $(( $(date +%s) - T0 ))s) $*"; }
 trap 'log "TRACE: died at line $LINENO rc=$? cmd=$BASH_COMMAND"' ERR
-
-restart_agentd() {
-  nomad job restart -on-error fail firepaas-agentd >/dev/null 2>&1 || return 1
-  for _ in $(seq 1 45); do
-    "$LAB_BIN/agentctl" info >/dev/null 2>&1 && return 0
-    sleep 2
-  done
-  return 1
-}
+# shellcheck source=lib/runtime.sh
+source "$HERE/lib/runtime.sh"
+restart_agentd() { lab_restart_agentd 45 2; }
 
 stream_exit_code() {
   python3 -c 'import json,sys
@@ -73,33 +67,9 @@ expect_guest_rc() {
   fi
 }
 
-# guest_exec <machine> <command...>：经 exec 通道跑 guest 命令，输出 stdout。
-guest_exec() {
-  local machine="$1"; shift
-  local opid="exec-$RANDOM-$RANDOM"
-  authed_raw -X POST "http://127.0.0.1:$API_PORT/v1/machines/$machine/exec" \
-    -H 'Content-Type: application/json' \
-    -d "$(python3 -c 'import json,sys; print(json.dumps({"command": list(sys.argv[2:]), "operation_id": sys.argv[1]}))' "$opid" "$@")"
-}
-
-exec_stdout() {
-  python3 -c '
-import json, sys, base64
-chunks = []
-rc = None
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    obj = json.loads(line)
-    if "stdout" in obj:
-        chunks.append(base64.b64decode(obj["stdout"]).decode("utf-8", "replace"))
-    if "exit_code" in obj:
-        rc = obj["exit_code"]
-sys.stdout.write("".join(chunks))
-sys.exit(0 if rc == 0 else (rc if isinstance(rc, int) else 1))
-'
-}
+# guest_exec <machine> <command...>：经 exec 通道跑 guest 命令。
+guest_exec() { lab_guest_exec "$@"; }
+exec_stdout() { lab_exec_stdout; }
 
 [[ -f "$LAB_BIN/agentd" && -f "$LAB_BIN/firepaas-api" && -f "$LAB_BIN/edge-proxy" ]] || fail "二进制未构建（make build 并复制到 $LAB_BIN）"
 [[ -f "$CERT_DIR/wildcard-$DOMAIN.crt" ]] || fail "泛域名证书缺失（先跑 scripts/lab/gen-certs.sh）"
@@ -257,7 +227,7 @@ summ=$(authed_raw "http://127.0.0.1:$API_PORT/v1/apps/$app/egress-audit")
 APP_ID="$app" MACHINE_ID="$machine" EXECUTION_ID="$allow_exec" SUMM="$summ" python3 - <<'PY' || fail "egress-audit API 缺本次 execution 拒绝摘要"
 import json, os
 body = json.loads(os.environ["SUMM"])
-rows = body.get("deny_summaries", [])
+rows = body.get("deny_summaries") or []
 assert rows, body
 assert all(r["AppID"] == os.environ["APP_ID"] for r in rows), body
 assert any(r["MachineID"] == os.environ["MACHINE_ID"] and r["ExecutionID"] == os.environ["EXECUTION_ID"] and r["DeniedConnections"] > 0 for r in rows), body

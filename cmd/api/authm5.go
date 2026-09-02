@@ -11,6 +11,8 @@ package main
 import (
 	"context"
 	"crypto/subtle"
+	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -133,6 +135,21 @@ var routeScope = map[string]string{
 	"POST /v1/images/pins":        "admin",
 	"GET /v1/images/pins":         "admin",
 	"DELETE /v1/images/pins/{id}": "admin",
+}
+
+// globalIdentityRoutes：API key 管理端点（P0，R2 评审）——project 受限身份
+// 一律拒绝（403）。只允许全局身份：root token 或 project_id 为空的 admin key。
+// 受限 admin 若能管理全局 key，就能为自己签发其他 project 的 key，
+// 直接突破整个 cross-project 防线；仅中间件收口不够，handler 层同样复核。
+var globalIdentityRoutes = map[string]bool{
+	"POST /v1/apikeys":        true,
+	"GET /v1/apikeys":         true,
+	"DELETE /v1/apikeys/{id}": true,
+}
+
+// identityIsGlobal 判定身份是否为全局身份（root token 或无 project 绑定的 key）。
+func identityIsGlobal(id identity) bool {
+	return id.Kind == "root" || (id.Kind == "key" && id.ProjectID == "")
 }
 
 // projectGated：受限 key 的跨 project 防线覆盖所有 by-id 资源路径。
@@ -331,17 +348,48 @@ func (a *API) auth(next http.HandlerFunc) http.HandlerFunc {
 		var id identity
 		if a.apiToken != "" && subtle.ConstantTimeCompare([]byte(got), []byte(a.apiToken)) == 1 {
 			id = identity{Kind: "root", Scopes: []string{"admin"}}
-		} else if a.apiKeys != nil {
-			k, err := a.apiKeys.GetByHash(r.Context(), apikeys.Hash(got))
-			if err == nil {
-				id = identity{
-					Kind: "key", KeyID: k.ID, KeyName: k.Name,
-					ProjectID: k.ProjectID, Scopes: k.Scopes,
+		} else {
+			// R2 评审 P1（401 限流）：暴力探测的桶空时直接 429，只做 hash+
+			// 桶判定，不触碰 PG（无效 key 后端不可用时不再被用来放大 DB 查询）。
+			ip := clientIP(r)
+			if a.authThrottle != nil && !a.authThrottle.hasCapacity(ip) {
+				if a.metrics != nil {
+					a.metrics.Inc("firepaas_auth_failure_throttled_total", map[string]string{}, 1)
 				}
-				// P3-16：last_used_at 节流写（≥1min 一次），避免每请求一行 UPDATE。
-				if k.LastUsedAt == nil || time.Since(*k.LastUsedAt) > time.Minute {
-					_ = a.apiKeys.Touch(r.Context(), apikeys.Hash(got))
+				writeErr(w, 429, "too many failed authentication attempts; retry later")
+				return
+			}
+			if a.apiKeys != nil {
+				hash := apikeys.Hash(got)
+				k, err := a.apiKeys.GetByHash(r.Context(), hash)
+				switch {
+				case err == nil:
+					id = identity{
+						Kind: "key", KeyID: k.ID, KeyName: k.Name,
+						ProjectID: k.ProjectID, Scopes: k.Scopes,
+					}
+					// P3-16：last_used_at 节流写（≥1min 一次），避免每请求一行 UPDATE。
+					if k.LastUsedAt == nil || time.Since(*k.LastUsedAt) > time.Minute {
+						_ = a.apiKeys.Touch(r.Context(), hash)
+					}
+				case errors.Is(err, apikeys.ErrNotFound):
+					// 无效/已撤销/已过期 key：确认失败后消耗一枚试错令牌。
+					if a.authThrottle != nil {
+						a.authThrottle.record(ip)
+					}
+				default:
+					// P1：PG 依赖失败不能降级成 401（错误信号 + 引发客户端无谓轮换）；
+					// 返回 503（可重试）+ 指标/日志，缓存命中不受 PG 抖动影响。
+					slog.Error("api key lookup failed", "route", r.Pattern, "error", err)
+					if a.metrics != nil {
+						a.metrics.Inc("firepaas_apikey_lookup_errors_total", map[string]string{}, 1)
+					}
+					writeErr(w, 503, "authentication backend temporarily unavailable")
+					return
 				}
+			} else if a.authThrottle != nil {
+				// 未装配 apikey 后端：任何非 root token 都必是失败尝试，计入桶。
+				a.authThrottle.record(ip)
 			}
 		}
 		if id.Kind == "" {
@@ -362,6 +410,12 @@ func (a *API) auth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		if maxRank(id.Scopes) < scopeRank[need] {
 			writeErr(w, 403, "insufficient scope: require "+need)
+			return
+		}
+		// P0（R2）：apikey 管理端点只接受全局身份；任何 project 受限身份
+		//（即便持有 admin scope）拒绝——MW 收口，handler 内还有第二道复核。
+		if globalIdentityRoutes[r.Pattern] && !identityIsGlobal(id) {
+			writeErr(w, 403, "api key management requires a global identity (root token or an unscoped admin key)")
 			return
 		}
 		// 跨 project：gate 清单内的路由，受限 key 只放行本项目资源。

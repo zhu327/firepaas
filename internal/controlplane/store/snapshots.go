@@ -82,8 +82,20 @@ func scanSnapshot(sc scanner) (*Snapshot, error) {
 	return &s, nil
 }
 
+// normalizeSnapshotCompression 把压缩字段的 Go 零值对齐到列默认（'none'）：
+// 零值串直接插入会违反 compression/compression_state 的 CHECK 约束。
+func normalizeSnapshotCompression(snap *Snapshot) {
+	if snap.Compression == "" {
+		snap.Compression = "none"
+	}
+	if snap.CompressionState == "" {
+		snap.CompressionState = "none"
+	}
+}
+
 // CreateSnapshot 插入 CREATING 快照（幂等：同 ID 已存在时返回既有行）。
 func (s *Store) CreateSnapshot(ctx context.Context, snap Snapshot) (*Snapshot, error) {
+	normalizeSnapshotCompression(&snap)
 	var level any
 	if snap.CompressionLevel != nil {
 		level = *snap.CompressionLevel
@@ -120,6 +132,7 @@ func (s *Store) CreateSnapshotAndEnqueue(
 		p.Generation != snap.SourceGeneration || p.Kind != "snapshot_create" || p.DispatchNodeID != snap.NodeID {
 		return nil, op, errors.New("create snapshot: invalid atomic command")
 	}
+	normalizeSnapshotCompression(&snap)
 	err := s.inTx(ctx, func(tx pgx.Tx) error {
 		var level any
 		if snap.CompressionLevel != nil {

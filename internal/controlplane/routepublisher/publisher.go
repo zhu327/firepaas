@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"sync"
 
 	"github.com/zhu327/firepaas/internal/controlplane/catalog"
 	"github.com/zhu327/firepaas/internal/controlplane/store"
@@ -17,21 +18,31 @@ type Store interface {
 	ActiveRouteMachines(context.Context) ([]store.Machine, error)
 	ListActiveRollouts(context.Context) ([]store.Rollout, error)
 	ListDeployments(context.Context, string) ([]store.Deployment, error)
-	SyncRoutes(context.Context, []store.RouteRow) error
+	// SyncRoutes 提交权威 route 集合并同事务分配各 hostname 的发布
+	// revision（D-2，单调，leader 换届不回退）。
+	SyncRoutes(context.Context, []store.RouteRow) (map[string]int64, error)
 }
 
 // Catalog is the narrow Redis projection port needed by a complete rebuild.
 type Catalog interface {
-	ReplaceHostRoutes(context.Context, string, []catalog.HostRoute, int) error
+	// ReplaceHostRoutes 返回 applied=false 表示被 revision 高水位拒绝
+	// （旧乱序快照，安全丢弃）。
+	ReplaceHostRoutes(context.Context, string, int64, []catalog.HostRoute, int) (bool, error)
 	PruneRoutes(context.Context, map[string]bool, map[string]bool) error
 }
 
 // Publisher is the controller's sole route writer.
+//
+// D-2：进程内 serialize 全部 Rebuild（周期 sync 与显式 KickRouteRebuild
+// 共用此互斥）。同一进程内两个 rebuild 并发不会并发分配 revision / 乱序
+// 写 Redis；跨进程（leader 换届）的乱序由 PG 分配的单调 revision + catalog
+// 高水位 Lua 守卫兜底。
 type Publisher struct {
 	store           Store
 	catalog         Catalog
 	defaultAppPort  int
 	legacyProxyAddr string
+	mu              sync.Mutex
 }
 
 func New(st Store, cat Catalog, defaultAppPort int, legacyProxyAddr string) *Publisher {
@@ -59,6 +70,11 @@ type Projection struct {
 // PostgreSQL authority, then replaces and prunes Redis. A Redis failure is
 // returned without undoing or reinterpreting the PostgreSQL result.
 func (p *Publisher) Rebuild(ctx context.Context, proxyByNode map[string]string) error {
+	// D-2：进程内串行化（mutex 而非 singleflight 丢弃：KickRouteRebuild 的
+	// 调用方期待自己这次重建真的执行过，排队等先行者结束后仍跑一遍）。
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	machines, err := p.store.ActiveRouteMachines(ctx)
 	if err != nil {
 		return err
@@ -91,10 +107,11 @@ func (p *Publisher) Rebuild(ctx context.Context, proxyByNode map[string]string) 
 		ProxyByNode: proxyByNode, DefaultAppPort: p.defaultAppPort,
 		LegacyProxyAddr: p.legacyProxyAddr,
 	})
-	if err := p.store.SyncRoutes(ctx, projection.Routes); err != nil {
+	revisions, err := p.store.SyncRoutes(ctx, projection.Routes)
+	if err != nil {
 		return err
 	}
-	return p.publishRedis(ctx, projection)
+	return p.publishRedis(ctx, projection, revisions)
 }
 
 // Derive applies readiness, rollout, generation, and multiport policy without I/O.
@@ -215,7 +232,7 @@ func Derive(in Input) Projection {
 	return Projection{Routes: routes, PrimaryPorts: primaryPorts}
 }
 
-func (p *Publisher) publishRedis(ctx context.Context, projection Projection) error {
+func (p *Publisher) publishRedis(ctx context.Context, projection Projection, revisions map[string]int64) error {
 	keepRoutes := make(map[string]bool, len(projection.Routes))
 	keepHosts := make(map[string]bool, len(projection.Routes))
 	hostRoutes := make(map[string][]catalog.HostRoute)
@@ -244,7 +261,10 @@ func (p *Publisher) publishRedis(ctx context.Context, projection Projection) err
 	}
 	sort.Strings(hostnames)
 	for _, hostname := range hostnames {
-		if err := p.catalog.ReplaceHostRoutes(ctx, hostname, hostRoutes[hostname], projection.PrimaryPorts[hostname]); err != nil {
+		// revisions 必有该 hostname（SyncRoutes 对每个活跃 hostname 分配）；
+		// 缺失视为 0 会被高水位守卫拒绝——宁可拒绝也不发布无 revision 投影。
+		rev := revisions[hostname]
+		if _, err := p.catalog.ReplaceHostRoutes(ctx, hostname, rev, hostRoutes[hostname], projection.PrimaryPorts[hostname]); err != nil {
 			return err
 		}
 	}

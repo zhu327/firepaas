@@ -6,13 +6,16 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -26,6 +29,12 @@ const (
 	freshTTLDefault        = 5 * time.Second
 	staleDefault           = 120 * time.Second
 	hardConcurrencyDefault = 256
+	certReloadDefault      = time.Minute
+	// WS/SSE 语义防护：只限制 header 读取与空闲连接；绝不设置
+	// WriteTimeout/ReadTimeout——它们对整条响应流/请求计时，会直接切断
+	// WebSocket 升级与 SSE 长连接（edge 是长连接的透传代理）。
+	readHeaderTimeout = 10 * time.Second
+	idleTimeout       = 90 * time.Second
 )
 
 func main() {
@@ -51,13 +60,21 @@ func run() error {
 	rdb := redis.NewClient(&redis.Options{Addr: envOr("FIREPAAS_REDIS_ADDR", "127.0.0.1:6379")})
 	defer func() { _ = rdb.Close() }()
 
-	agentTLS, err := loadAgentTLS()
+	certReload := envDurOr("FIREPAAS_EDGE_CERT_RELOAD_INTERVAL", certReloadDefault)
+	gauges := newCertExpiryGauges()
+	agentTLS, agentCertMgr, err := loadAgentTLS(certReload, gauges)
 	if err != nil {
 		return err
 	}
-	clientCerts, err := loadServerCertificates(tlsPort)
+	if agentCertMgr != nil {
+		defer agentCertMgr.Close()
+	}
+	serverCertMgr, err := loadServerCertificates(tlsPort, certReload, gauges)
 	if err != nil {
 		return err
+	}
+	if serverCertMgr != nil {
+		defer serverCertMgr.Close()
 	}
 
 	extraPorts, err := parseExtraPorts(os.Getenv("FIREPAAS_EDGE_EXTRA_PORTS"))
@@ -71,21 +88,31 @@ func run() error {
 		30*time.Second,
 	)
 	tokens.SetStaleWindow(staleWindow)
+	if n := envIntOr("FIREPAAS_EDGE_TOKEN_CACHE_MAX", 0); n > 0 { // F：token 缓存容量上限
+		tokens.MaxEntries = n
+	}
 	counters := &edgesvc.Counters{}
+	routes := edgesvc.NewRouteCache(freshTTL, staleWindow)
+	if n := envIntOr("FIREPAAS_EDGE_ROUTE_CACHE_MAX", 0); n > 0 { // P1-16 容量上限
+		routes.MaxEntries = n
+	}
+	limiter := edgesvc.NewRateLimiter(
+		envFloatOr("FIREPAAS_EDGE_RATE_LIMIT", 100),
+		envFloatOr("FIREPAAS_EDGE_RATE_BURST", 200),
+	)
+	if n := envIntOr("FIREPAAS_EDGE_RATELIMIT_BUCKETS_MAX", 0); n > 0 { // P1-16 容量上限
+		limiter.MaxBuckets = n
+	}
 	handler := edgesvc.NewHandler(edgesvc.Config{
-		Catalog: catalog.New(rdb), Routes: edgesvc.NewRouteCache(freshTTL, staleWindow), Tokens: tokens,
-		Limiter: edgesvc.NewRateLimiter(
-			envFloatOr("FIREPAAS_EDGE_RATE_LIMIT", 100),
-			envFloatOr("FIREPAAS_EDGE_RATE_BURST", 200),
-		),
+		Catalog: catalog.New(rdb), Routes: routes, Tokens: tokens, Limiter: limiter,
 		Counters: counters, AgentTLS: agentTLS, HardConcurrency: hardConcurrency, EdgePorts: edgePorts,
 	})
 
-	if err := startMetrics(counters, handler); err != nil {
+	if err := startMetrics(counters, handler, gauges); err != nil {
 		return err
 	}
 	plainHandler := http.Handler(handler)
-	tlsEnabled := tlsPort != "" && len(clientCerts) > 0
+	tlsEnabled := tlsPort != "" && serverCertMgr != nil
 	if tlsEnabled {
 		plainHandler = redirectHandler(tlsPort)
 	}
@@ -94,7 +121,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("listen :%s: %w", port, err)
 	}
-	server := &http.Server{Handler: plainHandler}
+	server := newEdgeServer(plainHandler)
 	serve(server, mainListener, "edge serve")
 
 	var extraServers []*http.Server
@@ -108,11 +135,9 @@ func run() error {
 			return fmt.Errorf("listen extra :%d: %w", p, listenErr)
 		}
 		p := p
-		srv := &http.Server{
-			Handler: http.HandlerFunc(
-				func(w http.ResponseWriter, r *http.Request) { handler.ServeHTTP(w, edgesvc.WithListenPort(r, p)) },
-			),
-		}
+		srv := newEdgeServer(http.HandlerFunc(
+			func(w http.ResponseWriter, r *http.Request) { handler.ServeHTTP(w, edgesvc.WithListenPort(r, p)) },
+		))
 		extraServers = append(extraServers, srv)
 		serve(srv, listener, fmt.Sprintf("edge extra serve port=%d", p))
 	}
@@ -120,15 +145,16 @@ func run() error {
 	var tlsServer *http.Server
 	if tlsEnabled {
 		tlsCfg := &tls.Config{
-			Certificates: clientCerts,
-			MinVersion:   tls.VersionTLS12,
-			NextProtos:   []string{"h2", "http/1.1"},
+			GetCertificate: serverCertMgr.GetCertificate, // 热重载（契约 C-1）
+			MinVersion:     tls.VersionTLS12,
+			NextProtos:     []string{"h2", "http/1.1"},
 		}
 		listener, listenErr := net.Listen("tcp", tlsPort)
 		if listenErr != nil {
 			return fmt.Errorf("listen %s: %w", tlsPort, listenErr)
 		}
-		tlsServer = &http.Server{Handler: handler, TLSConfig: tlsCfg}
+		tlsServer = newEdgeServer(handler)
+		tlsServer.TLSConfig = tlsCfg
 		serve(tlsServer, tls.NewListener(listener, tlsCfg), "edge tls serve")
 	}
 
@@ -144,25 +170,50 @@ func run() error {
 	return server.Shutdown(shutdownCtx)
 }
 
-func loadAgentTLS() (*tls.Config, error) {
-	cert, key, ca := os.Getenv(
-		"FIREPAAS_EDGE_TLS_CERT",
-	), os.Getenv(
-		"FIREPAAS_EDGE_TLS_KEY",
-	), os.Getenv(
-		"FIREPAAS_EDGE_TLS_CA",
-	)
+// loadAgentTLS 装配 edge→agent proxy（:5107）的 mTLS 客户端配置；证书经
+// CertManager 热重载并导出到期指标（契约 C-1）。
+//
+// P0#2 fail-closed：材料缺失即启动失败，不得静默退化为明文 HTTP。唯一例外是
+// 显式开发模式 FIREPAAS_EDGE_ALLOW_INSECURE_DEV=true（契约 C-2，对齐 agentd 的
+// FIREPAAS_ALLOW_INSECURE_DEV），此时打醒目告警。
+func loadAgentTLS(reloadEvery time.Duration, gauges *certExpiryGauges) (*tls.Config, *mtls.CertManager, error) {
+	cert := os.Getenv("FIREPAAS_EDGE_TLS_CERT")
+	key := os.Getenv("FIREPAAS_EDGE_TLS_KEY")
+	ca := os.Getenv("FIREPAAS_EDGE_TLS_CA")
+	if cert == "" && key == "" && ca == "" {
+		if isTruthy(os.Getenv("FIREPAAS_EDGE_ALLOW_INSECURE_DEV")) {
+			slog.Warn(
+				"FIREPAAS_EDGE_ALLOW_INSECURE_DEV=true：edge→agent :5107 使用明文 HTTP，仅限本地开发，生产必须配置 FIREPAAS_EDGE_TLS_CERT/KEY/CA",
+			)
+			return nil, nil, nil
+		}
+		return nil, nil, errors.New(
+			"edge agent mTLS required: set FIREPAAS_EDGE_TLS_CERT/KEY/CA (or FIREPAAS_EDGE_ALLOW_INSECURE_DEV=true for local development only)",
+		)
+	}
 	if cert == "" || key == "" || ca == "" {
-		return nil, nil
+		return nil, nil, errors.New("FIREPAAS_EDGE_TLS_CERT/KEY/CA must be set together")
 	}
-	cfg, err := mtls.ClientConfig(cert, key, ca, "agentd")
+	mgr, err := mtls.NewCertManager(cert, key, reloadEvery, nil, func(expiry time.Time) {
+		gauges.set(cert, expiry)
+	})
 	if err != nil {
-		return nil, fmt.Errorf("edge mTLS config: %w", err)
+		return nil, nil, fmt.Errorf("edge mTLS config: %w", err)
 	}
-	return cfg, nil
+	cfg, err := mgr.ClientTLSConfig(ca, "agentd")
+	if err != nil {
+		mgr.Close()
+		return nil, nil, fmt.Errorf("edge mTLS config: %w", err)
+	}
+	return cfg, mgr, nil
 }
 
-func loadServerCertificates(tlsPort string) ([]tls.Certificate, error) {
+// loadServerCertificates 装配面向公网的 server 证书（热重载 + 到期指标）。
+func loadServerCertificates(
+	tlsPort string,
+	reloadEvery time.Duration,
+	gauges *certExpiryGauges,
+) (*mtls.CertManager, error) {
 	cert, key := os.Getenv("FIREPAAS_EDGE_SERVER_CERT"), os.Getenv("FIREPAAS_EDGE_SERVER_KEY")
 	if (cert == "") != (key == "") {
 		return nil, errors.New("FIREPAAS_EDGE_SERVER_CERT and FIREPAAS_EDGE_SERVER_KEY must be set together")
@@ -175,14 +226,55 @@ func loadServerCertificates(tlsPort string) ([]tls.Certificate, error) {
 	if cert == "" {
 		return nil, nil
 	}
-	pair, err := tls.LoadX509KeyPair(cert, key)
+	mgr, err := mtls.NewCertManager(cert, key, reloadEvery, nil, func(expiry time.Time) {
+		gauges.set(cert, expiry)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("edge server cert: %w", err)
 	}
-	return []tls.Certificate{pair}, nil
+	return mgr, nil
 }
 
-func startMetrics(counters *edgesvc.Counters, handler *edgesvc.Handler) error {
+// certExpiryGauges 汇总各 CertManager 上报的证书到期时间，并在 metrics 端点
+// 导出 firepaas_tls_cert_not_after_seconds（gauge，label=file；契约 C-1）。
+type certExpiryGauges struct {
+	mu    sync.Mutex
+	files map[string]time.Time
+}
+
+func newCertExpiryGauges() *certExpiryGauges {
+	return &certExpiryGauges{files: map[string]time.Time{}}
+}
+
+func (g *certExpiryGauges) set(file string, expiry time.Time) {
+	g.mu.Lock()
+	g.files[file] = expiry
+	g.mu.Unlock()
+}
+
+func (g *certExpiryGauges) WritePrometheus(w io.Writer) {
+	g.mu.Lock()
+	files := make([]string, 0, len(g.files))
+	expiry := make(map[string]time.Time, len(g.files))
+	for f, t := range g.files {
+		files = append(files, f)
+		expiry[f] = t
+	}
+	g.mu.Unlock()
+	if len(files) == 0 {
+		return
+	}
+	sort.Strings(files)
+	_, _ = fmt.Fprint(
+		w,
+		"# HELP firepaas_tls_cert_not_after_seconds unix timestamp when the managed TLS certificate expires\n# TYPE firepaas_tls_cert_not_after_seconds gauge\n",
+	)
+	for _, f := range files {
+		_, _ = fmt.Fprintf(w, "firepaas_tls_cert_not_after_seconds{file=%q} %d\n", f, expiry[f].Unix())
+	}
+}
+
+func startMetrics(counters *edgesvc.Counters, handler *edgesvc.Handler, gauges *certExpiryGauges) error {
 	port := envOr("FIREPAAS_EDGE_METRICS_PORT", "")
 	if port == "" {
 		return nil
@@ -192,13 +284,26 @@ func startMetrics(counters *edgesvc.Counters, handler *edgesvc.Handler) error {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		counters.WritePrometheus(w)
 		handler.WriteInflightPrometheus(w)
+		handler.WriteRouteRevisionRejectsPrometheus(w)
+		gauges.WritePrometheus(w)
 	})
 	listener, err := net.Listen("tcp", ":"+port)
 	if err != nil {
 		return fmt.Errorf("listen metrics :%s: %w", port, err)
 	}
-	serve(&http.Server{Handler: mux}, listener, "edge metrics serve")
+	serve(newEdgeServer(mux), listener, "edge metrics serve")
 	return nil
+}
+
+// newEdgeServer 统一 edge 全部 http.Server 的超时口径：仅 ReadHeaderTimeout
+// 与 IdleTimeout。不设 WriteTimeout/ReadTimeout 的原因见顶部常量注释
+// （WS/SSE 长连接不得被整体超时切断）。
+func newEdgeServer(handler http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: readHeaderTimeout,
+		IdleTimeout:       idleTimeout,
+	}
 }
 
 func serve(server *http.Server, listener net.Listener, label string) {
@@ -302,6 +407,15 @@ func envFloatOr(key string, def float64) float64 {
 		var f float64
 		if _, e := fmt.Sscanf(v, "%g", &f); e == nil {
 			return f
+		}
+	}
+	return def
+}
+
+func envIntOr(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, e := strconv.Atoi(v); e == nil {
+			return n
 		}
 	}
 	return def

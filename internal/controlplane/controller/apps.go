@@ -31,21 +31,6 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
-// parsePGTime 解析 PG timestamp 文本（两种形态：
-// `2026-08-26 18:49:37.22+08` 或 RFC3339）。解析失败返回零值。
-func parsePGTime(s string) time.Time {
-	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
-		return t
-	}
-	if t, err := time.Parse("2006-01-02 15:04:05.999999-07", s); err == nil {
-		return t
-	}
-	if t, err := time.Parse("2006-01-02 15:04:05.999999+07", s); err == nil {
-		return t
-	}
-	return time.Time{}
-}
-
 const (
 	rolloutDefaultTimeout    = 300 * time.Second // PREPARING 超时 → 自动回滚（S3）
 	rolloutDefaultDrainGrace = 30 * time.Second  // CUTOVER 后旧代 drain 期限
@@ -104,8 +89,18 @@ func (c *Controller) reconcileRollout(ctx context.Context, app *store.App, r *st
 	switch r.Status {
 	case "PREPARING":
 		// S3 超时 → 回滚；S2 重试耗尽 → 回滚；全部 READY → 切流。
-		started := parsePGTime(r.StartedAt)
-		if !started.IsZero() && time.Since(started) > c.rolloutTimeout() {
+		// rollouts.started_at 是 timestamptz NOT NULL（迁移 0006，store 直接
+		// 扫描 time.Time）；出现零值说明存在数据缺陷。旧实现（文本解析失败）
+		// 此时会静默跳过 S3——现在按超时的 violation-safe 方向处理：告警并回滚，
+		// 不留永久 PREPARING 卡死窗口。
+		started := r.StartedAt
+		if started.IsZero() {
+			slog.Error("rollout has zero started_at; treating as preparing timeout",
+				"rollout_id", r.ID, "app_id", r.AppID)
+			c.recordEvent(ctx, "rollout", "", r.ID, "", "preparing timeout (missing started_at), rollback", nil)
+			return c.startRollback(ctx, r)
+		}
+		if time.Since(started) > c.rolloutTimeout() {
 			c.recordEvent(ctx, "rollout", "", r.ID, "", "preparing timeout, rollback", nil)
 			return c.startRollback(ctx, r)
 		}
@@ -123,7 +118,7 @@ func (c *Controller) reconcileRollout(ctx context.Context, app *store.App, r *st
 		// 使用旧 route/token。旧代必须保留至全部新代已 READY、CUTOVER 的
 		// drain grace 到期后再删除，避免 route/token 的短暂空窗。
 		if allReady(toMachines, app.DesiredReplicas) {
-			deadline := time.Now().Add(c.rolloutDrainGrace()).UTC().Format(time.RFC3339Nano)
+			deadline := time.Now().Add(c.rolloutDrainGrace())
 			if err := c.store.RolloutToCutover(ctx, app.ID, deadline); err != nil {
 				return err
 			}
@@ -142,8 +137,7 @@ func (c *Controller) reconcileRollout(ctx context.Context, app *store.App, r *st
 		if r.DrainDeadline == nil {
 			return nil
 		}
-		deadline := parsePGTime(*r.DrainDeadline)
-		if deadline.IsZero() || time.Now().Before(deadline) {
+		if time.Now().Before(*r.DrainDeadline) {
 			return nil
 		}
 		// 防御性重检：即使 rollout 已进入 CUTOVER，也不能因新代随后掉出
@@ -426,7 +420,10 @@ func (c *Controller) enqueueAppMachineCreate(
 	if err != nil {
 		return err
 	}
-	op, err := c.store.EnsureAppAndEnqueueCreate(ctx, app.ProjectID, app.ID, app.Hostname,
+	// 墓碑行（scale down 后）由 app owner 显式复活：v1.2-D 复活守卫只拦
+	// 用户直建/快照类重放，不拦 owner 自己的 scale up 决策（否则 2→1→2
+	// 永久死锁——多节点验收finding D2）。存活行走同一代幂等入队。
+	op, err := c.store.EnsureAppAndEnqueueCreateResurrect(ctx, app.ProjectID, app.ID, app.Hostname,
 		dep.ImageRef, dep.VCPU, dep.MemMIB,
 		int64(agentv1.EffectiveDiskMib(spec.GetDiskMib())), dep.Port,
 		machineID, dep.ID, executionID,

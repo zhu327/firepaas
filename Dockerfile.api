@@ -1,0 +1,31 @@
+# syntax=docker/dockerfile:1
+#
+# firepaas-api（控制面 HTTP API）生产镜像：静态二进制 + distroless nonroot。
+# iac/nomad/control-plane.hcl 的 docker driver 以不可变 digest 引用本镜像。
+# agentd 不走镜像（iac/nomad/agent.hcl 为 raw_exec）：agent 需要宿主 root、
+# cgroup v2 写入与 netns/TAP 操作，容器化反而模糊权限边界，保持二进制交付。
+#
+# 本地可用 --build-arg GOLANG_IMAGE=<mirror>/golang:1.25 覆盖构建基座
+# （离线/镜像站环境）；CI 使用下方默认的版本钉扎官方镜像。
+ARG GOLANG_IMAGE=golang:1.25.4-bookworm
+
+FROM ${GOLANG_IMAGE} AS build
+WORKDIR /src
+# 先拷依赖清单利用层缓存；hypeman 经 go.mod replace 指向公开 fork tag，
+# 无需 sibling checkout。GOWORK=off 走根 go.mod（与 CI 一致）。
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    GOWORK=off go mod download
+COPY . .
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOWORK=off go build -trimpath -ldflags='-s -w' \
+      -o /out/firepaas-api ./cmd/api
+
+# distroless/static-debian12:nonroot（多架构 index digest，2026-09 实测）。
+# 非 root 运行：API 仅监听 FIREPAAS_HTTP_PORT（默认 8080，免特权端口）。
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
+COPY --from=build /out/firepaas-api /firepaas-api
+USER 65532:65532
+EXPOSE 8080
+ENTRYPOINT ["/firepaas-api"]

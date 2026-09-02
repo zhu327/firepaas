@@ -65,6 +65,89 @@ func TestRedactTextRemovesURLsAndFlattenedSecrets(t *testing.T) {
 	}
 }
 
+// F：bare 精确键 token/credential/secret/password——normalize 后整键匹配，
+// 不做子串匹配（tokens、secret_id、source_url_digest 等合法元数据键不受影响）。
+func TestExactBareKeys(t *testing.T) {
+	for _, key := range []string{"token", "Token", "TOKEN", "credential", "secret", "password"} {
+		if !IsSensitive(key) {
+			t.Fatalf("bare key %q must be sensitive", key)
+		}
+	}
+	for _, key := range []string{
+		"tokens", "token_count", "secret_id", "secret_refs", "secretId",
+		"source_url_digest", "credentials_file",
+	} {
+		if IsSensitive(key) {
+			t.Fatalf("metadata key %q must NOT be redacted", key)
+		}
+	}
+	raw := []byte(`{"snapshot":{"token":"cap-token-123","snapshot_id":"s1"}}`)
+	out := string(RedactJSONBytes(raw))
+	if strings.Contains(out, "cap-token-123") {
+		t.Fatalf("bare token key leaked: %s", out)
+	}
+	if !strings.Contains(out, `"snapshot_id":"s1"`) {
+		t.Fatalf("non-sensitive key dropped: %s", out)
+	}
+}
+
+// F：camelCase 键（protojson 缺省输出）在对象树路径打码。
+func TestCamelCaseKeysInObjectTree(t *testing.T) {
+	raw := []byte(`{
+		"trafficToken":"ttp-1",
+		"proxyCredential":"pc-1",
+		"secretEnv":{"DB_PASSWORD":"pw1"},
+		"env":{"PLAIN":"keep"}
+	}`)
+	out := string(RedactJSONBytes(raw))
+	for _, leaked := range []string{"ttp-1", "pc-1", "pw1"} {
+		if strings.Contains(out, leaked) {
+			t.Fatalf("camelCase value leaked: %s", out)
+		}
+	}
+	if !strings.Contains(out, `"PLAIN":"keep"`) {
+		t.Fatalf("non-sensitive camelCase-adjacent key dropped: %s", out)
+	}
+}
+
+// F：数组内的对象键同样过黑名单（嵌套数组 + 顶层数组的结构化路径）。
+func TestArrayOfObjectsNesting(t *testing.T) {
+	raw := []byte(`{"items":[{"trafficToken":"a1","name":"keep1"},[{"secret":"a2","ok":1}],"plain"]}`)
+	out := string(RedactJSONBytes(raw))
+	for _, leaked := range []string{"a1", "a2"} {
+		if strings.Contains(out, leaked) {
+			t.Fatalf("array-nested secret leaked: %s", out)
+		}
+	}
+	if !strings.Contains(out, `"keep1"`) || !strings.Contains(out, `"plain"`) {
+		t.Fatalf("non-sensitive array content dropped: %s", out)
+	}
+
+	// 顶层数组原先是 regexp 兑底路径，现在必须结构化整树脱敏。
+	top := []byte(`[{"proxyCredential":"b1"},{"secretEnv":{"K":"b2"}},{"ok":"keep"}]`)
+	topOut := string(RedactJSONBytes(top))
+	if strings.Contains(topOut, "b1") || strings.Contains(topOut, "b2") {
+		t.Fatalf("top-level array leaked: %s", topOut)
+	}
+	if !strings.Contains(topOut, `"keep"`) {
+		t.Fatalf("top-level array safe content dropped: %s", topOut)
+	}
+}
+
+// F：非法 JSON 的兑底路径覆盖 camelCase 与 bare 精确键。
+func TestNonObjectFallbackCamelCaseAndBareKeys(t *testing.T) {
+	raw := []byte(`{"trafficToken":"camel-1",broken`) // 非法 JSON
+	out := string(RedactJSONBytes(raw))
+	if strings.Contains(out, "camel-1") {
+		t.Fatalf("fallback leaked camelCase value: %s", out)
+	}
+	raw = []byte(`{"token":"bare-1",broken`)
+	out = string(RedactJSONBytes(raw))
+	if strings.Contains(out, "bare-1") {
+		t.Fatalf("fallback leaked bare token value: %s", out)
+	}
+}
+
 func TestRedactJSONBytesEmpty(t *testing.T) {
 	if got := string(RedactJSONBytes(nil)); got != "{}" {
 		t.Fatalf("nil input should map to {}, got %q", got)

@@ -66,8 +66,9 @@ type NomadAllocStub struct {
 type allocResources struct {
 	Shared struct {
 		Ports []struct {
-			Label string `json:"Label"`
-			Value int    `json:"Value"`
+			HostIP string `json:"HostIP"`
+			Label  string `json:"Label"`
+			Value  int    `json:"Value"`
 		} `json:"Ports"`
 	} `json:"Shared"`
 }
@@ -84,11 +85,11 @@ type Config struct {
 
 // Manager 维护节点快照与 gRPC 连接池。
 type Manager struct {
-	cfg    Config
-	http   *http.Client
-	mu     sync.RWMutex
-	nodes  map[string]*Node // key: Nomad node ID
-	conns  map[string]*agentclient.Client
+	cfg   Config
+	http  *http.Client
+	mu    sync.RWMutex
+	nodes map[string]*Node // key: Nomad node ID
+	conns map[string]*agentclient.Client
 }
 
 // New 构造 Manager。
@@ -211,13 +212,19 @@ func (m *Manager) Discover(ctx context.Context) error {
 		}
 		alloc := bestAlloc[nomadID]
 		if alloc != nil {
-			grpcPort, proxyPort := allocPorts(alloc)
-			host, ok := nodeHost(stub)
-			if ok && grpcPort > 0 {
-				n.GRPCAddr = net.JoinHostPort(host, fmt.Sprintf("%d", grpcPort))
+			grpcHost, grpcPort, proxyHost, proxyPort := allocEndpoints(alloc)
+			nodeAddr, nodeAddrOK := nodeHost(stub)
+			if grpcHost == "" && nodeAddrOK {
+				grpcHost = nodeAddr
 			}
-			if ok && proxyPort > 0 {
-				n.ProxyAddr = net.JoinHostPort(host, fmt.Sprintf("%d", proxyPort))
+			if proxyHost == "" && nodeAddrOK {
+				proxyHost = nodeAddr
+			}
+			if grpcHost != "" && grpcPort > 0 {
+				n.GRPCAddr = net.JoinHostPort(grpcHost, fmt.Sprintf("%d", grpcPort))
+			}
+			if proxyHost != "" && proxyPort > 0 {
+				n.ProxyAddr = net.JoinHostPort(proxyHost, fmt.Sprintf("%d", proxyPort))
 			}
 		}
 		n.Status = nomadStatus(n)
@@ -561,19 +568,23 @@ func unknownStatus(n *Node) string {
 	return "UNKNOWN"
 }
 
-func allocPorts(a *NomadAllocStub) (grpc, proxy int) {
+func allocEndpoints(a *NomadAllocStub) (grpcHost string, grpcPort int, proxyHost string, proxyPort int) {
 	if a.AllocatedResources == nil {
-		return 0, 0
+		return "", 0, "", 0
 	}
 	for _, p := range a.AllocatedResources.Shared.Ports {
+		host := ""
+		if ip := net.ParseIP(p.HostIP); ip != nil && !ip.IsUnspecified() {
+			host = ip.String()
+		}
 		switch p.Label {
 		case "grpc":
-			grpc = p.Value
+			grpcHost, grpcPort = host, p.Value
 		case "proxy":
-			proxy = p.Value
+			proxyHost, proxyPort = host, p.Value
 		}
 	}
-	return grpc, proxy
+	return grpcHost, grpcPort, proxyHost, proxyPort
 }
 
 func nodeHost(stub *NomadNodeStub) (string, bool) {

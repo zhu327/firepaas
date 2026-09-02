@@ -1,4 +1,6 @@
 // apikeys.go：M5.1（mvp-plan §9.1）API key 管理端点（admin scope，routeScope 表已收口）。
+// P0（R2 评审）：本组端点是身份签发面——handler 层重新复核调用方为全局
+// 身份（root / 无 project 绑定 key），不依赖中间件单点；受限身份 403。
 //
 //	POST   /v1/apikeys       创建（响应仅此一次携带明文 key）
 //	GET    /v1/apikeys       列表（永不回显 key 与 hash）
@@ -7,8 +9,11 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
+
+	"github.com/zhu327/firepaas/internal/controlplane/apikeys"
 )
 
 type createAPIKeyBody struct {
@@ -18,9 +23,22 @@ type createAPIKeyBody struct {
 	TTLHours  int      `json:"ttl_hours"`  // 0 = 不过期
 }
 
+// requireGlobalIdentity 是 apikey 管理端点的第二道防线（P0，R2）：
+// 即使中间件被绕过/漏注册，handler 自身也拒绝所有非全局身份。
+func (a *API) requireGlobalIdentity(w http.ResponseWriter, r *http.Request) bool {
+	if identityIsGlobal(identFrom(r)) {
+		return true
+	}
+	writeErr(w, 403, "api key management requires a global identity (root token or an unscoped admin key)")
+	return false
+}
+
 func (a *API) createAPIKey(w http.ResponseWriter, r *http.Request) {
 	if a.apiKeys == nil {
 		writeErr(w, 503, "api keys disabled (no pool)")
+		return
+	}
+	if !a.requireGlobalIdentity(w, r) {
 		return
 	}
 	var b createAPIKeyBody
@@ -38,7 +56,12 @@ func (a *API) createAPIKey(w http.ResponseWriter, r *http.Request) {
 	k, plain, err := a.apiKeys.Create(r.Context(), b.Name, b.Scopes, b.ProjectID,
 		time.Duration(b.TTLHours)*time.Hour)
 	if err != nil {
-		writeErr(w, 400, err.Error())
+		// 仅入参非法映射 400（安全文案）；DB 错误不再伪装成客户端错误。
+		if errors.Is(err, apikeys.ErrInvalidInput) {
+			writeErr(w, 400, err.Error())
+			return
+		}
+		writeInternalErr(w, r, err)
 		return
 	}
 	writeJSON(w, 201, map[string]any{
@@ -57,9 +80,12 @@ func (a *API) listAPIKeys(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 503, "api keys disabled")
 		return
 	}
+	if !a.requireGlobalIdentity(w, r) {
+		return
+	}
 	keys, err := a.apiKeys.List(r.Context())
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	out := make([]map[string]any, 0, len(keys))
@@ -85,8 +111,11 @@ func (a *API) revokeAPIKey(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 503, "api keys disabled")
 		return
 	}
+	if !a.requireGlobalIdentity(w, r) {
+		return
+	}
 	if err := a.apiKeys.Revoke(r.Context(), r.PathValue("id")); err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	writeJSON(w, 200, map[string]string{"id": r.PathValue("id"), "status": "revoked"})

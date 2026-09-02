@@ -11,6 +11,8 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"math/rand/v2"
 	"net/http"
 	"strconv"
 	"time"
@@ -23,6 +25,23 @@ const (
 	waitMaxTimeout = 5 * time.Minute
 	waitPollEvery  = 250 * time.Millisecond
 )
+
+// waitSleep 在 deadline 前睡一个带抖动的轮询间隔（R2 评审：-10% 至 +25%
+// 随机抖动，打散多客户端长轮询与 controller sync 周期的同步共振）。
+// 总时间预算（deadline）语义不变。
+func waitSleep(ctxDone <-chan struct{}, deadline time.Time) (done, expired bool) {
+	if time.Now().After(deadline) {
+		return false, true
+	}
+	jitter := 0.9 + rand.Float64()*0.35
+	d := time.Duration(float64(waitPollEvery) * jitter)
+	select {
+	case <-ctxDone:
+		return true, false
+	case <-time.After(d):
+		return false, false
+	}
+}
 
 func waitTimeout(r *http.Request) time.Duration {
 	ms := 30_000
@@ -51,12 +70,10 @@ func (a *API) waitMachine(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	deadline := time.Now().Add(waitTimeout(r))
-	ticker := time.NewTicker(waitPollEvery)
-	defer ticker.Stop()
 	for {
 		m, err := a.store.GetMachine(r.Context(), id)
 		if err != nil {
-			writeErr(w, 500, err.Error())
+			writeInternalErr(w, r, err)
 			return
 		}
 		if m == nil {
@@ -103,18 +120,15 @@ func (a *API) waitMachine(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		if time.Now().After(deadline) {
+		if done, expired := waitSleep(r.Context().Done(), deadline); done {
+			return // 客户端断开不取消底层 operation
+		} else if expired {
 			writeJSON(w, 200, map[string]any{
 				"outcome": "timed_out", "status": "timed_out",
 				"execution_id": m.CurrentExecutionID, "generation": m.Generation,
 				"observed_state": m.ObservedState,
 			})
 			return
-		}
-		select {
-		case <-r.Context().Done():
-			return // 客户端断开不取消底层 operation
-		case <-ticker.C:
 		}
 	}
 }
@@ -137,12 +151,14 @@ func (a *API) waitOperation(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	project := effectiveProjectID(r, "dev")
 	deadline := time.Now().Add(waitTimeout(r))
-	ticker := time.NewTicker(waitPollEvery)
-	defer ticker.Stop()
 	for {
 		op, err := a.store.GetOperation(r.Context(), project, id)
 		if err != nil {
-			writeErr(w, 500, err.Error())
+			if errors.Is(err, store.ErrNotFound) {
+				writeErr(w, 404, "operation not found")
+				return
+			}
+			writeInternalErr(w, r, err)
 			return
 		}
 		if op == nil {
@@ -157,17 +173,14 @@ func (a *API) waitOperation(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		if time.Now().After(deadline) {
+		if done, expired := waitSleep(r.Context().Done(), deadline); done {
+			return
+		} else if expired {
 			writeJSON(w, 200, map[string]any{
 				"outcome": "timed_out", "status": "timed_out",
 				"operation_status": op.Status, "machine_id": op.MachineID,
 			})
 			return
-		}
-		select {
-		case <-r.Context().Done():
-			return
-		case <-ticker.C:
 		}
 	}
 }
@@ -195,12 +208,10 @@ func (a *API) waitRollout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	deadline := time.Now().Add(waitTimeout(r))
-	ticker := time.NewTicker(waitPollEvery)
-	defer ticker.Stop()
 	for {
 		rl, err := a.store.GetRollout(r.Context(), id)
 		if err != nil {
-			writeErr(w, 500, err.Error())
+			writeInternalErr(w, r, err)
 			return
 		}
 		if rl == nil {
@@ -222,17 +233,14 @@ func (a *API) waitRollout(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		if time.Now().After(deadline) {
+		if done, expired := waitSleep(r.Context().Done(), deadline); done {
+			return
+		} else if expired {
 			writeJSON(w, 200, map[string]any{
 				"outcome": "timed_out", "status": "timed_out",
 				"rollout_status": rl.Status, "to_generation": rl.ToGeneration,
 			})
 			return
-		}
-		select {
-		case <-r.Context().Done():
-			return
-		case <-ticker.C:
 		}
 	}
 }
@@ -275,7 +283,7 @@ func (a *API) updateMachineTTL(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, store.ErrMachineNotFound):
 			writeErr(w, 404, "machine not found: "+id)
 		default:
-			writeErr(w, 500, "set machine expiry: "+err.Error())
+			writeInternalErr(w, r, fmt.Errorf("set machine expiry: %w", err))
 		}
 		return
 	}
@@ -289,7 +297,7 @@ func (a *API) resetRestart(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, store.ErrMachineNotFound) {
 			writeErr(w, 404, "machine not found: "+id)
 		} else {
-			writeErr(w, 500, err.Error())
+			writeInternalErr(w, r, err)
 		}
 		return
 	}

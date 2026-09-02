@@ -12,6 +12,7 @@ set -euo pipefail
 TS() { date '+%H:%M:%S'; }
 say() { echo "[minio-rehearsal $(TS)] $*"; }
 
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONTAINER="${MINIO_CONTAINER:-dev-minio-1}"
 BASE=$(mktemp -d /tmp/minio-rehearsal.XXXXXX)
 trap 'rm -rf "$BASE"' EXIT
@@ -36,7 +37,7 @@ if ! cmp -s "$A_MAN" "$B_MAN"; then
 fi
 say "PASS 两次拷贝清单一致（$(wc -l < "$A_MAN") 个文件）"
 
-KEEP="/home/zty/Learn/firepaas/scripts/lab/results/m5/minio-manifest.txt"
+KEEP="${MINIO_MANIFEST_PATH:-$HERE/results/m5/minio-manifest.txt}"
 if [[ -f "$KEEP" ]]; then
   if cmp -s "$KEEP" "$A_MAN"; then
     say "PASS 与上次演练清单无漂移"

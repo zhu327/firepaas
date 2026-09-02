@@ -84,11 +84,15 @@ pg "UPDATE deployments SET status='SUPERSEDED', updated_at=now() WHERE status IN
 pg "UPDATE rollouts SET status='COMPLETE', failed=true, completed_at=now(), updated_at=now()
 	WHERE status IN ('PREPARING','CUTOVER','ROLLING_BACK')" >/dev/null
 sleep 3
+for _ in $(seq 1 30); do
+  snapshot_cap=$(pg "SELECT count(*) FROM nodes WHERE status='HEALTHY' AND feature_ids::text LIKE '%snapshot.memory.v1%'")
+  [[ "${snapshot_cap:-0}" -ge 1 ]] && break
+  sleep 2
+done
 
 log "1) A：memory checkpoint（源 execution 不变）"
 # 当前 pinned hypeman 不提供可验证 artifact checksum；agent 必须不发布能力，
 # 或在调用链上明确返回 unsupported。缺能力是验收阻塞，不得打印 ALL PASS。
-snapshot_cap=$(pg "SELECT count(*) FROM nodes WHERE status='HEALTHY' AND feature_ids::text LIKE '%snapshot.memory.v1%'")
 [[ "${snapshot_cap:-0}" -ge 1 ]] || blocked "健康节点未发布 snapshot.memory.v1（已知上游 checksum 缺口，checkpoint 验收不可兑现）"
 app="v13s-app-$RUN_ID"
 host="$app.$DOMAIN"

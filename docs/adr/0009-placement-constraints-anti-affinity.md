@@ -48,7 +48,7 @@ PaaS 多副本必须显式补齐。
 ## 后果
 
 - proto:`MachineSpec` 增加 `PlacementConstraints placement`;M1 契约冻结项更新。
-- scheduler 骨架(`control-plane/internal/scheduler/placement.go`)的 TODO 增加
-  过滤层;仿真器(tools/sim)断言增加"DEPLOYMENT 反亲和下副本落点 distinct,
+- scheduler 实现位于 `internal/scheduler/`，控制面 placement 层负责提供候选与
+  约束；仿真器断言增加"DEPLOYMENT 反亲和下副本落点 distinct,
   除非候选不足"。
 - 调度事件(跳过原因、降级打分)需纳入 M2 最低可观测项(mvp-plan §6.5)。

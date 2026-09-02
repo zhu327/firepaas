@@ -33,6 +33,10 @@ func (s *Store) GetProjectQuotaDetail(ctx context.Context, projectID string) (*P
 		Scan(&d.VCPU, &d.MemMib, &d.DiskMib, &d.MachineConcurrency,
 			&d.RuntimeSessionConcurrency, &d.Revision)
 	if err != nil {
+		// 确证 not-found 用哨兵返回，API 层据此区分 404 与 5xx。
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
 		return nil, fmt.Errorf("project quota detail %s: %w", projectID, err)
 	}
 	return &d, nil

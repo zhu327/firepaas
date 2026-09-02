@@ -11,6 +11,13 @@ global:
 rule_files:
   - /etc/prometheus/alerts.yml
 
+# 告警通知面（同目录 alertmanager.yml）；单机实验室未拉起 Alertmanager 时
+# 该段不生效，规则计算本身不受影响。
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
 scrape_configs:
   - job_name: firepaas-api
     metrics_path: /metrics
@@ -57,9 +64,26 @@ scrape_configs:
         labels:
           node: "lab-single"
     scrape_timeout: 10s
-  # v1.1（C）：edge 并发控制观测（inflight/hard 拒绝/钉扎）。
+  # v1.1（C）：edge 观测（inflight/hard 拒绝/钉扎/stale/token/证书到期）。
+  # 生产使用 Nomad 服务发现，匹配 iac/nomad/edge.hcl 注册的
+  # firepaas-edge-metrics 服务（host network 下固定 9465）；Prometheus 到
+  # 该端口的流量必须由网络 ACL 仅允许可信 observability 网段，该 endpoint
+  # 无鉴权，绝不可对公网暴露（同 firepaas-agentd 约束）。
   - job_name: firepaas-edge
     metrics_path: /metrics
-    static_configs:
-      - targets: ["host.docker.internal:9465"]
+    nomad_sd_configs:
+      - server: "nomad.service.consul:4646"
+    relabel_configs:
+      - source_labels: [__meta_nomad_service]
+        regex: firepaas-edge-metrics
+        action: keep
     scrape_timeout: 10s
+
+  # 单机实验室 dev 路径：edge 裸跑在宿主（FIREPAAS_EDGE_METRICS_PORT=9465，
+  # 见 scripts/lab/e2e-v11.sh）。需要时取消整段注释；生产不得用它替代上方
+  # 的 nomad_sd 发现。
+  # - job_name: firepaas-edge-lab
+  #   metrics_path: /metrics
+  #   static_configs:
+  #     - targets: ["host.docker.internal:9465"]
+  #   scrape_timeout: 10s

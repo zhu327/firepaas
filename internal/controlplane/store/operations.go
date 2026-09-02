@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // OperationTrace 是带全程时间戳的操作记录（复盘/压测关联）。
@@ -78,10 +80,30 @@ func (s *Store) GetOperation(ctx context.Context, projectID, id string) (*Operat
 		`SELECT `+operationTraceColumns+` FROM operations WHERE project_id=$1 AND id=$2`, projectID, id)
 	got, err := scanOperationTraceRow(row)
 	if err != nil {
+		// 确证 not-found 用哨兵返回，调用方（API 层）据此区分 404 与 5xx。
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
 		return nil, err
 	}
 	op = *got
 	return &op, nil
+}
+
+// DeleteTerminalOperationsOlderThan 是终端态 operation 的保留窗清理
+// （R2 加固，controller 周期调起）。保留窗内的行继续支持幂等键重放
+// （同 key 同请求 → 原行返回，不重复派发）；窗外再携同 key 重试按全新
+// 操作处理——这是记录在案的幂等保证时限，调用方（controller 配置与
+// 运维文档）须与保留期保持一致。
+func (s *Store) DeleteTerminalOperationsOlderThan(ctx context.Context, cutoff time.Time) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `
+		DELETE FROM operations
+		WHERE status IN ('SUCCEEDED','FAILED','CANCELLED','SUPERSEDED','TIMED_OUT')
+		  AND updated_at < $1`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("purge terminal operations: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }
 
 // CountOperations 统计某状态操作数（M5.2/5.3 积压 gauge）。status 空=全部。

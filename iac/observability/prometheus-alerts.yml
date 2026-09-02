@@ -71,3 +71,116 @@ groups:
         annotations:
           summary: "agent RPC 错误速率上升（凭证/网络/容量拒绝）"
           runbook: docs/runbook-operations.md
+
+  - name: firepaas-certs
+    rules:
+      # 契约 C-1（证书热重载）：各进程（edge 已接入，agentd/API 随 Wave-2 接入）
+      # 导出 gauge firepaas_tls_cert_not_after_seconds{file=...}。轮换操作见
+      # runbook 证书章节；指标缺失本身就是接入缺口，不作为本规则条件。
+      - alert: FirePaasTLSCertExpiringSoon
+        expr: firepaas_tls_cert_not_after_seconds - time() < 30 * 24 * 3600
+        for: 1h
+        labels: { severity: warning }
+        annotations:
+          summary: "证书 {{ $labels.file }} 30 天内到期（热重载已在线，仍需安排轮换窗口）"
+          runbook: docs/runbook-operations.md#证书到期处置
+
+      - alert: FirePaasTLSCertExpiryCritical
+        expr: firepaas_tls_cert_not_after_seconds - time() < 7 * 24 * 3600
+        for: 15m
+        labels: { severity: critical }
+        annotations:
+          summary: "证书 {{ $labels.file }} 7 天内到期：届时 mTLS 握手失败，edge→agent / API→agent 链路中断"
+          runbook: docs/runbook-operations.md#证书到期处置
+
+  - name: firepaas-edge
+    rules:
+      # serve-stale 是降级而非免死牌：stale 占比持续超一半说明 Redis catalog
+      # 长时间不可达，路由新鲜度已无保证（budget：允许短暂抖动，不允许常态）。
+      - alert: FirePaasEdgeStaleServesBeyondBudget
+        expr: |
+          sum(rate(firepaas_edge_stale_serves_total[15m]))
+            / clamp_min(
+                sum(rate(firepaas_edge_stale_serves_total[15m]))
+                  + sum(rate(firepaas_edge_proxied_requests_total[15m])), 0.001) > 0.5
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "edge 超过 50% 请求以 stale 路由缓存应答持续 15 分钟（catalog 源不可用）"
+          runbook: docs/runbook-operations.md
+
+      # beyond_stale = 超出 serve-stale 窗口后真实 503——用户可见损失，直接 critical。
+      - alert: FirePaasEdgeBeyondStaleRejections
+        expr: increase(firepaas_edge_beyond_stale_total[5m]) > 0
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "edge 存在超出 serve-stale 窗口的 503 拒绝（route origin 与缓存同时不可用）"
+          runbook: docs/runbook-operations.md
+
+      - alert: FirePaasEdgeRouteCatalogErrors
+        expr: rate(firepaas_edge_redis_errors_total[5m]) > 0.1
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "edge 路由 catalog 源拉取失败率上升（stale 消耗将随之而来）"
+          runbook: docs/runbook-operations.md
+
+      - alert: FirePaasEdgeTokenErrors
+        expr: rate(firepaas_edge_token_errors_total[5m]) > 0.1
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "edge traffic token 获取失败率上升（API 不可达或凭证签发故障）"
+          runbook: docs/runbook-operations.md
+
+      - alert: FirePaasEdgeTokenStaleServes
+        expr: rate(firepaas_edge_token_stale_serves_total[5m]) > 0.1
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "edge 正以 last-known-good token 应答（token 获取失败的降级形态）"
+          runbook: docs/runbook-operations.md
+
+  - name: firepaas-slo-burn
+    rules:
+      # SLO burn-rate（多窗口，Google SRE 形态）。映射的 slo-spec 目标：
+      # availability-probe-p95（docs/slo-spec.yaml）。假设月可用性目标 99.9%
+      # （错误预算 0.1%；slo-spec 未单独定义错误预算百分比，此假设必须与其
+      # 同步修正）。edge 失败面定义为用户可见 5xx 拒绝：beyond_stale（缓存
+      # 窗口失效）+ hard_rejected（并发硬上限拒绝）；429 限流属客户端行为，
+      # 不计入可用性消耗。
+      #
+      # slo-spec 其余目标（node-failure-detect/node-failover/vip-failover/
+      # control-quorum/inventory-age）当前仅由 probe 采样
+      # （scripts/lab/assert-slo.py）评估，无 Prometheus 指标源，不能注册
+      # burn-rate 告警；获得指标源后在此补充。
+      - alert: FirePaasEdgeAvailabilityBurnFast
+        expr: |
+          (
+            sum(rate(firepaas_edge_beyond_stale_total[1h])) + sum(rate(firepaas_edge_hard_rejected_total[1h]))
+          ) / clamp_min(sum(rate(firepaas_edge_proxied_requests_total[1h])), 0.001) > 0.0144
+          and
+          (
+            sum(rate(firepaas_edge_beyond_stale_total[5m])) + sum(rate(firepaas_edge_hard_rejected_total[5m]))
+          ) / clamp_min(sum(rate(firepaas_edge_proxied_requests_total[5m])), 0.001) > 0.0144
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "edge 可用性错误预算快速燃烧：1h 与 5m 窗口失败率 > 1.44%（99.9% 目标的 14.4 倍燃速）"
+          runbook: docs/runbook-operations.md
+
+      - alert: FirePaasEdgeAvailabilityBurnSlow
+        expr: |
+          (
+            sum(rate(firepaas_edge_beyond_stale_total[6h])) + sum(rate(firepaas_edge_hard_rejected_total[6h]))
+          ) / clamp_min(sum(rate(firepaas_edge_proxied_requests_total[6h])), 0.001) > 0.006
+          and
+          (
+            sum(rate(firepaas_edge_beyond_stale_total[30m])) + sum(rate(firepaas_edge_hard_rejected_total[30m]))
+          ) / clamp_min(sum(rate(firepaas_edge_proxied_requests_total[30m])), 0.001) > 0.006
+        for: 1h
+        labels: { severity: warning }
+        annotations:
+          summary: "edge 可用性错误预算慢速燃烧：6h 与 30m 窗口失败率 > 0.6%（99.9% 目标的 6 倍燃速）"
+          runbook: docs/runbook-operations.md

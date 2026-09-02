@@ -21,7 +21,11 @@ import (
 func (a *API) enqueueLifecycle(w http.ResponseWriter, r *http.Request, kind string) {
 	machineID := r.PathValue("id")
 	m, err := a.store.GetMachine(r.Context(), machineID)
-	if err != nil || m == nil {
+	if err != nil {
+		writeInternalErr(w, r, err)
+		return
+	}
+	if m == nil {
 		writeErr(w, 404, "machine not found")
 		return
 	}
@@ -37,8 +41,15 @@ func (a *API) enqueueLifecycle(w http.ResponseWriter, r *http.Request, kind stri
 	//（standby/pause 会快照 guest RAM，含 secret tmpfs）。agent 侧同样拒绝
 	//（双保险，防 PG 滞后）。
 	if kind == "pause" {
-		if hasSecret, err := a.store.MachineHasActiveSecretDelivery(r.Context(),
-			m.ID, m.CurrentExecutionID); err == nil && hasSecret {
+		hasSecret, err := a.store.MachineHasActiveSecretDelivery(r.Context(),
+			m.ID, m.CurrentExecutionID)
+		if err != nil {
+			// secret 判定失败必须 fail closed——误判“无 secret”意味着对含敏感
+			// tmpfs 的 VM 做 memory snapshot。
+			writeInternalErr(w, r, err)
+			return
+		}
+		if hasSecret {
 			writeErr(w, 409, "machine received one-shot secrets; pause/standby forbidden for this execution (ADR-0024)")
 			return
 		}
@@ -53,7 +64,7 @@ func (a *API) enqueueLifecycle(w http.ResponseWriter, r *http.Request, kind stri
 	op, err := a.store.EnqueueLifecycle(r.Context(), project, machineID,
 		m.CurrentExecutionID, opID, m.Generation, kind, []byte(req))
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	slog.Info("lifecycle op enqueued", "kind", kind, "machine_id", machineID,

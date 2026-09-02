@@ -98,6 +98,10 @@ type prewarmTargetView struct {
 	Reason string `json:"reason,omitempty"`
 }
 
+// errPrewarmNodesUnavailable 包装节点列表依赖错误，使 handler 能把 PG
+// 故障与选择器校验错误区分开（R2 评审：不再统一映射 400）。
+var errPrewarmNodesUnavailable = errors.New("node list unavailable")
+
 // eligiblePrewarmNodes resolves the target node set: explicit node IDs or all
 // healthy non-draining nodes in a pool. Disk hard-watermark nodes are reported
 // per node instead of silently dropped.
@@ -108,7 +112,7 @@ func (a *API) eligiblePrewarmNodes(
 ) ([]store.Node, []prewarmTargetView, error) {
 	nodes, err := a.store.ListNodes(r.Context())
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("%w: %v", errPrewarmNodesUnavailable, err)
 	}
 	var rejected []prewarmTargetView
 	byID := map[string]store.Node{}
@@ -163,7 +167,7 @@ func (a *API) eligiblePrewarmNodes(
 func (a *API) prewarmImage(w http.ResponseWriter, r *http.Request) {
 	limits := defaultPrewarmLimits()
 	var body prewarmBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		writeErr(w, 400, "bad request: "+err.Error())
 		return
 	}
@@ -178,7 +182,7 @@ func (a *API) prewarmImage(w http.ResponseWriter, r *http.Request) {
 	intentRaw, _ := json.Marshal(prewarmIntent{ImageRef: body.ImageRef, NodePool: body.NodePool, NodeIDs: body.NodeIDs})
 	idemKey := r.Header.Get("Idempotency-Key")
 	if replay, targets, err := a.store.FindPrewarmReplay(r.Context(), project, idemKey, intentRaw); err != nil {
-		writeErr(w, 409, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	} else if replay != nil {
 		writePrewarmResponse(w, replay, targets)
@@ -201,7 +205,7 @@ func (a *API) prewarmImage(w http.ResponseWriter, r *http.Request) {
 	}
 	active, err := a.store.ActivePrewarmCount(r.Context(), project)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	if active >= limits.MaxActivePrewarms {
@@ -214,6 +218,12 @@ func (a *API) prewarmImage(w http.ResponseWriter, r *http.Request) {
 	}
 	eligible, rejected, err := a.eligiblePrewarmNodes(r, body, limits)
 	if err != nil {
+		// eligiblePrewarmNodes 只返回两类错误：节点列表的 PG 错误（→ 5xx）与
+		// 选择器校验错误（→ 400）。PG 错误包装自 ListNodes。
+		if errors.Is(err, errPrewarmNodesUnavailable) {
+			writeInternalErr(w, r, err)
+			return
+		}
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -241,12 +251,12 @@ func (a *API) prewarmImage(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 429, fmt.Sprintf("project has reached the active prewarm limit (%d)", limits.MaxActivePrewarms))
 			return
 		}
-		writeErr(w, 409, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	persistedTargets, err := a.store.ListPrewarmTargets(r.Context(), op.ID)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	writePrewarmResponse(w, &op, persistedTargets)
@@ -287,13 +297,13 @@ func (a *API) imageCoverage(w http.ResponseWriter, r *http.Request) {
 	}
 	nodes, err := a.store.ListNodes(r.Context())
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	project := effectiveProjectID(r, "dev")
 	prewarmByNode, err := a.store.PrewarmStatusByNode(r.Context(), project, digest)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	type nodeView struct {
@@ -365,7 +375,7 @@ type imagePinBody struct {
 func (a *API) createImagePin(w http.ResponseWriter, r *http.Request) {
 	limits := defaultPrewarmLimits()
 	var body imagePinBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		writeErr(w, 400, "bad request: "+err.Error())
 		return
 	}
@@ -401,7 +411,7 @@ func (a *API) createImagePin(w http.ResponseWriter, r *http.Request) {
 	intentRaw, _ := json.Marshal(body)
 	idemKey := r.Header.Get("Idempotency-Key")
 	if replay, ok, err := a.store.FindImagePinReplay(r.Context(), project, idemKey, intentRaw); err != nil {
-		writeErr(w, 409, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	} else if ok {
 		writeJSON(w, 201, map[string]any{"pins": replay})
@@ -411,7 +421,7 @@ func (a *API) createImagePin(w http.ResponseWriter, r *http.Request) {
 	// unbounded quota growth when nodes are later added to that pool.
 	nodes, err := a.store.ListNodes(r.Context())
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	byID := map[string]store.Node{}
@@ -487,7 +497,7 @@ func (a *API) createImagePin(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, store.ErrImagePinWatermark):
 			writeErr(w, 409, "target node disk hard watermark reached")
 		default:
-			writeErr(w, 409, err.Error())
+			writeInternalErr(w, r, err)
 		}
 		return
 	}
@@ -498,7 +508,7 @@ func (a *API) listImagePins(w http.ResponseWriter, r *http.Request) {
 	project := effectiveProjectID(r, "")
 	pins, err := a.store.ListImagePins(r.Context(), project)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	out := make([]map[string]any, 0, len(pins))
@@ -521,7 +531,7 @@ func (a *API) deleteImagePin(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 404, "pin not found")
 			return
 		}
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"deleted": pinID})

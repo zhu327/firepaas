@@ -14,8 +14,10 @@ RUN_DIR="/var/lib/firepaas-p0/chaos-m2"
 RUN_ID="chaos-$(date +%s)"
 API_TOKEN="chaos-token-$RUN_ID"
 TRAFFIC_KEY="$(openssl rand -base64 32)"   # M4：proxy credential 密钥（与 agent 强制校验配套）
-MID="chaos-vm-$RUN_ID"
-HN="$MID.local"
+APPID="chaos-vm-$RUN_ID"
+# machine_id 由服务端按 (app_id, replica_ordinal) 生成（P0：fence 字段不再接受客户端提交）。
+MID="$APPID-r0"
+HN="$APPID.local"
 PG="docker exec dev-postgres-1 psql -U firepaas -d firepaas -tAc"
 RD="docker exec dev-redis-1 redis-cli"
 
@@ -59,7 +61,7 @@ wait_state() { # $1 machine_id $2 state $3 timeout
     local st
     st=$(authed_curl http://127.0.0.1:8080/v1/machines \
       | python3 -c 'import json,sys
-ms=json.load(sys.stdin)["machines"]
+ms=json.load(sys.stdin)["machines"] or []
 m=next((x for x in ms if x["ID"]=="'"$id"'"),None)
 print(m["ObservedState"] if m else "")')
     [[ "$st" == "$want" ]] && return 0
@@ -91,17 +93,17 @@ nohup env FIREPAAS_REDIS_ADDR=127.0.0.1:6379 FIREPAAS_EDGE_PORT=8081 \
 echo $! >"$RUN_DIR/edge.pid"
 start_api || fail "API 启动失败"
 for _ in $(seq 1 40); do
-  ST=$(authed_curl http://127.0.0.1:8080/v1/nodes | python3 -c 'import json,sys; ns=json.load(sys.stdin)["nodes"] or []; print(ns[0]["Status"] if ns else "")')
-  [[ "$ST" == "HEALTHY" ]] && break
+  HEALTHY_COUNT=$(authed_curl http://127.0.0.1:8080/v1/nodes | python3 -c 'import json,sys; ns=json.load(sys.stdin)["nodes"] or []; print(sum(n["Status"] == "HEALTHY" for n in ns))')
+  [[ "$HEALTHY_COUNT" -ge 1 ]] && break
   sleep 3
 done
-[[ "${ST:-}" == "HEALTHY" ]] || fail "无 HEALTHY 节点"
+[[ "${HEALTHY_COUNT:-0}" -ge 1 ]] || fail "无 HEALTHY 节点"
 
 log "1) 创建 baseline machine 并验证数据面"
 EXEC1=$($PG "SELECT current_execution_id FROM machines WHERE id='$MID'")
 if [[ -z "$EXEC1" ]]; then
   authed_curl -X POST http://127.0.0.1:8080/v1/machines -H 'Content-Type: application/json' \
-    -d "{\"machine_id\":\"$MID\",\"hostname\":\"$HN\",\"image\":\"docker.io/library/nginx:alpine\",\"vcpu\":1,\"mem_mib\":512,\"port\":80,\"operation_id\":\"op-$RUN_ID-create\"}" >/dev/null
+    -d "{\"app_id\":\"$APPID\",\"hostname\":\"$HN\",\"image\":\"docker.io/library/nginx:alpine\",\"vcpu\":1,\"mem_mib\":512,\"port\":80,\"operation_id\":\"op-$RUN_ID-create\"}" >/dev/null
 fi
 wait_state "$MID" RUNNING 180 || fail "baseline 未 RUNNING"
 wait_edge "$HN" 60 || fail "baseline 数据面不通"
@@ -166,7 +168,8 @@ for _ in $(seq 1 40); do
 done
 MID2="chaos-post-$RUN_ID"
 authed_curl -X POST http://127.0.0.1:8080/v1/machines -H 'Content-Type: application/json' \
-  -d "{\"machine_id\":\"$MID2\",\"hostname\":\"$MID2.local\",\"image\":\"docker.io/library/nginx:alpine\",\"vcpu\":1,\"mem_mib\":512,\"port\":80,\"operation_id\":\"op-$RUN_ID-post\"}" >/dev/null
+  -d "{\"app_id\":\"$MID2\",\"hostname\":\"$MID2.local\",\"image\":\"docker.io/library/nginx:alpine\",\"vcpu\":1,\"mem_mib\":512,\"port\":80,\"operation_id\":\"op-$RUN_ID-post\"}" >/dev/null
+MID2="$MID2-r0"   # 服务端生成 machine_id = {app_id}-r{replica_ordinal}
 wait_state "$MID2" RUNNING 180 || fail "API crash 后新 create 未 RUNNING"
 log "    API crash → leader 重选 → create 路径恢复 OK"
 
@@ -174,7 +177,8 @@ log "5.5) 注入在途 crash：POST 后立即 kill -9（op 可能 PENDING/CLAIME
 MID3="chaos-inflight-$RUN_ID"
 T0=$(date +%s)
 authed_curl -X POST http://127.0.0.1:8080/v1/machines -H 'Content-Type: application/json' \
-  -d "{\"machine_id\":\"$MID3\",\"hostname\":\"$MID3.local\",\"image\":\"docker.io/library/nginx:alpine\",\"vcpu\":1,\"mem_mib\":512,\"port\":80,\"operation_id\":\"op-$RUN_ID-inflight\"}" >/dev/null
+  -d "{\"app_id\":\"$MID3\",\"hostname\":\"$MID3.local\",\"image\":\"docker.io/library/nginx:alpine\",\"vcpu\":1,\"mem_mib\":512,\"port\":80,\"operation_id\":\"op-$RUN_ID-inflight\"}" >/dev/null
+MID3="$MID3-r0"   # 服务端生成 machine_id = {app_id}-r{replica_ordinal}
 APIPID=$(cat "$RUN_DIR/api.pid" 2>/dev/null || true)
 [[ -n "$APIPID" ]] && kill -9 "$APIPID" 2>/dev/null || true
 # 断言当时确有在途操作（否则本场景没有覆盖到目标窗口）

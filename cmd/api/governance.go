@@ -10,6 +10,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -94,10 +95,10 @@ func (a *API) applyRateLimit(w http.ResponseWriter, r *http.Request, callerProje
 func (a *API) getProjectQuota(w http.ResponseWriter, r *http.Request) {
 	d, err := a.store.GetProjectQuotaDetail(r.Context(), r.PathValue("id"))
 	if err != nil {
-		if strings.Contains(err.Error(), "no rows") {
+		if errors.Is(err, store.ErrNotFound) {
 			writeErr(w, 404, "project not found")
 		} else {
-			writeErr(w, 500, err.Error())
+			writeInternalErr(w, r, err)
 		}
 		return
 	}
@@ -125,7 +126,15 @@ func (a *API) putProjectQuota(w http.ResponseWriter, r *http.Request) {
 	}
 	out, err := a.store.UpdateProjectQuota(r.Context(), r.PathValue("id"), body.Revision, body)
 	if err != nil {
-		writeErr(w, 409, "quota revision conflict: "+err.Error())
+		if errors.Is(err, store.ErrQuotaRevisionConflict) {
+			writeErr(w, 409, "quota revision conflict")
+			return
+		}
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, 404, "project not found")
+			return
+		}
+		writeInternalErr(w, r, err)
 		return
 	}
 	w.Header().Set("ETag", fmt.Sprintf(`"rev-%d"`, out.Revision))
@@ -139,7 +148,7 @@ func (a *API) putProjectQuota(w http.ResponseWriter, r *http.Request) {
 func (a *API) getRateLimits(w http.ResponseWriter, r *http.Request) {
 	c, found, err := a.store.GetRateLimitConfig(r.Context(), r.PathValue("id"))
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"project_id": r.PathValue("id"), "found": found, "config": c})
@@ -170,7 +179,7 @@ func (a *API) putRateLimits(w http.ResponseWriter, r *http.Request) {
 		StreamRate: body.StreamRate, StreamBurst: body.StreamBurst,
 	}
 	if err := a.store.UpsertRateLimitConfig(r.Context(), r.PathValue("id"), cfg); err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	if a.limiter != nil {
@@ -206,7 +215,7 @@ func (a *API) acquireRuntimeSession(
 	}
 	project, err := a.machineProject(r.Context(), machineID)
 	if err != nil {
-		writeErr(w, 500, "resolve machine project: "+err.Error())
+		writeInternalErr(w, r, fmt.Errorf("resolve machine project: %w", err))
 		return nil, nil, false
 	}
 	d, err := a.store.GetProjectQuotaDetail(r.Context(), project)

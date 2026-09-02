@@ -293,7 +293,7 @@ CLAIMED 回收窗口为 30s 定时器（非精确租约）。
 ### 评审修复（2026-08-27）
 
 M3 全量代码评审发现两类 P0 与若干 P1/P2/P3，已全部修复并重跑验收
-（详见 plans/2026-08-26-m3-single-node.md 评审修复节）：
+（详见 `archive/milestones/2026-08-26-m3-single-node.md` 评审修复节）：
 
 - **P0-1**：删除的 app 被 AppController 无限复活——墓碑化改
   `apps.deleted_at`（migration 0007）+ `SoftDeleteApp` 事务（先墓碑后

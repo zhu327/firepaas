@@ -12,6 +12,16 @@ import (
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 )
 
+func TestMapSnapshotInfoDefaultsEmptyCompressionStateToNone(t *testing.T) {
+	info := mapSnapshotInfo(&instances.Snapshot{Id: "artifact"}, &pb.CreateSnapshotRequest{SnapshotId: "snapshot"})
+	if info.GetCompressionState() != "none" {
+		t.Fatalf("compression state = %q, want none", info.GetCompressionState())
+	}
+	if info.GetCompressionAlgorithm() != "none" {
+		t.Fatalf("compression algorithm = %q, want none", info.GetCompressionAlgorithm())
+	}
+}
+
 type snapshotSlotFake struct {
 	attachErr error
 	attached  int
@@ -65,6 +75,7 @@ func (f *restoreSnapshotFake) StopInstance(_ context.Context, _ string) (*instan
 	f.got.State = instances.StateStopped
 	return f.got, nil
 }
+
 func (f *restoreSnapshotFake) DeleteInstance(context.Context, string) error { f.deleted++; return nil }
 
 func (f *restoreSnapshotFake) StartInstance(

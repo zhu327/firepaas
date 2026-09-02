@@ -12,7 +12,7 @@ RPC,M5.1 的 imagepolicy 已用 ListImages 做大小校验,capacity-model 已定
 ### 1. 镜像缓存状态进入节点视图
 
 - proto `ServiceInfoResponse` 增加 `repeated string cached_image_digests`
-  (digest-pinned,LRU 序,上限截断如 512 条;agent 由 `ListImages` 派生);
+  （digest-pinned，上限截断如 512 条；当前 hypeman 列表只提供 `CreatedAt`，因此实现按创建时间近似缓存新旧顺序，不宣称真实访问 LRU）；
 - PG `nodes` 增加 `image_cache jsonb`,随 nodemanager 既有 20s ServiceInfo sync
   落库;scheduler 的 `Node` 视图同步扩展。
 

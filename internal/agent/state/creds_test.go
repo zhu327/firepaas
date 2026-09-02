@@ -51,6 +51,56 @@ func TestCredsLifecycle(t *testing.T) {
 	}
 }
 
+// M4/P0#1：Ensure 供 create 重放补写 credential——缺材料才写、同值不重写、
+// 换代覆盖；落盘遵守 0600 + temp/fsync/rename/fsync(dir) 纪律（可观测面：
+// 权限、无 .tmp 残留、重启后内容一致）。
+func TestCredsEnsureAndDurablePersistence(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "credentials.json")
+	c, err := OpenCreds(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := Digest("token-a")
+	if err := c.Ensure("m1", "exec-1", digest); err != nil {
+		t.Fatal(err)
+	}
+	if !c.Verify("m1", "exec-1", "token-a") {
+		t.Fatal("ensure on empty store must install the digest")
+	}
+	first := readFile(t, path)
+	// 同值 Ensure 不得重写（否则重放每次都产生一次无意义落盘）。
+	if err := c.Ensure("m1", "exec-1", digest); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, path); got != first {
+		t.Fatal("ensure with identical entry must not rewrite the file")
+	}
+	// 换代（execution/digest 变化）必须覆盖。
+	if err := c.Ensure("m1", "exec-2", Digest("token-b")); err != nil {
+		t.Fatal(err)
+	}
+	if c.Verify("m1", "exec-1", "token-a") || !c.Verify("m1", "exec-2", "token-b") {
+		t.Fatal("ensure on a replaced execution must overwrite the entry")
+	}
+	// 0600 权限 + 无 .tmp 残留。
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("creds file perm = %o, want 600", perm)
+	}
+	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
+		t.Fatalf("temp file must not survive rename: %v", err)
+	}
+	// 重载后内容一致（rename 语义）。
+	c2, err := OpenCreds(path)
+	if err != nil || !c2.Verify("m1", "exec-2", "token-b") {
+		t.Fatalf("reloaded creds: %v", err)
+	}
+}
+
 func readFile(t *testing.T, p string) string {
 	t.Helper()
 	b, err := os.ReadFile(p)
@@ -61,12 +111,12 @@ func readFile(t *testing.T, p string) string {
 }
 
 func contains(s, sub string) bool {
-	return len(s) >= len(sub) && (func() bool {
+	return len(s) >= len(sub) && func() bool {
 		for i := 0; i+len(sub) <= len(s); i++ {
 			if s[i:i+len(sub)] == sub {
 				return true
 			}
 		}
 		return false
-	})()
+	}()
 }

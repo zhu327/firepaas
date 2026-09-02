@@ -105,3 +105,39 @@ func TestFencesPruneBefore(t *testing.T) {
 		t.Fatalf("fresh fence must still reject lower generation, got %v", err)
 	}
 }
+
+// R2-6：fence GC 绑定 machine 存活——活 machine 的高水位永不年龄回收；
+// 已删 machine（不在存活清单）照常过期。
+func TestFencesPruneBeforeUnlessLive(t *testing.T) {
+	f, err := OpenFences(filepath.Join(t.TempDir(), "fences.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"m-live", "m-gone"} {
+		if err := f.Advance(id, 3, "e"); err != nil {
+			t.Fatal(err)
+		}
+		// 两台都把条目变老到保留窗口之外。
+		f.mu.Lock()
+		e := f.entries[id]
+		e.UpdatedAt = time.Now().Add(-48 * time.Hour)
+		f.entries[id] = e
+		f.mu.Unlock()
+	}
+	cutoff := time.Now().Add(-24 * time.Hour)
+	removed, err := f.PruneBeforeUnlessLive(cutoff, func(id string) bool { return id == "m-live" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed = %d, want 1 (only the deleted machine's fence)", removed)
+	}
+	// 活 machine：过期高水位仍拒绝旧请求。
+	if err := f.Check("m-live", 2); !errors.Is(err, ErrStaleGeneration) {
+		t.Fatalf("live machine fence must survive age GC, got %v", err)
+	}
+	// 已删 machine：照常过期，旧代重新放行。
+	if err := f.Check("m-gone", 1); err != nil {
+		t.Fatalf("deleted machine fence should be age-GC'd: %v", err)
+	}
+}

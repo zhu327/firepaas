@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 )
@@ -235,45 +234,13 @@ func (l *Ledger) PruneMachineExcept(machineID, keepOperationID string) (int, err
 	return removed, nil
 }
 
-// persistLocked uses the crash-safe sequence write temp, fsync temp, rename,
-// fsync parent. A successful return means both data and directory entry are durable.
+// persistLocked uses the crash-safe sequence (see writeFileDurable /
+// durablewrite.WriteFileAtomic): write temp, fsync temp, rename, fsync parent.
+// A successful return means both data and directory entry are durable.
 func (l *Ledger) persistLocked() error {
 	data, err := json.MarshalIndent(l.records, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal ledger: %w", err)
 	}
-	dir := filepath.Dir(l.path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("create ledger dir: %w", err)
-	}
-	tmp, err := os.OpenFile(l.path+".tmp", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
-		return fmt.Errorf("open ledger tmp: %w", err)
-	}
-	cleanup := func() { _ = tmp.Close(); _ = os.Remove(tmp.Name()) }
-	if _, err := tmp.Write(data); err != nil {
-		cleanup()
-		return fmt.Errorf("write ledger tmp: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		cleanup()
-		return fmt.Errorf("fsync ledger tmp: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmp.Name())
-		return fmt.Errorf("close ledger tmp: %w", err)
-	}
-	if err := os.Rename(tmp.Name(), l.path); err != nil {
-		_ = os.Remove(tmp.Name())
-		return fmt.Errorf("rename ledger: %w", err)
-	}
-	d, err := os.Open(dir)
-	if err != nil {
-		return fmt.Errorf("open ledger dir: %w", err)
-	}
-	defer func() { _ = d.Close() }()
-	if err := d.Sync(); err != nil {
-		return fmt.Errorf("fsync ledger dir: %w", err)
-	}
-	return nil
+	return writeFileDurable(l.path, "ledger", data)
 }

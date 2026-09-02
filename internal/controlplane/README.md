@@ -2,7 +2,7 @@
 
 ```
 cmd/api/                        # 入口：REST machines 最小 CRUD + /v1/nodes + /metrics
-internal/controlplane/db/       # PG 连接 + 嵌入式 migrations（0001-0005）
+internal/controlplane/db/       # PG 连接 + 按文件名记录的嵌入式历史 migrations（当前 0001-0031）
 internal/controlplane/store/    # PG desired/operations/nodes/scheduler_events 权威
 internal/controlplane/catalog/  # Redis route/location 投影（可重建，ADR-0005）
 internal/controlplane/agentclient/ # agent gRPC 客户端（mTLS fail-closed）
@@ -18,8 +18,4 @@ internal/controlplane/auth/     # JWT + API key + scopes（M5）
 internal/controlplane/reconcile/# 按 app 分区的对账（M2b 后需要时再拆）
 ```
 
-关键参考(本地 ../infra)：
-- placement:  `infra/packages/api/internal/orchestrator/placement/`
-- nodemanager: `infra/packages/api/internal/orchestrator/nodemanager/`
-- reservations: `infra/packages/api/internal/sandbox/reservations/`
-- catalog:     `infra/packages/shared/pkg/sandbox-catalog/`
+历史设计曾参考 e2b-dev/infra 的 placement、nodemanager、reservations 与 catalog 分层；当前行为以本仓库代码、测试、架构文档和 ADR 为准，不依赖 sibling checkout。

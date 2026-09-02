@@ -1,0 +1,16 @@
+# Dependabot 周更（生产就绪 P2#24）：Go module 与 GitHub Actions 两条生态线。
+# 升级合并仍须过 ci（含 govulncheck/lint/images 门禁）。
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    # hypeman 经 go.mod replace 钉在 fork tag，不交给 dependabot 浮动。
+    ignore:
+      - dependency-name: github.com/kernel/hypeman
+      - dependency-name: github.com/zhu327/hypeman
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

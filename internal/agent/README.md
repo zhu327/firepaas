@@ -14,12 +14,18 @@ internal/agent/mutation/    # typed fenced-mutation protocol（post-effect/recov
 ```
 
 设计红线:
-- hypeman 通过根 go.work `use ../hypeman` 引入(firepaas 与 hypeman 同级 checkout);
-  独立构建用根 `go.mod replace github.com/kernel/hypeman => ../hypeman` + GOWORK=off。
-  只 import `lib/*`,不改 hypeman 上游行为;需要修改时先上游化再升级。
-- **版本 pin 策略**:发布/生产构建不依赖同级 checkout 的最新代码——agent 的 go.mod 将
-  hypeman pin 到具体 commit/tag(定期、有意识地升级并跑 agent 回归),go.work/replace 仅用于
-  本地开发联调;CI 增加一条“禁止 replace 指向 ../ 进入发布构建”的检查,防止上游漂移打穿。
+- hypeman 作为远程 module 经根 `go.mod` replace 消费:
+  `replace github.com/kernel/hypeman => github.com/zhu327/hypeman v0.4.0-firepaas`
+  (公开 fork 的 firepaas-lib 分支 tag,提交了 go:embed 必需的 firecracker/guest-agent/init
+  二进制,可远程拉取,无需同级 checkout)。只 import `lib/*`,不改 hypeman 上游行为;
+  agent 本地变化只落在本仓库。
+- **fork 策略**:fork 承载 firepaas 必需的 lib 扩展——one-shot secret 下发通道依赖的
+  vsock/guest agent 能力(ADR-0024)、image/volume quarantine API、snapshot artifact
+  完整性校验(sha256)等(见根 go.mod 注释)。规则:不得删除 replace 或改为浮动版本;
+  上游 kernel/hypeman 发布包含所需 API 的正式 tag 后,切换 require 并删除 replace(先评审)。
+- **版本 pin 策略**:发布/生产构建不依赖同级 checkout——消费的是 fork 的固定 tag
+  `v0.4.0-firepaas`,升级是有意识动作并跑 agent 回归。本地联调未发布变更可创建不入库的
+  `go.work.local`;CI 与发布始终以 `GOWORK=off` 走根 go.mod。
 - agent 本地 runtime metadata 只是 observed 恢复缓存，业务权威状态在 PG；Redis 仅为投影。operation ledger 是节点侧幂等权威，必须原子持久化 request hash/result 并可在重启后重放。
 - `internal/agent/mutation` 明确区分三种协议族：无 pre-effect claim 的 post-effect 操作、可从 inventory 恢复的 durable-claim 操作，以及 Exec 的 non-reattachable tombstone。它只编排 ledger/fence/serialization 原语，不用 flags 或通用 effect callback 隐藏 runtime、credential 与 recovery 的顺序。create/delete、pause/resume、snapshot create/delete/fork/restore、volume create/import/attach/detach/delete、Exec claim 与 CopyTo 均由 typed family 方法编排；server 只保留验证、gRPC error mapping、adapter effect/recovery 和 credential hook。
 - edge/catalog 不得感知 slot IP；proxy 通过内部 workload endpoint 接口解析 bridge/slot 地址。
@@ -46,12 +52,15 @@ internal/agent/mutation/    # typed fenced-mutation protocol（post-effect/recov
 - `internal/agent/server`:fencing 校验 + request hash 幂等（protojson canonical）
   + generation fence Check/Advance（幂等重放优先于 fence）；
   Delete 的 NotFound 单独映射为 codes.NotFound（控制面据此幂等收敛）。
-- `internal/agent/info`:容量/用量取自 dataDir 所在文件系统；MemAllocated 为
-  实例 Size 之和（M2 换 lib/resources 实时采集）。
+- `internal/agent/info`:容量/用量取自 dataDir 所在文件系统；已承诺资源
+  （mem/vcpu/disk allocated）为 ListInstances 实时求和（实例 Size/Vcpus/
+  OverlaySize，v1.2-E 加磁盘维度）；利用率观测经 hypeman `lib/vm_metrics`
+  入 OTel 指标。`lib/resources` 直接实时采集未启用。
 - 身份（2026-08-26 评审后补齐）：静态 mTLS + 证书 CN 白名单——gRPC(5108) 仅
   接受 control-plane，proxy(5107) 仅接受 edge（`FIREPAAS_AGENT_GRPC_ALLOWED_CLIENTS`
   / `FIREPAAS_AGENT_PROXY_ALLOWED_CLIENTS` 可配，ADR-0006 M1 降级形态的
-  授权半边；轮换与完整矩阵仍属 M5）。
+  授权半边；2026-09 补齐证书热重载与到期指标/告警，per-node 身份、吊销与
+  完整矩阵仍为延期项，见 ADR-0006 后果更新）。
 
 ## M0.4 spike 状态(2026-08-25,运行 PASS)
 

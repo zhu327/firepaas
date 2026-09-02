@@ -39,13 +39,13 @@ type ImagePin struct {
 }
 
 var (
-	ErrImagePinNotFound   = errors.New("image pin not found")
-	ErrImagePinDuplicate  = errors.New("image pin already exists")
-	ErrImageSizeUnknown   = errors.New("image size has not been observed")
-	ErrPrewarmNotAllowed  = errors.New("prewarm rejected")
-	ErrPrewarmNotFound    = errors.New("prewarm operation not found")
-	ErrImagePinQuota      = errors.New("image pin quota exceeded")
-	ErrImagePinWatermark  = errors.New("image pin target reached disk hard watermark")
+	ErrImagePinNotFound  = errors.New("image pin not found")
+	ErrImagePinDuplicate = errors.New("image pin already exists")
+	ErrImageSizeUnknown  = errors.New("image size has not been observed")
+	ErrPrewarmNotAllowed = errors.New("prewarm rejected")
+	ErrPrewarmNotFound   = errors.New("prewarm operation not found")
+	ErrImagePinQuota     = errors.New("image pin quota exceeded")
+	ErrImagePinWatermark = errors.New("image pin target reached disk hard watermark")
 )
 
 // FindPrewarmReplay resolves a client idempotency key without consulting any

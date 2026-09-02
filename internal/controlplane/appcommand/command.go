@@ -209,6 +209,10 @@ func (c *Command) validateSecretRefs(
 }
 
 func prepare(active *store.Deployment, in Intent, generation int64) (store.Deployment, error) {
+	// R2 评审：负值显式拒绝（0 走继承；负值此前会静默落库成非法 spec）。
+	if in.VCPU < 0 || in.MemMIB < 0 {
+		return store.Deployment{}, invalid(errors.New("vcpu and mem_mib must be >= 0"))
+	}
 	if in.VCPU == 0 {
 		in.VCPU = active.VCPU
 	}

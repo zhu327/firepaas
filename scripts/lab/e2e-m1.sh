@@ -14,7 +14,8 @@ CERT_DIR="$HERE/certs"
 RUN_DIR="/var/lib/firepaas-p0/e2e"
 RUN_ID="e2e-$(date +%s)"
 HOSTNAME="$RUN_ID.local"
-MACHINE_ID="$RUN_ID"
+# machine_id 由服务端按 (app_id, replica_ordinal) 生成（P0：fence 字段不再接受客户端提交）。
+MACHINE_ID="$RUN_ID-r0"
 API_TOKEN="e2e-token-$RUN_ID"
 # M4：execution-bound proxy credential（旧脚本与新链路共用同一密钥；
 # API 不配 key 则不下发凭证，agent 默认强制校验会拒绝 create）。
@@ -123,7 +124,7 @@ CODE=$(curl -s -o /dev/null -w "%{http_code}" \
 log "    control-plane identity on proxy rejected(403) OK"
 
 log "5) 创建 machine"
-CREATE_BODY="{\"machine_id\":\"$MACHINE_ID\",\"hostname\":\"$HOSTNAME\",\"image\":\"docker.io/library/nginx:alpine\",\"vcpu\":1,\"mem_mib\":512,\"port\":80,\"operation_id\":\"$OP_CREATE\"}"
+CREATE_BODY="{\"app_id\":\"$RUN_ID\",\"hostname\":\"$HOSTNAME\",\"image\":\"docker.io/library/nginx:alpine\",\"vcpu\":1,\"mem_mib\":512,\"port\":80,\"operation_id\":\"$OP_CREATE\"}"
 authed_curl -X POST http://127.0.0.1:8080/v1/machines \
   -H 'Content-Type: application/json' -d "$CREATE_BODY" >"$RUN_DIR/create.json"
 log "    $(cat "$RUN_DIR/create.json")"
@@ -133,16 +134,19 @@ for i in $(seq 1 100); do
   authed_curl -X POST http://127.0.0.1:8080/v1/machines \
     -H 'Content-Type: application/json' -d "$CREATE_BODY" >/dev/null \
     || fail "第 $i 次幂等重试失败"
+  # 默认 mutation bucket 是 20 req/s、burst 40；验收幂等语义时不得
+  # 偶然把 API 限流也打满（限流行为由 e2e-v12 单独覆盖）。
+  sleep 0.1
 done
 COUNT=$(authed_curl http://127.0.0.1:8080/v1/machines \
   | python3 -c 'import json,sys
-ms=json.load(sys.stdin)["machines"]
+ms=json.load(sys.stdin)["machines"] or []
 print(sum(1 for m in ms if m["ID"]=="'"$MACHINE_ID"'"))')
 [[ "$COUNT" == "1" ]] || fail "重复提交后 machine 数 = $COUNT，期望 1"
 log "    100 retries → 1 machine OK"
 CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $API_TOKEN" \
   -X POST http://127.0.0.1:8080/v1/machines -H 'Content-Type: application/json' \
-  -d "{\"machine_id\":\"$MACHINE_ID\",\"hostname\":\"$HOSTNAME\",\"image\":\"docker.io/library/nginx:1.27-alpine\",\"vcpu\":1,\"mem_mib\":512,\"port\":80,\"operation_id\":\"$OP_CREATE\"}")
+  -d "{\"app_id\":\"$RUN_ID\",\"hostname\":\"$HOSTNAME\",\"image\":\"docker.io/library/nginx:1.27-alpine\",\"vcpu\":1,\"mem_mib\":512,\"port\":80,\"operation_id\":\"$OP_CREATE\"}")
 [[ "$CODE" == "409" ]] || fail "同 op 异 body 返回 $CODE，期望 409（P2-8）"
 log "    conflicting body rejected(409) OK"
 
@@ -151,7 +155,7 @@ ST=""
 for _ in $(seq 1 60); do
   ST=$(authed_curl http://127.0.0.1:8080/v1/machines \
     | python3 -c 'import json,sys
-ms=json.load(sys.stdin)["machines"]
+ms=json.load(sys.stdin)["machines"] or []
 print(next((m["ObservedState"] for m in ms if m["ID"]=="'"$MACHINE_ID"'"),""))')
   [[ "$ST" == "RUNNING" ]] && break
   sleep 3
@@ -174,11 +178,21 @@ log "    HTTP 200 + nginx page OK"
 log "9) agent 重启后 ledger 重放（验收 1：agent 重启后仍返回原结果）"
 restart_agentd || fail "agentd 重启失败"
 log "    agentd restarted OK"
+# API 与 agent 共用该 HMAC 规则派生 execution-bound credential。调试客户端
+# 必须重放完整原请求，否则验证的是凭证缺失而不是 ledger 幂等。
+PROXY_CREDENTIAL="$(python3 - "$TRAFFIC_KEY" "$MACHINE_ID" <<'PY'
+import hashlib, hmac, sys
+print(hmac.new(sys.argv[1].encode(), f"{sys.argv[2]}/exec-1".encode(), hashlib.sha256).hexdigest()[:32])
+PY
+)"
 # 同 operation_id + 完全一致 spec：必须命中 ledger 重放，返回已记录结果。
+# 注意：首创建 body 的 app_id 是 $RUN_ID（非默认 app-$HOSTNAME），重放必须
+# 与首次请求逐字段一致，否则 request hash 冲突（验收 AgentLedger 的正确拒
+# 绝，而不是幂等重放）。
 "$LAB_BIN/agentctl" create -machine-id "$MACHINE_ID" -operation "$OP_CREATE" \
   -image docker.io/library/nginx:alpine -vcpus 1 -mem-mib 512 \
-  -project dev -app "app-$HOSTNAME" -deployment "dep-$HOSTNAME" -execution exec-1 \
-  -generation 1 -hostname "$HOSTNAME" -port 80 >"$RUN_DIR/replay.json" \
+  -project dev -app "$RUN_ID" -deployment "dep-$HOSTNAME" -execution exec-1 \
+  -generation 1 -hostname "$HOSTNAME" -port 80 -proxy-credential "$PROXY_CREDENTIAL" >"$RUN_DIR/replay.json" \
   || fail "agent 重启后 ledger 重放失败"
 grep -Eq "\"machineId\": *\"$MACHINE_ID\"" "$RUN_DIR/replay.json" \
   || fail "重放结果不含 machine：$(cat "$RUN_DIR/replay.json")"
@@ -187,7 +201,7 @@ log "    ledger replay after restart OK"
 if "$LAB_BIN/agentctl" create -machine-id "$MACHINE_ID" -operation "$OP_CREATE" \
   -image docker.io/library/nginx:alpine -vcpus 2 -mem-mib 512 \
   -project dev -app "app-$HOSTNAME" -deployment "dep-$HOSTNAME" -execution exec-1 \
-  -generation 1 -hostname "$HOSTNAME" -port 80 >/dev/null 2>&1; then
+  -generation 1 -hostname "$HOSTNAME" -port 80 -proxy-credential "$PROXY_CREDENTIAL" >/dev/null 2>&1; then
   fail "同 op 异 hash 应被 agent ledger 拒绝"
 fi
 log "    hash conflict rejected OK"
@@ -199,7 +213,11 @@ FENCE_SECRET="fence-secret-$RUN_ID"
 "$LAB_BIN/agentctl" create -machine-id "$FENCE_ID" -operation "op-$RUN_ID-fence-create" \
   -image docker.io/library/nginx:alpine -vcpus 1 -mem-mib 512 \
   -project dev -app "app-$FENCE_ID" -deployment "dep-$FENCE_ID" -execution fence-exec-1 \
-  -generation 2 -secret "API_KEY=$FENCE_SECRET" >"$RUN_DIR/fence-create.json" \
+  -generation 2 -secret-lease-id "lease-$RUN_ID-fence" -proxy-credential "$(python3 - "$TRAFFIC_KEY" "$FENCE_ID" <<'PY'
+import hashlib, hmac, sys
+print(hmac.new(sys.argv[1].encode(), f"{sys.argv[2]}/fence-exec-1".encode(), hashlib.sha256).hexdigest()[:32])
+PY
+)" -secret "API_KEY=$FENCE_SECRET" >"$RUN_DIR/fence-create.json" \
   || fail "fence 前置 create(gen=2) 失败"
 if grep -q "$FENCE_SECRET" "$RUN_DIR/fence-create.json"; then
   fail "secret 值泄漏到 CreateMachineResponse"
@@ -220,7 +238,7 @@ fi
 if "$LAB_BIN/agentctl" create -machine-id "$FENCE_ID" -operation "op-$RUN_ID-fence-recreate-stale" \
   -image docker.io/library/nginx:alpine -vcpus 1 -mem-mib 512 \
   -project dev -app "app-$FENCE_ID" -deployment "dep-$FENCE_ID" -execution fence-exec-1 \
-  -generation 1 >/dev/null 2>&1; then
+  -generation 1 -proxy-credential "stale-credential" >/dev/null 2>&1; then
   fail "删除后旧 generation re-create 应被拒绝"
 fi
 # 同代 delete 成功，清理 fence 测试 machine。

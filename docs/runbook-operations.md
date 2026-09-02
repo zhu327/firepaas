@@ -96,6 +96,86 @@ autoresume 唤醒（<5s）。`/metrics` 关注
 72h 门禁的每个 probe 必须收集 inventory age/drift、scrub failure、quarantine active、
 attachment drift、prewarm pending 和 active pin；详见 `docs/runbook-72h-soak.md`。
 
+## 证书到期处置
+
+告警：`FirePaasTLSCertExpiringSoon`（<30d，warning）/
+`FirePaasTLSCertExpiryCritical`（<7d，critical），数据源各进程导出的
+gauge `firepaas_tls_cert_not_after_seconds{file=...}`（热重载契约 C-1；
+未导出该指标的进程本身就是接入缺口）。
+
+处置顺序：
+
+1. 确认哪个进程的哪张证书（label `file`）；实验室证书由
+   `scripts/lab/gen-certs.sh` 产出，生产证书由部署秘密通道下发。
+2. 准备新证书（同 CA、同 CN——mTLS 身份白名单按 CN 生效，换 CN 等同换身份）。
+3. 替换证书文件；运行中的进程按 CertManager 周期自动热重载（重读失败保留
+   旧证书并 warn——watch `/metrics` 中该 gauge 是否前进到新 notAfter 确认生效）。
+4. 证书已过期导致 mTLS 断链时：先恢复证书再重连，不得用
+   `FIREPAAS_EDGE_ALLOW_INSECURE_DEV=true` / `FIREPAAS_ALLOW_INSECURE_DEV=true`
+   明文降级绕过（两开关仅限本地开发，生产部署不得设置）。
+5. 轮换完成且告警静默后，把新 certificate 的 notAfter 录入容量/证书台账。
+
+备份注意：edge 公共入口证书与 edge→agent mTLS 客户端证书是两套
+（edge.hcl 模板变量分离），轮换别混用。
+
+## 备份与恢复（例行）
+
+- 例行备份：`scripts/lab/pg-backup.sh`（默认保留最近 7 份；可选 gpg 对称
+  加密 `FIREPAAS_BACKUP_GPG_PASSPHRASE_FILE` 与外送 hook
+  `FIREPAAS_BACKUP_UPLOAD_CMD`，默认关闭）。
+- 恢复演练：`scripts/lab/pg-restore-rehearsal.sh`；DR 链路见
+  `scripts/lab/dr-rehearsal.sh`。
+
+### 定时调度（cron / systemd timer 二选一）
+
+`FIREPAAS_BACKUP_UPLOAD_CMD` 以"命令前缀"方式调用：脚本把最终产物路径追加为
+最后一个参数（`eval "$FIREPAAS_BACKUP_UPLOAD_CMD" <artifact>`）；目的地、远端
+凭证写在接受单参数的目的端 wrapper 脚本里（例中
+`/usr/local/bin/firepaas-backup-upload`，可用 rclone/aws cli 封装）。
+
+cron（以 root 或具备 docker 权限的备份账户）：
+
+```cron
+# 每日 03:30 备份并外送；输出进 journal 无关时落日志文件
+30 3 * * * FIREPAAS_BACKUP_GPG_PASSPHRASE_FILE=/etc/firepaas/backup.pass \
+  FIREPAAS_BACKUP_UPLOAD_CMD='/usr/local/bin/firepaas-backup-upload' \
+  /usr/bin/bash scripts/lab/pg-backup.sh /var/lib/firepaas-p0/backups/postgres \
+  >> /var/log/firepaas/pg-backup.log 2>&1
+```
+
+systemd（pg-backup.service + pg-backup.timer）：
+
+```ini
+# /etc/systemd/system/firepaas-pg-backup.service
+[Unit]
+Description=firepaas PostgreSQL backup
+[Service]
+Type=oneshot
+Environment=FIREPAAS_BACKUP_GPG_PASSPHRASE_FILE=/etc/firepaas/backup.pass
+ExecStart=/usr/bin/bash scripts/lab/pg-backup.sh /var/lib/firepaas-p0/backups/postgres
+
+# /etc/systemd/system/firepaas-pg-backup.timer
+[Unit]
+Description=daily firepaas pg backup
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+[Install]
+WantedBy=timers.target
+```
+
+凭证文件（gpg passphrase、上传命令内含的远端凭证）权限 0400 且不提交仓库。
+备份失败以下一轮告警周期人工发现过晚——对 oneshot 失败配置
+`OnFailure=` 通知或外送 hook 成功性监控。
+
+## 发布回滚
+
+控制面（API）与 edge 的版本回滚（`nomad job revert`）、迁移回滚兼容纪律
+（新迁移须保持同 release 内 rollback-compatible）见
+`docs/runbook-upgrade-control-plane.md` 的 ROLLBACK 章节；发布前必须完成
+`scripts/lab/pg-backup.sh` + `scripts/lab/migration-rehearsal.sh` 两项前置。
+agentd 回滚沿用 `docs/runbook-operations.md` v1.4 节的发布与回滚顺序。
+
 ## 复盘要求（压测后一次，mvp-plan §9.3）
 
 任一压测结束：导出 `GET /v1/operations?limit=500` 与 `/metrics` 快照；

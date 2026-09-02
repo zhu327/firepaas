@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/zhu327/firepaas/internal/capabilities"
@@ -41,6 +42,23 @@ type liveNode struct {
 // Service owns machine placement preparation and commitment.
 const defaultCompensationTimeout = 5 * time.Second
 
+// deploymentLocks 按 deployment 串行化“读已占节点集合 → 选择 → 提交 dispatch”
+// 临界区。有界并发派生下同一 deployment 的多个 create 会并行进入 Place，
+// 而反亲和可见性依赖上一个放置的 dispatch 先落库（不串行则两副本互不可见，
+// 多节点真机验收复现：双副本同节点、无 anti-affinity degraded 事件）。
+// 重要边界：锁是进程内的，只能压住同一 leader 进程的并发放置；leader 切换
+// 瞬间旧 leader 的 worker 与新 leader 仍可能并发（残余窗口、降级非错误，
+// 见 ADR-0009 尽力而为语义）。refs 引用计数在无人持锁时摘除条目。
+type deploymentLocks struct {
+	mu    sync.Mutex
+	locks map[string]*deploymentLock
+}
+
+type deploymentLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
 type Service struct {
 	store               *store.Store
 	nodes               *nodemanager.Manager
@@ -48,6 +66,7 @@ type Service struct {
 	placer              *scheduler.Placer
 	metrics             *metrics.Registry
 	compensationTimeout time.Duration
+	depLocks            deploymentLocks
 }
 
 func New(st *store.Store, nodes *nodemanager.Manager, resv *reservations.Manager,
@@ -56,6 +75,29 @@ func New(st *store.Store, nodes *nodemanager.Manager, resv *reservations.Manager
 	return &Service{
 		store: st, nodes: nodes, resv: resv, placer: placer, metrics: reg,
 		compensationTimeout: compensationTimeout,
+		depLocks:            deploymentLocks{locks: map[string]*deploymentLock{}},
+	}
+}
+
+// lockDeployment 获取该 deployment 的放置互斥（refs 计数，无人使用时摘除）。
+func (s *Service) lockDeployment(deploymentID string) func() {
+	s.depLocks.mu.Lock()
+	l, ok := s.depLocks.locks[deploymentID]
+	if !ok {
+		l = &deploymentLock{}
+		s.depLocks.locks[deploymentID] = l
+	}
+	l.refs++
+	s.depLocks.mu.Unlock()
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		s.depLocks.mu.Lock()
+		l.refs--
+		if l.refs == 0 {
+			delete(s.depLocks.locks, deploymentID)
+		}
+		s.depLocks.mu.Unlock()
 	}
 }
 
@@ -167,6 +209,17 @@ func assembleSchedulerNodes(live []liveNode, allocated map[string]store.Allocate
 func (s *Service) Place(ctx context.Context, op store.Operation, req *pb.CreateMachineRequest,
 	excluded map[string]bool,
 ) (*Choice, error) {
+	// 串行区（D1）：deployment 反亲和的可见窗口必须覆盖“读集合→选择→commit
+	// dispatch”，否则并发放置互不可见。无 deployment 反亲和语义的请求
+	// （空 deployment 或非 DEPLOYMENT 策略）不占锁——调度器本就会跳过
+	// 反亲和过滤（评审 P3：空 deployment 全局串行钝器）。
+	p := req.GetSpec().GetPlacement()
+	needLock := req.GetSpec().GetDeploymentId() != "" &&
+		p != nil && p.GetAntiAffinity() == pb.PlacementConstraints_DEPLOYMENT
+	if needLock {
+		unlock := s.lockDeployment(req.GetSpec().GetDeploymentId())
+		defer unlock()
+	}
 	live := s.liveNodes()
 	allocated, err := s.store.AllocatedByNode(ctx)
 	if err != nil {
@@ -271,9 +324,12 @@ func (s *Service) Place(ctx context.Context, op store.Operation, req *pb.CreateM
 	}
 	capacity := chosen.Node.Info.Capacity
 	diskMib := agentv1.EffectiveDiskMib(spec.GetDiskMib())
-	if err := s.resv.Acquire(ctx, op.ID, chosen.NodeID, op.ProjectID, vcpu, memMib, diskMib,
+	// 契约 C-3：预约双保险与调度器使用同一个超售比 R（placement 持有调度
+	// 配置，是集群内唯一来源），避免两侧对“节点满”的判定发散。
+	if err := s.resv.AcquireR(ctx, op.ID, chosen.NodeID, op.ProjectID, vcpu, memMib, diskMib,
 		capacity.VcpuTotal, capacity.MemTotalMib, capacity.DiskTotalMib,
-		uint64(quotaVCPU), uint64(quotaMem), uint64(quotaDisk), uint64(detail.MachineConcurrency)); err != nil {
+		uint64(quotaVCPU), uint64(quotaMem), uint64(quotaDisk), s.placer.Config().R,
+		uint64(detail.MachineConcurrency)); err != nil {
 		s.metric("firepaas_reservations_total", map[string]string{"result": "failed"})
 		s.recordEvent(ctx, op, "reservation", chosen.NodeID, err.Error())
 		return nil, err

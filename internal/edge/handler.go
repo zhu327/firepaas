@@ -5,6 +5,8 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"log/slog"
+	"math"
 	"math/rand"
 	"net"
 	"net/http"
@@ -40,6 +42,101 @@ type Counters struct {
 	staleServes, beyondStale, redisErrors, tokenErrors atomic.Uint64
 	tokenStaleServes, rateLimited, proxiedReqs         atomic.Uint64
 	forbiddenRetry, hardRejected, pinHits, pinMisses   atomic.Uint64
+	// 非服务态 readiness 被过滤的 backend 观测计数（审视 publisher 契约
+	// 偏差；reason 见 selectBackend）。
+	backendIneligibleEmpty, backendIneligibleNotReady, backendIneligibleUnknown atomic.Uint64
+	// 每客户端请求一次的状态码分母（2xx/4xx/5xx；1xx 升级不计）。
+	req2xx, req4xx, req5xx atomic.Uint64
+
+	histOnce                             sync.Once
+	routeLookup, tokenFetch, upstreamRTT *latencyHistogram
+}
+
+// observeRequest 在 handler 出口记录最终响应码分类。每客户端请求恰好
+// 计一次（与内部 forbidden/transport 重试次数无关）；WS 101 升级不计入
+// 三个分类（非 2/4/5xx）。/healthz 在打点前提前返回，不计入。
+func (c *Counters) observeRequest(status int) {
+	switch status / 100 {
+	case 2:
+		c.req2xx.Add(1)
+	case 4:
+		c.req4xx.Add(1)
+	case 5:
+		c.req5xx.Add(1)
+	}
+}
+
+// defaultLatencyBuckets 是延迟直方图的固定秒桶（Prometheus 默认桶的裁剪版）。
+var defaultLatencyBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5}
+
+// latencyHistogram 是最小固定桶直方图（秒），与既有 hand-rolled 指标风格一致。
+type latencyHistogram struct {
+	bounds []float64
+	counts []atomic.Uint64 // len(bounds)+1；最后一格即 +Inf
+	sum    atomic.Uint64   // math.Float64bits 位存累计值
+	count  atomic.Uint64
+}
+
+func newLatencyHistogram(bounds []float64) *latencyHistogram {
+	return &latencyHistogram{bounds: bounds, counts: make([]atomic.Uint64, len(bounds)+1)}
+}
+
+func (h *latencyHistogram) observe(seconds float64) {
+	i := 0
+	for i < len(h.bounds) && seconds > h.bounds[i] {
+		i++
+	}
+	h.counts[i].Add(1)
+	h.count.Add(1)
+	for {
+		old := h.sum.Load()
+		if h.sum.CompareAndSwap(old, math.Float64bits(math.Float64frombits(old)+seconds)) {
+			return
+		}
+	}
+}
+
+func (h *latencyHistogram) writePrometheus(w http.ResponseWriter, name, help string) {
+	_, _ = fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s histogram\n", name, help, name)
+	var cumulative uint64
+	for i, b := range h.bounds {
+		cumulative += h.counts[i].Load()
+		_, _ = fmt.Fprintf(w, "%s_bucket{le=%q} %d\n", name, strconv.FormatFloat(b, 'g', -1, 64), cumulative)
+	}
+	cumulative += h.counts[len(h.bounds)].Load()
+	_, _ = fmt.Fprintf(
+		w,
+		"%s_bucket{le=\"+Inf\"} %d\n%s_sum %g\n%s_count %d\n",
+		name, cumulative, name, math.Float64frombits(h.sum.Load()), name, h.count.Load(),
+	)
+}
+
+// ensureHistograms 惰性初始化直方图（允许调用方零值构造 &Counters{}）。
+func (c *Counters) ensureHistograms() {
+	c.histOnce.Do(func() {
+		c.routeLookup = newLatencyHistogram(defaultLatencyBuckets)
+		c.tokenFetch = newLatencyHistogram(defaultLatencyBuckets)
+		c.upstreamRTT = newLatencyHistogram(defaultLatencyBuckets)
+	})
+}
+
+// observeRouteLookup 记录一次路由查询（含本地缓存命中）耗时，秒。
+func (c *Counters) observeRouteLookup(seconds float64) {
+	c.ensureHistograms()
+	c.routeLookup.observe(seconds)
+}
+
+// observeTokenFetch 记录一次 traffic token 获取（含本地缓存命中）耗时，秒。
+func (c *Counters) observeTokenFetch(seconds float64) {
+	c.ensureHistograms()
+	c.tokenFetch.observe(seconds)
+}
+
+// observeUpstreamRTT 记录一次转发给 agent proxy 的耗时，秒。
+// 对 WS/SSE 长连接，这一观测是整个会话时长而非单次 RTT（已知口径）。
+func (c *Counters) observeUpstreamRTT(seconds float64) {
+	c.ensureHistograms()
+	c.upstreamRTT.observe(seconds)
 }
 
 func (c *Counters) WritePrometheus(w http.ResponseWriter) {
@@ -69,7 +166,80 @@ func (c *Counters) WritePrometheus(w http.ResponseWriter) {
 		c.pinHits.Load(),
 	)
 	write("firepaas_edge_pin_misses_total", "pin requests whose machine was not eligible (404)", c.pinMisses.Load())
+	_, _ = fmt.Fprint(
+		w,
+		"# HELP firepaas_edge_backend_ineligible_total backend observations filtered out by non-serving readiness during selection\n"+
+			"# TYPE firepaas_edge_backend_ineligible_total counter\n",
+	)
+	for _, kv := range []struct {
+		reason string
+		v      uint64
+	}{
+		{"empty", c.backendIneligibleEmpty.Load()},
+		{"not_ready", c.backendIneligibleNotReady.Load()},
+		{"unknown", c.backendIneligibleUnknown.Load()},
+	} {
+		_, _ = fmt.Fprintf(w, "firepaas_edge_backend_ineligible_total{reason=%q} %d\n", kv.reason, kv.v)
+	}
+	_, _ = fmt.Fprint(
+		w,
+		"# HELP firepaas_edge_requests_total client requests by final status code class (one per request, retries not double-counted)\n"+
+			"# TYPE firepaas_edge_requests_total counter\n",
+	)
+	for _, kv := range []struct {
+		class string
+		v     uint64
+	}{
+		{"2xx", c.req2xx.Load()},
+		{"4xx", c.req4xx.Load()},
+		{"5xx", c.req5xx.Load()},
+	} {
+		_, _ = fmt.Fprintf(w, "firepaas_edge_requests_total{code_class=%q} %d\n", kv.class, kv.v)
+	}
+	c.ensureHistograms()
+	c.routeLookup.writePrometheus(
+		w,
+		"firepaas_edge_route_lookup_seconds",
+		"route catalog lookup latency (cache hits included)",
+	)
+	c.tokenFetch.writePrometheus(
+		w,
+		"firepaas_edge_token_fetch_seconds",
+		"traffic token fetch latency (cache hits included)",
+	)
+	c.upstreamRTT.writePrometheus(
+		w,
+		"firepaas_edge_upstream_rtt_seconds",
+		"upstream agent proxy round-trip (WS/SSE sessions report session duration)",
+	)
 }
+
+// statusRecorder 记录最终响应码用于结构化访问日志。实现 Unwrap 供
+// http.ResponseController 穿透到原始 writer（net/http 及
+// httputil.ReverseProxy 的 Flush/Hijack 均走 ResponseController），
+// 因此不破坏 WebSocket 升级与 SSE flush 语义。
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	wrote  bool
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	if !s.wrote {
+		s.status = code
+		s.wrote = true
+	}
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusRecorder) Write(b []byte) (int, error) {
+	if !s.wrote {
+		s.wrote = true // 未显式 WriteHeader 时默认 200
+	}
+	return s.ResponseWriter.Write(b)
+}
+
+func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter }
 
 type (
 	inflightEntry   struct{ count atomic.Int64 }
@@ -83,32 +253,12 @@ func newInflightTracker() *inflightTracker {
 	return &inflightTracker{entries: map[string]*inflightEntry{}}
 }
 
-func (t *inflightTracker) acquire(id string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	e := t.entries[id]
-	if e == nil {
-		e = &inflightEntry{}
-		t.entries[id] = e
-	}
-	e.count.Add(1)
-}
-
 func (t *inflightTracker) release(id string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if e := t.entries[id]; e != nil && e.count.Add(-1) == 0 {
 		delete(t.entries, id)
 	}
-}
-
-func (t *inflightTracker) load(id string) int64 {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if e := t.entries[id]; e != nil {
-		return e.count.Load()
-	}
-	return 0
 }
 
 func (t *inflightTracker) snapshot() map[string]int64 {
@@ -318,7 +468,10 @@ func (h *Handler) handleProxyError(w http.ResponseWriter, r *http.Request, err e
 		mark(retryTransport) {
 		return
 	}
-	http.Error(w, err.Error(), http.StatusBadGateway)
+	// P0#4：兜底分支不回传 err.Error()——transport 拨号错误通常携带
+	// RFC1918 内部地址，对客户端统一固定文案，细节只进内部日志。
+	slog.Warn("edge upstream proxy error", "error", err)
+	http.Error(w, "agent proxy unavailable", http.StatusBadGateway)
 }
 
 func routeCacheKey(host string, port int) string {
@@ -379,8 +532,24 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writePlain(w, http.StatusOK, "ok\n")
 		return
 	}
+	start := time.Now()
 	host := stripPort(r.Host)
 	port := h.requestRoutePort(r)
+	// 结构化访问日志：host/port/backend/outcome/duration。凭证、token、
+	// Authorization 等敏感材料绝不进日志（AGENTS.md 数据边界）。
+	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+	w = rec
+	backendID := ""
+	defer func() {
+		h.cnt.observeRequest(rec.status)
+		slog.Info("edge request",
+			"host", host,
+			"port", port,
+			"backend", backendID,
+			"status", rec.status,
+			"duration_ms", time.Since(start).Milliseconds(),
+		)
+	}()
 	if !h.limiter.Allow(host) {
 		h.cnt.rateLimited.Add(1)
 		w.Header().Set("Retry-After", "1")
@@ -388,11 +557,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	key := routeCacheKey(host, port)
+	lookupStart := time.Now()
 	v, stale, err := h.routes.Get(
 		r.Context(),
 		key,
 		func(ctx context.Context, _ string) (any, error) { return h.loadRoute(ctx, host, port) },
 	)
+	h.cnt.observeRouteLookup(time.Since(lookupStart).Seconds())
 	if errors.Is(err, ErrNotFound) {
 		http.Error(w, "no route for hostname", http.StatusNotFound)
 		return
@@ -418,29 +589,34 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.writeSelectionError(w, err)
 		return
 	}
+	backendID = backend.MachineID
 	if r.Header.Get(HeaderPinMachine) != "" {
-		h.cnt.pinHits.Add(1)
+		h.cnt.pinHits.Add(1) // 每个请求只计一次；重试路径不重复计数
 	}
 	if stale {
 		h.cnt.staleServes.Add(1)
 	}
-	w.Header().Set(HeaderMachineID, backend.MachineID)
-	cred, err := h.tokens.Get(r.Context(), backend.MachineID, backend.ExecutionID)
+	cred, tokenStale, err := h.getToken(r.Context(), backend)
 	if err != nil {
 		h.inflight.release(backend.MachineID)
 		h.cnt.tokenErrors.Add(1)
 		http.Error(w, "traffic token unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	if cred != "" {
-		h.cnt.proxiedReqs.Add(1)
+	if tokenStale {
+		h.cnt.tokenStaleServes.Add(1)
 	}
+	// P0#4：仅在 token 获取成功（转发决策确定）后回写 backend 标识，
+	// 避免 503 错误响应把选中的内部 backend id 泄露给外部客户端。
+	w.Header().Set(HeaderMachineID, backend.MachineID)
+	// proxiedReqs 统计到达转发决策的客户端请求（每请求只计一次，重试
+	// 不重复——评审 R2 P3：否则与 requests_total 分母在重试时语义无分叉）。
+	h.cnt.proxiedReqs.Add(1)
 	retry := h.tryServe(w, r, backend, cred, stale, true)
 	if retry == retryNone {
 		return
 	}
 	if !requestHasNoBody(r) {
-		w.Header().Set(HeaderMachineID, backend.MachineID)
 		if retry == retryForbidden {
 			http.Error(w, "agent proxy rejected request", http.StatusForbidden)
 		} else {
@@ -454,29 +630,31 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.tokens.Invalidate(backend.MachineID)
 	h.routes.Invalidate(key)
 	retryRoute := route
+	lookupStart = time.Now()
 	if nv, _, e := h.routes.Get(r.Context(), key, func(ctx context.Context, _ string) (any, error) { return h.loadRoute(ctx, host, port) }); e == nil {
 		if nr, ok := nv.(*catalog.Route); ok && nr != nil {
 			retryRoute = nr
 		}
 	}
+	h.cnt.observeRouteLookup(time.Since(lookupStart).Seconds())
 	retryBackend, err := h.selectBackend(retryRoute, r.Header.Get(HeaderPinMachine))
 	if err != nil {
 		h.writeSelectionError(w, err)
 		return
 	}
-	if r.Header.Get(HeaderPinMachine) != "" {
-		h.cnt.pinHits.Add(1)
-	}
-	w.Header().Set(HeaderMachineID, retryBackend.MachineID)
-	retryCred, err := h.tokens.Get(r.Context(), retryBackend.MachineID, retryBackend.ExecutionID)
+	backendID = retryBackend.MachineID
+	retryCred, retryTokenStale, err := h.getToken(r.Context(), retryBackend)
 	if err != nil {
 		h.inflight.release(retryBackend.MachineID)
 		h.cnt.tokenErrors.Add(1)
 		http.Error(w, "traffic token unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	if retryTokenStale {
+		h.cnt.tokenStaleServes.Add(1)
+	}
+	w.Header().Set(HeaderMachineID, retryBackend.MachineID)
 	if terminal := h.tryServe(w, r, retryBackend, retryCred, false, false); terminal == retryForbidden {
-		w.Header().Set(HeaderMachineID, retryBackend.MachineID)
 		http.Error(w, "agent proxy rejected request", http.StatusForbidden)
 	}
 }
@@ -484,8 +662,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) selectBackend(route *catalog.Route, pin string) (catalog.Backend, error) {
 	eligible := make([]catalog.Backend, 0, len(route.Backends))
 	for _, b := range route.Backends {
-		if !b.Draining && (b.Readiness == "READY" || b.Readiness == "UNCONFIGURED" || b.Readiness == "") {
+		if b.Draining {
+			continue
+		}
+		// readiness 白名单与 publisher 契约严格一致：machineServing()
+		// (internal/controlplane/routepublisher/publisher.go) 只发布
+		// ObservedReadiness ∈ {READY, UNCONFIGURED} 的 backend，任何其它值
+		//（空串、NOT_READY、未知/拼写漂移）表示投影异常，拒绝并计数，
+		// 不把"空"当作"未完成探针"放行。
+		switch b.Readiness {
+		case "READY", "UNCONFIGURED":
 			eligible = append(eligible, b)
+		case "":
+			h.cnt.backendIneligibleEmpty.Add(1)
+		case "NOT_READY":
+			h.cnt.backendIneligibleNotReady.Add(1)
+		default:
+			h.cnt.backendIneligibleUnknown.Add(1)
 		}
 	}
 	if len(eligible) == 0 {
@@ -545,8 +738,29 @@ func (h *Handler) tryServe(
 	if stale {
 		w.Header().Set("X-Firepaas-Stale", "stale")
 	}
+	upstreamStart := time.Now()
 	h.proxy.ServeHTTP(w, r.WithContext(ctx))
+	h.cnt.observeUpstreamRTT(time.Since(upstreamStart).Seconds())
 	return state.reason
+}
+
+// getToken 拉取 backend 凭证并打 token 获取延迟点；返回值同
+// TokenClient.Get（凭证, 是否 stale 降级, 错误）。
+func (h *Handler) getToken(ctx context.Context, b catalog.Backend) (string, bool, error) {
+	start := time.Now()
+	cred, stale, err := h.tokens.Get(ctx, b.MachineID, b.ExecutionID)
+	h.cnt.observeTokenFetch(time.Since(start).Seconds())
+	return cred, stale, err
+}
+
+// WriteRouteRevisionRejectsPrometheus 导出 D-2 revision 守卫的拒绝计数
+// （回源路由投影 revision 低于缓存高水位，旧快照覆盖被拦）。
+func (h *Handler) WriteRouteRevisionRejectsPrometheus(w http.ResponseWriter) {
+	_, _ = fmt.Fprintf(w,
+		"# HELP firepaas_edge_route_revision_rejects_total route projection redraws rejected for lower revision\n"+
+			"# TYPE firepaas_edge_route_revision_rejects_total counter\n"+
+			"firepaas_edge_route_revision_rejects_total %d\n",
+		h.routes.RevisionRejects())
 }
 
 // WriteInflightPrometheus writes the per-machine inflight gauge.

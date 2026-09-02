@@ -24,7 +24,7 @@ NOMAD_JOB="${FIREPAAS_AGENT_NOMAD_JOB:-firepaas-agentd}"
 api() { curl --fail-with-body -sS --connect-timeout 5 --max-time 20 -H "Authorization: Bearer $API_TOKEN" "$@"; }
 node_state() { api "$API_ADDR/v1/nodes" | python3 -c '
 import json,sys
-node_id=sys.argv[1]; nodes=json.load(sys.stdin).get("nodes", [])
+node_id=sys.argv[1]; nodes=json.load(sys.stdin).get("nodes") or []
 for n in nodes:
  if n.get("ID", n.get("id")) == node_id:
   print((n.get("Status", n.get("status", ""))).upper(), str(bool(n.get("Draining", n.get("draining", False)))).lower()); break
@@ -41,11 +41,28 @@ cd "$REPO"
 PATH="$(dirname "$GO"):$PATH" CGO_ENABLED=0 "$GO" build -o "$LAB_BIN/agentd.new" ./cmd/agentd
 [[ -s "$LAB_BIN/agentd.new" ]] || die "agentd build produced no binary"
 
-say "2/5 drain+evacuate node (v1.1 ADR-0021)"
-NODE_ID=$(api "$API_ADDR/v1/nodes" | python3 -c 'import json,sys; ns=json.load(sys.stdin).get("nodes", []); print((ns[0].get("ID") or ns[0].get("id")) if ns else "")')
+say "2/5 drain node (v1.1 ADR-0021；单节点降级常用 drain)"
+NODE_COUNT=$(api "$API_ADDR/v1/nodes" | python3 -c 'import json,sys
+ns=json.load(sys.stdin).get("nodes") or []
+print(sum(1 for n in ns if n.get("Status")=="HEALTHY"))')
+NODE_ID=$(api "$API_ADDR/v1/nodes" | python3 -c 'import json,sys
+ns=json.load(sys.stdin).get("nodes") or []
+n=next((n for n in ns if n.get("Status")=="HEALTHY" and not n.get("Draining", False)), None)
+print((n.get("ID") or n.get("id")) if n else "")')
 [[ -n "$NODE_ID" ]] || die "no registered node"
-api -X POST -H 'Content-Type: application/json' -d '{"evacuate": true}' \
-  "$API_ADDR/v1/nodes/$NODE_ID/drain" >/dev/null
+if [[ "${NODE_COUNT:-0}" -le 1 ]]; then
+  # ADR-0021 的驱离要求 replacement 在“非源节点”服务——单节点无可达目标，
+  # evacuate=true 会结构性死锁（验收实测 600s 超時）。降级为常用 drain：
+  # 重启后 controller R3 重建（M3 已知行为：agentd SIGTERM 带走本机 VM）。
+  say "    single compute node: skip evacuate (ADR-0021 requires a second node)"
+  EVAC_MODE=plain
+  api -X POST -H 'Content-Type: application/json' -d '{}' \
+    "$API_ADDR/v1/nodes/$NODE_ID/drain" >/dev/null
+else
+  EVAC_MODE=evacuate
+  api -X POST -H 'Content-Type: application/json' -d '{"evacuate": true}' \
+    "$API_ADDR/v1/nodes/$NODE_ID/drain" >/dev/null
+fi
 for _ in $(seq 1 20); do
   read -r STATUS DRAINING < <(node_state "$NODE_ID")
   [[ "$DRAINING" == true ]] && break
@@ -59,20 +76,24 @@ machines_on_node() {
   api "$API_ADDR/v1/machines" | python3 -c '
 import json,sys
 node_id=sys.argv[1]
-machines=json.load(sys.stdin).get("machines", [])
+machines=json.load(sys.stdin).get("machines") or []
 alive=[m for m in machines if m.get("DesiredState", m.get("desired_state")) not in ("DELETED",)]
 on_node=[m for m in alive if (m.get("NodeID") or m.get("node_id") or "") == node_id]
 print(len(on_node))' "$NODE_ID"
 }
 EVAC_TIMEOUT="${FIREPAAS_EVACUATE_TIMEOUT:-600}"
 EVAC_DEADLINE=$(( $(date +%s) + EVAC_TIMEOUT ))
-while :; do
-  N=$(machines_on_node) || N=99
-  [[ "$N" == "0" ]] && break
-  [[ $(date +%s) -ge $EVAC_DEADLINE ]] && die "evacuate did not drain node in ${EVAC_TIMEOUT}s (machines=$N)"
-  sleep 5
-done
-say "    node evacuated (0 machines remain)"
+if [[ "$EVAC_MODE" == "evacuate" ]]; then
+  while :; do
+    N=$(machines_on_node) || N=99
+    [[ "$N" == "0" ]] && break
+    [[ $(date +%s) -ge $EVAC_DEADLINE ]] && die "evacuate did not drain node in ${EVAC_TIMEOUT}s (machines=$N)"
+    sleep 5
+  done
+  say "    node evacuated (0 machines remain)"
+else
+  say "    node draining (plain; machines 假定重建于 R3)"
+fi
 
 say "3/5 atomically replace binary and restart $NOMAD_JOB"
 mv -f "$LAB_BIN/agentd.new" "$LAB_BIN/agentd"
@@ -105,7 +126,7 @@ trap - EXIT
 say "5/5 verify operation backlog is zero"
 # M5 实测：节点刚收敛时在途 op 还需 1-2 个 controller 周期落账，给 90s 等待窗。
 backlog() {
-  api "$API_ADDR/v1/operations?status=PENDING" | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("operations", [])))'
+  api "$API_ADDR/v1/operations?status=PENDING" | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("operations") or []))'
 }
 for _ in $(seq 1 30); do
   N=$(backlog) || N=99

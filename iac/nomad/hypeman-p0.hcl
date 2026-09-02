@@ -3,14 +3,14 @@
 # 多机版需另写 hypeman-p0-remote.hcl：artifact 用 http(s):// 源 + 校验 checksum。
 # 该 job 不代表 M1+ agentd 的端口、身份或安全模型。
 
-variable "hypeman_command" {
-  type    = string
-  default = "~/.local/firepaas-lab/bin/hypeman"
+variable "lab_bin" {
+  type        = string
+  description = "Absolute path to the lab binary directory on the Nomad client"
 }
 
-variable "hypeman_config" {
-  type    = string
-  default = "~/Learn/firepaas/scripts/lab/hypeman-p0.yaml"
+variable "repo_root" {
+  type        = string
+  description = "Absolute path to the firepaas repository on the Nomad client"
 }
 
 variable "hypeman_data_dir" {
@@ -57,7 +57,7 @@ job "firepaas-hypeman-p0" {
       }
 
       env {
-        CONFIG_PATH      = var.hypeman_config
+        CONFIG_PATH      = "${var.repo_root}/scripts/lab/hypeman-p0.yaml"
         HYPEMAN_DATA_DIR = var.hypeman_data_dir
         HYPEMAN_PORT     = "4973"
         # 受限网络下 Docker Hub 镜像站（hypeman lab 补丁）；无此限制的环境可置空。
@@ -68,7 +68,7 @@ job "firepaas-hypeman-p0" {
       }
 
       config {
-        command = var.hypeman_command
+        command = "${var.lab_bin}/hypeman"
       }
     }
   }

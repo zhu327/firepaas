@@ -36,17 +36,17 @@ func fakeDNSServer(t *testing.T, records map[string][]string) []string {
 		}
 		_ = w.WriteMsg(m)
 	})
-	srv := &dns.Server{Addr: "127.0.0.1:0", Net: "udp", Handler: mux}
-	go func() { _ = srv.ListenAndServe() }()
+	// 先自建 UDP 监听再 ActivateAndServe：dns.Server.PacketConn 的读写
+	// 在 miekg/dns 中无并发保护，go ListenAndServe 后轮询字段是数据竞争
+	// （-race CI 实测）。自建 conn 还避免 sleep 轮询，启动点确定。
+	pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatalf("listen dns: %v", err)
+	}
+	srv := &dns.Server{Handler: mux, PacketConn: pc}
+	go func() { _ = srv.ActivateAndServe() }()
 	t.Cleanup(func() { _ = srv.Shutdown() })
-	deadline := time.Now().Add(3 * time.Second)
-	for srv.PacketConn == nil && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if srv.PacketConn == nil {
-		t.Fatal("dns did not start")
-	}
-	port := srv.PacketConn.LocalAddr().(*net.UDPAddr).Port
+	port := pc.LocalAddr().(*net.UDPAddr).Port
 	return []string{net.JoinHostPort("127.0.0.1", itoaPort(port))}
 }
 

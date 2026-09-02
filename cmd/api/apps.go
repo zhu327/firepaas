@@ -77,12 +77,21 @@ type autoStandbyBody struct {
 
 func (a *API) createApp(w http.ResponseWriter, r *http.Request) {
 	var body createAppBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		writeErr(w, 400, "bad request: "+err.Error())
 		return
 	}
 	if body.Hostname == "" || body.Image == "" {
 		writeErr(w, 400, "hostname and image are required")
+		return
+	}
+	// R2 评审：显式拒绝负 vcpu/mem（0 走默认值）与超出面数的 port。
+	if body.VCPU < 0 || body.MemMIB < 0 {
+		writeErr(w, 400, "vcpu and mem_mib must be >= 0")
+		return
+	}
+	if body.Port < 0 || body.Port > 65535 {
+		writeErr(w, 400, "port must be in [0,65535]")
 		return
 	}
 	// P1-2（M5 评审）：受限 key 只能创建自己 project 的 app；body.project_id
@@ -109,7 +118,7 @@ func (a *API) createApp(w http.ResponseWriter, r *http.Request) {
 	// P3：已存在的 app（含软删墓碑）拒绝重建，避免 EnsureApp upsert 静默
 	// 改写 desired_replicas / dep-{app}-1 唯一键 500。
 	if existing, err := a.store.GetApp(r.Context(), body.AppID); err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	} else if existing != nil {
 		if existing.Deleted {
@@ -145,7 +154,7 @@ func (a *API) createApp(w http.ResponseWriter, r *http.Request) {
 	}
 	placeJSON, err := marshalPlacement(body.NodePool, body.Labels, body.AntiAffinity)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	// v1.1（ADR-0022）：services 声明校验与归一（与单端口 port 互斥）。
@@ -204,7 +213,7 @@ func (a *API) createApp(w http.ResponseWriter, r *http.Request) {
 		RequiredFeatures: requiredFeatures,
 		EgressPolicy:     egressJSON,
 	}); err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	writeJSON(w, 201, map[string]any{
@@ -220,7 +229,7 @@ func (a *API) listApps(w http.ResponseWriter, r *http.Request) {
 	project := effectiveProjectID(r, "")
 	apps, err := a.store.ListAppsFiltered(r.Context(), project)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"apps": apps})
@@ -230,7 +239,7 @@ func (a *API) getApp(w http.ResponseWriter, r *http.Request) {
 	appID := r.PathValue("id")
 	app, err := a.store.GetApp(r.Context(), appID)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	if app == nil {
@@ -239,17 +248,17 @@ func (a *API) getApp(w http.ResponseWriter, r *http.Request) {
 	}
 	deps, err := a.store.ListDeployments(r.Context(), appID)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	machines, err := a.store.ListMachinesForApp(r.Context(), appID, false)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	rollout, err := a.store.ActiveRolloutForApp(r.Context(), appID)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{
@@ -276,7 +285,7 @@ type deployBody struct {
 
 func (a *API) deployApp(w http.ResponseWriter, r *http.Request) {
 	var body deployBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		writeErr(w, 400, "bad request: "+err.Error())
 		return
 	}
@@ -287,7 +296,7 @@ func (a *API) deployApp(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := a.appCommands.Execute(r.Context(), intent)
 	if err != nil {
-		writeDeploymentCommandError(w, err)
+		writeDeploymentCommandError(w, r, err)
 		return
 	}
 	writeDeploymentResult(w, result)
@@ -342,7 +351,7 @@ func deploymentIntent(appID, projectID string, body deployBody, inheritAll bool)
 	}, nil
 }
 
-func writeDeploymentCommandError(w http.ResponseWriter, err error) {
+func writeDeploymentCommandError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, appcommand.ErrAppNotFound):
 		writeErr(w, 404, err.Error())
@@ -351,7 +360,7 @@ func writeDeploymentCommandError(w http.ResponseWriter, err error) {
 	case errors.Is(err, appcommand.ErrInvalidIntent):
 		writeErr(w, 400, strings.TrimPrefix(err.Error(), appcommand.ErrInvalidIntent.Error()+": "))
 	default:
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 	}
 }
 
@@ -367,7 +376,7 @@ func (a *API) scaleApp(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Replicas int `json:"replicas"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		writeErr(w, 400, "bad request: "+err.Error())
 		return
 	}
@@ -380,7 +389,7 @@ func (a *API) scaleApp(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 404, "app not found")
 			return
 		}
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	writeJSON(w, 202, map[string]any{"app_id": appID, "desired_replicas": body.Replicas})
@@ -390,7 +399,7 @@ func (a *API) rollbackApp(w http.ResponseWriter, r *http.Request) {
 	appID := r.PathValue("id")
 	// P3：无活跃 rollout 时明确 404（此前会因查不到行报 500）。
 	if rl, err := a.store.ActiveRolloutForApp(r.Context(), appID); err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	} else if rl == nil {
 		writeErr(w, 404, "no active rollout to roll back")
@@ -400,7 +409,7 @@ func (a *API) rollbackApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := a.store.RolloutToRollback(r.Context(), appID); err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	writeJSON(w, 202, map[string]any{"app_id": appID, "status": "ROLLING_BACK"})
@@ -408,63 +417,45 @@ func (a *API) rollbackApp(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) deleteApp(w http.ResponseWriter, r *http.Request) {
 	appID := r.PathValue("id")
-	app, err := a.store.GetApp(r.Context(), appID)
-	if err != nil {
-		writeErr(w, 500, err.Error())
-		return
-	}
-	if app == nil {
-		writeErr(w, 404, "app not found")
-		return
-	}
-	if app.Deleted {
-		// 幂等：重复删除返回当前收敛视图。
-		machines, _ := a.store.ListMachinesForApp(r.Context(), appID, false)
-		writeJSON(w, 202, map[string]any{"app_id": appID, "machines_to_delete": len(machines), "already_deleted": true})
-		return
-	}
-	machines, err := a.store.ListMachinesForApp(r.Context(), appID, false)
-	if err != nil {
-		writeErr(w, 500, err.Error())
-		return
-	}
-	// P0-1：先事务墓碑化（deleted_at + 终结 rollout + deployment SUPERSEDED），
-	// 再下发副本 delete。若先 delete 后墓碑，中间崩溃会让 controller 在窗口内
-	// 补建副本（复活）。墓碑后 reconcileApp 不再补建，未收敛的机器由
-	// processPGMachine 的 R5 路径继续收敛。
-	if err := a.store.SoftDeleteApp(r.Context(), appID); err != nil {
-		writeErr(w, 500, err.Error())
-		return
-	}
-	// 逐副本下发 delete（kind=delete 语义：成功即 desired=DELETED）。
-	// MVP 保留 app 行为墓碑（FK 级联会绕过 operation outbox 直接删机器行）。
-	// opID 嵌 execution 后缀（P0-2）：否则墓碑行若被复活会撞同幂等键不同
-	// 请求体的 409，永久无法再删。
-	for _, m := range machines {
-		req := &pb.DeleteMachineRequest{
-			MachineId:   m.ID,
-			ExecutionId: m.CurrentExecutionID,
-			Generation:  uint64(m.Generation),
-			OperationId: store.UserDeleteOpID(m.ID, m.CurrentExecutionID),
-		}
-		raw, err := protojson.Marshal(req)
-		if err != nil {
-			writeErr(w, 500, err.Error())
-			return
-		}
-		if _, err := a.store.EnqueueDelete(r.Context(), app.ProjectID, m.ID,
-			m.CurrentExecutionID, req.OperationId, m.Generation, raw); err != nil {
-			if errors.Is(err, store.ErrRequestConflict) {
-				// 同 execution 的重复 delete 请求体必一致；冲突只来自历史脏数据
-				//（旧版裸 op-del-{id}）。记日志继续，不阻塞删除收敛。
-				slog.Warn("delete app: idempotency conflict (legacy opID?)", "machine_id", m.ID, "error", err.Error())
-				continue
+	// R2 评审（app 删除原子化）：墓碑（deleted_at + 终结 rollout + deployment
+	// SUPERSEDED）与全部副本 delete 入队在同一个 PG 事务提交（P0-1 的
+	// “墓碑先于 delete”原序保留，同时消除两者之间的崩溃窗口）。
+	// already_deleted 的幂等重试同样走本方法：它会为尚未收敛的机器补发
+	// delete（同幂等键，store.UserDeleteOpID），以对消“入队途中崩溃只发了
+	// 部分删除”的残留。
+	result, err := a.store.SoftDeleteAppAndEnqueueDeletes(r.Context(), appID,
+		func(m store.Machine) store.AppDeleteOp {
+			// opID 嵌 execution 后缀（P0-2）：否则墓碑行若被复活会撞同幂等键
+			// 不同请求体的 409，永久无法再删。
+			opID := store.UserDeleteOpID(m.ID, m.CurrentExecutionID)
+			raw, _ := protojson.Marshal(&pb.DeleteMachineRequest{
+				MachineId: m.ID, ExecutionId: m.CurrentExecutionID,
+				Generation: uint64(m.Generation), OperationId: opID,
+			})
+			return store.AppDeleteOp{
+				MachineID: m.ID, ExecutionID: m.CurrentExecutionID,
+				Generation: m.Generation, OperationID: opID, Request: raw,
 			}
-			writeErr(w, 500, err.Error())
+		})
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, 404, "app not found")
 			return
 		}
+		if errors.Is(err, store.ErrRequestConflict) {
+			// 评审回流：同幂等键、不同请求体的历史脏数据会让删除整体回滚，
+			// 客户端需要一个可识别、可动作的信号而非不区分的 500。
+			slog.Warn("app delete blocked by idempotency conflict (legacy dirty row?)", "app_id", appID)
+			writeErr(w, 409, "delete blocked by conflicting in-flight operation; contact operator to reconcile")
+			return
+		}
+		writeInternalErr(w, r, err)
+		return
 	}
-	writeJSON(w, 202, map[string]any{"app_id": appID, "machines_to_delete": len(machines)})
+	writeJSON(w, 202, map[string]any{
+		"app_id": appID, "machines_to_delete": result.Pending,
+		"already_deleted": result.AlreadyDeleted,
+	})
 }
 
 // marshalHealthCheck 把 API body 的探针声明编码为 proto JSON（入库用）。
@@ -540,7 +531,7 @@ func (a *API) setAppSecretRefs(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		SecretRefs map[string]store.SecretRef `json:"secret_refs"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		writeErr(w, 400, "bad request: "+err.Error())
 		return
 	}
@@ -551,7 +542,7 @@ func (a *API) setAppSecretRefs(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := a.appCommands.Execute(r.Context(), intent)
 	if err != nil {
-		writeDeploymentCommandError(w, err)
+		writeDeploymentCommandError(w, r, err)
 		return
 	}
 	writeDeploymentResult(w, result)
@@ -716,7 +707,7 @@ func (a *API) getAppEgressAudit(w http.ResponseWriter, r *http.Request) {
 	appID := r.PathValue("id")
 	app, err := a.store.GetApp(r.Context(), appID)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	if app == nil {
@@ -731,7 +722,7 @@ func (a *API) getAppEgressAudit(w http.ResponseWriter, r *http.Request) {
 	}
 	sums, err := a.store.ListEgressDenySummaries(r.Context(), app.ProjectID)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	// 只回显本 app 的行。
@@ -743,7 +734,7 @@ func (a *API) getAppEgressAudit(w http.ResponseWriter, r *http.Request) {
 	}
 	changes, err := a.store.ListEgressPolicyChanges(r.Context(), appID)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{

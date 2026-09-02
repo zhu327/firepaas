@@ -22,9 +22,12 @@ import (
 // ---- 测试替身（实现 machine.InstanceManager / machine.ImageManager 子集）----
 
 type fakeInstances struct {
-	mu     sync.Mutex
-	byName map[string]*instances.Instance
-	nextID int
+	mu           sync.Mutex
+	byName       map[string]*instances.Instance
+	nextID       int
+	createCalls  int
+	standbyCalls int
+	restoreCalls int
 }
 
 func (f *fakeInstances) CreateInstance(
@@ -33,6 +36,7 @@ func (f *fakeInstances) CreateInstance(
 ) (*instances.Instance, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.createCalls++
 	f.nextID++
 	inst := &instances.Instance{
 		StoredMetadata: instances.StoredMetadata{
@@ -86,6 +90,7 @@ func (f *fakeInstances) StandbyInstance(
 ) (*instances.Instance, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.standbyCalls++
 	inst := f.byID(id)
 	if inst == nil {
 		return nil, instances.ErrNotFound
@@ -97,6 +102,7 @@ func (f *fakeInstances) StandbyInstance(
 func (f *fakeInstances) RestoreInstance(_ context.Context, id string) (*instances.Instance, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.restoreCalls++
 	inst := f.byID(id)
 	if inst == nil {
 		return nil, instances.ErrNotFound
@@ -256,10 +262,12 @@ func TestDeleteRejectsStaleExecution(t *testing.T) {
 	if _, err := srv.CreateMachine(ctx, createReq("m-exec", 1, "op-create")); err != nil {
 		t.Fatal(err)
 	}
+	// 确定性 mismatch（R2 加固）：FailedPrecondition 让控制面一次判决终态
+	// （取代早期无信息量的 Internal + 无限重试活锁）。
 	if _, err := srv.DeleteMachine(ctx, deleteReq("m-exec", 1, "op-delete", "wrong-execution")); status.Code(
 		err,
-	) != codes.Internal {
-		t.Fatalf("stale execution delete: want Internal, got %v", err)
+	) != codes.FailedPrecondition {
+		t.Fatalf("stale execution delete: want FailedPrecondition, got %v", err)
 	}
 	list, err := srv.ListMachines(ctx, &pb.ListMachinesRequest{})
 	if err != nil || len(list.Machines) != 1 {

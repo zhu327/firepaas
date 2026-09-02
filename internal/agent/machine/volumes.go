@@ -27,6 +27,7 @@ import (
 	"github.com/kernel/hypeman/lib/tags"
 	"github.com/kernel/hypeman/lib/volumes"
 
+	"github.com/zhu327/firepaas/internal/agent/netpolicy"
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 )
 
@@ -226,10 +227,17 @@ func datasetSpoolPattern(volumeID, operationID string) string {
 // CleanupStaleDatasetSpool removes dataset import spool leftovers from crashed
 // imports (v1.4-D：agent 启动时调用)。在途导入由年龄保护：导入授权窗口最大
 // 15 分钟，超过 maxAge 的 spool 文件一定属于已崩溃/过期的导入。
+// CopyTo 上传 spool（server/runtimeops.go 的 firepaas-copy-to-*）同窗清理：
+// 崩溃时其 defer Remove 不会执行，runtime 会话上限 15 分钟，超龄文件必然
+// 属于已崩溃会话（在途 session 不在 activeDatasetSpools 登记，纯年龄保护）。
 func CleanupStaleDatasetSpool(maxAge time.Duration) (int, error) {
-	matches, err := filepath.Glob(filepath.Join(os.TempDir(), "firepaas-dataset-*"))
-	if err != nil {
-		return 0, err
+	var matches []string
+	for _, pattern := range []string{"firepaas-dataset-*", "firepaas-copy-to-*"} {
+		glob, err := filepath.Glob(filepath.Join(os.TempDir(), pattern))
+		if err != nil {
+			return 0, err
+		}
+		matches = append(matches, glob...)
 	}
 	if len(matches) == 0 {
 		return 0, nil
@@ -296,26 +304,9 @@ func redactDatasetSource(rawURL string, err error) error {
 	return errors.New(msg)
 }
 
-var datasetReservedPrefixes = func() []netip.Prefix {
-	cidrs := []string{
-		"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
-		"172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24", "192.31.196.0/24", "192.52.193.0/24",
-		"192.88.99.0/24", "192.168.0.0/16", "192.175.48.0/24", "198.18.0.0/15",
-		"198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
-		"::/128", "::1/128", "::ffff:0:0/96", "64:ff9b::/96", "64:ff9b:1::/48", "100::/64",
-		"2001::/23", "2001:db8::/32", "3fff::/20", "2620:4f:8000::/48", "fc00::/7", "fe80::/10", "ff00::/8",
-	}
-	out := make([]netip.Prefix, 0, len(cidrs))
-	for _, cidr := range cidrs {
-		block, err := netip.ParsePrefix(cidr)
-		if err != nil {
-			panic(err)
-		}
-		out = append(out, block)
-	}
-	return out
-}()
-
+// dataset 下载目标的保留地址段黑名单（SSRF 防护）统一消费
+// internal/agent/netpolicy 的 canonical 集合（R2：与 slot fp-isolation 的
+// 私网目标 drop 同源，禁止再次各自抄写漂移）。
 func publicDatasetAddr(addr netip.Addr, allowLoopback bool) bool {
 	if !addr.IsValid() || addr.Is4In6() { // reject IPv4-mapped IPv6, not merely its mapped target
 		return false
@@ -323,10 +314,8 @@ func publicDatasetAddr(addr netip.Addr, allowLoopback bool) bool {
 	if allowLoopback && addr.IsLoopback() {
 		return true
 	}
-	for _, prefix := range datasetReservedPrefixes {
-		if prefix.Addr().BitLen() == addr.BitLen() && prefix.Contains(addr) {
-			return false
-		}
+	if netpolicy.Contains(addr) {
+		return false
 	}
 	return addr.IsGlobalUnicast()
 }
@@ -384,7 +373,9 @@ func (a *Adapter) CreateVolume(
 	if err != nil {
 		return nil, err
 	}
-	sizeGb := int(sizeBytes / (1024 * 1024 * 1024))
+	// GiB 向上取整（R2：向下取整会让 hypeman 创建的卷小于已准入的预算，
+	// 磁盘承诺与实际用量出现负差——与 ImportDataset 的 sizeGB 计算同构）。
+	sizeGb := int((sizeBytes + 1024*1024*1024 - 1) / (1024 * 1024 * 1024))
 	if sizeGb < 1 {
 		sizeGb = 1
 	}

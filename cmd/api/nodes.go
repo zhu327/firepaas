@@ -29,7 +29,12 @@ func (a *API) setNodeDraining(w http.ResponseWriter, r *http.Request, draining b
 			writeErr(w, 409, "another node evacuation is already in progress")
 			return
 		}
-		writeErr(w, 404, "node not found: "+id)
+		// 仅确证 not-found 才 404；PG 故障等内部错误不再伪装成“节点不存在”。
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, 404, "node not found: "+id)
+			return
+		}
+		writeInternalErr(w, r, err)
 		return
 	}
 	state := "ready"
@@ -66,7 +71,7 @@ func (a *API) readyNode(w http.ResponseWriter, r *http.Request) {
 func (a *API) listCapabilities(w http.ResponseWriter, r *http.Request) {
 	nodes, err := a.store.ListNodes(r.Context())
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	type capEntry struct {

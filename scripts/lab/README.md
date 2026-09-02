@@ -20,6 +20,8 @@ scripts/lab/
 ├── root-setup.sh       # root 一次性准备（数据目录/docker/kvm 组），sudo 执行
 ├── run-p0.sh           # root 部署 P0 job 并等 /health，sudo 执行
 ├── smoke-p0.sh         # P0 冒烟：pull/run/exec/logs/stop/delete + 残留检查
+├── validate-nomad.sh   # Nomad HCL validate/render 与路径语义断言（CI 入口）
+├── lib/                # 单机场景共享 helper；不与多节点 ha-lib.sh 混用
 └── results/            # 基准原始样本（JSON/CSV，gitignore 之外人工保留）
 ```
 
@@ -132,7 +134,7 @@ fork p95 660ms、micro 密度 32（网络带宽准入上限）。
 
 ## M3 vertical slice（补充）
 
-M3 新增（详见 `docs/plans/2026-08-26-m3-single-node.md`）：
+M3 新增（历史执行记录见 `docs/archive/milestones/2026-08-26-m3-single-node.md`）：
 
 ```
 e2e-m3.sh          # 一键 M3 验收：U1/隔离/U2 发布与回滚/U3/1000 次 slot 无泄漏

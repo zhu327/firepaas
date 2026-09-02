@@ -22,12 +22,14 @@ import (
 	goruntime "runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/kernel/hypeman/lib/autostandby"
 	"github.com/kernel/hypeman/lib/healthcheck"
 	"github.com/kernel/hypeman/lib/hypervisor"
+	"github.com/kernel/hypeman/lib/hypervisor/firecracker"
 	"github.com/kernel/hypeman/lib/instances"
 	"github.com/kernel/hypeman/lib/network"
 	"github.com/kernel/hypeman/lib/vm_metrics"
@@ -78,7 +80,7 @@ func run() error {
 	bind := envOr("FIREPAAS_AGENT_BIND", "127.0.0.1")
 	nodePool := envOr("FIREPAAS_AGENT_NODE_POOL", "compute")
 	nodeID := envOr("FIREPAAS_AGENT_NODE_ID", hostnameOr("firepaas-node"))
-	fcVersion := envOr("FIREPAAS_AGENT_FIRECRACKER_VERSION", "v1.14.2")
+	fcVersion := os.Getenv("FIREPAAS_AGENT_FIRECRACKER_VERSION")
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -97,6 +99,12 @@ func run() error {
 	set, err := runtime.Assemble(cfg)
 	if err != nil {
 		return err
+	}
+	if fcVersion == "" {
+		fcVersion, err = (&firecracker.Starter{}).GetVersion(set.Paths)
+		if err != nil {
+			return fmt.Errorf("detect firecracker version: %w", err)
+		}
 	}
 
 	// 首次启动需要准备内核/initrd（走 HYPEMAN_DOCKER_HUB_MIRROR 补丁）。
@@ -121,7 +129,9 @@ func run() error {
 	}
 
 	// ledger/fences 年龄 GC（mvp-plan §5.5 可配置去重窗口，评审 P2-5）：
-	// 启动时清理一次，之后每小时一次。
+	// 启动时清理一次，之后每小时一次。fence 侧额外绑定 machine 存活（R2-6）：
+	// 活 machine 的高水位必须随 machine 存活，年龄窗口不适用；实例清单
+	// 不可得时跳过本轮 fence GC（不清单≠已死，误回收会让过期请求复活）。
 	retention, err := time.ParseDuration(envOr("FIREPAAS_AGENT_LEDGER_RETENTION", "24h"))
 	if err != nil || retention <= 0 {
 		return fmt.Errorf("invalid FIREPAAS_AGENT_LEDGER_RETENTION: %v", err)
@@ -133,7 +143,20 @@ func run() error {
 		} else if n > 0 {
 			slog.Info("ledger gc pruned expired records", "removed", n)
 		}
-		if n, err := fences.PruneBefore(cutoff); err != nil {
+		liveCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		live, err := liveSlotInstances(liveCtx, set.Instances)
+		cancel()
+		if err != nil {
+			slog.Warn("fences gc skipped this round: instance inventory unavailable", "error", err)
+			return
+		}
+		liveSet := make(map[string]struct{}, len(live))
+		for _, li := range live {
+			liveSet[li.MachineID] = struct{}{}
+		}
+		// 清单里没有的 machine 视为已删除（prune-if-unknown），高水位超龄即收。
+		liveFn := func(machineID string) bool { _, ok := liveSet[machineID]; return ok }
+		if n, err := fences.PruneBeforeUnlessLive(cutoff, liveFn); err != nil {
 			slog.Error("fences gc", "error", err)
 		} else if n > 0 {
 			slog.Info("fences gc pruned expired entries", "removed", n)
@@ -173,25 +196,16 @@ func run() error {
 		if err := slotManager.Load(); err != nil {
 			return err
 		}
-		live := make([]slot.LiveInstance, 0)
-		if listed, err := set.Instances.ListInstances(ensureCtx, nil); err == nil {
-			for i := range listed {
-				inst := &listed[i]
-				id := inst.Name
-				if id == "" {
-					id = inst.Id
-				}
-				live = append(live, slot.LiveInstance{
-					MachineID: id,
-					Tap:       network.GenerateTAPName(inst.Id),
-					GuestIP:   inst.IP,
-				})
-			}
-		}
-		if err := slotManager.Reconcile(ensureCtx, live); err != nil {
+		live, err := liveSlotInstances(ensureCtx, set.Instances)
+		if err != nil {
+			// 实例清单不可得时跳过启动对账：空清单会被 reconcile 解读为
+			// “全部 VM 已死”而误删 live slot。降级运行，周期 reconcile 补偿。
+			slog.Warn("slot startup reconcile skipped: instance inventory unavailable", "error", err)
+		} else if err := slotManager.Reconcile(ensureCtx, live); err != nil {
 			return fmt.Errorf("slot reconcile: %w", err)
 		}
 		slog.Info("slot network backend active", "slots", slotManager.Count())
+		startSlotReconcileLoop(ctx, set.Instances, slotManager, slotReconcileInterval())
 	}
 
 	tracker := health.New()
@@ -304,24 +318,48 @@ func run() error {
 		}
 	}()
 	// 已承诺资源（硬准入输入）：实例 Size / Vcpus 之和（M2.2）；v1.2-E
-	//（ADR-0035）增加 OverlaySize 之和（磁盘 requested 维度）。
-	listedResources := func() (memMiB, diskMiB uint64, vcpus int) {
+	//（ADR-0035）增加 OverlaySize 之和（磁盘 requested 维度）。R2（契约 D-1）：
+	// 采集带有效性——见 resourceSampler 注释；inventory 失败 → Unavailable
+	// fail-closed，容量上报回退 ≤60s last-known-good。
+	// 失败钩子每次调用计指标；warn 日志每分钟最多一条（ServiceInfo 每 5s
+	// 消费一次采样器，未节流的告警会淹没日志）。
+	var counter otelmetric.Int64Counter
+	if meter != nil {
+		if c, cerr := meter.Int64Counter("firepaas_agent_inventory_errors_total",
+			otelmetric.WithDescription("list-instances failures observed by the admission/capacity sampler")); cerr == nil {
+			counter = c
+		}
+	}
+	var hookMu sync.Mutex
+	var lastWarn time.Time
+	inventoryErrorHook := func(err error) {
+		if counter != nil {
+			counter.Add(context.Background(), 1)
+		}
+		hookMu.Lock()
+		defer hookMu.Unlock()
+		if time.Since(lastWarn) >= time.Minute {
+			lastWarn = time.Now()
+			slog.Warn("resource inventory unavailable; admission may degrade to fail-closed", "error", err)
+		}
+	}
+	sampler := newResourceSampler(func() (resourceSample, error) {
 		listCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		listed, err := set.Instances.ListInstances(listCtx, nil)
 		if err != nil {
-			return 0, 0, 0
+			return resourceSample{}, err
 		}
+		var out resourceSample
 		var totalBytes int64
 		var totalDiskBytes int64
-		var totalVCPU int
 		for i := range listed {
 			totalBytes += listed[i].Size
 			totalDiskBytes += listed[i].OverlaySize
-			totalVCPU += listed[i].Vcpus
+			out.vcpus += listed[i].Vcpus
 		}
 		if totalBytes > 0 {
-			memMiB = uint64(totalBytes) / (1024 * 1024)
+			out.memMiB = uint64(totalBytes) / (1024 * 1024)
 		}
 		if set.Volumes != nil {
 			if volumeBytes, volumeErr := set.Volumes.TotalVolumeBytes(listCtx); volumeErr == nil {
@@ -329,12 +367,12 @@ func run() error {
 			}
 		}
 		if totalDiskBytes > 0 {
-			diskMiB = uint64(totalDiskBytes) / (1024 * 1024)
+			out.diskMiB = uint64(totalDiskBytes) / (1024 * 1024)
 		}
-		return memMiB, diskMiB, totalVCPU
-	}
-	memAllocated := func() uint64 { m, _, _ := listedResources(); return m }
-	vcpuAllocated := func() int { _, _, v := listedResources(); return v }
+		return out, nil
+	}, time.Minute, inventoryErrorHook)
+	memAllocated := func() uint64 { m, _ := sampler.current(); return m.memMiB }
+	vcpuAllocated := func() int { m, _ := sampler.current(); return m.vcpus }
 	infoProvider := info.New(
 		nodeID,
 		serviceVersion,
@@ -347,7 +385,10 @@ func run() error {
 		vcpuAllocated,
 	)
 	// v1.2-E（ADR-0035）：已承诺磁盘上报（节点投影 + 硬准入输入）。
-	infoProvider.SetDiskAllocatedFunc(func() uint64 { _, d, _ := listedResources(); return d })
+	infoProvider.SetDiskAllocatedFunc(func() uint64 { m, _ := sampler.current(); return m.diskMiB })
+	// R2（契约 D-1）：资源采集有效性（无 live 样本且无 ≤60s LKG → false，
+	// create 硬准入 fail-closed；其余 RPC 不消费该判定）。
+	infoProvider.SetResourcesValidFunc(func() bool { _, ok := sampler.current(); return ok })
 	// v1.1（ADR-0018）：镜像缓存 digest 上报（scheduler 镜像亲和输入）。
 	infoProvider.SetImageDigestsFunc(func() []string {
 		listCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -407,9 +448,12 @@ func run() error {
 	// 4 MiB 会静默拒收大 stdin。消息上限与 maxBytes 流量限额语义不同。
 	grpcOpts = append(grpcOpts, grpc.MaxRecvMsgSize(16<<20))
 	var proxyTLS *tls.Config
-	tlsConf, err := agentServerTLS()
+	tlsConf, certMgr, err := agentServerTLS(meter)
 	if err != nil {
 		return err
+	}
+	if certMgr != nil {
+		defer certMgr.Close()
 	}
 	proxyHandler := http.Handler(proxy.NewWithVerifier(adapter, creds))
 	if tlsConf != nil {
@@ -425,7 +469,7 @@ func run() error {
 		)
 		proxyTLS = tlsConf
 		proxyHandler = mtls.RequireClientIdentity(proxyHandler, proxyAllowed)
-		slog.Info("agentd mTLS enabled (static certs, ADR-0006 degradation)",
+		slog.Info("agentd mTLS enabled (hot-reload certs, ADR-0006 degradation)",
 			"grpc_clients", grpcAllowed, "proxy_clients", proxyAllowed)
 	}
 	grpcServer := grpc.NewServer(grpcOpts...)
@@ -445,7 +489,17 @@ func run() error {
 		errCh <- nil
 	}()
 
-	proxyServer := &http.Server{Addr: net.JoinHostPort(bind, proxyPort), Handler: proxyHandler, TLSConfig: proxyTLS}
+	// 超时口径与 edge 一致（cmd/edge-proxy newEdgeServer）：仅 ReadHeaderTimeout
+	//（Slowloris 防护）与 IdleTimeout（回收空闲 keep-alive）；不设
+	// WriteTimeout/ReadTimeout——workload 响应体与 WS/SSE 类长流不得被整体
+	// 超时切断。
+	proxyServer := &http.Server{
+		Addr:              net.JoinHostPort(bind, proxyPort),
+		Handler:           proxyHandler,
+		TLSConfig:         proxyTLS,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       90 * time.Second, // 与 cmd/edge-proxy 同值
+	}
 	go func() {
 		slog.Info("agentd workload proxy listening", "addr", proxyServer.Addr, "mtls", proxyTLS != nil)
 		var err error
@@ -462,7 +516,26 @@ func run() error {
 	select {
 	case <-ctx.Done():
 		slog.Info("agentd shutting down")
-		grpcServer.GracefulStop()
+		// R2-5：GracefulStop 带 deadline（FIREPAAS_AGENT_GRACEFUL_STOP_TIMEOUT，
+		// 默认 30s）。GracefulStop 会等在途流结束——Exec/logs/cp 流长可达 15
+		// 分钟（runtimeLimits），不绑死节点重启/升级窗口；超时后强制 Stop()
+		// 切断全部在途 RPC（流的客户端侧按确定性重试语义处理，幂等性由
+		// operation ledger/fence 兜底）。proxy 走直接 Close（服务端推送的
+		// workload 响应没有优雅排空语义，close 即可）。
+		graceful := envDur("FIREPAAS_AGENT_GRACEFUL_STOP_TIMEOUT", 30*time.Second)
+		done := make(chan struct{})
+		go func() {
+			grpcServer.GracefulStop()
+			close(done)
+		}()
+		select {
+		case <-done:
+			slog.Info("grpc graceful stop completed")
+		case <-time.After(graceful):
+			slog.Warn("grpc graceful stop deadline reached; forcing stop and abandoning in-flight exec/log streams",
+				"timeout", graceful)
+			grpcServer.Stop()
+		}
 		_ = proxyServer.Close()
 		return nil
 	case err := <-errCh:
@@ -493,21 +566,107 @@ func envDur(key string, def time.Duration) time.Duration {
 	return d
 }
 
-// envInt 解析整数环境变量（非法/非正值回退默认）。
+// envFloat 解析 (0,1) 区间的浮点环境变量（非法/越界回退默认并告警）。
 func envFloat(key string, def float64) float64 {
-	if v, err := strconv.ParseFloat(os.Getenv(key), 64); err == nil && v > 0 && v < 1 {
-		return v
+	v := os.Getenv(key)
+	if v == "" {
+		return def
 	}
-	return def
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f <= 0 || f >= 1 {
+		slog.Warn("invalid env value; using default", "key", key, "value", v, "default", def)
+		return def
+	}
+	return f
 }
 
+// envInt 解析正整数环境变量（非法/非正值回退默认并告警）。
 func envInt(key string, def int) int {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return n
-		}
+	v := os.Getenv(key)
+	if v == "" {
+		return def
 	}
-	return def
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		slog.Warn("invalid env value; using default", "key", key, "value", v, "default", def)
+		return def
+	}
+	return n
+}
+
+// liveSlotInstances 从 hypeman 实例清单构建 slot 对账的存活实例视图。
+func liveSlotInstances(ctx context.Context, mgr instances.Manager) ([]slot.LiveInstance, error) {
+	listed, err := mgr.ListInstances(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	live := make([]slot.LiveInstance, 0, len(listed))
+	for i := range listed {
+		inst := &listed[i]
+		id := inst.Name
+		if id == "" {
+			id = inst.Id
+		}
+		live = append(live, slot.LiveInstance{
+			MachineID: id,
+			Tap:       network.GenerateTAPName(inst.Id),
+			GuestIP:   inst.IP,
+		})
+	}
+	return live, nil
+}
+
+// slotReconcileInterval 解析 FIREPAAS_AGENT_SLOT_RECONCILE_INTERVAL
+// （默认 5m；<=0 禁用；非法值回退默认并告警）。
+func slotReconcileInterval() time.Duration {
+	const def = 5 * time.Minute
+	v := os.Getenv("FIREPAAS_AGENT_SLOT_RECONCILE_INTERVAL")
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		slog.Warn("invalid FIREPAAS_AGENT_SLOT_RECONCILE_INTERVAL; using default",
+			"value", v, "default", def, "error", err)
+		return def
+	}
+	return d
+}
+
+// startSlotReconcileLoop 周期性执行 slot 对账（回收孤儿 netns、为存活实例
+// 补接线）。错误一律降级为日志（M3 真机事故教训：slot 异常绝不能让 agentd
+// 退出）；实例清单不可得时跳过本轮——空清单会让 reconcile 误判 VM 已死
+// 而误删 live slot。
+func startSlotReconcileLoop(ctx context.Context, mgr instances.Manager, m *slot.Manager, interval time.Duration) {
+	if interval <= 0 {
+		slog.Info("periodic slot reconcile disabled", "interval", interval)
+		return
+	}
+	slog.Info("periodic slot reconcile enabled", "interval", interval)
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				liveCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+				live, err := liveSlotInstances(liveCtx, mgr)
+				cancel()
+				if err != nil {
+					slog.Warn("slot reconcile skipped: instance inventory unavailable", "error", err)
+					continue
+				}
+				reconcileCtx, cancel := context.WithTimeout(ctx, time.Minute)
+				err = m.Reconcile(reconcileCtx, live)
+				cancel()
+				if err != nil {
+					slog.Warn("slot reconcile failed (degraded; retried next round)", "error", err)
+				}
+			}
+		}
+	}()
 }
 
 // envIntDefault 解析整数环境变量（0 合法，非法/负值回退默认；egress 端口用）。
@@ -591,23 +750,45 @@ func agentFeatureIDs(secretMode string, egressIDs []string, optional ...bool) []
 
 // agentServerTLS requires mTLS in production. Local plaintext operation is deliberately
 // opt-in so an omitted certificate cannot silently expose control/data-plane RPCs.
-func agentServerTLS() (*tls.Config, error) {
+// 服务端证书经 CertManager 热重载（P0#5 契约 C-1）：文件轮换无需重启；到期时间
+// 导出为 firepaas_tls_cert_not_after_seconds 供告警。
+func agentServerTLS(meter otelmetric.Meter) (*tls.Config, *mtls.CertManager, error) {
 	certFile := os.Getenv("FIREPAAS_AGENT_TLS_CERT")
 	keyFile := os.Getenv("FIREPAAS_AGENT_TLS_KEY")
 	caFile := os.Getenv("FIREPAAS_AGENT_TLS_CA")
 	if certFile == "" && keyFile == "" && caFile == "" {
 		if strings.EqualFold(os.Getenv("FIREPAAS_ALLOW_INSECURE_DEV"), "true") {
 			slog.Warn("agentd running without TLS because FIREPAAS_ALLOW_INSECURE_DEV=true")
-			return nil, nil
+			return nil, nil, nil
 		}
-		return nil, fmt.Errorf(
+		return nil, nil, fmt.Errorf(
 			"agent mTLS required: set FIREPAAS_AGENT_TLS_CERT/KEY/CA (or FIREPAAS_ALLOW_INSECURE_DEV=true for local development only)",
 		)
 	}
 	if certFile == "" || keyFile == "" || caFile == "" {
-		return nil, fmt.Errorf("FIREPAAS_AGENT_TLS_CERT/KEY/CA must be set together")
+		return nil, nil, fmt.Errorf("FIREPAAS_AGENT_TLS_CERT/KEY/CA must be set together")
 	}
-	return mtls.ServerConfig(certFile, keyFile, caFile)
+	var hook func(time.Time)
+	if meter != nil {
+		if gauge, err := meter.Float64Gauge("firepaas_tls_cert_not_after_seconds"); err == nil {
+			hook = func(expiry time.Time) {
+				gauge.Record(context.Background(), float64(expiry.Unix()),
+					otelmetric.WithAttributes(attribute.String("file", certFile)))
+			}
+		}
+	}
+	cm, err := mtls.NewCertManager(certFile, keyFile,
+		envDur("FIREPAAS_AGENT_TLS_CERT_RELOAD_INTERVAL", time.Minute),
+		slog.Default().With("component", "mtls"), hook)
+	if err != nil {
+		return nil, nil, err
+	}
+	conf, err := mtls.ServerConfigWithManager(cm, caFile)
+	if err != nil {
+		cm.Close()
+		return nil, nil, err
+	}
+	return conf, cm, nil
 }
 
 func hostnameOr(def string) string {

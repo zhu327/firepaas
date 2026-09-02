@@ -71,7 +71,7 @@ nohup env FIREPAAS_POSTGRES_URL='postgres://firepaas:firepaas@127.0.0.1:5432/fir
   FIREPAAS_AGENT_TLS_CERT="$CERT_DIR/control-plane.crt" FIREPAAS_AGENT_TLS_KEY="$CERT_DIR/control-plane.key" \
   FIREPAAS_AGENT_TLS_CA="$CERT_DIR/ca.crt" \
   FIREPAAS_ROLLOUT_TIMEOUT=180s FIREPAAS_ROLLOUT_DRAIN=10s \
-  FIREPAAS_GC_MODE=dry-run FIREPAAS_GC_INTERVAL=20s FIREPAAS_GC_MIN_AGE=1s \
+  FIREPAAS_LOCAL_GC_MODE=dry-run FIREPAAS_GC_INTERVAL=20s FIREPAAS_GC_MIN_AGE=1s \
   FIREPAAS_REGISTRY_ALLOWLIST="127.0.0.1:5000" FIREPAAS_IMAGE_REQUIRE_DIGEST=true \
   "$LAB_BIN/firepaas-api" > "$RUN_DIR/v12-api.log" 2>&1 &
 nohup env FIREPAAS_EDGE_PORT=$EDGE_HTTP FIREPAAS_EDGE_TLS_LISTEN=":$EDGE_TLS" \
@@ -169,7 +169,7 @@ mark "canary 经路由可见"
 # 镜像无 env/grep，用 shell 内建参数展开：无 TOKEN 时输出 unset。
 exec_env=$(authed_raw -X POST "http://127.0.0.1:$API_PORT/v1/machines/$secret_machine/exec" \
   -H 'Content-Type: application/json' \
-  -d '{"command":["/bin/sh","-c","echo exec_env_token=${TOKEN-unset}"]}')
+  -d '{"operation_id":"op-exec-env-'"$RUN_ID"'","command":["/bin/sh","-c","echo exec_env_token=${TOKEN-unset}"]}')
 EXEC_ENV="$exec_env" python3 - <<'PY' || fail "exec 环境不应含 secret"
 import json, os, base64
 lines = [json.loads(l) for l in os.environ["EXEC_ENV"].splitlines() if l.strip()]
@@ -222,7 +222,7 @@ authed_curl "http://127.0.0.1:$API_PORT/v1/machines/$machine_id/logs?follow=fals
 grep -qiE "ontime|healthz|ready|listen" "$RUN_DIR/logs.txt" || log "    (warn) logs 无标志行；继续（serial 输出可能为空）"
 exec_out=$(authed_raw -X POST "http://127.0.0.1:$API_PORT/v1/machines/$machine_id/exec" \
   -H 'Content-Type: application/json' \
-  -d '{"command":["/bin/sh","-c","echo hello-v12"]}')
+  -d '{"operation_id":"op-exec-hello-'"$RUN_ID"'","command":["/bin/sh","-c","echo hello-v12"]}')
 EXEC_OUT="$exec_out" python3 - <<'PY' || fail "exec 输出/退出码错误"
 import json, os, base64
 lines = [json.loads(l) for l in os.environ["EXEC_OUT"].splitlines() if l.strip()]
@@ -236,7 +236,7 @@ mark "logs/exec OK"
 log "6) C：cp up/down checksum + symlink/目录拒绝"
 src="$RUN_DIR/v12-src.bin"
 head -c 1048576 /dev/urandom > "$src"   # 1 MiB 随机文件
-authed_curl -X PUT "http://127.0.0.1:$API_PORT/v1/machines/$machine_id/files?path=%2Ftmp%2Fv12-file" \
+authed_curl -X PUT "http://127.0.0.1:$API_PORT/v1/machines/$machine_id/files?path=%2Ftmp%2Fv12-file&operation_id=op-copy-v12-$RUN_ID" \
   -H 'Content-Type: application/octet-stream' --data-binary "@$src" | grep -q '"bytes_written":1048576' || fail "cp up 失败"
 authed_curl "http://127.0.0.1:$API_PORT/v1/machines/$machine_id/files?path=%2Ftmp%2Fv12-file" \
   -o "$RUN_DIR/v12-dst.bin"
@@ -244,12 +244,12 @@ cmp "$src" "$RUN_DIR/v12-dst.bin" || fail "cp down checksum 不一致"
 # 目录 cp 拒绝（v1.2 只支持单普通文件）
 dir_code=$(authed_raw -o /dev/null -w '%{http_code}' \
   "http://127.0.0.1:$API_PORT/v1/machines/$machine_id/files?path=%2Ftmp")
-[[ "$dir_code" == "400" ]] || fail "目录 cp 应 400，got $dir_code"
+[[ "$dir_code" == "400" || "$dir_code" == "404" ]] || fail "目录 cp 应被拒绝（400/404），got $dir_code"
 # symlink 拒绝：先 exec 建链，再 GET。无论 guest 返回 header（agent 拒
 # 绝→400）还是 copy error（→404），关键不变量是拿不到 symlink 目标内容。
 authed_raw -X POST "http://127.0.0.1:$API_PORT/v1/machines/$machine_id/exec" \
   -H 'Content-Type: application/json' \
-  -d '{"command":["/bin/sh","-c","ln -sf /etc/passwd /tmp/v12-link; echo ln_rc=$?"]}' >/dev/null
+  -d '{"operation_id":"op-exec-symlink-'"$RUN_ID"'","command":["/bin/sh","-c","ln -sf /etc/passwd /tmp/v12-link; echo ln_rc=$?"]}' >/dev/null
 link_code=$(authed_raw -o /dev/null -w '%{http_code}' \
   "http://127.0.0.1:$API_PORT/v1/machines/$machine_id/files?path=%2Ftmp%2Fv12-link")
 [[ "$link_code" == "400" || "$link_code" == "404" ]] || fail "symlink cp 应被拒绝（400/404），got $link_code"
@@ -263,7 +263,9 @@ log "7) D：TTL 到期 → 摘路由 + desired DELETED"
 ttl_machine="v12-ttl-$RUN_ID"
 authed_curl -X POST "http://127.0.0.1:$API_PORT/v1/machines" \
   -H 'Content-Type: application/json' \
-  -d "{\"project_id\":\"dev\",\"app_id\":\"$ttl_machine\",\"hostname\":\"$ttl_machine.$DOMAIN\",\"image\":\"$ONTIME_REF\",\"machine_id\":\"$ttl_machine\",\"execution_id\":\"exec-1\",\"operation_id\":\"op-ttl-create-$RUN_ID\",\"ttl_seconds\":25,\"health_check\":{\"type\":\"http\",\"target\":\"http://127.0.0.1:8080/\",\"interval_seconds\":2,\"timeout_seconds\":2,\"unhealthy_threshold\":3}}" >/dev/null
+  -d "{\"project_id\":\"dev\",\"app_id\":\"$ttl_machine\",\"hostname\":\"$ttl_machine.$DOMAIN\",\"image\":\"$ONTIME_REF\",\"operation_id\":\"op-ttl-create-$RUN_ID\",\"ttl_seconds\":25,\"health_check\":{\"type\":\"http\",\"target\":\"http://127.0.0.1:8080/\",\"interval_seconds\":2,\"timeout_seconds\":2,\"unhealthy_threshold\":3}}" >/dev/null
+# machine_id 由服务端按 (app_id, replica_ordinal) 生成（P0：fence 字段不再接受客户端提交）。
+ttl_machine="$ttl_machine-r0"
 for _ in $(seq 1 60); do
   st=$(pg "SELECT desired_state FROM machines WHERE id='$ttl_machine'")
   [[ "$st" == "DELETED" ]] && break
@@ -306,7 +308,8 @@ authed_raw -o /dev/null -X PUT "http://127.0.0.1:$API_PORT/v1/projects/dev/quota
 qm="v12-qmachine-$RUN_ID"
 authed_raw -o /dev/null -X POST "http://127.0.0.1:$API_PORT/v1/machines" \
   -H 'Content-Type: application/json' \
-  -d "{\"project_id\":\"dev\",\"app_id\":\"$qm\",\"hostname\":\"$qm.$DOMAIN\",\"image\":\"$ONTIME_REF\",\"machine_id\":\"$qm\",\"execution_id\":\"exec-q1\",\"operation_id\":\"op-qmachine-$RUN_ID\"}" >/dev/null
+  -d "{\"project_id\":\"dev\",\"app_id\":\"$qm\",\"hostname\":\"$qm.$DOMAIN\",\"image\":\"$ONTIME_REF\",\"operation_id\":\"op-qmachine-$RUN_ID\"}" >/dev/null
+qm="$qm-r0"   # 服务端生成 machine_id = {app_id}-r{replica_ordinal}
 QUOTA_BLOCKED=0
 for _ in $(seq 1 40); do
   qs=$(pg "SELECT status FROM operations WHERE id='op-qmachine-$RUN_ID'")

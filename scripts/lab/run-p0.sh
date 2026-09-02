@@ -17,11 +17,12 @@ CONFIG="$HERE/hypeman-p0.yaml"
 curl -fsS "$NOMAD_ADDR/v1/status/leader" >/dev/null || { echo "ERROR: Nomad 不可达" >&2; exit 1; }
 
 cd "$ROOT_DIR"
+JOB_VARS=(-var "repo_root=$ROOT_DIR" -var "lab_bin=$(dirname "$BIN")")
 echo "==> nomad job plan"
-nomad job plan iac/nomad/hypeman-p0.hcl || echo "    (plan rc=$?, Nomad 2.x 在有待提交变更时返回 1，继续 run)"
+nomad job plan "${JOB_VARS[@]}" iac/nomad/hypeman-p0.hcl || echo "    (plan rc=$?, Nomad 2.x 在有待提交变更时返回 1，继续 run)"
 
 echo "==> nomad job run"
-nomad job run iac/nomad/hypeman-p0.hcl
+nomad job run "${JOB_VARS[@]}" iac/nomad/hypeman-p0.hcl
 
 echo "==> 等待 alloc"
 for _ in $(seq 1 30); do

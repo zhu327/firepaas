@@ -51,6 +51,37 @@ func TestCleanupStaleDatasetSpool(t *testing.T) {
 	}
 }
 
+// R2-7：CopyTo 上传 spool（firepaas-copy-to-*）同窗清理——崩溃窗口下其
+// defer Remove 不执行，超龄文件必须随 dataset spool 一起回收。
+func TestCleanupStaleSpoolCoversCopyToUploads(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TMPDIR", dir)
+	staleCopy := filepath.Join(dir, "firepaas-copy-to-12345")
+	freshCopy := filepath.Join(dir, "firepaas-copy-to-67890")
+	for _, p := range []string{staleCopy, freshCopy} {
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	past := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(staleCopy, past, past); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := CleanupStaleDatasetSpool(time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed = %d, want 1 (only the stale copy-to spool)", removed)
+	}
+	if _, err := os.Stat(staleCopy); !os.IsNotExist(err) {
+		t.Fatal("stale copy-to spool must be removed")
+	}
+	if _, err := os.Stat(freshCopy); err != nil {
+		t.Fatal("fresh copy-to spool (possible in-flight session) must survive")
+	}
+}
+
 func TestCleanupStaleDatasetSpoolReportsStatErrors(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("TMPDIR", dir)

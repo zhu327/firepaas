@@ -262,6 +262,7 @@ func (s *copyToFakeStream) Recv() (*pb.CopyToInput, error) {
 	s.recvN++
 	return f, nil
 }
+
 func (s *copyToFakeStream) SendAndClose(resp *pb.CopyToResponse) error { s.response = resp; return nil }
 func (s *copyToFakeStream) SetHeader(metadata.MD) error                { return nil }
 func (s *copyToFakeStream) SendHeader(metadata.MD) error               { return nil }

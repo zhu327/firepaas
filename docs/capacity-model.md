@@ -41,10 +41,10 @@ agentd 依赖 firecracker 二进制、内核与 guest rootfs 基件;分发与版
 
 | 项 | 决策 |
 |---|---|
-| 分发渠道 | 单机实验室:构建产物经 Nomad raw_exec 绝对路径执行(`scripts/lab/build-hypeman.sh`);多机形态:http(s) artifact + checksum(待实现 `hypeman-p0-remote.hcl`) |
-| 版本 pin | hypeman git `72440f5`(含 lab 镜像站补丁);Firecracker v1.14.2(嵌入);CH v49.0/v51.1(嵌入);Caddy v2.10.2(嵌入) |
-| 升级路径 | (待填:与 agent drain/rebuild 升级的先后关系) |
-| snapshot compatibility key | Firecracker v1.14.2 + ch-6.12.8-kernel-3.0-202605291 + hypeman 默认 snapshot 格式 + CPU vendor AuthenticAMD/model 25/SVM + host KVM 特性;不兼容时 cold-start 降级 |
+| 分发渠道 | 正式构建通过 `github.com/zhu327/hypeman v0.4.0-firepaas` Go module 消费嵌入式 runtime；Nomad raw_exec 执行已构建的 agentd。`build-hypeman.sh` 仅保留为历史 P0 复现工具，不是发布链路。 |
+| 版本 pin | module/tag 和 `go.sum` 固定 hypeman；Firecracker compatibility key 由 agentd 从实际嵌入 runtime 检测，不再以本文历史版本常量上报。 |
+| 升级路径 | 先 drain 节点，替换并校验 agent artifact，再恢复调度；实验室入口见 `scripts/lab/upgrade-agentd.sh`。 |
+| snapshot compatibility key | 实际 Firecracker/runtime 版本 + kernel/rootfs/snapshot 格式 + CPU/KVM 特征；不兼容时禁止 restore，并回退到 digest-pinned image cold-start。 |
 | 不兼容降级 | 禁止 restore，回退到 digest-pinned image cold-start |
 
 ## Host/runtime 容量与稳定性边界（M0 采样，M5 实测回填 2026-08-27）
@@ -66,7 +66,7 @@ agentd 依赖 firecracker 二进制、内核与 guest rootfs 基件;分发与版
 - 受限网络基线:`HYPEMAN_DOCKER_HUB_MIRROR=docker.m.daocloud.io`(hypeman
   lab 分支补丁,仅重写 docker.io 网络访问,不改存储命名);生产环境使用
   registry allowlist,不依赖公共镜像站。
-- registry allowlist、最大镜像压缩体积、最大解包体积与磁盘预检查:（待填）。
+- registry allowlist、镜像压缩/解包限制和磁盘准入由当前 image policy、disk quota 与 inventory 实现共同约束；具体阈值以部署配置和 ADR-0035/0036/0037 为准，本文不复制易漂移的默认值。
 - registry 使用短期 scoped credential 或 agent credential provider，不持久化长期密码。
 
 ## 规格示例

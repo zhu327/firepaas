@@ -361,9 +361,15 @@ func TestImageAffinityDisabledWithZeroWeight(t *testing.T) {
 		t.Fatalf("default weight must prefer cached node, got %s", plOn.NodeID)
 	}
 
+	// P1#14a：经 New 归一后 WeightImage 必被补成默认 0.5（0 视为未设置——
+	// 半配置不再静默丢失镜像亲和）；打分层仍把 0 视作关闭，仅直接构造
+	// Placer（不经 New）时可表达。
 	cfg := DefaultBestOfKConfig()
 	cfg.WeightImage = 0
-	pOff := New(cfg, Options{})
+	if got := New(cfg, Options{}).cfg.WeightImage; got != 0.5 {
+		t.Fatalf("New must fill WeightImage default on partial config, got %v", got)
+	}
+	pOff := &Placer{cfg: cfg}
 	plOff, err := pOff.Place(Request{VCPU: 1, MemMib: 512, ImageDigest: "sha256:abc"},
 		[]Node{cachedBusy, emptyCold}, rand.New(rand.NewSource(1)))
 	if err != nil {
@@ -371,6 +377,21 @@ func TestImageAffinityDisabledWithZeroWeight(t *testing.T) {
 	}
 	if plOff.NodeID != "empty-cold" {
 		t.Fatalf("weight=0 must ignore image cache (resource score decides), got %s", plOff.NodeID)
+	}
+
+	// 显式关闭的公共入口：Options.ImageAffinityDisabled 保留 WeightImage=0
+	// （FIREPAAS_SCHED_WEIGHT_IMAGE=0 的接线路径）。
+	pOffPublic := New(cfg, Options{ImageAffinityDisabled: true})
+	if got := pOffPublic.cfg.WeightImage; got != 0 {
+		t.Fatalf("ImageAffinityDisabled must keep WeightImage=0, got %v", got)
+	}
+	plOff2, err := pOffPublic.Place(Request{VCPU: 1, MemMib: 512, ImageDigest: "sha256:abc"},
+		[]Node{cachedBusy, emptyCold}, rand.New(rand.NewSource(1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plOff2.NodeID != "empty-cold" {
+		t.Fatalf("disabled affinity must behave like weight=0, got %s", plOff2.NodeID)
 	}
 }
 
@@ -545,5 +566,61 @@ func TestDiskHardFilter(t *testing.T) {
 	full := []Node{nodes[0]}
 	if _, err := p.Place(Request{VCPU: 1, MemMib: 512, DiskMib: 1000}, full, rand.New(rand.NewSource(1))); err == nil {
 		t.Fatal("disk-exceeded single node must yield ErrNoCandidates")
+	}
+}
+
+// P1#14a：New 必须补齐所有零值字段——全零配置等价默认配置。
+func TestNewNormalizesFullyZeroConfig(t *testing.T) {
+	p := New(BestOfKConfig{}, Options{})
+	if p.cfg != DefaultBestOfKConfig() {
+		t.Fatalf("zero config normalized to %+v, want default %+v", p.cfg, DefaultBestOfKConfig())
+	}
+}
+
+// P1#14a：半配置不得丢失未指定维度。旧实现中 WeightImage 的默认填充条件
+// 依赖 WeightCPU/WeightMem 仍为零，而它们在前面已被补成 0.5——条件永远不
+// 触发，只设部分权重的调用方会静默丢失镜像亲和。
+func TestNewPartialConfigKeepsDefaults(t *testing.T) {
+	p := New(BestOfKConfig{WeightCPU: 0.8}, Options{})
+	if p.cfg.WeightCPU != 0.8 {
+		t.Fatalf("explicit WeightCPU lost: %+v", p.cfg)
+	}
+	if p.cfg.R != 4 || p.cfg.MemR != 1.0 || p.cfg.DiskR != 1.0 ||
+		p.cfg.K != 3 || p.cfg.Alpha != 0.5 || p.cfg.WeightImage != 0.5 {
+		t.Fatalf("partial config normalization = %+v", p.cfg)
+	}
+	// 行为断言：半配置下镜像缓存亲和仍参与打分（已缓存节点胜出）。
+	cached := healthyNode("cached", "compute", 64, 65536)
+	cached.CachedImageDigests = map[string]bool{"sha256:x": true}
+	uncached := healthyNode("uncached", "compute", 64, 65536)
+	uncached.CachedImageDigests = map[string]bool{}
+	pl, err := p.Place(Request{VCPU: 1, MemMib: 1, ImageDigest: "sha256:x"},
+		[]Node{uncached, cached}, rand.New(rand.NewSource(1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pl.NodeID != "cached" {
+		t.Fatalf("image affinity lost on partial config: placed on %s", pl.NodeID)
+	}
+}
+
+// P1#14a：DiskR 漏补（=0）时 canFit 会把任何磁盘承诺判为超售，把
+// DiskTotalMib>0 的节点全部硬过滤掉（集群不可调度）。New 必须补成 1.0。
+func TestNewNormalizesDiskR(t *testing.T) {
+	cfg := DefaultBestOfKConfig()
+	cfg.DiskR = 0 // 模拟“只设了部分字段”的半配置输入
+	p := New(cfg, Options{})
+	if p.cfg.DiskR != 1.0 {
+		t.Fatalf("DiskR must be defaulted to 1.0, got %v", p.cfg.DiskR)
+	}
+	node := healthyNode("disk-node", "compute", 64, 65536)
+	node.DiskTotalMib = 51200
+	pl, err := p.Place(Request{VCPU: 1, MemMib: 512, DiskMib: 10240},
+		[]Node{node}, rand.New(rand.NewSource(1)))
+	if err != nil {
+		t.Fatalf("DiskR=0 normalization must not hard-filter every node: %v", err)
+	}
+	if pl.NodeID != "disk-node" {
+		t.Fatalf("placed on %s", pl.NodeID)
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
@@ -620,6 +621,19 @@ func (a *Adapter) Create(ctx context.Context, req *pb.CreateMachineRequest) (*pb
 	}
 
 	inst, err := a.instances.CreateInstance(ctx, hreq)
+	if err != nil && errors.Is(err, instances.ErrImageNotReady) {
+		// 冷镜像首创建：hypeman 已异步启动 pull 并即刻返回 ErrImageNotReady。
+		// 在 RPC 窗口内等待 ready 后重试一次，而不是把“pull 中”作为失败上抛——
+		// secret 机器的任何 create RPC 错误都按 fail-closed 视为不确定并回收
+		// execution（ADR-0024），普通机器也会多一轮 requeue 抖动与调度记账
+		// 噪声（真机验收复现）。WaitForReady 本身 ctx 有界。
+		slog.Info("image pull in progress, waiting before create retry",
+			"machine_id", req.MachineId, "image", hreq.Image)
+		if werr := a.images.WaitForReady(ctx, hreq.Image); werr != nil {
+			return nil, fmt.Errorf("hypeman create: wait image ready: %w", werr)
+		}
+		inst, err = a.instances.CreateInstance(ctx, hreq)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("hypeman create: %w", err)
 	}
@@ -632,7 +646,7 @@ func (a *Adapter) Create(ctx context.Context, req *pb.CreateMachineRequest) (*pb
 		// 刚创建的实例并返回错误（controller 会按退避重试）。
 		tap := network.GenerateTAPName(inst.Id)
 		if _, err := a.slots.Attach(ctx, req.MachineId, tap, inst.IP); err != nil {
-			_ = a.instances.DeleteInstance(ctx, inst.Id)
+			a.deleteInstanceOrWarn(ctx, inst.Id, req.MachineId, "slot attach cleanup")
 			return nil, fmt.Errorf("slot attach: %w", err)
 		}
 	}
@@ -642,12 +656,12 @@ func (a *Adapter) Create(ctx context.Context, req *pb.CreateMachineRequest) (*pb
 	if a.egressMgr != nil && spec.GetNetwork().GetEgress() != nil {
 		policy, perr := egress.FromProto(spec.GetNetwork().GetEgress())
 		if perr != nil {
-			_ = a.instances.DeleteInstance(ctx, inst.Id)
+			a.deleteInstanceOrWarn(ctx, inst.Id, req.MachineId, "egress policy cleanup")
 			return nil, fmt.Errorf("egress policy: %w", perr)
 		}
 		if err := a.egressMgr.Apply(ctx, req.MachineId, spec.GetExecutionId(),
 			spec.GetProjectId(), spec.GetAppId(), inst.IP, policy); err != nil {
-			_ = a.instances.DeleteInstance(ctx, inst.Id)
+			a.deleteInstanceOrWarn(ctx, inst.Id, req.MachineId, "egress apply cleanup")
 			return nil, fmt.Errorf("egress apply: %w", err)
 		}
 	}
@@ -655,7 +669,7 @@ func (a *Adapter) Create(ctx context.Context, req *pb.CreateMachineRequest) (*pb
 		// 同步投递（ADR-0024）：值只在本函数内存与 guest tmpfs 存在；
 		// 失败即销毁实例（gate 未放行，无泄漏面），控制面换新 execution 重试。
 		if err := a.deliverSecrets(ctx, inst.Id, req.SecretEnv); err != nil {
-			_ = a.instances.DeleteInstance(ctx, inst.Id)
+			a.deleteInstanceOrWarn(ctx, inst.Id, req.MachineId, "secret delivery cleanup")
 			return nil, fmt.Errorf("secret delivery: %w", err)
 		}
 		// 明文生命周期收口：投递完成立即清零，缩短明文在 agent 内存的停留。
@@ -664,6 +678,16 @@ func (a *Adapter) Create(ctx context.Context, req *pb.CreateMachineRequest) (*pb
 		}
 	}
 	return mapMachine(inst), nil
+}
+
+// deleteInstanceOrWarn 在 create 失败回收路径上尽力删除刚创建的实例。
+// 删除失败不再静默吞掉：孤儿实例（hypeman Name == machine_id）依赖控制面
+// R6 orphan 周期扫描兜底清理，本机日志是事故排查的唯一线索。
+func (a *Adapter) deleteInstanceOrWarn(ctx context.Context, instanceID, machineID, op string) {
+	if err := a.instances.DeleteInstance(ctx, instanceID); err != nil {
+		slog.Warn("create cleanup failed; orphan instance relies on control-plane R6 sweep",
+			"op", op, "machine_id", machineID, "instance_id", instanceID, "error", err)
+	}
 }
 
 // List 返回全部（或按 project 过滤）的 machine。
@@ -702,37 +726,83 @@ func (a *Adapter) List(ctx context.Context, projectID string) ([]*pb.Machine, er
 	return out, nil
 }
 
-// Delete 停止并删除 machine。machineID 是 firepaas 稳定 ID（hypeman Name）；
-// hypeman DeleteInstance 只接受其内部 ID，因此先 GetInstance 解析。expectedExecution
-// 非空时必须在删除前验证当前实例 tag；调用方须以 machine fence 串行这段
-// 读取、验证、删除，避免旧 execution 删除新 execution。
-func (a *Adapter) Delete(ctx context.Context, machineID, expectedExecution string) error {
+// Delete 分阶段删除 machine（R2：分阶段可恢复快）。每阶段幂等、失败独立
+// 报告——前置阶段失败不再截断后续清理，VM NotFound 只代表 runtime 阶段已
+// 完成（首次成功删除后重试会收到 NotFound，届时必须继续补做其余阶段）：
+//  1. runtime：GetInstance 校验 execution → DeleteInstance；
+//     hypeman DeleteInstance 幂等性假设——成功删除后重放得到 NotFound，与
+//     其 release 对缺失 TAP 的 best-effort 语义同源（见包注释的集成约定）；
+//  2. slot Release（未分配 slot 时 no-op）；
+//  3. egress Remove（代理注册 + slot 规则，未注册时 no-op）；
+//  4. health Remove（进程内视图，无失败面）。
+//
+// 每阶段失败 warn-log 并聚合为可重试错误返回；execution 不匹配仍整体中止
+// ErrExecutionMismatch：删除目标的实例 tags 属于另一个 execution——
+// 该实例属于更新的 execution，任何清理都会误伤 live VM。这是确定性
+// 门禁（重试不会收敛），server 映射为 FailedPrecondition，controller
+// 据此区分“目标机已换代（收敛）”与真异常。
+var ErrExecutionMismatch = errors.New("execution mismatch")
+
+// machineID 是 firepaas 稳定 ID（hypeman Name）；hypeman DeleteInstance
+// 只接受内部 ID，因此先 GetInstance 解析。调用方须以 machine fence 串行
+// 这段读取、验证、删除，避免旧 execution 删除新 execution。
+//
+// fenceGen 是删除请求的 generation（已过 fence 高水位校验）。实例 tags
+// execution 不同但 tagGeneration < fenceGen 时，实例是已换代 execution 的
+// 所所造/或代理孤儿（不是该 op 删除权限外的资产），必须随之删除——否则
+// 「机器行已前进到新 execution，实例还是旧代」状态会使 old/new 两边的
+// delete 互相拒绝形成永續 reap 活锁（真机验收复现）。tagGeneration >
+// fenceGen 才是真的“delete 目标属于更新的 execution”，必须拒絶。
+func (a *Adapter) Delete(ctx context.Context, machineID, expectedExecution string, fenceGen uint64) error {
+	var errs []error
 	inst, err := a.instances.GetInstance(ctx, machineID)
-	if err != nil {
-		return fmt.Errorf("hypeman get for delete: %w", err)
-	}
-	if expectedExecution != "" && inst.Tags[tagExecution] != expectedExecution {
-		return fmt.Errorf("execution mismatch for %s: want %s got %s",
-			machineID, expectedExecution, inst.Tags[tagExecution])
-	}
-	if err := a.instances.DeleteInstance(ctx, inst.Id); err != nil {
-		return fmt.Errorf("hypeman delete: %w", err)
+	switch {
+	case errors.Is(err, instances.ErrNotFound):
+		// 阶段 1 已完成：实例不存在不等于可以跳过其余阶段。
+	case err != nil:
+		slog.Warn("delete phase runtime lookup failed; remaining phases continue",
+			"machine_id", machineID, "error", err)
+		errs = append(errs, fmt.Errorf("hypeman get for delete: %w", err))
+	default:
+		if expectedExecution != "" && inst.Tags[tagExecution] != expectedExecution {
+			tagGen, _ := strconv.ParseUint(inst.Tags[tagGeneration], 10, 64)
+			if tagGen == 0 || tagGen >= fenceGen {
+				// tagGen > fenceGen：实例属于更新的 execution，删除会误伤 live VM；
+				// tagGen == fenceGen：同代不同 execution 是非法状态（execution 与
+				// generation 一一对应），无法建立此战的代际序；tagGen == 0：元数
+				// 据不全。三种情况都保守拒絶（保持 system 不变式的讱唯一路径）。
+				return fmt.Errorf("%w for %s: want %s got %s",
+					ErrExecutionMismatch, machineID, expectedExecution, inst.Tags[tagExecution])
+			}
+			slog.Warn("orphaned instance from superseded execution; deleting",
+				"machine_id", machineID, "instance_execution", inst.Tags[tagExecution],
+				"instance_generation", tagGen, "delete_execution", expectedExecution)
+		}
+		if err := a.instances.DeleteInstance(ctx, inst.Id); err != nil && !errors.Is(err, instances.ErrNotFound) {
+			slog.Warn("delete phase runtime removal failed; remaining phases continue",
+				"machine_id", machineID, "error", err)
+			errs = append(errs, fmt.Errorf("hypeman delete: %w", err))
+		}
 	}
 	if a.slots != nil {
 		if err := a.slots.Release(ctx, machineID); err != nil {
-			return fmt.Errorf("slot release: %w", err)
+			slog.Warn("delete phase slot release failed; remaining phases continue",
+				"machine_id", machineID, "error", err)
+			errs = append(errs, fmt.Errorf("slot release: %w", err))
 		}
 	}
 	// v1.3-A（ADR-0027）：egress 策略随 machine 删除清除（代理注册 + slot 规则）。
 	if a.egressMgr != nil {
 		if err := a.egressMgr.Remove(ctx, machineID); err != nil {
-			return fmt.Errorf("egress remove: %w", err)
+			slog.Warn("delete phase egress remove failed; remaining phases continue",
+				"machine_id", machineID, "error", err)
+			errs = append(errs, fmt.Errorf("egress remove: %w", err))
 		}
 	}
 	if a.health != nil {
 		a.health.Remove(machineID)
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // GetEndpoint 解析 proxy 需要的 workload endpoint（M1 bridge guest IP）。
@@ -1076,6 +1146,52 @@ func (a *Adapter) Resume(ctx context.Context, machineID, executionID string) (*p
 		return nil, err
 	}
 	return mapMachine(inst), nil
+}
+
+// ConvergePause（R2 claimed lifecycle）观测 machine 是否已收敛到暂停目标态
+// （Standby/Paused）：Found=true 即认领上次 pause claim 的效果。machine 不
+// 存在或尚未收敛时 Found=false，协议层重跑幂等的 Pause。execution 不匹配
+// 仍返回错误（旧代操作不得触碰新代实例）。
+func (a *Adapter) ConvergePause(ctx context.Context, machineID, executionID string) (*pb.Machine, bool, error) {
+	inst, err := a.instances.GetInstance(ctx, machineID)
+	if err != nil {
+		if errors.Is(err, instances.ErrNotFound) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("converge pause: get instance %s: %w", machineID, err)
+	}
+	if executionID != "" && inst.Tags[tagExecution] != executionID {
+		return nil, false, fmt.Errorf("execution mismatch for %s: want %s got %s",
+			machineID, executionID, inst.Tags[tagExecution])
+	}
+	if inst.State == instances.StateStandby || inst.State == instances.StatePaused {
+		return mapMachine(inst), true, nil
+	}
+	return nil, false, nil
+}
+
+// ConvergeResume（R2 claimed lifecycle）观测 machine 是否已收敛到 Running。
+// 已收敛仍重放幂等 slot 重挂——崩溃窗口（restore 成功、reattach 之前崩溃）
+// 必须补上，否则 VM Running 但无数据面（与 RecoverRestore 的收敛纪律同源）。
+func (a *Adapter) ConvergeResume(ctx context.Context, machineID, executionID string) (*pb.Machine, bool, error) {
+	inst, err := a.instances.GetInstance(ctx, machineID)
+	if err != nil {
+		if errors.Is(err, instances.ErrNotFound) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("converge resume: get instance %s: %w", machineID, err)
+	}
+	if executionID != "" && inst.Tags[tagExecution] != executionID {
+		return nil, false, fmt.Errorf("execution mismatch for %s: want %s got %s",
+			machineID, executionID, inst.Tags[tagExecution])
+	}
+	if inst.State != instances.StateRunning {
+		return nil, false, nil
+	}
+	if err := a.reattachSlot(ctx, machineID, inst); err != nil {
+		return nil, false, err
+	}
+	return mapMachine(inst), true, nil
 }
 
 // ErrMachineNotFound 表示 machine 在 agent 侧不存在（实例已删/未建）。

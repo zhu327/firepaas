@@ -38,3 +38,18 @@ v1.4 运维注意：
 - API 设置 `FIREPAAS_METRICS_TOKEN` 后，需在 prometheus.yml 的 job 里追加
   `authorization: credentials: <token>`（P3-15）。
 - 该栈只读 API，不参与数据面；停止不影响业务。
+
+v1.5 告警面增补（生产就绪 P2#21）：
+
+- `prometheus-alerts.yml` 新增 firepaas-certs（证书 30d/7d 到期，数据源
+  契约 C-1 的 `firepaas_tls_cert_not_after_seconds`）、firepaas-edge（stale
+  极限/beyond-stale 拒绝/catalog token 错误）与 firepaas-slo-burn 组
+  （edge 可用性 burn-rate 1h/5m 快走 + 6h/30m 慢走）。slo-spec.yaml 其余
+  目标（node-failure/failover/vip/quorum/inventory-age）目前仅由 probe
+  采样评估，无 Prometheus 指标源，未注册告警——获得指标源后再补。
+- `alertmanager.yml`：route 树（critical 首报 10s + 1h 重复，critical 抑制
+  同名 warning）与内部 IM webhook receiver 示例；部署时以
+  `amtool check-config` 校验，webhook 地址按环境替换、不提交真实凭证。
+- edge job 的 Prometheus target 已切换为 Nomad 服务发现
+  （`firepaas-edge-metrics`，edge.hcl 固定 9465 端口）；单机实验室的
+  `host.docker.internal:9465` 路径在 prometheus.yml 中保留为注释形式。

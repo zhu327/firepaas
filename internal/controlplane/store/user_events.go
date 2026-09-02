@@ -44,9 +44,12 @@ const (
 	UserEventMachineRestartBlock = "machine.restart_blocked"
 	UserEventRolloutUpdated      = "rollout.updated"
 	UserEventSecretDelivered     = "secret.delivered"
-	UserEventQuotaRejected       = "quota.rejected"
-	UserEventRateLimitRejected   = "ratelimit.rejected"
-	UserEventSessionRejected     = "session.rejected"
+	// UserEventSecretCreateRejected（R2 评审 P0）：master key 缺失导致的
+	// fail-closed 拒绝（未创建 VM），与 quota 拒绝区分开以便针对性告警。
+	UserEventSecretCreateRejected = "secret.create_rejected"
+	UserEventQuotaRejected        = "quota.rejected"
+	UserEventRateLimitRejected    = "ratelimit.rejected"
+	UserEventSessionRejected      = "session.rejected"
 )
 
 // RecordUserEvent 追加一条租户事件（fire-and-forget：错误只返回给调用方

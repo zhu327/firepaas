@@ -73,7 +73,7 @@ func (a *API) createSnapshot(w http.ResponseWriter, r *http.Request) {
 	machineID := r.PathValue("id")
 	m, err := a.store.GetMachine(r.Context(), machineID)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	if m == nil {
@@ -81,7 +81,11 @@ func (a *API) createSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	app, aerr := a.store.GetApp(r.Context(), m.AppID)
-	if aerr != nil || app == nil {
+	if aerr != nil {
+		writeInternalErr(w, r, aerr)
+		return
+	}
+	if app == nil {
 		writeErr(w, 500, "resolve app")
 		return
 	}
@@ -91,7 +95,7 @@ func (a *API) createSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body createSnapshotBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		writeErr(w, 400, "bad request: "+err.Error())
 		return
 	}
@@ -115,7 +119,7 @@ func (a *API) createSnapshot(w http.ResponseWriter, r *http.Request) {
 	if kind == "MEMORY" {
 		writable, err := a.store.WritableActiveAttachments(r.Context(), machineID, m.CurrentExecutionID)
 		if err != nil {
-			writeErr(w, 500, err.Error())
+			writeInternalErr(w, r, err)
 			return
 		}
 		if len(writable) > 0 {
@@ -135,7 +139,7 @@ func (a *API) createSnapshot(w http.ResponseWriter, r *http.Request) {
 	compatibilityKey := ""
 	nodes, err := a.store.ListNodes(r.Context())
 	if err != nil {
-		writeErr(w, 500, "resolve snapshot compatibility: "+err.Error())
+		writeInternalErr(w, r, fmt.Errorf("resolve snapshot compatibility: %w", err))
 		return
 	}
 	for _, node := range nodes {
@@ -163,7 +167,7 @@ func (a *API) createSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 	raw, err := json.Marshal(req)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	if _, _, err := a.store.CreateSnapshotAndEnqueue(r.Context(), store.Snapshot{
@@ -180,7 +184,7 @@ func (a *API) createSnapshot(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 409, "snapshot operation conflict")
 			return
 		}
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	writeJSON(w, 202, map[string]any{
@@ -218,7 +222,7 @@ func (a *API) listSnapshots(w http.ResponseWriter, r *http.Request) {
 	project := effectiveProjectID(r, "")
 	list, err := a.store.ListSnapshots(r.Context(), project)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	out := make([]map[string]any, 0, len(list))
@@ -232,7 +236,7 @@ func (a *API) getSnapshot(w http.ResponseWriter, r *http.Request) {
 	snapID := r.PathValue("id")
 	snap, err := a.store.GetSnapshot(r.Context(), snapID)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	if snap == nil {
@@ -251,7 +255,7 @@ func (a *API) deleteSnapshot(w http.ResponseWriter, r *http.Request) {
 	snapID := r.PathValue("id")
 	snap, err := a.store.GetSnapshot(r.Context(), snapID)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	if snap == nil {
@@ -285,7 +289,7 @@ func (a *API) deleteSnapshot(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 409, "snapshot is in use or cannot be deleted")
 			return
 		}
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	writeJSON(w, 202, map[string]any{"snapshot_id": snapID, "status": "DELETING", "operation_id": op.ID})
@@ -306,7 +310,11 @@ type snapshotPreflightBody struct {
 func (a *API) snapshotPreflight(w http.ResponseWriter, r *http.Request) {
 	snapID := r.PathValue("id")
 	snap, err := a.store.GetSnapshot(r.Context(), snapID)
-	if err != nil || snap == nil {
+	if err != nil {
+		writeInternalErr(w, r, err)
+		return
+	}
+	if snap == nil {
 		writeErr(w, 404, "snapshot not found")
 		return
 	}
@@ -316,7 +324,7 @@ func (a *API) snapshotPreflight(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body snapshotPreflightBody
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body) // 空 body 合法；仅约束上限
 	mode := strings.ToLower(body.RestoreMode)
 	if mode == "" {
 		mode = "auto"
@@ -331,7 +339,7 @@ func (a *API) snapshotPreflight(w http.ResponseWriter, r *http.Request) {
 	var origin *store.Node
 	nodes, err := a.store.ListNodes(r.Context())
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	for i := range nodes {
@@ -419,12 +427,20 @@ func (a *API) snapshotPreflight(w http.ResponseWriter, r *http.Request) {
 func (a *API) upsertSnapshotSchedule(w http.ResponseWriter, r *http.Request) {
 	machineID := r.PathValue("id")
 	m, err := a.store.GetMachine(r.Context(), machineID)
-	if err != nil || m == nil {
+	if err != nil {
+		writeInternalErr(w, r, err)
+		return
+	}
+	if m == nil {
 		writeErr(w, 404, "machine not found")
 		return
 	}
 	app, err := a.store.GetApp(r.Context(), m.AppID)
-	if err != nil || app == nil {
+	if err != nil {
+		writeInternalErr(w, r, err)
+		return
+	}
+	if app == nil {
 		writeErr(w, 500, "resolve app")
 		return
 	}
@@ -434,7 +450,7 @@ func (a *API) upsertSnapshotSchedule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body snapshotScheduleBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		writeErr(w, 400, "bad request: "+err.Error())
 		return
 	}
@@ -464,7 +480,7 @@ func (a *API) upsertSnapshotSchedule(w http.ResponseWriter, r *http.Request) {
 		Compression: body.Compression, CompressionLevel: body.CompressionLevel,
 		Enabled: enabled,
 	}); err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	writeJSON(w, 202, map[string]any{"schedule_id": scheduleID, "machine_id": machineID})
@@ -473,13 +489,17 @@ func (a *API) upsertSnapshotSchedule(w http.ResponseWriter, r *http.Request) {
 func (a *API) listSnapshotSchedules(w http.ResponseWriter, r *http.Request) {
 	machineID := r.PathValue("id")
 	m, err := a.store.GetMachine(r.Context(), machineID)
-	if err != nil || m == nil {
+	if err != nil {
+		writeInternalErr(w, r, err)
+		return
+	}
+	if m == nil {
 		writeErr(w, 404, "machine not found")
 		return
 	}
 	list, err := a.store.ListSnapshotSchedules(r.Context(), m.AppID)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	out := make([]store.SnapshotSchedule, 0, len(list))
@@ -495,17 +515,25 @@ func (a *API) deleteSnapshotSchedule(w http.ResponseWriter, r *http.Request) {
 	machineID := r.PathValue("id")
 	scheduleID := r.PathValue("schedule")
 	m, err := a.store.GetMachine(r.Context(), machineID)
-	if err != nil || m == nil {
+	if err != nil {
+		writeInternalErr(w, r, err)
+		return
+	}
+	if m == nil {
 		writeErr(w, 404, "machine not found")
 		return
 	}
 	sc, err := a.store.GetSnapshotSchedule(r.Context(), scheduleID)
-	if err != nil || sc == nil || sc.MachineID != machineID {
+	if err != nil {
+		writeInternalErr(w, r, err)
+		return
+	}
+	if sc == nil || sc.MachineID != machineID {
 		writeErr(w, 404, "schedule not found")
 		return
 	}
 	if err := a.store.DeleteSnapshotSchedule(r.Context(), scheduleID); err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	writeJSON(w, 202, map[string]any{"schedule_id": scheduleID, "deleted": true})
@@ -534,7 +562,11 @@ type rescueMachineBody struct {
 func (a *API) forkSnapshot(w http.ResponseWriter, r *http.Request) {
 	snapID := r.PathValue("id")
 	snap, err := a.store.GetSnapshot(r.Context(), snapID)
-	if err != nil || snap == nil {
+	if err != nil {
+		writeInternalErr(w, r, err)
+		return
+	}
+	if snap == nil {
 		writeErr(w, 404, "snapshot not found")
 		return
 	}
@@ -547,7 +579,7 @@ func (a *API) forkSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body forkSnapshotBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		writeErr(w, 400, "bad request: "+err.Error())
 		return
 	}
@@ -564,7 +596,11 @@ func (a *API) forkSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	app, err := a.store.GetApp(r.Context(), body.AppID)
-	if err != nil || app == nil {
+	if err != nil {
+		writeInternalErr(w, r, err)
+		return
+	}
+	if app == nil {
 		writeErr(w, 404, "app not found")
 		return
 	}
@@ -575,7 +611,7 @@ func (a *API) forkSnapshot(w http.ResponseWriter, r *http.Request) {
 	var target *store.Node
 	nodes, err := a.store.ListNodes(r.Context())
 	if err != nil {
-		writeErr(w, 500, "resolve fork capability: "+err.Error())
+		writeInternalErr(w, r, fmt.Errorf("resolve fork capability: %w", err))
 		return
 	}
 	for i := range nodes {
@@ -622,7 +658,7 @@ func (a *API) forkSnapshot(w http.ResponseWriter, r *http.Request) {
 		ExecutionID: executionID, Generation: 1, Kind: "fork",
 		Request: raw, DispatchNodeID: snap.NodeID,
 	}); err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	writeJSON(w, 202, map[string]any{
@@ -635,7 +671,7 @@ func (a *API) forkSnapshot(w http.ResponseWriter, r *http.Request) {
 func (a *API) rescueMachine(w http.ResponseWriter, r *http.Request) {
 	machineID := r.PathValue("id")
 	var body rescueMachineBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		writeErr(w, 400, "bad request: "+err.Error())
 		return
 	}
@@ -652,12 +688,20 @@ func (a *API) rescueMachine(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	m, err := a.store.GetMachine(r.Context(), machineID)
-	if err != nil || m == nil {
+	if err != nil {
+		writeInternalErr(w, r, err)
+		return
+	}
+	if m == nil {
 		writeErr(w, 404, "machine not found")
 		return
 	}
 	app, err := a.store.GetApp(r.Context(), m.AppID)
-	if err != nil || app == nil {
+	if err != nil {
+		writeInternalErr(w, r, err)
+		return
+	}
+	if app == nil {
 		writeErr(w, 500, "resolve app")
 		return
 	}
@@ -667,7 +711,11 @@ func (a *API) rescueMachine(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	snap, err := a.store.GetSnapshot(r.Context(), body.SnapshotID)
-	if err != nil || snap == nil {
+	if err != nil {
+		writeInternalErr(w, r, err)
+		return
+	}
+	if snap == nil {
 		writeErr(w, 404, "snapshot not found")
 		return
 	}
@@ -690,7 +738,7 @@ func (a *API) rescueMachine(w http.ResponseWriter, r *http.Request) {
 	var target *store.Node
 	nodes, err := a.store.ListNodes(r.Context())
 	if err != nil {
-		writeErr(w, 500, "resolve restore capability: "+err.Error())
+		writeInternalErr(w, r, fmt.Errorf("resolve restore capability: %w", err))
 		return
 	}
 	for i := range nodes {
@@ -725,7 +773,7 @@ func (a *API) rescueMachine(w http.ResponseWriter, r *http.Request) {
 	}
 	raw, err := json.Marshal(req)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	_, err = a.store.EnqueueRescueReplacement(r.Context(), store.RescueReplacementParams{
@@ -742,7 +790,7 @@ func (a *API) rescueMachine(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 409, err.Error())
 			return
 		}
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	writeJSON(w, 202, map[string]any{
@@ -824,7 +872,7 @@ func (a *API) selectVolumeNode(ctx context.Context, requested, feature string, s
 // createVolume 创建 LOCAL_RW 空卷（硬钉 origin node）。
 func (a *API) createVolume(w http.ResponseWriter, r *http.Request) {
 	var body createVolumeBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		writeErr(w, 400, "bad request: "+err.Error())
 		return
 	}
@@ -869,7 +917,7 @@ func (a *API) createVolume(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf(`{"volume_id":%q,"size_bytes":%d,"operation_id":%q}`, volID, sizeBytes, opID),
 		)
 		if _, _, err := a.store.CreateLocalRWVolumeAndEnqueue(r.Context(), v, params); err != nil {
-			writeErr(w, 409, err.Error())
+			writeVolumeEnqueueErr(w, r, err)
 			return
 		}
 	case "DATASET_RO":
@@ -894,16 +942,28 @@ func (a *API) createVolume(w http.ResponseWriter, r *http.Request) {
 		expires := time.Now().Add(10 * time.Minute).Unix()
 		allowLoopback := false
 		if os.Getenv("FIREPAAS_E2E_ALLOW_HTTP_LOOPBACK") == "1" {
-			if parsed, perr := url.Parse(body.SourceURL); perr == nil && parsed.Scheme == "http" && parsed.Hostname() == "127.0.0.1" {
+			if parsed, perr := url.Parse(body.SourceURL); perr == nil && parsed.Scheme == "http" &&
+				parsed.Hostname() == "127.0.0.1" {
 				allowLoopback = true
 			}
 		}
-		req := map[string]any{"volume_id": volID, "source_url": body.SourceURL, "source_url_digest": datasetSourceDigest(body.SourceURL), "expected_digest": body.ContentDigest, "max_download_bytes": body.MaxDownloadBytes, "max_expanded_bytes": sizeBytes, "max_files": body.MaxFiles, "expires_at_unix": expires, "operation_id": opID, "allow_http_loopback_for_tests": allowLoopback}
+		req := map[string]any{
+			"volume_id":                     volID,
+			"source_url":                    body.SourceURL,
+			"source_url_digest":             datasetSourceDigest(body.SourceURL),
+			"expected_digest":               body.ContentDigest,
+			"max_download_bytes":            body.MaxDownloadBytes,
+			"max_expanded_bytes":            sizeBytes,
+			"max_files":                     body.MaxFiles,
+			"expires_at_unix":               expires,
+			"operation_id":                  opID,
+			"allow_http_loopback_for_tests": allowLoopback,
+		}
 		params.Kind = "dataset_import"
 		params.Request, _ = json.Marshal(req)
 		v.ContentDigest = body.ContentDigest
 		if _, _, err := a.store.CreateDatasetAndEnqueue(r.Context(), v, params); err != nil {
-			writeErr(w, 409, err.Error())
+			writeVolumeEnqueueErr(w, r, err)
 			return
 		}
 	default:
@@ -927,7 +987,7 @@ func (a *API) listVolumes(w http.ResponseWriter, r *http.Request) {
 	project := effectiveProjectID(r, "")
 	list, err := a.store.ListVolumes(r.Context(), project)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"volumes": list})
@@ -936,7 +996,11 @@ func (a *API) listVolumes(w http.ResponseWriter, r *http.Request) {
 func (a *API) getVolume(w http.ResponseWriter, r *http.Request) {
 	volID := r.PathValue("id")
 	v, err := a.store.GetVolume(r.Context(), volID)
-	if err != nil || v == nil {
+	if err != nil {
+		writeInternalErr(w, r, err)
+		return
+	}
+	if v == nil {
 		writeErr(w, 404, "volume not found")
 		return
 	}
@@ -951,7 +1015,11 @@ func (a *API) getVolume(w http.ResponseWriter, r *http.Request) {
 func (a *API) deleteVolume(w http.ResponseWriter, r *http.Request) {
 	volID := r.PathValue("id")
 	v, err := a.store.GetVolume(r.Context(), volID)
-	if err != nil || v == nil {
+	if err != nil {
+		writeInternalErr(w, r, err)
+		return
+	}
+	if v == nil {
 		writeErr(w, 404, "volume not found")
 		return
 	}
@@ -972,7 +1040,7 @@ func (a *API) deleteVolume(w http.ResponseWriter, r *http.Request) {
 	}
 	active, err := a.store.ActiveAttachments(r.Context(), volID)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	if len(active) > 0 {
@@ -985,7 +1053,7 @@ func (a *API) deleteVolume(w http.ResponseWriter, r *http.Request) {
 		OperationID: opID, ProjectID: v.ProjectID, MachineID: "", ExecutionID: "",
 		Generation: 1, Kind: "volume_delete", Request: raw, DispatchNodeID: v.NodeID,
 	}); err != nil {
-		writeErr(w, 409, err.Error())
+		writeVolumeEnqueueErr(w, r, err)
 		return
 	}
 	writeJSON(w, 202, map[string]any{"volume_id": volID, "status": "DELETING"})
@@ -1006,12 +1074,20 @@ func (a *API) attachVolume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	m, err := a.store.GetMachine(r.Context(), machineID)
-	if err != nil || m == nil {
+	if err != nil {
+		writeInternalErr(w, r, err)
+		return
+	}
+	if m == nil {
 		writeErr(w, 404, "machine not found")
 		return
 	}
 	v, err := a.store.GetVolume(r.Context(), volID)
-	if err != nil || v == nil {
+	if err != nil {
+		writeInternalErr(w, r, err)
+		return
+	}
+	if v == nil {
 		writeErr(w, 404, "volume not found")
 		return
 	}
@@ -1038,7 +1114,7 @@ func (a *API) attachVolume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body attachVolumeBody
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body) // 空 body 合法；仅约束上限
 	if body.OverlaySizeBytes < 0 {
 		writeErr(w, 400, "overlay_size_bytes must not be negative")
 		return
@@ -1048,7 +1124,7 @@ func (a *API) attachVolume(w http.ResponseWriter, r *http.Request) {
 		if body.OverlaySizeBytes > 0 {
 			nodes, nerr := a.store.ListNodes(r.Context())
 			if nerr != nil {
-				writeErr(w, 500, nerr.Error())
+				writeInternalErr(w, r, nerr)
 				return
 			}
 			capable := false
@@ -1107,7 +1183,7 @@ func (a *API) attachVolume(w http.ResponseWriter, r *http.Request) {
 		_, err = a.store.ClaimLocalRWAttachmentAndEnqueue(r.Context(), att, p)
 	}
 	if err != nil {
-		writeErr(w, 409, err.Error())
+		writeVolumeEnqueueErr(w, r, err)
 		return
 	}
 	writeJSON(w, 202, map[string]any{"volume_id": volID, "machine_id": machineID, "status": "PENDING"})
@@ -1122,7 +1198,11 @@ func (a *API) detachVolume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	m, err := a.store.GetMachine(r.Context(), machineID)
-	if err != nil || m == nil {
+	if err != nil {
+		writeInternalErr(w, r, err)
+		return
+	}
+	if m == nil {
 		writeErr(w, 404, "machine not found")
 		return
 	}
@@ -1134,7 +1214,11 @@ func (a *API) detachVolume(w http.ResponseWriter, r *http.Request) {
 	raw := []byte(fmt.Sprintf(`{"volume_id":%q,"machine_id":%q,"execution_id":%q,"generation":%d,"operation_id":%q}`,
 		volID, machineID, m.CurrentExecutionID, m.Generation, opID))
 	v, err := a.store.GetVolume(r.Context(), volID)
-	if err != nil || v == nil {
+	if err != nil {
+		writeInternalErr(w, r, err)
+		return
+	}
+	if v == nil {
 		writeErr(w, 404, "volume not found")
 		return
 	}
@@ -1149,8 +1233,30 @@ func (a *API) detachVolume(w http.ResponseWriter, r *http.Request) {
 		DispatchNodeID: m.NodeID,
 	}
 	if _, err := a.store.BeginDetachVolumeAndEnqueue(r.Context(), volID, machineID, m.CurrentExecutionID, p); err != nil {
-		writeErr(w, 409, err.Error())
+		writeVolumeEnqueueErr(w, r, err)
 		return
 	}
 	writeJSON(w, 202, map[string]any{"volume_id": volID, "machine_id": machineID, "status": "DETACHING"})
+}
+
+// writeVolumeEnqueueErr 映射 volume/dataset enqueue 类错误：已知的域哨兵
+// → 固定文案 4xx；其余（PG 故障等内部错误）一律走 writeInternalErr
+// （P0#4 评审遗留：不再向客户端回吐 driver/SQL 原文，也不把宕机误报为 409）。
+func writeVolumeEnqueueErr(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, store.ErrVolumeStateConflict):
+		writeErr(w, 409, "volume state conflict")
+	case errors.Is(err, store.ErrVolumeSingleWriter):
+		writeErr(w, 409, "LOCAL_RW volume already has an active attachment")
+	case errors.Is(err, store.ErrVolumeLocality):
+		writeErr(w, 409, "volume locality mismatch")
+	case errors.Is(err, store.ErrVolumeQuota):
+		writeErr(w, 429, "project disk quota exceeded")
+	case errors.Is(err, store.ErrDatasetDigest):
+		writeErr(w, 409, "dataset digest is immutable")
+	case errors.Is(err, store.ErrNotFound):
+		writeErr(w, 404, "not found")
+	default:
+		writeInternalErr(w, r, err)
+	}
 }

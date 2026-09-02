@@ -37,35 +37,12 @@ authed_curl() { curl -fsS -m 20 -H "Authorization: Bearer $API_TOKEN" "$@"; }
 authed_raw() { curl -sS -m 20 -H "Authorization: Bearer $API_TOKEN" "$@"; }
 pg() { $PG "$1"; }
 mark() { log "    (累计 $(( $(date +%s) - T0 ))s) $*"; }
+# shellcheck source=lib/runtime.sh
+source "$HERE/lib/runtime.sh"
+restart_agentd() { lab_restart_agentd 45 2; }
 
-restart_agentd() {
-  nomad job restart -on-error fail firepaas-agentd >/dev/null 2>&1 || return 1
-  for _ in $(seq 1 45); do
-    "$LAB_BIN/agentctl" info >/dev/null 2>&1 && return 0
-    sleep 2
-  done
-  return 1
-}
-
-guest_exec() {
-  local machine="$1"; shift
-  local opid="exec-$RANDOM-$RANDOM"
-  authed_raw -X POST "http://127.0.0.1:$API_PORT/v1/machines/$machine/exec" \
-    -H 'Content-Type: application/json' \
-    -d "$(python3 -c 'import json,sys; print(json.dumps({"command": list(sys.argv[2:]), "operation_id": sys.argv[1]}))' "$opid" "$@")"
-}
-
-exec_stdout() {
-  python3 -c 'import base64,json,sys
-chunks=[]; rc=None
-for line in sys.stdin:
-    if not line.strip(): continue
-    obj=json.loads(line)
-    if "stdout" in obj: chunks.append(base64.b64decode(obj["stdout"]).decode("utf-8","replace"))
-    if "exit_code" in obj: rc=obj["exit_code"]
-sys.stdout.write("".join(chunks))
-raise SystemExit(0 if rc == 0 else (rc if isinstance(rc,int) else 1))'
-}
+guest_exec() { lab_guest_exec "$@"; }
+exec_stdout() { lab_exec_stdout; }
 
 wait_machine_running() {
   local machine="$1" st=""
@@ -190,7 +167,7 @@ for _ in $(seq 1 30); do active=$(pg "SELECT count(*) FROM volume_attachments WH
 mark "并发双 attach 原子单写 OK（winner=$winner）"
 
 log "4) node loss → UNAVAILABLE；恢复后不空建且数据仍在"
-nomad job stop firepaas-agentd >/dev/null || fail "停止 agentd job 失败"
+nomad job stop -purge firepaas-agentd >/dev/null || fail "停止 agentd job 失败"
 UNAVAILABLE=0
 for _ in $(seq 1 60); do st=$(pg "SELECT state FROM volumes WHERE id='$VOL_ID'"); [[ "$st" == "UNAVAILABLE" ]] && UNAVAILABLE=1 && break; sleep 2; done
 [[ "$UNAVAILABLE" == "1" ]] || fail "node loss 后 volume 未转 UNAVAILABLE（state=$st）"

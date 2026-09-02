@@ -63,6 +63,10 @@ job "firepaas-edge" {
       port "https" {
         static = 443
       }
+      # 指标端口：host network 下直接占用宿主 9465；仅供 observability 网段访问。
+      port "metrics" {
+        static = 9465
+      }
     }
     service {
       name     = "firepaas-edge"
@@ -74,6 +78,20 @@ job "firepaas-edge" {
         path     = "/healthz"
         interval = "5s"
         timeout  = "3s"
+      }
+    }
+    service {
+      name     = "firepaas-edge-metrics"
+      port     = "metrics"
+      provider = "nomad"
+      # Do not expose this service outside the observability ACL boundary.
+      tags = ["metrics", "prometheus-scrape"]
+      check {
+        type     = "http"
+        path     = "/metrics"
+        name     = "edge-metrics"
+        interval = "30s"
+        timeout  = "5s"
       }
     }
     task "edge" {
@@ -90,6 +108,9 @@ job "firepaas-edge" {
         FIREPAAS_EDGE_TLS_CA      = "secrets/agent-ca.crt"
         FIREPAAS_EDGE_SERVER_CERT = "secrets/edge-server.crt"
         FIREPAAS_EDGE_SERVER_KEY  = "secrets/edge-server.key"
+        # 固定端口以匹配上方 static port；Prometheus 经 firepaas-edge-metrics
+        # 服务发现抓取（host network 下未授权网段不可达）。
+        FIREPAAS_EDGE_METRICS_PORT = "9465"
       }
       # Variables carry PEM contents; templates materialize them inside the
       # allocation with restrictive permissions rather than relying on host paths.
@@ -121,6 +142,9 @@ job "firepaas-edge" {
       config {
         image        = var.edge_image
         network_mode = "host"
+        # 镜像以 nonroot(65532) 运行；host network 下绑定 :80/:443 需要内核
+        # 能力 NET_BIND_SERVICE，不因此退回 root 容器。
+        cap_add = ["NET_BIND_SERVICE"]
       }
       resources {
         cpu    = 500

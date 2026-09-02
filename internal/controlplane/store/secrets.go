@@ -134,7 +134,9 @@ func (s *Store) DeleteSecret(ctx context.Context, projectID, name string) (int64
 	return tag.RowsAffected(), nil
 }
 
-var errSecretNotFound = errors.New("secret not found")
+// ErrSecretNotFound：secret 不存在（未复用通用 ErrNotFound 以便调用方
+// 区分 secrets 域语义；API 据此映射 404 而非吞掉 PG 故障）。
+var ErrSecretNotFound = errors.New("secret not found")
 
 // ErrSecretVersionConflict：并发写入同一 secret 时 UNIQUE(project,name,
 // version) 冲突。幂等性由客户端重试保证（重取版本号再 Seal）。
@@ -167,7 +169,7 @@ func (s *Store) GetSealedSecret(ctx context.Context, projectID, name string, ver
 	if err := row.Scan(&r.Meta.ID, &r.Meta.ProjectID, &r.Meta.Name, &r.Meta.Version,
 		&r.Meta.KeyVersion, &r.Meta.CreatedAt, &ct, &wrapped); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, errSecretNotFound
+			return nil, ErrSecretNotFound
 		}
 		return nil, fmt.Errorf("get secret: %w", err)
 	}
@@ -205,8 +207,8 @@ func ResolveDeploymentSecretRefs(ctx context.Context, s *Store, cm *secrets.Mana
 	for varName, ref := range refs {
 		pt, _, err := ResolveSecretValue(ctx, s, cm, projectID, ref.Secret, ref.Version)
 		if err != nil {
-			if errors.Is(err, errSecretNotFound) {
-				return nil, fmt.Errorf("secret %q (ref %q): %w", ref.Secret, varName, errSecretNotFound)
+			if errors.Is(err, ErrSecretNotFound) {
+				return nil, fmt.Errorf("secret %q (ref %q): %w", ref.Secret, varName, ErrSecretNotFound)
 			}
 			return nil, err
 		}

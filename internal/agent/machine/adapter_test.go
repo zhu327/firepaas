@@ -3,6 +3,7 @@ package machine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -432,7 +433,7 @@ func TestAdapterDeleteResolvesNameToInternalID(t *testing.T) {
 	if _, err := a.Create(context.Background(), validCreateRequest()); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.Delete(context.Background(), "m1-test", "e1"); err != nil {
+	if err := a.Delete(context.Background(), "m1-test", "e1", 1); err != nil {
 		t.Fatal(err)
 	}
 	if im.deleted != "internal-1" {
@@ -446,7 +447,7 @@ func TestAdapterDeleteRequiresMatchingExecution(t *testing.T) {
 	if _, err := a.Create(context.Background(), validCreateRequest()); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.Delete(context.Background(), "m1-test", "stale-execution"); err == nil {
+	if err := a.Delete(context.Background(), "m1-test", "stale-execution", 0); err == nil {
 		t.Fatal("delete with stale execution must fail")
 	}
 	if im.deleted != "" {
@@ -698,4 +699,87 @@ func encode(t *testing.T, list []svcJSON) string {
 		t.Fatal(err)
 	}
 	return tag
+}
+
+// errOnceInstances 首次 CreateInstance 返回指定错误，后续走正常逻辑——
+// 用于模拟“冷镜像首创建：创建中 pull”的瞬时态。
+type errOnceInstances struct {
+	*fakeInstances
+	firstErr error
+	waited   chan string // WaitForReady 收到的 name
+}
+
+func (f *errOnceInstances) CreateInstance(
+	ctx context.Context,
+	req instances.CreateInstanceRequest,
+) (*instances.Instance, error) {
+	select {
+	case name := <-f.waited:
+		_ = name // 已等待过镜像 ready，放行
+	default:
+		if f.firstErr != nil {
+			err := f.firstErr
+			f.firstErr = nil
+			return nil, err
+		}
+	}
+	return f.fakeInstances.CreateInstance(ctx, req)
+}
+
+type notifyImages struct {
+	fakeImages
+	waited  chan string
+	waitErr error
+}
+
+func (f *notifyImages) WaitForReady(_ context.Context, name string) error {
+	if f.waitErr != nil {
+		return f.waitErr
+	}
+	select {
+	case f.waited <- name:
+	default:
+	}
+	return nil
+}
+
+// 回归：首次 CreateInstance 命中 ErrImageNotReady（冷镜像正在 pull）必须先
+// 等待镜像 ready 再重试，而不是直接把错误上抛为不确定 create（ADR-0024
+// secret 机器会把该错误当 fail-closed 自杀信号，普通机器也多一轮 requeue）。
+func TestAdapterCreateWaitsForImagePullBeforeRetry(t *testing.T) {
+	waited := make(chan string, 1)
+	fi := &fakeInstances{}
+	a := New(
+		&errOnceInstances{
+			fakeInstances: fi,
+			firstErr:      fmt.Errorf("%w: image status is pulling", instances.ErrImageNotReady),
+		},
+		&notifyImages{waited: waited},
+		nil,
+		nil,
+	)
+	if _, err := a.Create(context.Background(), validCreateRequest()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case name := <-waited:
+		if name != "docker.io/library/nginx:alpine" {
+			t.Fatalf("WaitForReady name = %q", name)
+		}
+	default:
+		t.Fatal("WaitForReady was not called before create retry")
+	}
+	if fi.created == nil {
+		t.Fatal("create was not retried after image ready")
+	}
+}
+
+// 镜像最终 pull 失败时错误必须上抛（不得无条件重试吞错）。
+func TestAdapterCreateSurfacesImagePullFailure(t *testing.T) {
+	a := New(&errOnceInstances{fakeInstances: &fakeInstances{}, firstErr: instances.ErrImageNotReady},
+		&notifyImages{waitErr: errors.New("pull failed: 401")}, nil, nil)
+	_, err := a.Create(context.Background(), validCreateRequest())
+	if err == nil || !strings.Contains(err.Error(), "wait image ready") {
+		t.Fatalf("err = %v, want wait image ready wrapping", err)
+	}
 }

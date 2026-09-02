@@ -141,3 +141,16 @@ func TestExecuteMapsDomainErrors(t *testing.T) {
 		t.Fatalf("busy: %v", err)
 	}
 }
+
+// R2 评审：负 vcpu/mem 显式拒绝（不静默继承/落库）。
+func TestPrepareRejectsNegativeResources(t *testing.T) {
+	active := &store.Deployment{Generation: 1, ImageRef: "old", VCPU: 2, MemMIB: 1024, Port: 8080}
+	for _, in := range []Intent{
+		{VCPU: -1, Port: 8080},
+		{MemMIB: -256, Port: 8080},
+	} {
+		if _, err := prepare(active, in, 2); !errors.Is(err, ErrInvalidIntent) {
+			t.Fatalf("intent %+v: expected ErrInvalidIntent, got %v", in, err)
+		}
+	}
+}

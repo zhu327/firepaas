@@ -6,30 +6,29 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5"
 )
 
-func testPool(t *testing.T) *pgxpool.Pool {
+func testConfig(t *testing.T) *pgx.ConnConfig {
 	t.Helper()
 	dsn := os.Getenv("FIREPAAS_TEST_POSTGRES")
 	if dsn == "" {
 		t.Skip("set FIREPAAS_TEST_POSTGRES to run leader tests")
 	}
-	pool, err := pgxpool.New(context.Background(), dsn)
+	cfg, err := pgx.ParseConfig(dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(pool.Close)
-	return pool
+	return cfg
 }
 
 func TestSingleLeaderAndHandover(t *testing.T) {
-	pool := testPool(t)
+	cfg := testConfig(t)
 	key := "firepaas:leader-test"
 
 	ctx1, cancel1 := context.WithCancel(context.Background())
 	defer cancel1()
-	got1, err := tryAcquire(ctx1, cancel1, pool, key)
+	got1, err := tryAcquire(ctx1, cancel1, cfg, key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +38,7 @@ func TestSingleLeaderAndHandover(t *testing.T) {
 
 	// 实例 2 抢不到。
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	got2, err := tryAcquire(ctx2, cancel2, pool, key)
+	got2, err := tryAcquire(ctx2, cancel2, cfg, key)
 	cancel2()
 	if err != nil {
 		t.Fatal(err)
@@ -54,7 +53,7 @@ func TestSingleLeaderAndHandover(t *testing.T) {
 
 	ctx3, cancel3 := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel3()
-	got3, err := tryAcquire(ctx3, cancel3, pool, key)
+	got3, err := tryAcquire(ctx3, cancel3, cfg, key)
 	if err != nil {
 		t.Fatal(err)
 	}

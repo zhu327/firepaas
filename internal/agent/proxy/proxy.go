@@ -12,6 +12,7 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -80,9 +81,14 @@ func NewWithVerifier(machines *machine.Adapter, creds credentialVerifier) *Proxy
 			resp.Header.Del(HeaderRetryable)
 			return nil
 		},
-		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			// P0#4：transport 错误正文不得携带 guest IP:port 等内部拓扑——
+			// 对 edge 只回固定文案，拨号细节留在本机日志。retryable 头
+			// 语义不变（edge 仍可按它决定是否换 backend 重试）。
+			slog.Warn("workload proxy transport error",
+				"method", r.Method, "path", r.URL.Path, "error", err)
 			w.Header().Set(HeaderRetryable, retryableValue)
-			http.Error(w, err.Error(), http.StatusBadGateway)
+			http.Error(w, "workload upstream unreachable", http.StatusBadGateway)
 		},
 		Transport: &http.Transport{
 			MaxIdleConns:        64,

@@ -24,6 +24,7 @@ import (
 
 	"github.com/zhu327/firepaas/internal/capabilities"
 	"github.com/zhu327/firepaas/internal/controlplane/agentclient"
+	"github.com/zhu327/firepaas/internal/controlplane/store"
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -54,23 +55,28 @@ func (a *API) requireFeature(w http.ResponseWriter, feats map[string]bool, featu
 }
 
 // grpcErrStatus 把 agent gRPC 错误映射为 HTTP 状态码。
+// R2 评审（错误映射长尾）：4xx/5xx body 统一固定文案——gRPC 错误原文可能
+// 携带 agent 内部细节（文件路径、请求回显），只允许进服务端日志。
 func grpcErrStatus(err error) (int, string) {
 	c := status.Code(err)
 	switch c {
 	case codes.NotFound:
 		return 404, "machine not found at agent"
 	case codes.FailedPrecondition:
-		return 409, "stale execution: " + err.Error()
+		return 409, "stale execution fencing; re-read machine state and retry"
 	case codes.AlreadyExists:
-		return 409, "operation conflict: " + err.Error()
+		return 409, "operation conflict"
 	case codes.Unimplemented:
-		return 501, "guest operations unsupported: " + err.Error()
+		return 501, "guest operations unsupported by node"
 	case codes.ResourceExhausted:
-		return 429, "runtime session limit: " + err.Error()
+		return 429, "runtime session limit reached"
 	case codes.InvalidArgument:
-		return 400, err.Error()
+		return 400, "agent rejected request as invalid"
 	default:
-		return 502, "agent error: " + err.Error()
+		// 不受信分支：传输错误/未知 gRPC 错误可能携内部细节（拨号地址、栈），
+		// 只回固定文案，细节由调用方中间件/日志可见。
+		slog.Warn("agent runtime op failed", "error", err)
+		return 502, "agent error"
 	}
 }
 
@@ -78,7 +84,7 @@ func grpcErrStatus(err error) (int, string) {
 func (a *API) machineLogs(w http.ResponseWriter, r *http.Request) {
 	tgt, feats, err := a.runtimeTarget(r)
 	if err != nil {
-		writeErr(w, 503, err.Error())
+		writeUnavailableErr(w, r, err)
 		return
 	}
 	if !a.requireFeature(w, feats, capabilities.GuestLogsV1) {
@@ -90,10 +96,9 @@ func (a *API) machineLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer releaseSession()
-	m, err := a.store.GetMachine(r.Context(), r.PathValue("id"))
-	if err != nil || m == nil {
-		writeErr(w, 404, "machine not found")
-		return
+	m, err := a.loadMachineForRuntime(w, r)
+	if m == nil || err != nil {
+		return // loadMachineForRuntime 已写响应
 	}
 	follow := r.URL.Query().Get("follow") == "true" || r.URL.Query().Get("follow") == "1"
 	tail := r.URL.Query().Get("tail") == "true" || r.URL.Query().Get("tail") == "1"
@@ -155,7 +160,7 @@ type execOpen struct {
 func (a *API) machineExec(w http.ResponseWriter, r *http.Request) {
 	tgt, feats, err := a.runtimeTarget(r)
 	if err != nil {
-		writeErr(w, 503, err.Error())
+		writeUnavailableErr(w, r, err)
 		return
 	}
 	if !a.requireFeature(w, feats, capabilities.GuestExecV1) {
@@ -167,9 +172,8 @@ func (a *API) machineExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer releaseSession()
-	m, err := a.store.GetMachine(r.Context(), r.PathValue("id"))
-	if err != nil || m == nil {
-		writeErr(w, 404, "machine not found")
+	m, err := a.loadMachineForRuntime(w, r)
+	if m == nil || err != nil {
 		return
 	}
 	var open execOpen
@@ -271,7 +275,7 @@ func (a *API) machineFilesPut(w http.ResponseWriter, r *http.Request) {
 	}
 	tgt, feats, err := a.runtimeTarget(r)
 	if err != nil {
-		writeErr(w, 503, err.Error())
+		writeUnavailableErr(w, r, err)
 		return
 	}
 	if !a.requireFeature(w, feats, capabilities.GuestCopyV1) {
@@ -283,9 +287,8 @@ func (a *API) machineFilesPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer releaseSession()
-	m, err := a.store.GetMachine(r.Context(), r.PathValue("id"))
-	if err != nil || m == nil {
-		writeErr(w, 404, "machine not found")
+	m, err := a.loadMachineForRuntime(w, r)
+	if m == nil || err != nil {
 		return
 	}
 	path := r.URL.Query().Get("path")
@@ -364,7 +367,7 @@ func (a *API) machineFilesPut(w http.ResponseWriter, r *http.Request) {
 func (a *API) machineFilesGet(w http.ResponseWriter, r *http.Request) {
 	tgt, feats, err := a.runtimeTarget(r)
 	if err != nil {
-		writeErr(w, 503, err.Error())
+		writeUnavailableErr(w, r, err)
 		return
 	}
 	if !a.requireFeature(w, feats, capabilities.GuestCopyV1) {
@@ -376,9 +379,8 @@ func (a *API) machineFilesGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer releaseSession()
-	m, err := a.store.GetMachine(r.Context(), r.PathValue("id"))
-	if err != nil || m == nil {
-		writeErr(w, 404, "machine not found")
+	m, err := a.loadMachineForRuntime(w, r)
+	if m == nil || err != nil {
 		return
 	}
 	path := r.URL.Query().Get("path")
@@ -438,6 +440,21 @@ func (a *API) machineFilesGet(w http.ResponseWriter, r *http.Request) {
 		"machine_id", m.ID, "execution_id", m.CurrentExecutionID,
 		"direction", "download", "path_digest", runtimeDigest(path),
 		"bytes", total, "result", "completed")
+}
+
+// loadMachineForRuntime：runtime 通道的 machine 读取统一收口——nil 行才
+// 404，PG 错误 5xx（R2 评审：不再把依赖故障伪装成 not-found）。
+// 返回 m==nil && err==nil 时响应已写。
+func (a *API) loadMachineForRuntime(w http.ResponseWriter, r *http.Request) (*store.Machine, error) {
+	m, err := a.store.GetMachine(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeInternalErr(w, r, err)
+		return nil, err
+	}
+	if m == nil {
+		writeErr(w, 404, "machine not found")
+	}
+	return m, nil
 }
 
 func runtimeDigest(value string) string {

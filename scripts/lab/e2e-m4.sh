@@ -222,32 +222,33 @@ stale_hdr=$(edge_curl -D - -o /dev/null "https://$HN:$EDGE_TLS/" | grep -ci '^x-
 [[ "$stale_hdr" == "1" ]] || fail "fresh 窗口外未见 X-Firepaas-Stale 头（未走 stale 或实现失效）"
 code_stale=$(edge_curl -o /dev/null -w '%{http_code}' "https://$HN:$EDGE_TLS/")
 [[ "$code_stale" == "200" ]] || fail "stale 服务非 200: $code_stale"
-# P2-10：宕机窗口内发布操作不得悬挂——deploy 是纯 PG 事务（Redis 不在
-# 关键路径），应正常 202 受理；rollout 的投影发布随 controller 重试，
-# Redis 恢复后自然收敛（不丢操作、不悬挂）。断言三件事：
-#   1) deploy 受理非 5xx；
-#   2) 不产生悬挂的 PREPARING（超时前有明确的推进路径）；
-#   3) Redis 恢复后 rollout 最终 COMPLETE（见 F 段尾部的收敛轮询）。
+# mutation 限流依赖 Redis 并按 ADR-0035 fail closed；Redis 宕机时 deploy
+# 必须返回明确 503，且不得先写 PG 形成半提交 rollout。恢复后再提交并验证收敛。
+rollouts_before=$(pg "SELECT count(*) FROM rollouts WHERE app_id='$APP'")
 dep_down=$(curl -s -m 10 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $API_TOKEN" \
   -X POST "http://127.0.0.1:$API_PORT/v1/apps/$APP/deployments" -H 'Content-Type: application/json' \
   -d '{"env":{"WINDOW":"redis-down"}}' || true)
-[[ "$dep_down" != "5"* ]] || fail "Redis 宕机期间 deploy 不应 5xx（PG 事务受理）: $dep_down"
-log "    Redis down +7s 数据面持续 200（X-Firepaas-Stale 命中 last-known-good）；deploy 受理（$dep_down）不悬挂"
+[[ "$dep_down" == "503" ]] || fail "Redis 宕机期间 mutation 应 fail closed 503，got $dep_down"
+rollouts_after=$(pg "SELECT count(*) FROM rollouts WHERE app_id='$APP'")
+[[ "$rollouts_after" == "$rollouts_before" ]] || fail "503 请求产生了部分 rollout 写入"
+log "    Redis down +7s 数据面持续 200（X-Firepaas-Stale）；mutation 503 且 PG 无半提交"
 
 timeout 30 docker start dev-redis-1 >/dev/null || fail "docker start dev-redis-1 卡死（>30s）"
 for _ in $(seq 1 20); do
   [[ "$(docker exec dev-redis-1 redis-cli ping 2>/dev/null || true)" == "PONG" ]] && break
   sleep 1
 done
-# 宕机窗口受理的发布不得悬挂：rollout 必须在恢复后收敛 COMPLETE。
-# （先收敛再 FLUSHALL：切流窗口与新代 readiness 会让数据面短暂非 200，
-# 不能与投影重建断言叠加在同一窗口里。）
+# Redis 恢复后同一发布可正常受理并收敛 COMPLETE。
+dep_recovered=$(curl -s -m 10 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $API_TOKEN" \
+  -X POST "http://127.0.0.1:$API_PORT/v1/apps/$APP/deployments" -H 'Content-Type: application/json' \
+  -d '{"env":{"WINDOW":"redis-recovered"}}')
+[[ "$dep_recovered" == "202" ]] || fail "Redis 恢复后 deploy 应 202，got $dep_recovered"
 for _ in $(seq 1 60); do
   r_status=$(pg "SELECT status FROM rollouts WHERE app_id='$APP' ORDER BY started_at DESC LIMIT 1")
   [[ "$r_status" == "COMPLETE" ]] && break
   sleep 3
 done
-[[ "$r_status" == "COMPLETE" ]] || fail "宕机窗口受理的发布未收敛（rollout=$r_status）"
+[[ "$r_status" == "COMPLETE" ]] || fail "Redis 恢复后的发布未收敛（rollout=$r_status）"
 # 切流后旧代 drain：等待到单副本新代稳定服务。
 for _ in $(seq 1 40); do
   code=$(edge_curl -o /dev/null -w '%{http_code}' "https://$HN:$EDGE_TLS/" || true)
@@ -256,7 +257,7 @@ for _ in $(seq 1 40); do
   sleep 3
 done
 [[ "$code" == "200" ]] || fail "宕机窗口发布的切流未收敛 200（code=$code）"
-log "    宕机窗口受理的 rollout 已收敛 COMPLETE + 切流稳定（发布不悬挂）OK"
+log "    Redis 恢复后 rollout 已收敛 COMPLETE + 切流稳定 OK"
 
 # P2-10（续）：FLUSHALL 真测投影重建（AOF 下 stop/start 不丢数据，旧实现
 # 未真正验证重建路径）。清空后：1) 短暂非 200（权威 miss）；2) ≤75s 重建。

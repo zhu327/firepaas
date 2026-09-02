@@ -8,13 +8,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/kernel/hypeman/lib/images"
-	"github.com/kernel/hypeman/lib/instances"
 	"github.com/zhu327/firepaas/internal/agent/info"
 	"github.com/zhu327/firepaas/internal/agent/machine"
 	"github.com/zhu327/firepaas/internal/agent/mutation"
@@ -62,6 +62,12 @@ type Server struct {
 	inflightVCPU atomic.Int64
 	inflightMem  atomic.Int64
 	inflightDisk atomic.Int64 // v1.2-E（ADR-0035）：在途 create 的磁盘承诺
+
+	// R2-8：在途 volume 预算（MiB）。create volume / dataset import / overlay
+	// 的节点级硬准入此前各自只看已落地 volume——「检查→落地」窗口内并发
+	// 请求互相不可见会同时越过水位。与 create 的 inflight 计数同型
+	//（先加后查），统一计入 admitVolume 的已承诺量。
+	inflightVolumeDisk atomic.Int64
 
 	// runtimeLimits/runtimeSem（v1.2-C，ADR-0025）：logs/exec/cp 会话限制。
 	runtimeLimits runtimeLimits
@@ -174,13 +180,29 @@ func (s *Server) CreateMachine(ctx context.Context, req *pb.CreateMachineRequest
 			}
 			return release, nil
 		},
+		Recover: func() (mutation.Recovery[*pb.CreateMachineResponse], error) {
+			// 崩溃窗口恢复：按 hypeman inventory 查找本操作的产物（Name
+			// == machine_id，且 execution/generation tags 匹配）。找到 = 认领
+			// 上次已创建的实例；找不到 = 重跑 Effect（协议层保证不会二次撞名）。
+			m, found, err := s.machines.RecoverMachine(
+				ctx,
+				req.GetMachineId(),
+				req.GetSpec().GetExecutionId(),
+				req.GetGeneration(),
+			)
+			return mutation.Recovery[*pb.CreateMachineResponse]{
+				Value: &pb.CreateMachineResponse{Machine: m},
+				Found: found,
+			}, err
+		},
 		Effect: func() (*pb.CreateMachineResponse, error) {
 			m, err := s.machines.Create(ctx, req)
 			return &pb.CreateMachineResponse{Machine: m}, err
 		},
 		PersistCredential: func() error {
 			if s.creds != nil && req.GetProxyCredential() != "" {
-				return s.creds.Set(
+				// Ensure：首次落地与重放补写共用（已存同值摘要时不重写）。
+				return s.creds.Ensure(
 					req.GetMachineId(),
 					req.GetSpec().GetExecutionId(),
 					state.Digest(req.GetProxyCredential()),
@@ -201,6 +223,18 @@ func (s *Server) CreateMachine(ctx context.Context, req *pb.CreateMachineRequest
 	return out, nil
 }
 
+// dropCredential 撤销 machine 的 proxy 验证材料；落盘失败不再静默——残留
+// 条目无功能危害（machine 已删，下次同 id create 会覆盖），但需可见。
+func (s *Server) dropCredential(machineID string) {
+	if s.creds == nil {
+		return
+	}
+	if err := s.creds.Drop(machineID); err != nil {
+		slog.Warn("credential drop failed; stale digest lingers until retention window",
+			"machine_id", machineID, "error", err)
+	}
+}
+
 // ListMachines 实现列表（M1 无分页）。
 func (s *Server) ListMachines(ctx context.Context, req *pb.ListMachinesRequest) (*pb.ListMachinesResponse, error) {
 	if req == nil {
@@ -213,7 +247,12 @@ func (s *Server) ListMachines(ctx context.Context, req *pb.ListMachinesRequest) 
 	return &pb.ListMachinesResponse{Machines: machines}, nil
 }
 
-// DeleteMachine 实现带 fencing/幂等的删除。
+// DeleteMachine 实现带 fencing/幂等的删除。adapter.Delete 已是分阶段可恢复
+// 语义（R2）：VM 不存在只代表 runtime 阶段完成，其余阶段照常补做——因此
+// agent 侧不再返回 NotFound，已完成的幂等收敛与 controller 的“NotFound 视作
+// 删除成功”决策等价。阶段失败 warn-log（adapter 内）并聚合为 Internal
+// （controller 决策表的非永久性错误 = 重试；重放的同 operation claim 重跑
+// 剩余阶段）。
 func (s *Server) DeleteMachine(ctx context.Context, req *pb.DeleteMachineRequest) (*emptypb.Empty, error) {
 	if err := contracts.ValidateDeleteRequest(req); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
@@ -227,22 +266,21 @@ func (s *Server) DeleteMachine(ctx context.Context, req *pb.DeleteMachineRequest
 			RequestHash: hashRequest(req),
 		},
 		Effect: func() error {
-			if err := s.machines.Delete(ctx, req.GetMachineId(), req.GetExecutionId()); err != nil {
-				if errors.Is(err, instances.ErrNotFound) {
-					if s.creds != nil {
-						_ = s.creds.Drop(req.GetMachineId())
-					}
-					return status.Errorf(codes.NotFound, "machine %s not found at agent", req.GetMachineId())
+			if err := s.machines.Delete(ctx, req.GetMachineId(), req.GetExecutionId(), req.GetGeneration()); err != nil {
+				if errors.Is(err, machine.ErrExecutionMismatch) {
+					// 确定性门禁（instances tags 属于其他 execution）：重试
+					// 永不收敛——映射 FailedPrecondition，让 controller 按
+					// execution 已经换代/仍有效分流，而不是无限 requeue。
+					return status.Errorf(codes.FailedPrecondition, "delete execution mismatch: %v", err)
 				}
-				return status.Error(codes.Internal, err.Error())
+				// Internal 在 controller 决策表中是非永久性错误（重试）；
+				// 同 operation 的重法会重跑剩余未完成的阶段。
+				return status.Errorf(codes.Internal, "staged delete of %s incomplete (retry): %v",
+					req.GetMachineId(), err)
 			}
 			return nil
 		},
-		DropCredential: func() {
-			if s.creds != nil {
-				_ = s.creds.Drop(req.GetMachineId())
-			}
-		},
+		DropCredential: func() { s.dropCredential(req.GetMachineId()) },
 	})
 	_ = replayed
 	if err != nil {
@@ -261,7 +299,14 @@ func (s *Server) admit(req *pb.CreateMachineRequest) error {
 	if req.GetSpec() == nil {
 		return status.Error(codes.InvalidArgument, "spec is required")
 	}
-	vcpuTotal, memTotal, vcpuAllocated, memAllocated := s.info.AdmissionSnapshot()
+	vcpuTotal, memTotal, vcpuAllocated, memAllocated, resourcesValid := s.info.AdmissionSnapshot()
+	// R2（契约 D-1）：资源采集无效 = 没有 live 样本也没有 ≤60s 的
+	// last-known-good。此时把“采集失败”当 0 占用会在硬准入里放行 ghost
+	// 超售——fail closed；非 create RPC（List/生命周期等）不经过本检查。
+	if !resourcesValid {
+		return status.Error(codes.Unavailable,
+			"resource inventory unavailable (no fresh last-known-good); admission fail-closed")
+	}
 	if vcpuTotal == 0 || memTotal == 0 {
 		return status.Error(codes.ResourceExhausted, "node capacity unknown, admission denied")
 	}
@@ -339,9 +384,11 @@ func hashRequest(msg proto.Message) string {
 }
 
 // PauseMachine / ResumeMachine（M4.5 scale-to-zero，mvp-plan §8.4）：
-// generation fencing + ledger 幂等，与其它变更 RPC 同一纪律。suspend 期间
-// observed PAUSED 不摘路由？——由 controller 决策：proxy 端首个请求触发
-// 同步 restore（autoresume），路由保留但请求有唤醒延迟。
+// R2 起走 claimed mutation（与 create/delete 共享 LockMachine 串行化）：
+// durable claim → 未完成 claim 的重试经 ConvergePause/ConvergeResume 从实例
+// 实际状态恢复收敛 → 幂等 Effect → fence Advance → durable Complete。
+// suspend 期间 observed PAUSED 不摘路由？——由 controller 决策：proxy 端首个
+// 请求触发同步 restore（autoresume），路由保留但请求有唤醒延迟。
 func (s *Server) PauseMachine(ctx context.Context, req *pb.PauseMachineRequest) (*pb.Machine, error) {
 	op := req.GetOperation()
 	if op == nil || op.MachineId == "" || op.ExecutionId == "" || op.OperationId == "" {
@@ -350,20 +397,12 @@ func (s *Server) PauseMachine(ctx context.Context, req *pb.PauseMachineRequest) 
 			"operation with machine_id/execution_id/operation_id is required",
 		)
 	}
-	out, err := mutation.RunLifecycle(
-		s.mutations,
-		mutation.Lifecycle[*pb.Machine]{
-			Identity: mutation.Identity{
-				OperationID: op.OperationId,
-				MachineID:   op.MachineId,
-				ExecutionID: op.ExecutionId,
-				Generation:  op.Generation,
-				RequestHash: hashRequest(req),
-			},
-			Effect: func() (*pb.Machine, error) { return s.machines.Pause(ctx, op.MachineId, op.ExecutionId) },
-			Codec:  protoCodec(func() *pb.Machine { return &pb.Machine{} }),
-		},
-	)
+	out, err := mutation.RunLifecycle(s.mutations, s.machineLifecycle(op, hashRequest(req),
+		func() (*pb.Machine, error) { return s.machines.Pause(ctx, op.MachineId, op.ExecutionId) },
+		func() (mutation.Recovery[*pb.Machine], error) {
+			m, found, err := s.machines.ConvergePause(ctx, op.MachineId, op.ExecutionId)
+			return mutation.Recovery[*pb.Machine]{Value: m, Found: found}, err
+		}))
 	if err != nil {
 		if errors.Is(err, machine.ErrSecretSnapshotForbidden) {
 			return nil, status.Error(codes.FailedPrecondition, err.Error())
@@ -381,20 +420,12 @@ func (s *Server) ResumeMachine(ctx context.Context, req *pb.ResumeMachineRequest
 			"operation with machine_id/execution_id/operation_id is required",
 		)
 	}
-	out, err := mutation.RunLifecycle(
-		s.mutations,
-		mutation.Lifecycle[*pb.Machine]{
-			Identity: mutation.Identity{
-				OperationID: op.OperationId,
-				MachineID:   op.MachineId,
-				ExecutionID: op.ExecutionId,
-				Generation:  op.Generation,
-				RequestHash: hashRequest(req),
-			},
-			Effect: func() (*pb.Machine, error) { return s.machines.Resume(ctx, op.MachineId, op.ExecutionId) },
-			Codec:  protoCodec(func() *pb.Machine { return &pb.Machine{} }),
-		},
-	)
+	out, err := mutation.RunLifecycle(s.mutations, s.machineLifecycle(op, hashRequest(req),
+		func() (*pb.Machine, error) { return s.machines.Resume(ctx, op.MachineId, op.ExecutionId) },
+		func() (mutation.Recovery[*pb.Machine], error) {
+			m, found, err := s.machines.ConvergeResume(ctx, op.MachineId, op.ExecutionId)
+			return mutation.Recovery[*pb.Machine]{Value: m, Found: found}, err
+		}))
 	if err != nil {
 		if errors.Is(err, mutation.ErrConflict) {
 			return nil, mutationError(err)
@@ -402,6 +433,29 @@ func (s *Server) ResumeMachine(ctx context.Context, req *pb.ResumeMachineRequest
 		return nil, status.Error(codes.FailedPrecondition, err.Error())
 	}
 	return out, nil
+}
+
+// machineLifecycle 构造 pause/resume 的 claimed mutation 参数（identity + 效果
+// + 崩溃窗口恢复收敛由调用方给出）。
+func (s *Server) machineLifecycle(
+	op *pb.MachineOperationRequest,
+	requestHash string,
+	effect func() (*pb.Machine, error),
+	recover func() (mutation.Recovery[*pb.Machine], error),
+) mutation.Lifecycle[*pb.Machine] {
+	return mutation.Lifecycle[*pb.Machine]{
+		Identity: mutation.Identity{
+			OperationID: op.OperationId,
+			MachineID:   op.MachineId,
+			ExecutionID: op.ExecutionId,
+			Generation:  op.Generation,
+			Kind:        "machine.lifecycle",
+			RequestHash: requestHash,
+		},
+		Recover: recover,
+		Effect:  effect,
+		Codec:   protoCodec(func() *pb.Machine { return &pb.Machine{} }),
+	}
 }
 
 // ---------------------------------------------------------------------------

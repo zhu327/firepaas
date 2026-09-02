@@ -59,6 +59,10 @@ type Options struct {
 	// ScoreHook 在每个候选节点进入打分前被调用一次；仿真用它在
 	// “打分前”校验该节点已通过全部过滤（断言过滤先于打分）。
 	ScoreHook func(nodeID string)
+	// ImageAffinityDisabled 为 true 时保留 WeightImage=0：score 层据此
+	// 整体跳过镜像亲和（见 score），而不是把它当作“未配置”归一化为
+	// 默认权重。供显式关闭亲和的配置面使用（FIREPAAS_SCHED_WEIGHT_IMAGE=0）。
+	ImageAffinityDisabled bool
 }
 
 // Node 是调度器看到的节点视图（nodemanager 同步，纯数据）。
@@ -144,12 +148,22 @@ type Placer struct {
 }
 
 // New 构造 Placer。cfg 零值字段会被默认值补齐。
+//
+// P1#14a：DiskR 也必须归一——漏补时 DiskR=0 会把任何磁盘承诺都判为超售
+// （canFit 把 DiskTotalMib>0 的节点全部硬过滤掉，集群不可调度）。
+// WeightImage 的默认填充不得依赖 CPU/Mem 权重仍为零：旧条件在
+// WeightCPU/WeightMem 默认值补齐后永远不触发，半配置（只设部分权重）会
+// 静默丢失镜像亲和。归一后 WeightImage 不再能为 0（关闭镜像亲和的入口
+// 不复存在）；score 中的 0 短路仅作为直接构造 Placer 时的防御保留。
 func New(cfg BestOfKConfig, opts Options) *Placer {
 	if cfg.R == 0 {
 		cfg.R = DefaultBestOfKConfig().R
 	}
 	if cfg.MemR == 0 {
-		cfg.MemR = 1.0
+		cfg.MemR = DefaultBestOfKConfig().MemR
+	}
+	if cfg.DiskR == 0 {
+		cfg.DiskR = DefaultBestOfKConfig().DiskR
 	}
 	if cfg.K == 0 {
 		cfg.K = DefaultBestOfKConfig().K
@@ -161,11 +175,15 @@ func New(cfg BestOfKConfig, opts Options) *Placer {
 		cfg.WeightCPU = 0.5
 		cfg.WeightMem = 0.5
 	}
-	if cfg.WeightImage == 0 && cfg.WeightCPU == 0 && cfg.WeightMem == 0 {
-		cfg.WeightImage = 0.5
+	if cfg.WeightImage == 0 && !opts.ImageAffinityDisabled {
+		cfg.WeightImage = DefaultBestOfKConfig().WeightImage
 	}
 	return &Placer{cfg: cfg, opts: opts}
 }
+
+// Config 返回归一化后的放置参数。reservations 的节点 CPU 超售双保险必须
+// 与调度器使用同一个 R（契约 C-3），由调用方从这里取值传入。
+func (p *Placer) Config() BestOfKConfig { return p.cfg }
 
 // PrefetchTopK 按真实 deployment 放置的硬候选过滤后，按同一评分升序返回前 k
 // 个节点。预取不做 reservation，但绝不向 pool/labels/资源/反亲和不合格的节点

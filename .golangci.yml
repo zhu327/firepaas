@@ -1,0 +1,24 @@
+# golangci-lint v2 配置：保守基线（生产就绪 P2#18）。
+# 只启用整树已能通过的检查；后续收紧请按"先修后启"追加 linter。
+version: "2"
+linters:
+  # 默认集（govet/errcheck/staticcheck/unused/ineffassign）之外显式补充。
+  default: standard
+  enable:
+    - misspell
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - std-error-handling
+    paths:
+      # protobuf 生成代码（由 make proto 产出，不手改、不 lint）。
+      - shared/gen
+      - third_party$
+      - builtin$
+      - examples$
+run:
+  timeout: 5m
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

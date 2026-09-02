@@ -4,19 +4,21 @@
 
 - 数据面复用 [hypeman](https://github.com/zhu327/hypeman) 的 VM/镜像/快照能力（`firepaas-lib` 分支，tag `v0.4.0-firepaas`，作为 Go module 直接消费）
 - 管控面与调度模式参考 [e2b-dev/infra](https://github.com/e2b-dev/infra)：控制面/数据面分离、Best-of-K 自研调度、Nomad 只编排基础设施作业
-- 当前状态：MVP 主体（M1–M5）与 v1.1–v1.4 增量（自动待机、镜像亲和、drain 驱离、多端口 service、one-shot secret、运行时交互、checkpoint/fork、node-local volume、镜像治理）已实现并通过对应 e2e 验收
+- 当前状态：MVP 主体（M1–M5）及 v1.1–v1.4 的主要代码路径已实现；单机 smoke 覆盖部分能力，但版本发布门禁、标准多节点故障矩阵与长期观测尚未全部满足。当前发布证据以 [GA observation scorecard](docs/ga-observation-scorecard.md) 和各版本记录为准。
 
 ## 文档
 
 | 文档 | 说明 |
 |---|---|
 | [docs/architecture.md](docs/architecture.md) | 目标架构、状态权威、路由与 fencing 契约 |
-| [docs/adr/](docs/adr/) | 关键设计决策（Nomad 边界、调度、状态分层、网络、route catalog、内部身份、secret 路径、edge 入口等 37 篇） |
-| [docs/mvp-plan.md](docs/mvp-plan.md) | MVP 计划：范围、阶段、出口和降级策略 |
-| [docs/v1.1-plan.md](docs/v1.1-plan.md) | v1.1：scale-to-zero 完整化、镜像亲和/预取、edge 流量语义、drain 驱离、多端口 services |
-| [docs/v1.2-plan.md](docs/v1.2-plan.md) | v1.2：one-shot secret、运行时交互、生命周期与资源治理 |
-| [docs/v1.3-plan.md](docs/v1.3-plan.md) | v1.3：域名 egress、checkpoint/fork、node-local volume/dataset |
-| [docs/v1.4-plan.md](docs/v1.4-plan.md) | v1.4：磁盘配额、API 治理与镜像 prewarm |
+| [docs/adr/](docs/adr/) | 关键设计决策（Nomad 边界、调度、状态分层、网络、route catalog、内部身份、secret 路径、edge 入口等 38 篇） |
+| [docs/releases/README.md](docs/releases/README.md) | MVP–v1.4 的范围、实现记录与证据状态索引 |
+| [docs/mvp-plan.md](docs/mvp-plan.md) | MVP 范围、实现记录、出口和降级策略 |
+| [docs/v1.1-plan.md](docs/v1.1-plan.md) | v1.1 范围与验收契约；实现状态另见同版本 implementation notes |
+| [docs/v1.2-plan.md](docs/v1.2-plan.md) | v1.2 范围与验收契约；当前发布门禁尚未全部满足 |
+| [docs/v1.3-plan.md](docs/v1.3-plan.md) | v1.3 范围、实现状态与验证边界 |
+| [docs/v1.4-plan.md](docs/v1.4-plan.md) | v1.4 方向性范围；当前仍未完成版本级验收 |
+| [docs/ga-observation-scorecard.md](docs/ga-observation-scorecard.md) | GA 证据状态与尚未评估项 |
 | [docs/runbook-*.md](docs/runbook-*.md) | 运维流程：soak、备份恢复、容量、HA 验证、节点替换等 |
 
 ## 仓库布局
@@ -33,7 +35,8 @@ firepaas/
 ├── internal/edge/       # edge 实现（router/catalog/autoresume/tls）
 ├── internal/scheduler/  # Best-of-K 放置算法
 ├── shared/pkg/          # ID/错误等公共库
-├── shared/gen/          # proto 生成代码（make proto 重新生成并提交）
+├── shared/gen/          # proto 生成代码（已跟踪入库；make proto 重新生成后提交。
+│                         # CI 门禁：重新生成后 git diff 必须为空且无 untracked 文件）
 ├── protos/agent/v1/     # agent gRPC 契约（唯一数据面契约）
 ├── iac/                 # Nomad jobs + Terraform + 可观测性配置
 ├── scripts/             # 实验室搭建、e2e/混沌/soak 脚本

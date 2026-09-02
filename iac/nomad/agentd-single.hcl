@@ -15,6 +15,13 @@ variable "lab_bin" {
   default = "~/.local/firepaas-lab/bin"
 }
 
+# The raw_exec driver does not notice in-place binary replacement. The launcher
+# supplies the digest so a new binary always changes the job and rolls the alloc.
+variable "agentd_binary_sha256" {
+  type    = string
+  default = "development"
+}
+
 job "firepaas-agentd" {
   type      = "system"
   node_pool = "compute"
@@ -77,6 +84,7 @@ job "firepaas-agentd" {
         CONFIG_PATH               = "${var.repo_root}/scripts/lab/agentd.yaml"
         HYPEMAN_DOCKER_HUB_MIRROR = "docker.m.daocloud.io"
         FIREPAAS_AGENT_GRPC_PORT  = "5108"
+        FIREPAAS_BUILD_SHA256     = var.agentd_binary_sha256
         FIREPAAS_AGENT_PROXY_PORT = "5107"
         FIREPAAS_AGENT_NODE_POOL  = "compute"
         FIREPAAS_AGENT_NODE_ID    = "${node.unique.id}"

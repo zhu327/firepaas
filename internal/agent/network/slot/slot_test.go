@@ -5,10 +5,48 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+// TestPersistDurablePermissions 验证 slots.json 落盘纪律的可观测面：0600
+// 权限、无 .tmp 残留、Load 往返一致（temp/fsync/rename/fsync(dir) 序列
+// 本身无法在单测中直接断言）。
+func TestPersistDurablePermissions(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state", "slots.json")
+	m, err := New(Config{SubnetCIDR: "10.100.0.0/24", StatePath: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.slots["m1"] = Slot{Index: 3, MachineID: "m1", Tap: "hype-tap1", GuestIP: "10.100.0.5"}
+	if err := m.persistLocked(); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("slots.json perm = %o, want 600", perm)
+	}
+	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
+		t.Fatalf("temp file must not survive rename: %v", err)
+	}
+	m2, err := New(Config{SubnetCIDR: "10.100.0.0/24", StatePath: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m2.Load(); err != nil {
+		t.Fatal(err)
+	}
+	s, ok := m2.SlotFor("m1")
+	if !ok || s.Index != 3 || s.GuestIP != "10.100.0.5" {
+		t.Fatalf("reload mismatch: %+v ok=%v", s, ok)
+	}
+}
 
 // cleanupStaleTestNetns 删除无 TAP 的 fp-slot-* netns（无 TAP = 无 firecracker
 // 持有它，删除不影响业务机；带 TAP 的 slot 属于 live VM，必须保留）。
@@ -248,5 +286,41 @@ func TestSlotLifecycle(t *testing.T) {
 	}
 	if len(strays) != 0 {
 		t.Fatalf("stray netns: %v", strays)
+	}
+}
+
+// TestIsolationRuleGeneration 是 nft 规则生成级测试（R2：无需 root）：隔离脚本
+// 的私网 drop 必含 canonical 集合关键段（CGNAT/loopback，与 dataset SSRF
+// 校验同源），且存在 ip6 family 的 slot veth 默认拒绝表。
+func TestIsolationRuleGeneration(t *testing.T) {
+	m, err := New(Config{SubnetCIDR: "10.100.0.0/24", StatePath: filepath.Join(t.TempDir(), "slots.json")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v4 strings.Builder
+	for _, args := range m.isolationStepsIPv4() {
+		v4.WriteString(strings.Join(args, " ") + "\n")
+	}
+	for _, want := range []string{"100.64.0.0/10", "127.0.0.0/8", "daddr", "masquerade"} {
+		if !strings.Contains(v4.String(), want) {
+			t.Fatalf("ip isolation steps missing %q:\n%s", want, v4.String())
+		}
+	}
+	var v6 strings.Builder
+	for _, args := range ip6IsolationSteps() {
+		v6.WriteString(strings.Join(args, " ") + "\n")
+	}
+	for _, want := range []string{
+		"nft add table ip6 fp-isolation",
+		"nft add rule ip6 fp-isolation in iifname @slot-veths drop",
+		"nft add rule ip6 fp-isolation fwdchain iifname @slot-veths drop",
+	} {
+		if !strings.Contains(v6.String(), want) {
+			t.Fatalf("ip6 isolation steps missing %q:\n%s", want, v6.String())
+		}
+	}
+	// ip6 默认拒绝不得有意外放行口（无 established accept）。
+	if strings.Contains(v6.String(), "accept") {
+		t.Fatalf("ip6 isolation must be default-deny without accepts:\n%s", v6.String())
 	}
 }

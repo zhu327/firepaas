@@ -129,12 +129,12 @@ func (a *API) putSecret(w http.ResponseWriter, r *http.Request) {
 	// 行间密文互换。并发同 name 写入靠 UNIQUE 冲突失败，客户端重试即可。
 	version, err := a.store.NextSecretVersion(ctx, body.ProjectID, body.Name)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	sealed, err := a.secrets.Seal([]byte(body.Value), body.ProjectID, body.Name, version)
 	if err != nil {
-		writeErr(w, 500, "seal secret: "+err.Error())
+		writeInternalErr(w, r, fmt.Errorf("seal secret: %w", err))
 		return
 	}
 	meta, err := a.store.PutSecretVersion(ctx, body.ProjectID, body.Name, version,
@@ -147,7 +147,7 @@ func (a *API) putSecret(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 409, "concurrent write to the same secret; retry with a new version")
 			return
 		}
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	body.Value = "" // 尽快丢弃明文引用
@@ -162,7 +162,7 @@ func (a *API) listSecrets(w http.ResponseWriter, r *http.Request) {
 	}
 	metas, err := a.store.ListSecrets(r.Context(), effectiveProjectID(r, "dev"))
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	if metas == nil {
@@ -182,7 +182,11 @@ func (a *API) getSecretMeta(w http.ResponseWriter, r *http.Request) {
 	}
 	meta, err := a.store.GetSecretMeta(r.Context(), effectiveProjectID(r, "dev"), r.PathValue("name"), ver)
 	if err != nil {
-		writeErr(w, 404, err.Error())
+		if errors.Is(err, store.ErrSecretNotFound) {
+			writeErr(w, 404, "secret not found")
+			return
+		}
+		writeInternalErr(w, r, err)
 		return
 	}
 	writeJSON(w, 200, meta)
@@ -195,7 +199,7 @@ func (a *API) deleteSecret(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	n, err := a.store.DeleteSecret(r.Context(), effectiveProjectID(r, "dev"), name)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	slog.Info("secret deleted", "name", name, "versions_removed", n)
@@ -216,7 +220,11 @@ func (a *API) trafficToken(w http.ResponseWriter, r *http.Request) {
 	}
 	machineID := r.PathValue("id")
 	m, err := a.store.GetMachine(r.Context(), machineID)
-	if err != nil || m == nil {
+	if err != nil {
+		writeInternalErr(w, r, err)
+		return
+	}
+	if m == nil {
 		writeErr(w, 404, "machine not found")
 		return
 	}

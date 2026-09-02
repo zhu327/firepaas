@@ -8,6 +8,7 @@
 package main
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 
@@ -26,7 +27,7 @@ func (a *API) listOperations(w http.ResponseWriter, r *http.Request) {
 	project := effectiveProjectID(r, "dev")
 	ops, err := a.store.ListOperations(r.Context(), project, q.Get("machine_id"), q.Get("kind"), q.Get("status"), limit)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalErr(w, r, err)
 		return
 	}
 	out := make([]map[string]any, 0, len(ops))
@@ -39,7 +40,13 @@ func (a *API) listOperations(w http.ResponseWriter, r *http.Request) {
 func (a *API) getOperation(w http.ResponseWriter, r *http.Request) {
 	op, err := a.store.GetOperation(r.Context(), effectiveProjectID(r, "dev"), r.PathValue("id"))
 	if err != nil {
-		writeErr(w, 404, "operation not found")
+		// 仅确证 not-found 才 404（store 将 pgx.ErrNoRows 归为 ErrNotFound 哨兵）；
+		// PG 故障等内部错误 5xx，不再伪装成“操作不存在”。
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, 404, "operation not found")
+			return
+		}
+		writeInternalErr(w, r, err)
 		return
 	}
 	writeJSON(w, 200, opJSON(*op))

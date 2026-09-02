@@ -91,6 +91,8 @@ func main() {
 		operation := fs.String("operation", "", "fencing operation id (required)")
 		hostname := fs.String("hostname", "", "route hostname (spec.hostname)")
 		port := fs.Uint64("port", 0, "ingress port (spec.network.ingress_port)")
+		proxyCredential := fs.String("proxy-credential", "", "execution-bound proxy credential")
+		secretLeaseID := fs.String("secret-lease-id", "", "one-shot secret delivery lease id")
 		var secrets stringSlice
 		fs.Var(&secrets, "secret", "secret env KEY=VALUE (repeatable); value must not echo in response")
 		_ = fs.Parse(args[1:])
@@ -105,6 +107,7 @@ func main() {
 			ImageRef:     *image,
 			Vcpu:         *vcpus,
 			MemMib:       *mem,
+			Placement:    &pb.PlacementConstraints{AntiAffinity: pb.PlacementConstraints_NONE},
 		}
 		if *hostname != "" {
 			spec.Hostname = *hostname
@@ -113,10 +116,12 @@ func main() {
 			spec.Network = &pb.NetworkSpec{IngressPort: *port}
 		}
 		req := &pb.CreateMachineRequest{
-			MachineId:   *machineID,
-			Generation:  *generation,
-			OperationId: *operation,
-			Spec:        spec,
+			MachineId:       *machineID,
+			Generation:      *generation,
+			OperationId:     *operation,
+			Spec:            spec,
+			ProxyCredential: *proxyCredential,
+			SecretLeaseId:   *secretLeaseID,
 		}
 		for _, kv := range secrets {
 			parts := strings.SplitN(kv, "=", 2)

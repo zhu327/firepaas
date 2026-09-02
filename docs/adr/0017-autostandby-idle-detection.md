@@ -32,10 +32,7 @@ usage 管道方案。
 
 ### 3. 探针流量必须排除(关键集成点)
 
-host 侧 readiness 探针(ADR-0008,health worker → slot IP:port)会被 conntrack
-记为入站活动,导致实例**永不清闲**。因此策略下发时必须注入
-`IgnoreSourceCIDRs` 覆盖探针源段(slot 网关/veth 段,如 `10.12.0.0/16`);平台保留
-字段 `IgnoreDestinationPorts` 透传给 app 声明(如监控拨测端口)。
+host 侧 readiness 探针（ADR-0008，health worker → slot IP:port）会进入 conntrack，若按源 CIDR 粗略忽略容易漏算真实流量。实现因此采用更精确的连接过滤：按已知探针连接/端点排除健康检查，同时保留真实入站连接作为活动信号。早期 `IgnoreSourceCIDRs` 方案仅是设计过程，不再是当前契约；具体过滤行为以 agent autostandby adapter 的测试为准。
 
 ### 4. 路由与对账语义(已验证的既有行为,本 ADR 确认为契约)
 

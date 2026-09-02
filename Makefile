@@ -56,5 +56,13 @@ sim: ## M2.6 调度仿真：10 万次放置断言（过滤先于打分/硬准入
 dev-up: ## 启动本地开发依赖(postgres/redis/minio,需要 docker)
 	docker compose -f iac/dev/docker-compose.yaml up -d
 
-clean:
-	rm -rf bin/ shared/gen/
+clean: ## 仅清理未跟踪产物（bin/）；shared/gen/ 是已跟踪的 protobuf 生成物，不再删除
+	rm -rf bin/
+
+# --- 生产就绪 P2#19：控制面/edge 生产镜像（与 CI images job 同一 Dockerfile；
+# agentd 不走镜像，raw_exec 要求宿主 root/cgroup/netns，见 Dockerfile.api 头注） ---
+
+.PHONY: images
+images: ## 构建 api/edge 生产镜像（本地 tag firepaas-api:local / firepaas-edge-proxy:local）
+	docker build -f Dockerfile.api -t firepaas-api:local .
+	docker build -f Dockerfile.edge-proxy -t firepaas-edge-proxy:local .

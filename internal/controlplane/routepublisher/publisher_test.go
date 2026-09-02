@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/zhu327/firepaas/internal/controlplane/catalog"
 	"github.com/zhu327/firepaas/internal/controlplane/store"
@@ -360,6 +363,10 @@ type fakeStore struct {
 	synced      []store.RouteRow
 	calls       *[]string
 	syncErr     error
+	// revs 是 SynnRoutes 返回的 hostname → revision（缺省按序递增分配）。
+	revs map[string]int64
+	mu   sync.Mutex
+	seq  int64
 }
 
 func (f *fakeStore) ActiveRouteMachines(context.Context) ([]store.Machine, error) {
@@ -374,10 +381,25 @@ func (f *fakeStore) ListDeployments(_ context.Context, appID string) ([]store.De
 	return f.deployments[appID], nil
 }
 
-func (f *fakeStore) SyncRoutes(_ context.Context, routes []store.RouteRow) error {
+func (f *fakeStore) SyncRoutes(_ context.Context, routes []store.RouteRow) (map[string]int64, error) {
 	*f.calls = append(*f.calls, "pg")
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.synced = routes
-	return f.syncErr
+	if f.syncErr != nil {
+		return nil, f.syncErr
+	}
+	if f.revs != nil {
+		return f.revs, nil
+	}
+	revs := make(map[string]int64)
+	for _, r := range routes {
+		if _, ok := revs[r.Hostname]; !ok {
+			f.seq++
+			revs[r.Hostname] = f.seq
+		}
+	}
+	return revs, nil
 }
 
 type fakeCatalog struct {
@@ -385,16 +407,111 @@ type fakeCatalog struct {
 	replaceErr error
 	pruned     bool
 	replaced   []catalog.HostRoute
+	revisions  map[string]int64
 }
 
-func (f *fakeCatalog) ReplaceHostRoutes(_ context.Context, hostname string, routes []catalog.HostRoute, _ int) error {
+func (f *fakeCatalog) ReplaceHostRoutes(
+	_ context.Context,
+	hostname string,
+	revision int64,
+	routes []catalog.HostRoute,
+	_ int,
+) (bool, error) {
 	*f.calls = append(*f.calls, "redis:"+hostname)
+	if f.revisions == nil {
+		f.revisions = map[string]int64{}
+	}
+	f.revisions[hostname] = revision
 	f.replaced = append(f.replaced, routes...)
-	return f.replaceErr
+	return f.replaceErr == nil, f.replaceErr
 }
 
 func (f *fakeCatalog) PruneRoutes(context.Context, map[string]bool, map[string]bool) error {
 	f.pruned = true
 	*f.calls = append(*f.calls, "prune")
 	return nil
+}
+
+// D-2：Rebuild 必须进程内串行——周期 sync 与显式 KickRouteRebuild 并发时
+// 只有单一执行流（PG 分配 revision 与 Redis 高水位写入都不允许交错成
+// 新 revision 先写、旧 revision 后到的乱序）。
+func TestRebuildSerializedAcrossConcurrentCallers(t *testing.T) {
+	calls := []string{}
+	var inFlight, maxInFlight atomic.Int32
+	st := &blockingStore{
+		fakeStore: fakeStore{calls: &calls},
+		enter: func() {
+			n := inFlight.Add(1)
+			for {
+				old := maxInFlight.Load()
+				if n <= old || maxInFlight.CompareAndSwap(old, n) {
+					break
+				}
+			}
+			time.Sleep(5 * time.Millisecond) // 拉长窗口：未串行化必然撞车
+			inFlight.Add(-1)
+		},
+	}
+	cat := &fakeCatalog{calls: &calls}
+	p := New(st, cat, 8080, "")
+
+	const n = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- p.Rebuild(context.Background(), nil)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := maxInFlight.Load(); got != 1 {
+		t.Fatalf("rebuild must be serialized in-process, observed %d concurrent writers", got)
+	}
+}
+
+type blockingStore struct {
+	fakeStore
+	enter func()
+}
+
+func (b *blockingStore) SyncRoutes(ctx context.Context, routes []store.RouteRow) (map[string]int64, error) {
+	b.enter()
+	return b.fakeStore.SyncRoutes(ctx, routes)
+}
+
+// D-2：publisher 把 SyncRoutes 同事务分配的 revision 透传给 catalog 发布。
+func TestRebuildPassesAllocatedRevisionToCatalog(t *testing.T) {
+	calls := []string{}
+	st := &fakeStore{
+		machines: []store.Machine{
+			{
+				ID:                 "m",
+				AppID:              "app",
+				DeploymentID:       "dep",
+				Hostname:           "app.test",
+				NodeID:             "node",
+				CurrentExecutionID: "exec",
+				ObservedState:      "RUNNING",
+				ObservedReadiness:  "READY",
+			},
+		},
+		deployments: map[string][]store.Deployment{"app": {{ID: "dep", AppID: "app", Generation: 1, Port: 8080}}},
+		calls:       &calls,
+		revs:        map[string]int64{"app.test": 42},
+	}
+	cat := &fakeCatalog{calls: &calls}
+	if err := New(st, cat, 8080, "").Rebuild(context.Background(), map[string]string{"node": "proxy"}); err != nil {
+		t.Fatal(err)
+	}
+	if cat.revisions["app.test"] != 42 {
+		t.Fatalf("catalog revision = %d, want 42 (allocated by SyncRoutes)", cat.revisions["app.test"])
+	}
 }

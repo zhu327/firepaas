@@ -10,6 +10,30 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # 真实依赖（生产就绪 P2#17）：postgres:16/redis:7 供 8 个 env-gated 包
+    # （store/leader/apikeys/catalog/reservations/ratelimit/controller/prewarm）
+    # 的集成测试运行；env 值与 Makefile check-lab 一致。
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: firepaas
+          POSTGRES_PASSWORD: firepaas
+          POSTGRES_DB: firepaas
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U firepaas"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -22,24 +46,160 @@ jobs:
           GOWORK=off go build ./...
           GOWORK=off go vet ./...
 
-      - name: Test + scheduler simulation
-        run: |
-          GOWORK=off go test ./...
-          GOWORK=off go run ./tools/sim -n 100000
+      - name: Test + coverage
+        env:
+          FIREPAAS_TEST_POSTGRES: "postgres://firepaas:firepaas@127.0.0.1:5432/firepaas?sslmode=disable"
+          FIREPAAS_TEST_REDIS: "127.0.0.1:6379"
+        run: GOWORK=off go test -count=1 -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-${{ github.sha }}
+          path: coverage.out
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Scheduler simulation
+        run: GOWORK=off go run ./tools/sim -n 100000
 
       - name: go.mod/go.sum tidy check
         run: GOWORK=off make tidy-check
 
-      - name: Shell and Nomad syntax
+      - name: Shell syntax and helper tests
         run: |
-          bash -n scripts/lab/*.sh
+          bash -n scripts/lab/*.sh scripts/lab/lib/*.sh
+          bash scripts/lab/lib/runtime_test.sh
+
+      - name: Nomad 1.10 job validation
+        run: |
           curl -fsSL -o /tmp/nomad.zip https://releases.hashicorp.com/nomad/1.10.5/nomad_1.10.5_linux_amd64.zip
-          unzip -q /tmp/nomad.zip -d /tmp
-          /tmp/nomad fmt -check iac/nomad
-          /tmp/nomad job validate -var-file=iac/nomad/ci/agent.vars.hcl iac/nomad/agent.hcl
-          /tmp/nomad job validate iac/nomad/agentd-single.hcl
-          /tmp/nomad job validate -var-file=iac/nomad/ci/control-plane.vars.hcl iac/nomad/control-plane.hcl
-          /tmp/nomad job validate -var-file=iac/nomad/ci/edge.vars.hcl iac/nomad/edge.hcl
+          unzip -q /tmp/nomad.zip -d /tmp/nomad-1.10
+          NOMAD_BIN=/tmp/nomad-1.10/nomad bash scripts/lab/validate-nomad.sh
+
+      - name: Nomad 2.0 job validation
+        run: |
+          curl -fsSL -o /tmp/nomad.zip https://releases.hashicorp.com/nomad/2.0.5/nomad_2.0.5_linux_amd64.zip
+          unzip -q /tmp/nomad.zip -d /tmp/nomad-2.0
+          NOMAD_BIN=/tmp/nomad-2.0/nomad bash scripts/lab/validate-nomad.sh
+
+  race:
+    # -race 单独 job 控制 check 时长；同样的 PG/Redis 真实依赖。
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: firepaas
+          POSTGRES_PASSWORD: firepaas
+          POSTGRES_DB: firepaas
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U firepaas"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: "1.25"
+      - name: go test -race
+        env:
+          FIREPAAS_TEST_POSTGRES: "postgres://firepaas:firepaas@127.0.0.1:5432/firepaas?sslmode=disable"
+          FIREPAAS_TEST_REDIS: "127.0.0.1:6379"
+        # 全树 -race（egress 测试桩的 dns.Server.PacketConn 轮询竞态已修复，
+        # 改为自建 UDP conn + ActivateAndServe）。
+        run: GOWORK=off go test -race ./...
+
+  lint:
+    # golangci-lint 配置见仓库根 .golangci.yml（保守基线）。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: "1.25"
+      - name: golangci-lint
+        run: |
+          curl -sSfL -o /tmp/golangci-lint.tar.gz \
+            https://github.com/golangci/golangci-lint/releases/download/v2.6.2/golangci-lint-2.6.2-linux-amd64.tar.gz
+          tar -xzf /tmp/golangci-lint.tar.gz -C /tmp
+          GOWORK=off /tmp/golangci-lint-2.6.2-linux-amd64/golangci-lint run ./...
+
+  images:
+    # PR 只构建不推送（不需要 registry 凭证）；tag 推送（v*）发布 digest 引用、
+    # cosign keyless 签名与 syft SBOM。registry 由仓库/组织变量
+    # FIREPAAS_IMAGE_REGISTRY 提供（如 ghcr.io/<org>/firepaas），凭证为 secrets
+    # FIREPAAS_IMAGE_PUSH_USER / FIREPAAS_IMAGE_PUSH_TOKEN；均不写死在仓库中。
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # cosign keyless（仅 tag 推送时实际使用）
+    env:
+      REGISTRY: ${{ vars.FIREPAAS_IMAGE_REGISTRY }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Build images
+        run: |
+          docker build -f Dockerfile.api -t firepaas-api:ci .
+          docker build -f Dockerfile.edge-proxy -t firepaas-edge-proxy:ci .
+
+      - name: Login, push, record digests
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          PUSH_USER: ${{ secrets.FIREPAAS_IMAGE_PUSH_USER }}
+          PUSH_TOKEN: ${{ secrets.FIREPAAS_IMAGE_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          [ -n "${REGISTRY}" ] || { echo "::error::set repository variable FIREPAAS_IMAGE_REGISTRY (registry/namespace)"; exit 1; }
+          [ -n "${PUSH_TOKEN}" ] || { echo "::error::set secret FIREPAAS_IMAGE_PUSH_TOKEN"; exit 1; }
+          echo "$PUSH_TOKEN" | docker login "${REGISTRY%%/*}" -u "$PUSH_USER" --password-stdin
+          for c in api edge-proxy; do
+            ref="${REGISTRY}/firepaas-${c}:${GITHUB_REF_NAME}"
+            docker tag "firepaas-${c}:ci" "$ref"
+            docker push "$ref"
+            digest=$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}')
+            echo "${c} ${ref}@${digest}" >> digests.txt
+            cat digests.txt
+          done
+
+      - name: Install cosign + syft
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          curl -sSfL -o /tmp/cosign https://github.com/sigstore/cosign/releases/download/v2.6.5/cosign-linux-amd64
+          sudo install -m 0755 /tmp/cosign /usr/local/bin/cosign
+          curl -sSfL -o /tmp/syft.tar.gz https://github.com/anchore/syft/releases/download/v1.51.1/syft_1.51.1_linux_amd64.tar.gz
+          sudo tar -xzf /tmp/syft.tar.gz -C /usr/local/bin syft
+
+      - name: Keyless sign + SBOM
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          while read -r name ref; do
+            cosign sign --yes "$ref"
+            syft "$ref" -o "spdx-json=sbom-${name}.spdx.json"
+          done < digests.txt
+
+      - name: Upload digests + SBOM
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: image-provenance-${{ github.ref_name }}
+          path: |
+            digests.txt
+            sbom-*.spdx.json
+          retention-days: 90
 
   proto:
     # Generated code consistency only. API/breaking checks remain in contract tests.

@@ -1,6 +1,7 @@
 // Package mtls 提供 M1.3 静态证书的 TLS 配置加载（ADR-0006 降级路径）。
 // 生产形态（轮换/授权矩阵）在 M5 补齐；本包只负责“有证书才能连”，
 // 并按调用方证书 CN 做最小授权白名单（M1.2 评审补齐，P1-2）。
+// CertManager（certmanager.go）在其上提供证书热重载与到期观测（契约 C-1）。
 package mtls
 
 import (
@@ -35,6 +36,22 @@ func ServerConfig(certFile, keyFile, caFile string) (*tls.Config, error) {
 		ClientCAs:    pool,
 		ClientAuth:   tls.RequireAndVerifyClientCert,
 		MinVersion:   tls.VersionTLS12,
+	}, nil
+}
+
+// ServerConfigWithManager 与 ServerConfig 同语义（mTLS、require-and-verify-
+// client-cert），但服务端证书由 CertManager 提供：tls 在每次握手时经
+// GetCertificate 取最新加载的证书，文件轮换无需重启进程（契约 C-1）。
+func ServerConfigWithManager(cm *CertManager, caFile string) (*tls.Config, error) {
+	pool, err := loadCA(caFile)
+	if err != nil {
+		return nil, err
+	}
+	return &tls.Config{
+		GetCertificate: cm.GetCertificate,
+		ClientCAs:      pool,
+		ClientAuth:     tls.RequireAndVerifyClientCert,
+		MinVersion:     tls.VersionTLS12,
 	}, nil
 }
 
@@ -144,7 +161,11 @@ func RequireClientIdentity(next http.Handler, allowedCNs []string) http.Handler 
 		}
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+		// 与 gRPC 侧 PeerCN 同强度：必须存在已验证链（否则未来把
+		// ClientAuth 放宽为 VerifyClientCertIfGiven 或出现
+		// InsecureSkipVerify 路径时，PeerCertificates[0] 会变成未验证
+		// 证书而悄然 fail-open——评审 R2 交叉发现）。
+		if r.TLS == nil || len(r.TLS.VerifiedChains) == 0 || len(r.TLS.PeerCertificates) == 0 {
 			http.Error(w, "client certificate required", http.StatusUnauthorized)
 			return
 		}

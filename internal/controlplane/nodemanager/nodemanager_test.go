@@ -48,8 +48,9 @@ func alloc(nodeID string, version uint64, running bool, grpcPort, proxyPort int)
 	a := NomadAllocStub{ID: "alloc-" + nodeID, NodeID: nodeID, JobVersion: version, ClientStatus: status}
 	a.AllocatedResources = &allocResources{}
 	a.AllocatedResources.Shared.Ports = []struct {
-		Label string `json:"Label"`
-		Value int    `json:"Value"`
+		HostIP string `json:"HostIP"`
+		Label  string `json:"Label"`
+		Value  int    `json:"Value"`
 	}{
 		{Label: "grpc", Value: grpcPort},
 		{Label: "proxy", Value: proxyPort},
@@ -148,6 +149,33 @@ func TestDiscoverSelectsRoutableNomadNodeAddress(t *testing.T) {
 				t.Fatalf("unexpected addresses: %+v", got)
 			}
 		})
+	}
+}
+
+func TestDiscoverUsesAllocHostIPWhenNodeAddressIsLoopback(t *testing.T) {
+	nodes := []NomadNodeStub{{
+		ID: "n1", Name: "node-1", NodePool: "compute", Status: "ready",
+		SchedulingEligibility: "eligible", Address: "127.0.0.1",
+	}}
+	detail := alloc("n1", 3, true, 5108, 5107)
+	for i := range detail.AllocatedResources.Shared.Ports {
+		detail.AllocatedResources.Shared.Ports[i].HostIP = "10.0.0.1"
+	}
+	stub := alloc("n1", 3, true, 0, 0)
+	stub.AllocatedResources = nil
+	srv := fakeNomad(t, nodes, []NomadAllocStub{stub}, map[string]NomadAllocStub{"alloc-n1": detail})
+
+	m, err := New(Config{NomadAddr: srv.URL, JobName: "firepaas-agentd"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if err := m.Discover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := m.Nodes()
+	if len(got) != 1 || got[0].GRPCAddr != "10.0.0.1:5108" || got[0].ProxyAddr != "10.0.0.1:5107" {
+		t.Fatalf("alloc host IP not used: %+v", got)
 	}
 }
 

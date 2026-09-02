@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/kernel/hypeman/lib/images"
@@ -102,6 +103,11 @@ func TestProxyMarksGuestTransport502Retryable(t *testing.T) {
 	}
 	if got := rr.Header().Get(HeaderRetryable); got != retryableValue {
 		t.Fatalf("retry marker = %q, want %q", got, retryableValue)
+	}
+	// P0#4：transport 502 正文不得携带 guest IP:port 等内部拓扑。
+	body := rr.Body.String()
+	if strings.Contains(body, "127.0.0.1") || strings.Contains(body, port) || strings.Contains(body, "dial") {
+		t.Fatalf("502 body leaks internal address: %q", body)
 	}
 }
 
