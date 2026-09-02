@@ -97,8 +97,12 @@ for objective in objectives:
         timestamp = row.get("timestamp")
         if not isinstance(timestamp, str) or not timestamp.strip():
             fail(f"observation {index} missing required timestamp", results)
+        # Different HA objectives are sampled at different cadences: availability
+        # and inventory run every minute, while destructive failover probes run
+        # only periodically. A row may therefore omit an objective metric; the
+        # objective's minimum_samples remains the fail-closed completeness gate.
         if metric not in row:
-            fail(f"observation {index} missing required metric {metric}", results)
+            continue
         value = row[metric]
         if isinstance(value, bool):
             fail(f"observation {index} has non-numeric {metric}", results)
