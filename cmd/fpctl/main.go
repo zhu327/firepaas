@@ -39,7 +39,9 @@ func main() {
 
 func run(args []string) error {
 	if len(args) < 1 {
-		return errors.New("usage: fpctl app/secrets/apikey/ops/images/logs/exec/cp <...>")
+		return errors.New(
+			"usage: fpctl app/secrets/apikey/ops/images/logs/exec/cp/project/nodes/events/machines/wait/ttl/snapshot/volume <...>",
+		)
 	}
 	switch args[0] {
 	case "app":
@@ -52,6 +54,22 @@ func run(args []string) error {
 		return runOps(args[1:])
 	case "images":
 		return runImages(args[1:])
+	case "project":
+		return runProject(args[1:])
+	case "nodes":
+		return runNodes(args[1:])
+	case "events":
+		return runEvents(args[1:])
+	case "machines":
+		return runMachines(args[1:])
+	case "wait":
+		return runWait(args[1:])
+	case "ttl":
+		return runTTL(args[1:])
+	case "snapshot":
+		return runSnapshot(args[1:])
+	case "volume":
+		return runVolume(args[1:])
 	case "logs", "exec", "cp":
 		return runRuntime(args)
 	default:
@@ -157,7 +175,7 @@ func runSecrets(args []string) error {
 
 func runApp(args []string) error {
 	if len(args) < 1 {
-		return errors.New("usage: fpctl app <create|list|status|deploy|scale|rollback|delete>")
+		return errors.New("usage: fpctl app <create|list|status|deploy|scale|rollback|delete|egress-audit>")
 	}
 	switch args[0] {
 	case "create":
@@ -307,6 +325,13 @@ func runApp(args []string) error {
 			return err
 		}
 		return do("DELETE", "/v1/apps/"+appID, nil, nil)
+
+	case "egress-audit":
+		appID, err := oneArg(args[1:], "fpctl app egress-audit <app_id>")
+		if err != nil {
+			return err
+		}
+		return do("GET", "/v1/apps/"+appID+"/egress-audit", nil, nil)
 
 	default:
 		return fmt.Errorf("unknown app command %q", args[0])

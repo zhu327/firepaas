@@ -81,6 +81,45 @@ func TestInvalidScopeRejected(t *testing.T) {
 	}
 }
 
+// v1.5 RBAC 角色展开（纯函数，无 DB）：未知角色拒绝；展开结果均为合法 scope。
+func TestExpandRole(t *testing.T) {
+	want := map[string][]string{
+		"viewer":     {"read"},
+		"operator":   {"read", "exec"},
+		"deployer":   {"read", "deploy"},
+		"maintainer": {"read", "deploy", "exec"},
+		"owner":      {"admin"},
+	}
+	for role, scopes := range want {
+		got, ok := ExpandRole(role)
+		if !ok {
+			t.Fatalf("role %q must expand", role)
+		}
+		if len(got) != len(scopes) {
+			t.Fatalf("role %q = %v, want %v", role, got, scopes)
+		}
+		for i := range scopes {
+			if got[i] != scopes[i] {
+				t.Fatalf("role %q = %v, want %v", role, got, scopes)
+			}
+		}
+		for _, s := range got {
+			valid := false
+			for _, v := range ValidScopes {
+				if v == s {
+					valid = true
+				}
+			}
+			if !valid {
+				t.Fatalf("role %q expands to invalid scope %q", role, s)
+			}
+		}
+	}
+	if _, ok := ExpandRole("superuser"); ok {
+		t.Fatal("unknown role must be rejected")
+	}
+}
+
 // 跨 project：key 带 project 约束时，GetByHash 不受影响（授权在 API 层），
 // 但 last_used touch 必须精确命中。
 func TestTouch(t *testing.T) {

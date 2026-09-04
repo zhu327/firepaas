@@ -176,6 +176,11 @@ func (a *API) prewarmImage(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 403, "cross-project access denied")
 		return
 	}
+	// v1.5 租户自助：受限身份不得指定 node_ids（拓扑枚举），只许 node_pool。
+	if !identityIsGlobal(identFrom(r)) && len(body.NodeIDs) > 0 {
+		writeErr(w, 403, "project keys must specify node_pool, not node_ids (topology is operator-managed)")
+		return
+	}
 	if project == "" {
 		project = "dev"
 	}
@@ -351,14 +356,46 @@ func (a *API) imageCoverage(w http.ResponseWriter, r *http.Request) {
 	if views == nil {
 		views = []nodeView{}
 	}
+	summary := map[string]any{
+		"eligible": eligible, "cached": cached,
+		"pending_prewarm": pending, "prewarm_failed": failed,
+		"uncached": eligible - cached,
+	}
+	// v1.5 脱敏：受限身份只见汇总 + 按 pool 聚合，不暴露 node_id/拓扑与
+	// 单节点观测时间；全局身份保留全量 per-node 视图。
+	if !identityIsGlobal(identFrom(r)) {
+		byPool := map[string]map[string]int{}
+		for _, v := range views {
+			poolName := v.NodePool
+			if poolName == "" {
+				poolName = "default"
+			}
+			m, ok := byPool[poolName]
+			if !ok {
+				m = map[string]int{}
+				byPool[poolName] = m
+			}
+			m["eligible"]++
+			if v.Cached {
+				m["cached"]++
+			}
+			if v.Pending {
+				m["pending_prewarm"]++
+			}
+			if v.Failed {
+				m["prewarm_failed"]++
+			}
+		}
+		writeJSON(w, 200, map[string]any{
+			"project_id": project, "digest": digest,
+			"summary": summary, "by_pool": byPool,
+		})
+		return
+	}
 	writeJSON(w, 200, map[string]any{
 		"project_id": project, "digest": digest,
-		"summary": map[string]any{
-			"eligible": eligible, "cached": cached,
-			"pending_prewarm": pending, "prewarm_failed": failed,
-			"uncached": eligible - cached,
-		},
-		"nodes": views,
+		"summary": summary,
+		"nodes":   views,
 	})
 }
 
@@ -386,6 +423,11 @@ func (a *API) createImagePin(w http.ResponseWriter, r *http.Request) {
 	}
 	if project == "" {
 		project = "dev"
+	}
+	// v1.5 租户自助：受限身份不得指定 node_ids，只许 node_pool。
+	if !identityIsGlobal(identFrom(r)) && len(body.NodeIDs) > 0 {
+		writeErr(w, 403, "project keys must specify node_pool, not node_ids (topology is operator-managed)")
+		return
 	}
 	digest := body.ImageDigest
 	if digest == "" && body.ImageRef != "" {

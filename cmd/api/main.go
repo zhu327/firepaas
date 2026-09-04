@@ -387,10 +387,16 @@ func run() error {
 	mux.HandleFunc("PUT /v1/projects/{id}/quota", api.auth(api.putProjectQuota))
 	mux.HandleFunc("GET /v1/projects/{id}/rate-limits", api.auth(api.getRateLimits))
 	mux.HandleFunc("PUT /v1/projects/{id}/rate-limits", api.auth(api.putRateLimits))
-	// M5.1（mvp-plan §9.1）：API key 管理（admin scope，routeScope 表收口）。
+	// v1.5（最小可用项目面）：projects CRUD（配额/限流仍走 governance 端点）。
+	mux.HandleFunc("POST /v1/projects", api.auth(api.createProject))
+	mux.HandleFunc("GET /v1/projects", api.auth(api.listProjects))
+	mux.HandleFunc("GET /v1/projects/{id}", api.auth(api.getProject))
+	mux.HandleFunc("DELETE /v1/projects/{id}", api.auth(api.deleteProject))
+	// M5.1（mvp-plan §9.1）+ v1.5 自助轮换：admin scope，越权边界由 handler 强制。
 	mux.HandleFunc("POST /v1/apikeys", api.auth(api.createAPIKey))
 	mux.HandleFunc("GET /v1/apikeys", api.auth(api.listAPIKeys))
 	mux.HandleFunc("DELETE /v1/apikeys/{id}", api.auth(api.revokeAPIKey))
+	mux.HandleFunc("POST /v1/apikeys/{id}/rotate", api.auth(api.rotateAPIKey))
 	// M5.3：操作追踪（请求/结果字段已脱敏）。
 	mux.HandleFunc("GET /v1/operations", api.auth(api.listOperations))
 	mux.HandleFunc("GET /v1/operations/{id}", api.auth(api.getOperation))

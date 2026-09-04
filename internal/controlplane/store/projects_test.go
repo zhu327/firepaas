@@ -36,6 +36,73 @@ func TestProjectQuotaRevisionCAS(t *testing.T) {
 	}
 }
 
+// v1.5（最小可用项目面）：项目 CRUD——创建/重复 409/列表/详情/非空保护/删除。
+func TestProjectCRUD(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	project := fmt.Sprintf("p-crud-%d", os.Getpid())
+	defer cleanupProject(t, s, project)
+	p, err := s.CreateProject(ctx, project, "crud-test")
+	if err != nil || p.ID != project || p.Name != "crud-test" {
+		t.Fatalf("create project: %+v err=%v", p, err)
+	}
+	// 重复创建 → ErrProjectExists（调用方映射 409）。
+	if _, err := s.CreateProject(ctx, project, "dup"); !errors.Is(err, ErrProjectExists) {
+		t.Fatalf("duplicate create must fail with ErrProjectExists, got %v", err)
+	}
+	// 详情与列表可见。
+	got, err := s.GetProject(ctx, project)
+	if err != nil || got.ID != project {
+		t.Fatalf("get project: %+v err=%v", got, err)
+	}
+	all, err := s.ListProjects(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, q := range all {
+		if q.ID == project {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("list must contain the created project")
+	}
+	// 非空保护：建一个 app 后删除必须拒绝。
+	err = s.CreateAppAndDeployment(
+		ctx,
+		project,
+		App{
+			ID:              project + "-app",
+			Hostname:        project + ".local",
+			ImageRef:        "img:v1",
+			VCPU:            1,
+			MemMIB:          512,
+			DesiredReplicas: 1,
+		},
+		Deployment{
+			ID:         project + "-dep",
+			AppID:      project + "-app",
+			Generation: 1,
+			ImageRef:   "img:v1",
+			VCPU:       1,
+			MemMIB:     512,
+			Port:       80,
+			Status:     "ACTIVE",
+		},
+	)
+	if err != nil {
+		t.Fatalf("seed app: %v", err)
+	}
+	if err := s.DeleteProjectIfEmpty(ctx, project); !errors.Is(err, ErrProjectNotEmpty) {
+		t.Fatalf("non-empty delete must fail with ErrProjectNotEmpty, got %v", err)
+	}
+	// 不存在 → ErrNotFound。
+	if err := s.DeleteProjectIfEmpty(ctx, project+"-missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing delete must fail with ErrNotFound, got %v", err)
+	}
+}
+
 func TestRateLimitConfigDefaultAndUpsert(t *testing.T) {
 	s := testStore(t)
 	ctx := context.Background()

@@ -63,8 +63,35 @@ func NewCached(pool *pgxpool.Pool, ttl time.Duration) *Manager {
 	return m
 }
 
-// ValidScopes 是合法 scope 全集。Beyond 三档的形状 v1 不接（计划风险表）。
-var ValidScopes = []string{"admin", "write", "read"}
+// ValidScopes 是合法 scope 全集。write/debug 为历史兼容别名：write 授予
+// deploy+exec 等全部非 admin 能力，debug 授予 exec；新 key 推荐按最小权限
+// 直接申请 deploy / exec。admin 授予一切。
+var ValidScopes = []string{"admin", "write", "read", "debug", "deploy", "exec"}
+
+// ProjectRoles 是 project 级 RBAC 角色到 scope 束的映射（文档与 CLI --role
+// 展开用；落库仍是 scopes，不新增成员表）：
+//
+//   - viewer: 只读
+//   - operator: 可 exec（logs/exec/cp）不可 deploy
+//   - deployer: 可 deploy 不可 exec
+//   - maintainer: deploy+exec（write 等价，不含 admin）
+//   - owner: 项目内 admin（含自助发 key、配额读、预热自助）
+var ProjectRoles = map[string][]string{
+	"viewer":     {"read"},
+	"operator":   {"read", "exec"},
+	"deployer":   {"read", "deploy"},
+	"maintainer": {"read", "deploy", "exec"},
+	"owner":      {"admin"},
+}
+
+// ExpandRole 将角色名展开为 scopes；ok=false 表示未知角色。
+func ExpandRole(role string) ([]string, bool) {
+	s, ok := ProjectRoles[role]
+	if !ok {
+		return nil, false
+	}
+	return slices.Clone(s), true
+}
 
 // Create 生成新 key：'fp_'+64 hex（32B）。返回（记录, 明文）；明文只有这一次。
 func (m *Manager) Create(
@@ -197,6 +224,54 @@ func (m *Manager) Touch(ctx context.Context, keyHash string) error {
 	_, err := m.pool.Exec(ctx,
 		`UPDATE api_keys SET last_used_at=now() WHERE key_hash=$1`, keyHash)
 	return err
+}
+
+// GetByID 按 id 取 key（含已撤销/过期，用于自助 revoke 的归属校验）。
+func (m *Manager) GetByID(ctx context.Context, id string) (*Key, error) {
+	var k Key
+	var expiresAt, lastUsedAt, revokedAt *time.Time
+	err := m.pool.QueryRow(ctx, `
+		SELECT id, name, key_hash, scopes, coalesce(project_id,''), created_at, expires_at, last_used_at, revoked_at
+		FROM api_keys WHERE id=$1`, id,
+	).Scan(&k.ID, &k.Name, &k.KeyHash, &k.Scopes, &k.ProjectID,
+		&k.CreatedAt, &expiresAt, &lastUsedAt, &revokedAt)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get api key by id: %w", err)
+	}
+	k.ExpiresAt, k.LastUsedAt, k.RevokedAt = expiresAt, lastUsedAt, revokedAt
+	return &k, nil
+}
+
+// ListByProject 列出某项目 key（projectID 空 = 全部，global 调用方用）。
+func (m *Manager) ListByProject(ctx context.Context, projectID string) ([]Key, error) {
+	q := `SELECT id, name, key_hash, scopes, coalesce(project_id,''), created_at, expires_at, last_used_at, revoked_at
+		FROM api_keys`
+	args := []any{}
+	if projectID != "" {
+		q += ` WHERE project_id=$1`
+		args = append(args, projectID)
+	}
+	q += ` ORDER BY created_at DESC`
+	rows, err := m.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list api keys: %w", err)
+	}
+	defer rows.Close()
+	var out []Key
+	for rows.Next() {
+		var k Key
+		var expiresAt, lastUsedAt, revokedAt *time.Time
+		if err := rows.Scan(&k.ID, &k.Name, &k.KeyHash, &k.Scopes, &k.ProjectID,
+			&k.CreatedAt, &expiresAt, &lastUsedAt, &revokedAt); err != nil {
+			return nil, err
+		}
+		k.ExpiresAt, k.LastUsedAt, k.RevokedAt = expiresAt, lastUsedAt, revokedAt
+		out = append(out, k)
+	}
+	return out, rows.Err()
 }
 
 // List 列出全部 key（admin 端点用）。

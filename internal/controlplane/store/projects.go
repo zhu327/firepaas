@@ -13,6 +13,98 @@ import (
 // ErrQuotaRevisionConflict：CAS 更新配额时 revision 不匹配（并发管理操作）。
 var ErrQuotaRevisionConflict = errors.New("project quota revision conflict")
 
+// ErrProjectExists：创建已存在的 project（调用方应复用或换名）。
+var ErrProjectExists = errors.New("project already exists")
+
+// ErrProjectNotEmpty：删除仍有业务资源（apps/volumes/snapshots/pins）的 project。
+var ErrProjectNotEmpty = errors.New("project not empty")
+
+// Project 是项目 CRUD 视图（配额/限流走既有 governance 端点）。
+type Project struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// CreateProject 创建项目（非幂等：已存在返回 ErrProjectExists；配额列走 DB 默认）。
+func (s *Store) CreateProject(ctx context.Context, id, name string) (*Project, error) {
+	var p Project
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO projects(id, name) VALUES($1,$2)
+		RETURNING id, name, created_at`, id, name,
+	).Scan(&p.ID, &p.Name, &p.CreatedAt)
+	if err != nil {
+		if isUniqueViolation(err) {
+			return nil, ErrProjectExists
+		}
+		return nil, fmt.Errorf("create project %s: %w", id, err)
+	}
+	return &p, nil
+}
+
+// GetProject 取单个项目；不存在返回 ErrNotFound。
+func (s *Store) GetProject(ctx context.Context, id string) (*Project, error) {
+	var p Project
+	err := s.pool.QueryRow(ctx, `SELECT id, name, created_at FROM projects WHERE id=$1`, id).
+		Scan(&p.ID, &p.Name, &p.CreatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get project %s: %w", id, err)
+	}
+	return &p, nil
+}
+
+// ListProjects 列出全部项目（按 id 排序；租户侧在 API 层过滤）。
+func (s *Store) ListProjects(ctx context.Context) ([]Project, error) {
+	rows, err := s.pool.Query(ctx, `SELECT id, name, created_at FROM projects ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("list projects: %w", err)
+	}
+	defer rows.Close()
+	var out []Project
+	for rows.Next() {
+		var p Project
+		if err := rows.Scan(&p.ID, &p.Name, &p.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// DeleteProjectIfEmpty 仅当项目无业务资源时删除，否则 ErrProjectNotEmpty。
+// 业务资源：apps、volumes、未过期 pins、snapshots（含已删快照的审计行？以
+// snapshots 表为准）、api_keys（key 随项目级联撤销，删除前需先 revoke/随删）。
+func (s *Store) DeleteProjectIfEmpty(ctx context.Context, id string) error {
+	return s.inTx(ctx, func(tx pgx.Tx) error {
+		var n int
+		checks := []string{
+			`SELECT count(*) FROM apps WHERE project_id=$1`,
+			`SELECT count(*) FROM volumes WHERE project_id=$1 AND state<>'DELETED'`,
+			`SELECT count(*) FROM snapshots WHERE project_id=$1`,
+			`SELECT count(*) FROM image_pins WHERE project_id=$1 AND expires_at>now()`,
+		}
+		for _, q := range checks {
+			if err := tx.QueryRow(ctx, q, id).Scan(&n); err != nil {
+				return err
+			}
+			if n > 0 {
+				return ErrProjectNotEmpty
+			}
+		}
+		tag, err := tx.Exec(ctx, `DELETE FROM projects WHERE id=$1`, id)
+		if err != nil {
+			return fmt.Errorf("delete project %s: %w", id, err)
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
+}
+
 // ProjectQuotaDetail 是项目的完整配额视图（含乐观锁 revision）。
 type ProjectQuotaDetail struct {
 	VCPU                      int64 `json:"vcpu_quota"`

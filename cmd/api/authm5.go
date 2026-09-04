@@ -56,6 +56,41 @@ func maxRank(scopes []string) int {
 	return r
 }
 
+// scopeGrants：scope → 授予的能力集合（v1.5 RBAC 拆分：deploy 与 exec 互斥可分）。
+//
+//   - read：只读
+//   - exec / debug（历史别名）：logs/exec/cp（read + exec）
+//   - deploy：app 创建/部署/扩缩/回滚/删除（read + deploy）
+//   - write（历史兼容）：全部非 admin mutation（read + exec + deploy + write）
+//   - admin：一切（含项目配额写、节点运维、自助 key 的越权边界）
+//
+// 路由表 routeScope 的 need 取值：read / exec / deploy / write / admin /
+// debug（debug 仅历史路由残留，新路由用 exec）。
+var scopeGrants = map[string]map[string]bool{
+	"read":   {"read": true},
+	"exec":   {"read": true, "exec": true, "debug": true},
+	"debug":  {"read": true, "exec": true, "debug": true},
+	"deploy": {"read": true, "deploy": true},
+	"write": {
+		"read": true, "exec": true, "debug": true,
+		"deploy": true, "write": true,
+	},
+	"admin": {
+		"read": true, "exec": true, "debug": true,
+		"deploy": true, "write": true, "admin": true,
+	},
+}
+
+// scopeAllows 判定 scopes 是否授予 need 能力。未知 scope 永不授予。
+func scopeAllows(scopes []string, need string) bool {
+	for _, s := range scopes {
+		if g, ok := scopeGrants[s]; ok && g[need] {
+			return true
+		}
+	}
+	return false
+}
+
 // routeScope：r.Pattern → 最小 scope。auth wrapper 对未登记路由默认拒绝，
 // 因而每个经 auth 包装的端点必须在这里显式登记。
 var routeScope = map[string]string{
@@ -84,14 +119,15 @@ var routeScope = map[string]string{
 	"POST /v1/secrets":                "write",
 	"DELETE /v1/secrets/{name}":       "write",
 	"PUT /v1/apps/{id}/secret-refs":   "write",
-	"POST /v1/apps":                   "write",
-	"POST /v1/apps/{id}/deployments":  "write",
-	"POST /v1/apps/{id}/scale":        "write",
-	"POST /v1/apps/{id}/rollback":     "write",
-	"DELETE /v1/apps/{id}":            "write",
+	"POST /v1/apps":                   "deploy",
+	"POST /v1/apps/{id}/deployments":  "deploy",
+	"POST /v1/apps/{id}/scale":        "deploy",
+	"POST /v1/apps/{id}/rollback":     "deploy",
+	"DELETE /v1/apps/{id}":            "deploy",
 	"POST /v1/apikeys":                "admin",
 	"GET /v1/apikeys":                 "admin",
 	"DELETE /v1/apikeys/{id}":         "admin",
+	"POST /v1/apikeys/{id}/rotate":    "admin",
 	"POST /v1/system/reprojections":   "admin",
 	"POST /v1/nodes/{id}/drain":       "admin",
 	"POST /v1/nodes/{id}/ready":       "admin",
@@ -100,10 +136,10 @@ var routeScope = map[string]string{
 	"GET /v1/machines/{id}/traffic-token": "write",
 	// v1.2-C（ADR-0025）：实时 logs/exec/cp 使用独立 debug scope（等价 write）；
 	// read key 只能读历史元数据。
-	"GET /v1/machines/{id}/logs":  "debug",
-	"POST /v1/machines/{id}/exec": "debug",
-	"PUT /v1/machines/{id}/files": "debug",
-	"GET /v1/machines/{id}/files": "debug",
+	"GET /v1/machines/{id}/logs":  "exec",
+	"POST /v1/machines/{id}/exec": "exec",
+	"PUT /v1/machines/{id}/files": "exec",
+	"GET /v1/machines/{id}/files": "exec",
 	"GET /v1/capabilities":        "read",
 	// v1.2-D：wait/TTL/restart 治理（TTL/restart 变更按 write 收口）。
 	"GET /v1/machines/{id}/wait":           "read",
@@ -129,23 +165,26 @@ var routeScope = map[string]string{
 	"DELETE /v1/volumes/{id}":                                "write",
 	"POST /v1/machines/{id}/volume-attach":                   "write",
 	"POST /v1/machines/{id}/volume-detach":                   "write",
-	// Node-pool ACL 尚未存在；涉及节点拓扑和缓存状态的 v1.4 API 暂只开放给管理员。
-	"POST /v1/images/prewarm":     "admin",
-	"GET /v1/images/coverage":     "admin",
-	"POST /v1/images/pins":        "admin",
-	"GET /v1/images/pins":         "admin",
-	"DELETE /v1/images/pins/{id}": "admin",
+	// v1.5（租户自助预热）：prewarm/pin 写 = write（项目配额内自助，handler 层
+	// 对受限身份禁 node_ids、只许 node_pool）；coverage 读 = read（受限身份只见
+	// 脱敏汇总，不暴露 node 拓扑）。全局 admin 保留全量视图。
+	"POST /v1/images/prewarm":     "write",
+	"GET /v1/images/coverage":     "read",
+	"POST /v1/images/pins":        "write",
+	"GET /v1/images/pins":         "read",
+	"DELETE /v1/images/pins/{id}": "write",
+	// v1.5（项目 CRUD，最小可用）：创建/删除 = admin 且全局身份；读 = read
+	//（受限身份仅见本项目，handler 层过滤）。
+	"POST /v1/projects":        "admin",
+	"GET /v1/projects":         "read",
+	"GET /v1/projects/{id}":    "read",
+	"DELETE /v1/projects/{id}": "admin",
 }
 
-// globalIdentityRoutes：API key 管理端点（P0，R2 评审）——project 受限身份
-// 一律拒绝（403）。只允许全局身份：root token 或 project_id 为空的 admin key。
-// 受限 admin 若能管理全局 key，就能为自己签发其他 project 的 key，
-// 直接突破整个 cross-project 防线；仅中间件收口不够，handler 层同样复核。
-var globalIdentityRoutes = map[string]bool{
-	"POST /v1/apikeys":        true,
-	"GET /v1/apikeys":         true,
-	"DELETE /v1/apikeys/{id}": true,
-}
+// v1.5 自助 key 说明（中间件不再一刀切拦截受限身份）：受限 project admin
+// 可在 handler 约束下管理本项目 key（目标 project == 自身 + 申请 scopes 的
+// 能力 ⊆ 自身）；全局 key 管理仍需全局身份（handler 内 identityIsGlobal
+// 判定）。中间件只做 admin scope 门槛，越权边界由 handler 强制。
 
 // identityIsGlobal 判定身份是否为全局身份（root token 或无 project 绑定的 key）。
 func identityIsGlobal(id identity) bool {
@@ -154,6 +193,8 @@ func identityIsGlobal(id identity) bool {
 
 // projectGated：受限 key 的跨 project 防线覆盖所有 by-id 资源路径。
 var projectGated = map[string]bool{
+	"GET /v1/projects/{id}":                                  true,
+	"DELETE /v1/projects/{id}":                               true,
 	"GET /v1/projects/{id}/quota":                            true,
 	"PUT /v1/projects/{id}/quota":                            true,
 	"GET /v1/projects/{id}/rate-limits":                      true,
@@ -408,16 +449,16 @@ func (a *API) auth(next http.HandlerFunc) http.HandlerFunc {
 			writeErr(w, 403, "route is not authorized")
 			return
 		}
-		if maxRank(id.Scopes) < scopeRank[need] {
+		if _, ok := scopeGrants[need]; !ok {
+			writeErr(w, 403, "route is not authorized")
+			return
+		}
+		if !scopeAllows(id.Scopes, need) {
 			writeErr(w, 403, "insufficient scope: require "+need)
 			return
 		}
-		// P0（R2）：apikey 管理端点只接受全局身份；任何 project 受限身份
-		//（即便持有 admin scope）拒绝——MW 收口，handler 内还有第二道复核。
-		if globalIdentityRoutes[r.Pattern] && !identityIsGlobal(id) {
-			writeErr(w, 403, "api key management requires a global identity (root token or an unscoped admin key)")
-			return
-		}
+		// v1.5：apikey 管理不再在中间件一刀切拦截受限身份；越权边界
+		// 由 handler 强制（全局操作需全局身份，项目自助需本项目 + 能力子集）。
 		// 跨 project：gate 清单内的路由，受限 key 只放行本项目资源。
 		if id.ProjectID != "" && projectGated[r.Pattern] &&
 			!a.allowsProjectResource(r.Context(), r, id.ProjectID) {

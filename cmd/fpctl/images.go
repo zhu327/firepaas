@@ -27,12 +27,9 @@ func runImages(args []string) error {
 	case "pin":
 		return runImagesPin(args[1:])
 	case "pins":
-		return do("GET", "/v1/images/pins", nil, nil)
+		return runImagesPins(args[1:])
 	case "unpin":
-		if len(args) < 2 {
-			return errors.New("usage: fpctl images unpin <pin_id>")
-		}
-		return do("DELETE", "/v1/images/pins/"+url.PathEscape(args[1]), nil, nil)
+		return runImagesUnpin(args[1:])
 	default:
 		return fmt.Errorf("unknown images command %q", args[0])
 	}
@@ -65,6 +62,7 @@ func runImagesPrewarm(args []string) error {
 	var nodePool string
 	var nodeIDs []string
 	nodeTargetFlags(fs, &nodePool, &nodeIDs)
+	idem := idemKeyFlag(fs)
 	_ = fs.Parse(args)
 	if *image == "" || (nodePool == "" && len(nodeIDs) == 0) {
 		return errors.New(
@@ -78,7 +76,7 @@ func runImagesPrewarm(args []string) error {
 	if len(nodeIDs) > 0 {
 		body["node_ids"] = nodeIDs
 	}
-	return do("POST", "/v1/images/prewarm", body, nil)
+	return doIdem("POST", "/v1/images/prewarm", body, nil, resolveIdemKey(*idem))
 }
 
 func runImagesCoverage(args []string) error {
@@ -103,6 +101,27 @@ func runImagesCoverage(args []string) error {
 	return do("GET", "/v1/images/coverage?"+q.Encode(), nil, nil)
 }
 
+func runImagesPins(args []string) error {
+	fs := flag.NewFlagSet("images pins", flag.ExitOnError)
+	project := fs.String("project", "", "filter by project id (default: own/Global sees all)")
+	_ = fs.Parse(args)
+	path := "/v1/images/pins"
+	if *project != "" {
+		path += "?project_id=" + url.QueryEscape(*project)
+	}
+	return do("GET", path, nil, nil)
+}
+
+func runImagesUnpin(args []string) error {
+	if len(args) < 1 {
+		return errors.New("usage: fpctl images unpin <pin_id> [--idempotency-key K]")
+	}
+	fs := flag.NewFlagSet("images unpin", flag.ExitOnError)
+	idem := idemKeyFlag(fs)
+	_ = fs.Parse(args[1:])
+	return doIdem("DELETE", "/v1/images/pins/"+url.PathEscape(args[0]), nil, nil, resolveIdemKey(*idem))
+}
+
 func runImagesPin(args []string) error {
 	fs := flag.NewFlagSet("images pin", flag.ExitOnError)
 	project := fs.String("project", "dev", "project id")
@@ -112,6 +131,7 @@ func runImagesPin(args []string) error {
 	var nodePool string
 	var nodeIDs []string
 	nodeTargetFlags(fs, &nodePool, &nodeIDs)
+	idem := idemKeyFlag(fs)
 	_ = fs.Parse(args)
 	if *image == "" || (nodePool == "" && len(nodeIDs) == 0) {
 		return errors.New(
@@ -128,5 +148,5 @@ func runImagesPin(args []string) error {
 	if len(nodeIDs) > 0 {
 		body["node_ids"] = nodeIDs
 	}
-	return do("POST", "/v1/images/pins", body, nil)
+	return doIdem("POST", "/v1/images/pins", body, nil, resolveIdemKey(*idem))
 }

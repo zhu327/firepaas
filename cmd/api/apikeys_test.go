@@ -16,14 +16,9 @@ import (
 	"github.com/zhu327/firepaas/internal/controlplane/store"
 )
 
-// 受限 admin key（project 绑定）绝不能：
-//   - 创建全局 key（project_id=""）或他 project 的 key；
-//   - 列出全部 key；
-//   - 撤销任何 key。
-// 只有全局身份（root token 或 project_id="" 的 admin key）放行。
-
-// 第一层：middleware 必须拦截受限身份（不依赖 handler 复核）。
-// 用真实 PG 造一枚 project 受限 admin key 与一枚全局 admin key。
+// v1.5 自助 key：受限 project admin 可管理本项目 key（目标 project == 自身 +
+// 申请 scopes ⊆ 自身），仍不能碰全局 key 或他项目。全局身份不受限。
+// 中间件只做 admin scope 门槛，越权边界由 handler 强制——本测试走全链路断言。
 func TestAPIKeyEndpointsRequireGlobalIdentityMiddleware(t *testing.T) {
 	dsn := os.Getenv("FIREPAAS_TEST_POSTGRES")
 	if dsn == "" {
@@ -71,33 +66,86 @@ func TestAPIKeyEndpointsRequireGlobalIdentityMiddleware(t *testing.T) {
 	mux.HandleFunc("GET /v1/apikeys", a.auth(a.listAPIKeys))
 	mux.HandleFunc("DELETE /v1/apikeys/{id}", a.auth(a.revokeAPIKey))
 
-	// 受限 admin：四条定向操作（含“给自己 project 造 key”）全部 403。
-	for _, tc := range []struct {
-		method, path, body string
-	}{
-		{http.MethodPost, "/v1/apikeys", `{"name":"x","scopes":["admin"],"project_id":""}`},         // 造全局 key
-		{http.MethodPost, "/v1/apikeys", `{"name":"x","scopes":["admin"],"project_id":"t-proj-y"}`}, // 造他 project key
-		{http.MethodGet, "/v1/apikeys", ""},                                                         // list 全部
-		{http.MethodDelete, "/v1/apikeys/apik_any", ""},                                             // revoke 任意
-	} {
-		req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
-		req.Header.Set("Authorization", "Bearer "+scopedPlain)
-		rec := httptest.NewRecorder()
-		mux.ServeHTTP(rec, req)
-		if rec.Code != 403 {
-			t.Fatalf("%s %s: scoped admin status = %d, want 403; body=%q",
-				tc.method, tc.path, rec.Code, rec.Body.String())
-		}
-		if !strings.Contains(rec.Body.String(), "global identity") {
-			t.Fatalf("%s %s: 403 must explain global identity requirement, got %q",
-				tc.method, tc.path, rec.Body.String())
+	// 受限 admin 越权操作仍 403：造他 project key。
+	// 注：project_id 留空不是“造全局 key”——handler 按 clamp 语义归一到自身
+	// 项目（全局 key 只能由全局身份显式创建，见下），此处单独断言归一行为。
+	req0 := httptest.NewRequest(http.MethodPost, "/v1/apikeys",
+		strings.NewReader(`{"name":"x","scopes":["admin"],"project_id":"t-proj-y"}`))
+	req0.Header.Set("Authorization", "Bearer "+scopedPlain)
+	rec0 := httptest.NewRecorder()
+	mux.ServeHTTP(rec0, req0)
+	if rec0.Code != 403 {
+		t.Fatalf("scoped admin cross-project create status = %d, want 403; body=%q",
+			rec0.Code, rec0.Body.String())
+	}
+	// project_id 留空 → 归一到自身项目（201，且返回的 project_id 为自身）。
+	reqClamp := httptest.NewRequest(http.MethodPost, "/v1/apikeys",
+		strings.NewReader(`{"name":"clamped","scopes":["read"],"project_id":""}`))
+	reqClamp.Header.Set("Authorization", "Bearer "+scopedPlain)
+	recClamp := httptest.NewRecorder()
+	mux.ServeHTTP(recClamp, reqClamp)
+	if recClamp.Code != 201 {
+		t.Fatalf("scoped empty-project create status = %d, want 201; body=%q",
+			recClamp.Code, recClamp.Body.String())
+	}
+	var clamped struct {
+		Project string `json:"project_id"`
+	}
+	if err := json.Unmarshal(recClamp.Body.Bytes(), &clamped); err != nil || clamped.Project != "t-proj-x" {
+		t.Fatalf("empty project_id must clamp to own project, got %q err=%v", recClamp.Body.String(), err)
+	}
+
+	// 受限 admin 自助：给自己 project 造 read key（scope 子集）应 201。
+	req := httptest.NewRequest(http.MethodPost, "/v1/apikeys",
+		strings.NewReader(`{"name":"self-read","scopes":["read"],"project_id":"t-proj-x"}`))
+	req.Header.Set("Authorization", "Bearer "+scopedPlain)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != 201 {
+		t.Fatalf("scoped self-issue status = %d, want 201; body=%q", rec.Code, rec.Body.String())
+	}
+	// 提权尝试：受限 admin 不能签发自己没有的 scope（此处 scoped admin 有 admin，
+	// 用另一枚 read-only 受限 key 验证超集拒绝）。
+	_, scopedReadPlain, err := mgr.Create(t.Context(), "t-scoped-read", []string{"read"}, "t-proj-x", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/v1/apikeys",
+		strings.NewReader(`{"name":"escalate","scopes":["write"],"project_id":"t-proj-x"}`))
+	req.Header.Set("Authorization", "Bearer "+scopedReadPlain)
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	// read key 连中间件 admin 门槛都过不了（403 insufficient scope）。
+	if rec.Code != 403 {
+		t.Fatalf("scoped read self-issue status = %d, want 403; body=%q", rec.Code, rec.Body.String())
+	}
+
+	// 受限 admin list：200 且仅见本项目。
+	req = httptest.NewRequest(http.MethodGet, "/v1/apikeys", nil)
+	req.Header.Set("Authorization", "Bearer "+scopedPlain)
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("scoped list status = %d, want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	var scopedList struct {
+		Keys []struct {
+			Project string `json:"project_id"`
+		} `json:"keys"`
+	}
+	if uerr := json.Unmarshal(rec.Body.Bytes(), &scopedList); uerr != nil {
+		t.Fatal(uerr)
+	}
+	for _, k := range scopedList.Keys {
+		if k.Project != "t-proj-x" {
+			t.Fatalf("scoped list leaked project %q", k.Project)
 		}
 	}
 
-	// 全局 admin：middleware 不拦截（handler 正常工作，list 200）。
-	req := httptest.NewRequest(http.MethodGet, "/v1/apikeys", nil)
+	// 全局 admin：handler 正常工作，list 200。
+	req = httptest.NewRequest(http.MethodGet, "/v1/apikeys", nil)
 	req.Header.Set("Authorization", "Bearer "+globalPlain)
-	rec := httptest.NewRecorder()
+	rec = httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != 200 {
 		t.Fatalf("global admin list status = %d, want 200; body=%q", rec.Code, rec.Body.String())
@@ -105,7 +153,7 @@ func TestAPIKeyEndpointsRequireGlobalIdentityMiddleware(t *testing.T) {
 	var out struct {
 		Keys []map[string]any `json:"keys"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil || len(out.Keys) == 0 {
+	if err = json.Unmarshal(rec.Body.Bytes(), &out); err != nil || len(out.Keys) == 0 {
 		t.Fatalf("global admin list must return key metadata, got %q err=%v", rec.Body.String(), err)
 	}
 
@@ -120,9 +168,9 @@ func TestAPIKeyEndpointsRequireGlobalIdentityMiddleware(t *testing.T) {
 	}
 }
 
-// 第二层：handler 自身再次复核（中间件单点失效/漏注册时，返回的也必须是
-// 403 而不是越过 guard 落库）。apiKeys Manager 指向已关闭的池——若 handler
-// 误触 PG 会直接报错而非 403，测试即失败。
+// 第二层：handler 自身再次复核 admin 能力（中间件单点失效/漏注册时，
+// 非 admin 与匿名返回的也必须是 403 而不是越过 guard 落库）。
+// 受限 admin 走自助路径，需真实 store，本测试只断言非 admin/匿名被拦。
 func TestAPIKeyHandlersReverifyGlobalIdentity(t *testing.T) {
 	pool, err := pgxpool.New(t.Context(), "postgres://firepaas:firepaas@127.0.0.1:5432/firepaas?sslmode=disable")
 	if err != nil {
@@ -132,8 +180,8 @@ func TestAPIKeyHandlersReverifyGlobalIdentity(t *testing.T) {
 	a := &API{apiKeys: apikeys.New(pool)}
 
 	identities := []identity{
-		{Kind: "key", KeyID: "k1", ProjectID: "p-x", Scopes: []string{"admin"}}, // 受限 admin
-		{Kind: "key", KeyID: "k2", ProjectID: "p-x", Scopes: nil},               // 受限 read
+		{Kind: "key", KeyID: "k2", ProjectID: "p-x", Scopes: nil},              // 受限 read
+		{Kind: "key", KeyID: "k3", ProjectID: "p-x", Scopes: []string{"read"}}, // 受限 read
 		{Kind: "anon"}, // 无身份（中间件被绕过）
 	}
 	for _, id := range identities {
@@ -141,6 +189,7 @@ func TestAPIKeyHandlersReverifyGlobalIdentity(t *testing.T) {
 			func(a *API, w http.ResponseWriter, r *http.Request) { a.createAPIKey(w, r) },
 			func(a *API, w http.ResponseWriter, r *http.Request) { a.listAPIKeys(w, r) },
 			func(a *API, w http.ResponseWriter, r *http.Request) { a.revokeAPIKey(w, r) },
+			func(a *API, w http.ResponseWriter, r *http.Request) { a.rotateAPIKey(w, r) },
 		} {
 			req := httptest.NewRequest(http.MethodGet, "/v1/apikeys",
 				strings.NewReader(`{"name":"x","project_id":"etc"}`))
@@ -153,6 +202,40 @@ func TestAPIKeyHandlersReverifyGlobalIdentity(t *testing.T) {
 					id, rec.Code, rec.Body.String())
 			}
 		}
+	}
+}
+
+// v1.5 自助 key 委托逻辑（纯函数，无 DB）：全局自由、受限归一本项目 +
+// 能力子集，无越权。
+func TestResolveCreateTargetDelegation(t *testing.T) {
+	global := identity{Kind: "key", Scopes: []string{"admin"}}
+	if p, s, ok := resolveCreateTarget(global, "any", []string{"deploy"}); !ok || p != "any" || len(s) != 1 {
+		t.Fatalf("global must pass through: %q %v %v", p, s, ok)
+	}
+	scopedAdmin := identity{Kind: "key", ProjectID: "p-a", Scopes: []string{"admin"}}
+	// 留空归一到自身。
+	if p, _, ok := resolveCreateTarget(scopedAdmin, "", []string{"read"}); !ok || p != "p-a" {
+		t.Fatalf("empty project must clamp to self: %q %v", p, ok)
+	}
+	// 本项目 + 能力子集放行（含 admin 签发 deploy/exec：能力语义）。
+	for _, scopes := range [][]string{{"read"}, {"deploy"}, {"read", "exec"}, {"admin"}} {
+		if _, _, ok := resolveCreateTarget(scopedAdmin, "p-a", scopes); !ok {
+			t.Fatalf("scoped admin must issue %v in own project", scopes)
+		}
+	}
+	// 他项目拒绝。
+	if _, _, ok := resolveCreateTarget(scopedAdmin, "p-b", []string{"read"}); ok {
+		t.Fatal("scoped admin must not issue for another project")
+	}
+	// 非法 scope 永不放行（scopeAllows 对未知 scope 为 false）。
+	if _, _, ok := resolveCreateTarget(scopedAdmin, "p-a", []string{"root"}); ok {
+		t.Fatal("unknown scope must be rejected")
+	}
+	if scopesSubset([]string{"exec"}, []string{"read", "deploy"}) {
+		t.Fatal("deployer must not cover exec")
+	}
+	if !scopesSubset([]string{"read", "deploy"}, []string{"write"}) {
+		t.Fatal("legacy write must cover read+deploy")
 	}
 }
 
