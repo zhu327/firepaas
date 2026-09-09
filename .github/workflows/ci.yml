@@ -69,7 +69,7 @@ jobs:
 
       - name: Shell syntax and helper tests
         run: |
-          bash -n scripts/lab/*.sh scripts/lab/lib/*.sh
+          bash -n scripts/lab/*.sh scripts/lab/lib/*.sh scripts/lab/archive/*.sh
           bash scripts/lab/lib/runtime_test.sh
 
       - name: Nomad 1.10 job validation

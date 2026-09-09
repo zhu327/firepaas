@@ -2,6 +2,9 @@
 # 生产骨架见 iac/nomad/agent.hcl（mTLS/host volume/artifact 契约）；两者不混用。
 # 前提：compute 节点池已创建，Nomad client 以 root 运行（scripts/lab/start.sh）。
 # 与 hypeman-p0 job 互斥（共享 data_dir 的实例状态）。
+# 与 firepaas-agentd-dual 互斥（同 WG 端口/网段，ADR-0040）：本 job 自 ADR-0040
+# 起即为单节点 mesh 形态（ebpf + eastwest，等价 dual 的 node-a），跑单机 e2e
+#（m3/m4/m5 系）前先 stop dual，反之亦然。
 
 # 单机实验室默认值假定仓库 checkout 在 ~/Learn/firepaas 且 lab 工具安装在
 # ~/.local/firepaas-lab；环境不同时用 -var 覆盖。
@@ -89,7 +92,11 @@ job "firepaas-agentd" {
         FIREPAAS_AGENT_NODE_POOL  = "compute"
         FIREPAAS_AGENT_NODE_ID    = "${node.unique.id}"
         FIREPAAS_AGENT_BIND       = "0.0.0.0"
-        FIREPAAS_NETWORK_BACKEND  = "slot"
+        # ADR-0040 §24：slot/bridge 后端已删，只剩 ebpf / nft-fallback。
+        FIREPAAS_NETWORK_BACKEND = "ebpf"
+        # ADR-0040 G1：WG mesh underlay（同主机 node-b 用 51920）。
+        FIREPAAS_MESH         = "eastwest"
+        FIREPAAS_MESH_WG_PORT = "51820"
         # M5.1：镜像解包大小上限（agent 侧准入，超限永久拒绝）。
         FIREPAAS_IMAGE_MAX_UNPACK_MIB = "4096"
         # v1.1（ADR-0017）：auto-standby 空闲检测控制器（conntrack 驱动；

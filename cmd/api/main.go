@@ -33,6 +33,7 @@ import (
 	"github.com/zhu327/firepaas/internal/controlplane/catalog"
 	"github.com/zhu327/firepaas/internal/controlplane/controller"
 	"github.com/zhu327/firepaas/internal/controlplane/db"
+	"github.com/zhu327/firepaas/internal/controlplane/fabric"
 	"github.com/zhu327/firepaas/internal/controlplane/imagepolicy"
 	"github.com/zhu327/firepaas/internal/controlplane/leader"
 	"github.com/zhu327/firepaas/internal/controlplane/nodemanager"
@@ -189,7 +190,7 @@ func run() error {
 	nodeInfoEvery := 20 * time.Second
 	nm, err := nodemanager.New(nodemanager.Config{
 		NomadAddr:     nomadAddr,
-		JobName:       "firepaas-agentd",
+		JobName:       envOr("FIREPAAS_AGENT_JOB_NAME", "firepaas-agentd"),
 		DiscoverEvery: 10 * time.Second,
 		InfoEvery:     nodeInfoEvery,
 		Store:         st,
@@ -224,19 +225,59 @@ func run() error {
 			}
 		}()
 		err := leader.Elect(ctx, pgURL, leader.Key, func(lctx context.Context) error {
+			// ADR-0040 §24（W0-2）：单次解析后复用，避免 reconciler 与 controller 双读漂移。
+			meshEnabled, err := parseMeshMode(envOr("FIREPAAS_MESH", "disabled"))
+			if err != nil {
+				return err
+			}
 			go func() {
 				if err := nm.RunServiceInfo(lctx); err != nil && lctx.Err() == nil {
 					slog.Error("node service info sync exited", "error", err)
 				}
 			}()
 
+			// ADR-0040 §18（T4b）：fabric 下发协调器（leader 写者纪律）。
+			// 仅 FIREPAAS_MESH=eastwest 装配；agent 侧同开关联动（未启用的
+			// 节点不上报公钥，不会被注册进 mesh）。
+			if meshEnabled {
+				edgeHub := fabric.EdgeHubConfig{
+					NodeID:   envOr("FIREPAAS_MESH_EDGE_ID", "edge-hub"),
+					Pubkey:   strings.TrimSpace(os.Getenv("FIREPAAS_MESH_EDGE_PUBKEY")),
+					Endpoint: os.Getenv("FIREPAAS_MESH_EDGE_ENDPOINT"),
+				}
+				fr, err := fabric.New(fabric.Config{
+					Store:      st,
+					NodeSource: nm,
+					CellPrefix: envOr("FIREPAAS_MESH_CELL_PREFIX", "fd7a:9a55::/40"),
+					WgPort:     uint16(envInt("FIREPAAS_MESH_WG_PORT", 51820)),
+					// G2c：.internal 记录源（publisher 写 dns:internal:*，快照下发）。
+					DNS: cat,
+					// G2d（§14）：edge hub WG 注册（公钥/endpoint 由运维配置）+
+					// mesh 寻址投影（edge 消费；nil = 不写，edge 回落 legacy）。
+					EdgeHub:        edgeHub,
+					IngressPort:    envInt("FIREPAAS_AGENT_FABRIC_INGRESS_PORT", 5109),
+					MeshProjection: cat,
+				})
+				if err != nil {
+					return fmt.Errorf("fabric reconciler: %w", err)
+				}
+				go func() {
+					if err := fr.Run(lctx); err != nil && lctx.Err() == nil {
+						slog.Error("fabric reconciler exited", "error", err)
+					}
+				}()
+			}
+
 			ctrl := controller.New(st, cat, nm, resv, placer, reg, controller.Config{
 				// R2 加固：派发有界并发（默认 4）与 operations 保留窗（默认 7d）。
 				DispatchWorkers: envInt("FIREPAAS_OP_DISPATCH_WORKERS", 4),
 				OperationRetention: time.Duration(envInt(
 					"FIREPAAS_OPERATION_RETENTION_DAYS", 7)) * 24 * time.Hour,
-				DefaultAppPort:        8080,
-				LegacyAgentProxyAddr:  legacyProxyAddr,
+				DefaultAppPort:       8080,
+				LegacyAgentProxyAddr: legacyProxyAddr,
+				// P1（独立评审）：dns:internal 投影 TTL 与 edge
+				// FIREPAAS_EDGE_STALE_WINDOW 同源（默认 120s）。
+				DNSStaleWindow:        envDur("FIREPAAS_DNS_STALE_WINDOW", 120*time.Second),
 				OpPollInterval:        time.Second,
 				SyncInterval:          5 * time.Second,
 				RebuildInterval:       30 * time.Second,
@@ -248,6 +289,12 @@ func run() error {
 				RolloutDrainGrace:     envDur("FIREPAAS_ROLLOUT_DRAIN", 30*time.Second),
 				Secrets:               secretsMgr,
 				Traffic:               trafficSigner,
+				// ADR-0040 T4c：与 fabric reconciler 同开关/同 cell 前缀；
+				// mesh 未启用时派发跳过身份/ULA 分配（legacy 零回归）。
+				FabricMesh: controller.FabricMeshConfig{
+					Enabled:    meshEnabled,
+					CellPrefix: envOr("FIREPAAS_MESH_CELL_PREFIX", "fd7a:9a55::/40"),
+				},
 				// v1.1（ADR-0018/0021）：部署预取 top-K 与 evacuate 步超时。
 				PrefetchTopK:        envInt("FIREPAAS_PREFETCH_TOPK", 3),
 				EvacuateStepTimeout: envDur("FIREPAAS_EVACUATE_STEP_TIMEOUT", 5*time.Minute),
@@ -332,6 +379,10 @@ func run() error {
 	mux.HandleFunc("GET /v1/secrets", api.auth(api.listSecrets))
 	mux.HandleFunc("GET /v1/secrets/{name}", api.auth(api.getSecretMeta))
 	mux.HandleFunc("DELETE /v1/secrets/{name}", api.auth(api.deleteSecret))
+	// ADR-0040 G2a（§15）：EastWestPolicy 租户自助 CRUD（dst 侧归属授权）。
+	mux.HandleFunc("PUT /v1/eastwest-policies", api.auth(api.putEastWestPolicy))
+	mux.HandleFunc("GET /v1/eastwest-policies", api.auth(api.listEastWestPolicies))
+	mux.HandleFunc("DELETE /v1/eastwest-policies", api.auth(api.deleteEastWestPolicy))
 	// M4（ADR-0006）：execution-bound proxy credential 按需现算给 edge。
 	mux.HandleFunc("GET /v1/machines/{id}/traffic-token", api.auth(api.trafficToken))
 	mux.HandleFunc("PUT /v1/apps/{id}/secret-refs", api.auth(api.setAppSecretRefs))
@@ -956,6 +1007,20 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 
 func writeErr(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]string{"error": msg})
+}
+
+// parseMeshMode 解析 FIREPAAS_MESH（ADR-0040 §24，W0-2）：G1 只接受
+// disabled/eastwest；未知值（含 full 与拼写错误）fail-closed 报错，
+// 与 agentd 同行为，避免控制面静默 legacy 而 agent 崩溃循环的脑裂半启用。
+func parseMeshMode(v string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "", "disabled":
+		return false, nil
+	case "eastwest":
+		return true, nil
+	default:
+		return false, fmt.Errorf("FIREPAAS_MESH=%q unsupported (accepts: disabled, eastwest)", v)
+	}
 }
 
 func envOr(key, def string) string {

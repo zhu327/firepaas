@@ -6,52 +6,52 @@ import (
 	"net/netip"
 	"testing"
 
-	"github.com/zhu327/firepaas/internal/agent/network/slot"
+	"github.com/zhu327/firepaas/internal/agent/network/api"
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 )
 
-type fakeSlots struct {
-	current             slot.EgressRuleSet
+type fakePolicyEngine struct {
+	current             api.PolicySnapshot
 	present             bool
 	applyErr, removeErr error
 	onApply             func()
-	applies             []slot.EgressRuleSet
+	applies             []api.PolicySnapshot
 	removes             int
 	rollbacks           int
 }
 
-func (f *fakeSlots) ApplyEgressPolicy(_ context.Context, _ string, rs slot.EgressRuleSet) error {
-	f.applies = append(f.applies, rs)
+func (f *fakePolicyEngine) ApplySnapshot(_ context.Context, _ string, snap api.PolicySnapshot) error {
+	f.applies = append(f.applies, snap)
 	if f.applyErr != nil {
 		return f.applyErr
 	}
-	f.current, f.present = rs, true
+	f.current, f.present = snap, true
 	if f.onApply != nil {
 		f.onApply()
 	}
 	return nil
 }
 
-func (f *fakeSlots) RemoveEgressPolicy(context.Context, string) error {
+func (f *fakePolicyEngine) RemoveSnapshot(context.Context, string) error {
 	f.removes++
 	if f.removeErr != nil {
 		return f.removeErr
 	}
-	f.current, f.present = slot.EgressRuleSet{}, false
+	f.current, f.present = api.PolicySnapshot{}, false
 	return nil
 }
 
-func (f *fakeSlots) CurrentEgressPolicy(string) (slot.EgressRuleSet, bool) {
+func (f *fakePolicyEngine) CurrentSnapshot(string) (api.PolicySnapshot, bool) {
 	return f.current, f.present
 }
 
-func (f *fakeSlots) RollbackEgressPolicy(_ context.Context, _ string, rs slot.EgressRuleSet, present bool) error {
+func (f *fakePolicyEngine) RollbackSnapshot(_ context.Context, _ string, snap api.PolicySnapshot, present bool) error {
 	f.rollbacks++
-	f.current, f.present = rs, present
+	f.current, f.present = snap, present
 	return nil
 }
 
-func (*fakeSlots) RestoreEgress(context.Context, string) error { return nil }
+func (*fakePolicyEngine) RestoreSnapshot(context.Context, string) error { return nil }
 
 func managerProxy(t *testing.T) *Proxy {
 	t.Helper()
@@ -81,8 +81,8 @@ func TestManagerApplyNftFailureKeepsProxyGenerationAndBinding(t *testing.T) {
 	if err := p.BindIP("10.100.0.7", "m1"); err != nil {
 		t.Fatal(err)
 	}
-	fs := &fakeSlots{
-		current:  slot.EgressRuleSet{Mode: "allowlist", Generation: 1},
+	fs := &fakePolicyEngine{
+		current:  api.PolicySnapshot{Mode: "allowlist", Generation: 1},
 		present:  true,
 		applyErr: errors.New("nft failed"),
 	}
@@ -103,7 +103,7 @@ func TestManagerRemoveClearsNftBeforeUnregister(t *testing.T) {
 	if err := p.Register("m1", "e1", "p", "a", managerPolicy(1)); err != nil {
 		t.Fatal(err)
 	}
-	fs := &fakeSlots{removeErr: errors.New("nft failed")}
+	fs := &fakePolicyEngine{removeErr: errors.New("nft failed")}
 	m := NewManager(p, fs)
 	if err := m.Remove(context.Background(), "m1"); err == nil {
 		t.Fatal("expected failure")
@@ -122,7 +122,7 @@ func TestManagerRemoveClearsNftBeforeUnregister(t *testing.T) {
 
 func TestManagerApplyBindIPValidationDoesNotTouchNft(t *testing.T) {
 	p := managerProxy(t)
-	fs := &fakeSlots{}
+	fs := &fakePolicyEngine{}
 	m := NewManager(p, fs)
 	if err := m.Apply(context.Background(), "m1", "e1", "p", "a", "bad-ip", managerPolicy(1)); err == nil {
 		t.Fatal("expected bind validation failure")

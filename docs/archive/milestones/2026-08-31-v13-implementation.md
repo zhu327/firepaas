@@ -34,5 +34,5 @@
     CIDR 生效）。
   - 代理连接忽略 guest 原始目标 IP，只连接本次可信解析且通过保留段检查的
     A/AAAA 集合；解析失败/集合为空/全部连接失败即拒绝（不回退 guest DNS）。
-- e2e：`scripts/lab/e2e-v13-egress.sh` 覆盖 allowlist Host 放行/拒绝、CIDR 矩阵、
+- e2e：`(scripts/lab/archive/)e2e-v13-egress.sh` 覆盖 allowlist Host 放行/拒绝、CIDR 矩阵、
   deny_all、连接限额、审计脱敏；SNI/ECH/DNS rebinding 矩阵由单测覆盖。

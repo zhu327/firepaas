@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l1-base  PREREQ: -  DESTRUCTIVE: yes  FROZEN: no
 # 停止单机实验室进程。用法: bash scripts/lab/stop.sh
 # 普通用户只能停用户态 Nomad/Consul；root 运行的 Nomad 需要 sudo bash scripts/lab/stop.sh。
 set -euo pipefail

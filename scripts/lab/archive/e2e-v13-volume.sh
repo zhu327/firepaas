@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l2-archived  PREREQ: nomad,agentd,root  DESTRUCTIVE: yes  FROZEN: yes
 # v1.3-D/E（ADR-0029/0030）node-local volume 验收：
 #   A) 不指定 node 创建 LOCAL_RW，控制面选择健康 origin node；
 #   B) guest 真实写读，agent restart 后数据仍在；
@@ -12,7 +13,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAB_BIN="$HOME/.local/firepaas-lab/bin"
-CERT_DIR="$HERE/certs"
+CERT_DIR="$HERE/../certs"
 RUN_DIR="/var/lib/firepaas-p0/e2e-v13-volume"
 RUN_ID="v13v-$(date +%s)"
 API_TOKEN="v13v-token-$RUN_ID"
@@ -38,7 +39,7 @@ authed_raw() { curl -sS -m 20 -H "Authorization: Bearer $API_TOKEN" "$@"; }
 pg() { $PG "$1"; }
 mark() { log "    (累计 $(( $(date +%s) - T0 ))s) $*"; }
 # shellcheck source=lib/runtime.sh
-source "$HERE/lib/runtime.sh"
+source "$HERE/../lib/runtime.sh"
 restart_agentd() { lab_restart_agentd 45 2; }
 
 guest_exec() { lab_guest_exec "$@"; }
@@ -66,8 +67,8 @@ create_app() {
 
 log "0) 启动 agentd + API/edge"
 T0=$(date +%s)
-"$HERE/root-setup.sh" >/dev/null || fail "root-setup 失败"
-"$HERE/run-agentd.sh" >/dev/null || fail "agentd 未就绪"
+"$HERE/../root-setup.sh" >/dev/null || fail "root-setup 失败"
+"$HERE/../run-agentd.sh" >/dev/null || fail "agentd 未就绪"
 MASTER_KEY="$(openssl rand -base64 32)"
 TRAFFIC_KEY="$(openssl rand -base64 32)"
 pkill -f "$LAB_BIN/firepaas-api" 2>/dev/null || true
@@ -89,7 +90,7 @@ nohup env FIREPAAS_EDGE_PORT=$EDGE_HTTP FIREPAAS_EDGE_TLS_LISTEN=":$EDGE_TLS" \
   "$LAB_BIN/edge-proxy" >"$RUN_DIR/v13v-edge.log" 2>&1 &
 for _ in $(seq 1 40); do authed_curl "http://127.0.0.1:$API_PORT/v1/health" >/dev/null 2>&1 && break; sleep 1; done
 authed_curl "http://127.0.0.1:$API_PORT/v1/health" >/dev/null || fail "API 未就绪"
-ONLINE_OUT=$(bash "$HERE/push-ontime.sh") || fail "push-ontime 失败"
+ONLINE_OUT=$(bash "$HERE/../push-ontime.sh") || fail "push-ontime 失败"
 ONTIME_REF=$(printf '%s\n' "$ONLINE_OUT" | grep '^REF=' | cut -d= -f2-)
 [[ -n "$ONTIME_REF" ]] || fail "ontime REF 解析失败"
 
@@ -172,7 +173,7 @@ UNAVAILABLE=0
 for _ in $(seq 1 60); do st=$(pg "SELECT state FROM volumes WHERE id='$VOL_ID'"); [[ "$st" == "UNAVAILABLE" ]] && UNAVAILABLE=1 && break; sleep 2; done
 [[ "$UNAVAILABLE" == "1" ]] || fail "node loss 后 volume 未转 UNAVAILABLE（state=$st）"
 [[ "$(pg "SELECT node_id FROM volumes WHERE id='$VOL_ID'")" == "$vol_node" ]] || fail "node loss 后 volume locality 被改写"
-"$HERE/run-agentd.sh" >/dev/null || fail "恢复 agentd 失败"
+"$HERE/../run-agentd.sh" >/dev/null || fail "恢复 agentd 失败"
 for _ in $(seq 1 60); do st=$(pg "SELECT state FROM volumes WHERE id='$VOL_ID'"); [[ "$st" == "READY" ]] && break; sleep 2; done
 [[ "$st" == "READY" ]] || fail "origin node 恢复后 volume 未 READY（state=$st）"
 # node restart 后带 LOCAL_RW 的 machine 不得在别处自动重建；运行态可保持

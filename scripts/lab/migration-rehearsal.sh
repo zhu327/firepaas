@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l2-ops  PREREQ: dev-pg  DESTRUCTIVE: yes  FROZEN: no
 # migration-rehearsal.sh：迁移重演（生产就绪 P2#22）。
 #
 # 对独立 scratch 库按文件名顺序重演全部迁移，验证：

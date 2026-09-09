@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l1-base  PREREQ: -  DESTRUCTIVE: no  FROZEN: no
 # 检查单机实验室状态。用法: bash scripts/lab/status.sh
 set -uo pipefail
 

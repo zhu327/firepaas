@@ -2,16 +2,19 @@
 
 基于 Firecracker 的私有 PaaS 平台（目标形态：私有化 Fly.io）。
 
-- 数据面复用 [hypeman](https://github.com/zhu327/hypeman) 的 VM/镜像/快照能力（`firepaas-lib` 分支，tag `v0.4.0-firepaas`，作为 Go module 直接消费）
+- 数据面复用 [hypeman](https://github.com/zhu327/hypeman) 的 VM/镜像/快照能力（`firepaas-lib` 分支，tag `v0.4.1-firepaas`，作为 Go module 直接消费）
 - 管控面与调度模式参考 [e2b-dev/infra](https://github.com/e2b-dev/infra)：控制面/数据面分离、Best-of-K 自研调度、Nomad 只编排基础设施作业
-- 当前状态：MVP 主体（M1–M5）及 v1.1–v1.4 的主要代码路径已实现；单机 smoke 覆盖部分能力，但版本发布门禁、标准多节点故障矩阵与长期观测尚未全部满足。当前发布证据以 [GA observation scorecard](docs/ga-observation-scorecard.md) 和各版本记录为准。
+- 当前状态：MVP 主体（M1–M5）及 v1.1–v1.4 的主要代码路径已实现；ADR-0040 网络
+  fabric（G1–G3）已落地并在双节点同主机实验室通过 spike/chaos/soak 验收
+  （真双主机断连断言与发布门禁未完成）。当前发布证据以
+  [GA observation scorecard](docs/ga-observation-scorecard.md) 和各版本记录为准。
 
 ## 文档
 
 | 文档 | 说明 |
 |---|---|
 | [docs/architecture.md](docs/architecture.md) | 目标架构、状态权威、路由与 fencing 契约 |
-| [docs/adr/](docs/adr/) | 关键设计决策（Nomad 边界、调度、状态分层、网络、route catalog、内部身份、secret 路径、edge 入口等 38 篇） |
+| [docs/adr/](docs/adr/) | 关键设计决策（Nomad 边界、调度、状态分层、网络、route catalog、内部身份、secret 路径、edge 入口、网络 fabric 等 40 篇；ADR-0040 为网络 fabric G1–G3 契约） |
 | [docs/releases/README.md](docs/releases/README.md) | MVP–v1.4 的范围、实现记录与证据状态索引 |
 | [docs/mvp-plan.md](docs/mvp-plan.md) | MVP 范围、实现记录、出口和降级策略 |
 | [docs/v1.1-plan.md](docs/v1.1-plan.md) | v1.1 范围与验收契约；实现状态另见同版本 implementation notes |
@@ -30,7 +33,8 @@ firepaas/
 ├── cmd/edge-proxy/      # 边缘路由（TLS + catalog 路由 + 自动唤醒）
 ├── cmd/fpctl/           # 运维 CLI
 ├── cmd/agentctl/        # agent 侧运维 CLI
-├── internal/agent/      # agent 实现（server/machine/network/proxy/state）
+├── internal/agent/      # agent 实现（server/machine/network/proxy/state；网络含
+│                         eBPF 数据面、WG mesh、fabric ingress、节点本地 DNS）
 ├── internal/controlplane/ # 控制面实现（api/db/store/controllers/...）
 ├── internal/edge/       # edge 实现（router/catalog/autoresume/tls）
 ├── internal/scheduler/  # Best-of-K 放置算法
@@ -39,7 +43,8 @@ firepaas/
 │                         # CI 门禁：重新生成后 git diff 必须为空且无 untracked 文件）
 ├── protos/agent/v1/     # agent gRPC 契约（唯一数据面契约）
 ├── iac/                 # Nomad jobs + Terraform + 可观测性配置
-├── scripts/             # 实验室搭建、e2e/混沌/soak 脚本
+├── scripts/             # 实验室搭建、分层 e2e/混沌/soak 脚本（统一入口 verify.sh，
+│                         历史里程碑脚本在 scripts/lab/archive/）
 └── docs/                # 架构、计划、ADR、runbook
 ```
 
@@ -67,8 +72,22 @@ source scripts/lab/env.sh
 bash scripts/lab/start.sh             # 单节点 Nomad + compute 池
 sudo bash scripts/lab/root-setup.sh   # root 准备并切换 Nomad 到 root 运行
 sudo bash scripts/lab/run-agentd.sh   # 部署 agentd system job
-sudo bash scripts/lab/e2e-m1.sh       # M1 一键验证（API→agent→edge→VM→HTTP 200）
+sudo bash scripts/lab/verify.sh --layer l2   # 单机回归：smoke + e2e-m3/m4/m5
 ```
+
+### fabric 实验室（ADR-0040，当前主战场）
+
+单机也可直接跑双节点 fabric 拓扑（同主机两个 Nomad client，eBPF 数据面 +
+WireGuard mesh 东西向）：
+
+```bash
+sudo bash scripts/lab/verify.sh --layer l3   # spike 前置门禁 + stage1/2/3
+# 破坏性混沌与 soak 须显式授权：
+sudo bash scripts/lab/verify.sh --layer l3 --with-chaos --soak-cycles 20
+```
+
+注意：`agentd-single.hcl`（单机 mesh 形态）与 `agentd-fabric-dual.hcl` 互斥
+（同 WG 端口/网段），切换时先 stop 另一个 job。
 
 完整验收矩阵与脚本说明见 [scripts/lab/README.md](scripts/lab/README.md)。
 
@@ -88,7 +107,7 @@ nomad node pool create iac/nomad/pools/compute.hcl
 
 单根 module（`github.com/zhu327/firepaas`）：`go.mod` + 多个 `cmd/*` + `internal/*`。
 
-hypeman 依赖经 `go.mod` replace 指向公开 fork 的 `v0.4.0-firepaas` tag（`github.com/zhu327/hypeman`，`firepaas-lib` 分支）：该 tag 提交了 go:embed 必需的 firecracker/guest-agent/init 二进制，可远程作为 module 消费，clone 后无需 sibling checkout。上游 [kernel/hypeman](https://github.com/kernel/hypeman) 发布包含所需 API 的正式 tag 后，可切换 require 并删除 replace。
+hypeman 依赖经 `go.mod` replace 指向公开 fork 的 `v0.4.1-firepaas` tag（`github.com/zhu327/hypeman`，`firepaas-lib` 分支）：该系列 tag 提交了 go:embed 必需的 firecracker/guest-agent/init 二进制与 ADR-0040 v6 中间层 API（`CreateInstanceRequest.IPv6Address`），可远程作为 module 消费，clone 后无需 sibling checkout。上游 [kernel/hypeman](https://github.com/kernel/hypeman) 发布包含所需 API 的正式 tag 后，可切换 require 并删除 replace。
 
 本地如需联调未发布的 hypeman 改动，可创建不入库的 `go.work.local` 覆盖 replace；CI 与 release 始终以 `GOWORK=off` 走根 `go.mod`。
 

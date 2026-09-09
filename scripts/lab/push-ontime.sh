@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l3-fabric  PREREQ: docker,registry  DESTRUCTIVE: no  FROZEN: no
 # push-ontime.sh：构建并推送 ontime guest-clock 探针镜像到本地 registry
 # （P1-6 修复：e2e-m5 依赖此镜像；此前硬编码 digest 且无构建脚本，registry
 # 数据一旦损坏即无法复现——2026-08-27 实测踩中：tag 指向的 manifest blob 404）。
@@ -47,7 +48,11 @@ with _gz.open(os.path.join(w, "layer.tar.gz"), "rb") as f:
     layer = f.read()
 diff_id = hashlib.sha256(layer).hexdigest()
 cfg = {"architecture": "amd64", "os": "linux",
-       "config": {"Env": ["PORT=80"], "Entrypoint": ["/ontime"]},
+       # ADR-0040 G1 spike：指定 guest 内核 = ch-6.12.8-kernel-1.5（iptables/xt
+       # 版，内置 IPv6）。更新的 1.6/3.0 内核把 IPv6 裁成 stub（ipv6_bpf_stub），
+       # ULA 注入会得到 “RTNETLINK answers: Not supported”。
+       "config": {"Env": ["PORT=80"], "Entrypoint": ["/ontime"],
+                  "Labels": {"io.kernel.kernel-version": "ch-6.12.8-kernel-1.5-202603091"}},
        "rootfs": {"type": "layers", "diff_ids": ["sha256:" + diff_id]}}
 open(os.path.join(w, "config.json"), "w").write(json.dumps(cfg))
 manifest = {

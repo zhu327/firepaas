@@ -285,8 +285,8 @@ func (a *Adapter) ForkSnapshot(ctx context.Context, req *pb.ForkSnapshotRequest)
 	}
 	if err := a.reattachSlot(ctx, req.GetMachineId(), forked); err != nil {
 		cleanupErr := a.instances.DeleteInstance(context.WithoutCancel(ctx), forked.Id)
-		if a.slots != nil {
-			cleanupErr = errors.Join(cleanupErr, a.slots.Release(context.WithoutCancel(ctx), req.GetMachineId()))
+		if a.network != nil {
+			cleanupErr = errors.Join(cleanupErr, a.network.DetachNetns(context.WithoutCancel(ctx), req.GetMachineId()))
 		}
 		return nil, errors.Join(err, cleanupErr)
 	}
@@ -370,8 +370,8 @@ func (a *Adapter) RestoreSnapshot(
 		cleanupCtx := context.WithoutCancel(ctx)
 		_, stopErr := sp.StopInstance(cleanupCtx, restored.Id)
 		var releaseErr error
-		if a.slots != nil {
-			releaseErr = a.slots.Release(cleanupCtx, req.GetMachineId())
+		if a.network != nil {
+			releaseErr = a.network.DetachNetns(cleanupCtx, req.GetMachineId())
 		}
 		return nil, "", "", errors.Join(err, stopErr, releaseErr)
 	}

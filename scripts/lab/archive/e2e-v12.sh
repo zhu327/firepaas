@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l2-archived  PREREQ: nomad,agentd,root  DESTRUCTIVE: yes  FROZEN: yes
 # v1.2 single-node smoke harness：提供局部集成回归，不是发布级 e2e/HA 证据。
 #   A) capability discovery（ADR-0023）：
 #      - /v1/nodes 携带 feature_ids；/v1/capabilities 汇总 eligible 节点数
@@ -21,9 +22,9 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "$HERE/../.." && pwd)"
+ROOT_DIR="$(cd "$HERE/../../.." && pwd)"
 LAB_BIN="$HOME/.local/firepaas-lab/bin"
-CERT_DIR="$HERE/certs"
+CERT_DIR="$HERE/../certs"
 RUN_DIR="/var/lib/firepaas-p0/e2e-v12"
 RUN_ID="v12-$(date +%s)"
 API_TOKEN="v12-token-$RUN_ID"
@@ -54,8 +55,8 @@ mark() { log "    (累计 $(( $(date +%s) - T0 ))s) $*"; }
 
 log "0) 启动 agentd（root）+ API/edge"
 T0=$(date +%s)
-"$HERE/root-setup.sh" >/dev/null || fail "root-setup 失败"
-"$HERE/run-agentd.sh" >/dev/null || fail "agentd 未就绪"
+"$HERE/../root-setup.sh" >/dev/null || fail "root-setup 失败"
+"$HERE/../run-agentd.sh" >/dev/null || fail "agentd 未就绪"
 for _ in $(seq 1 60); do "$LAB_BIN/agentctl" info >/dev/null 2>&1 && break; sleep 2; done
 mark "agentd ready"
 
@@ -89,7 +90,7 @@ authed_curl "http://127.0.0.1:$API_PORT/v1/health" >/dev/null || { tail -5 "$RUN
 mark "api/edge up"
 
 # ontime 探针镜像（含 /healthz 与 /slow 端点），供 C/D 与 secret fail-closed 用。
-ONLINE_OUT=$(bash "$HERE/push-ontime.sh") || fail "push-ontime 失败"
+ONLINE_OUT=$(bash "$HERE/../push-ontime.sh") || fail "push-ontime 失败"
 ONTIME_REF=$(echo "$ONLINE_OUT" | grep '^REF=' | cut -d= -f2-)
 [[ -n "$ONTIME_REF" ]] || fail "ontime REF 解析失败"
 

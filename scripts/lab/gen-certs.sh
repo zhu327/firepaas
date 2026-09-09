@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l1-base  PREREQ: openssl  DESTRUCTIVE: no  FROZEN: no
 # 生成 M1.3 静态 mTLS 证书（ADR-0006 降级路径）。用法: bash scripts/lab/gen-certs.sh
 # 输出 scripts/lab/certs/（gitignore）：ca / agentd server / control-plane client / edge client。
 set -euo pipefail

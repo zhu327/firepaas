@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l2-ops  PREREQ: dev-pg  DESTRUCTIVE: yes  FROZEN: no
 # pg-restore-rehearsal.sh：M5.4（mvp-plan §9.4）恢复演练。
 #
 # 用法：sudo bash scripts/lab/pg-restore-rehearsal.sh [dump.sql.gz]

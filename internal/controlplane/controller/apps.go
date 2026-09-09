@@ -541,7 +541,10 @@ func applyDeploymentSpecExtras(dep *store.Deployment, spec *pb.MachineSpec) {
 			if name == "" {
 				name = fmt.Sprintf("port-%d", s.InternalPort)
 			}
-			spec.Services = append(spec.Services, &pb.ServiceSpec{Name: name, InternalPort: uint32(s.InternalPort)})
+			spec.Services = append(
+				spec.Services,
+				&pb.ServiceSpec{Name: name, InternalPort: uint32(s.InternalPort), MeshDirect: s.MeshDirect},
+			)
 		}
 		if spec.Network == nil {
 			spec.Network = &pb.NetworkSpec{IngressPort: uint64(dep.Services[0].InternalPort)}

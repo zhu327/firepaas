@@ -3,11 +3,15 @@
 package agentv1
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"path"
 	"strings"
+
+	"github.com/zhu327/firepaas/shared/pkg/ulanet"
 
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 )
@@ -90,6 +94,18 @@ func ValidateMachineSpecForCreate(spec *pb.MachineSpec) error {
 	if spec.GetNetwork() != nil {
 		if err := ValidateEgressPolicy(spec.GetNetwork().GetEgress()); err != nil {
 			return err
+		}
+		// ADR-0040 §15/§18：东西向快照契约校验（G2 数据面执行前拒绝非法输入）；
+		// 快照 scoped 到本 execution 的 src 身份（其他 src 的规则必须拒绝）。
+		if err := ValidateEastWestPolicy(spec.GetNetwork().GetEastwest()); err != nil {
+			return err
+		}
+		for i, r := range spec.GetNetwork().GetEastwest().GetRules() {
+			if r.GetSrcProject() != spec.ProjectId || r.GetSrcApp() != spec.AppId {
+				return fmt.Errorf(
+					"eastwest rules[%d] src %s/%s is not this execution's identity %s/%s",
+					i, r.GetSrcProject(), r.GetSrcApp(), spec.ProjectId, spec.AppId)
+			}
 		}
 	}
 	return nil
@@ -425,4 +441,230 @@ func ValidateEgressPolicy(p *pb.EgressPolicySpec) error {
 		return errors.New("egress policy_generation must be > 0")
 	}
 	return nil
+}
+
+// ValidateEastWestPolicy 校验 EastWestPolicySpec（ADR-0040 §15；nil = 未
+// 声明，合法 = default deny）。全量替换快照：generation > 0、规则字段非空、
+// 端口 [1,65535] 且规则内不重复、同 (dst 三元组) 规则不重复。
+func ValidateEastWestPolicy(p *pb.EastWestPolicySpec) error {
+	if p == nil {
+		return nil
+	}
+	if p.GetGeneration() == 0 {
+		return errors.New("eastwest generation must be > 0")
+	}
+	seen := map[string]bool{}
+	for i, r := range p.GetRules() {
+		if err := checkEastWestRuleFields(r, i); err != nil {
+			return err
+		}
+		key := r.GetDstProject() + "/" + r.GetDstApp() + "/" + r.GetDstService()
+		if seen[key] {
+			return fmt.Errorf("eastwest rules[%d] dst %s duplicated", i, key)
+		}
+		seen[key] = true
+	}
+	return nil
+}
+
+// ValidateEastWestPolicyTable 校验 fabric 快照携带的东西向放行全表（G2a）。
+// 与 ValidateEastWestPolicy（单 execution 快照，dst 唯一）不同，全表允许
+// 多个 src 声明同一 dst（web→api 与 worker→api 并存），唯一键为 src+dst。
+// nil = 无放行（默认 deny，不校验）。
+func ValidateEastWestPolicyTable(p *pb.EastWestPolicySpec) error {
+	if p == nil {
+		return nil
+	}
+	if p.GetGeneration() == 0 {
+		return errors.New("eastwest table generation must be > 0")
+	}
+	seen := map[string]bool{}
+	for i, r := range p.GetRules() {
+		if err := checkEastWestRuleFields(r, i); err != nil {
+			return err
+		}
+		key := r.GetSrcProject() + "/" + r.GetSrcApp() + "→" +
+			r.GetDstProject() + "/" + r.GetDstApp() + "/" + r.GetDstService()
+		if seen[key] {
+			return fmt.Errorf("eastwest table rules[%d] %s duplicated", i, key)
+		}
+		seen[key] = true
+	}
+	return nil
+}
+
+// checkEastWestRuleFields 校验单条规则的必填字段与端口范围（两处复用）。
+func checkEastWestRuleFields(r *pb.EastWestPolicyRule, i int) error {
+	switch {
+	case r.GetSrcProject() == "":
+		return fmt.Errorf("eastwest rules[%d].src_project is required", i)
+	case r.GetSrcApp() == "":
+		return fmt.Errorf("eastwest rules[%d].src_app is required", i)
+	case r.GetDstProject() == "":
+		return fmt.Errorf("eastwest rules[%d].dst_project is required", i)
+	case r.GetDstApp() == "":
+		return fmt.Errorf("eastwest rules[%d].dst_app is required", i)
+	case r.GetDstService() == "":
+		return fmt.Errorf("eastwest rules[%d].dst_service is required", i)
+	case len(r.GetPorts()) == 0:
+		return fmt.Errorf("eastwest rules[%d].ports is required", i)
+	}
+	portSeen := map[uint32]bool{}
+	for _, port := range r.GetPorts() {
+		if port == 0 || port > 65535 {
+			return fmt.Errorf("eastwest rules[%d].ports contains %d, want [1,65535]", i, port)
+		}
+		if portSeen[port] {
+			return fmt.Errorf("eastwest rules[%d].ports %d duplicated", i, port)
+		}
+		portSeen[port] = true
+	}
+	return nil
+}
+
+// ValidateApplyFabricRequest 校验 fabric 快照下发（ADR-0040 §18）：节点级
+// fencing 键、本节点 /64 ULA、peer 与 identity 集合形态。控制面与 agent
+// 复用；非法请求在两端都 fail closed。
+func ValidateApplyFabricRequest(req *pb.ApplyFabricRequest) error {
+	if req == nil {
+		return errors.New("request is required")
+	}
+	switch {
+	case req.GetNodeId() == "":
+		return errors.New("node_id is required")
+	case req.GetOperationId() == "":
+		return errors.New("operation_id is required")
+	case req.GetFabricGeneration() == 0:
+		return errors.New("fabric_generation must be > 0")
+	}
+	nodePrefix, err := ParseULANodePrefix(req.GetNodePrefix())
+	if err != nil {
+		return fmt.Errorf("node_prefix: %w", err)
+	}
+	seenPeer := map[string]bool{}
+	for i, p := range req.GetPeers() {
+		switch {
+		case p.GetNodeId() == "":
+			return fmt.Errorf("peers[%d].node_id is required", i)
+		case seenPeer[p.GetNodeId()]:
+			return fmt.Errorf("peers[%d].node_id %s duplicated", i, p.GetNodeId())
+		case strings.TrimSpace(p.GetPubkey()) == "" || strings.ContainsAny(p.GetPubkey(), " \t\n"):
+			return fmt.Errorf("peers[%d].pubkey is not a valid base64 key", i)
+		case p.GetFabricGeneration() == 0:
+			return fmt.Errorf("peers[%d].fabric_generation must be > 0", i)
+		}
+		decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(p.GetPubkey()))
+		if err != nil || len(decoded) != 32 {
+			return fmt.Errorf("peers[%d].pubkey must decode to a 32-byte WireGuard key", i)
+		}
+		seenPeer[p.GetNodeId()] = true
+		if _, _, err := net.SplitHostPort(p.GetEndpoint()); err != nil {
+			return fmt.Errorf("peers[%d].endpoint %q: %v", i, p.GetEndpoint(), err)
+		}
+		if _, err := ParseULANodePrefix(p.GetNodePrefix()); err != nil {
+			return fmt.Errorf("peers[%d].node_prefix: %w", i, err)
+		}
+	}
+	seenBinding := map[string]bool{}
+	seenULA := map[netip.Addr]bool{}
+	for i, m := range req.GetIdentities() {
+		switch {
+		case m.GetIdentityId() == 0:
+			return fmt.Errorf("identities[%d].identity_id is required", i)
+		case m.GetTrustDomain() == "":
+			return fmt.Errorf("identities[%d].trust_domain is required", i)
+		case m.GetProjectId() == "":
+			return fmt.Errorf("identities[%d].project_id is required", i)
+		case m.GetAppId() == "":
+			return fmt.Errorf("identities[%d].app_id is required", i)
+		case m.GetService() == "":
+			return fmt.Errorf("identities[%d].service is required", i)
+		case m.GetMachineId() == "":
+			return fmt.Errorf("identities[%d].machine_id is required", i)
+		case m.GetExecutionId() == "":
+			return fmt.Errorf("identities[%d].execution_id is required", i)
+		case m.GetGeneration() == 0:
+			return fmt.Errorf("identities[%d].generation must be > 0", i)
+		}
+		key := m.GetMachineId() + "/" + m.GetExecutionId()
+		if seenBinding[key] {
+			return fmt.Errorf("identities[%d] binding %s duplicated", i, key)
+		}
+		seenBinding[key] = true
+		ula, err := netip.ParseAddr(m.GetUla())
+		if err != nil || !ulanet.IsULAAddr(ula) {
+			return fmt.Errorf("identities[%d].ula %q is not a ULA IPv6 address", i, m.GetUla())
+		}
+		if seenULA[ula] {
+			return fmt.Errorf("identities[%d].ula %s duplicated across bindings", i, ula)
+		}
+		seenULA[ula] = true
+		// G2a 起身份集合为集群全域（跨节点源绑定/策略解析）：ULA 只需是
+		// 合法 ULA，不再要求落在接收节点自身 /64 内（远端 workload 的
+		// ULA 必然在其它节点前缀）。节点内路由仍由本机 ipcache/路由表约束。
+		_ = nodePrefix
+	}
+	// G2a：东西向放行全表（nil = 无放行）。全表允许多 src 同 dst，用表级校验。
+	if req.GetEastwest() != nil {
+		if err := ValidateEastWestPolicyTable(req.GetEastwest()); err != nil {
+			return fmt.Errorf("eastwest: %w", err)
+		}
+	}
+	// G2c（§16）：.internal 记录全表（空 = 无记录）。名字唯一且必须是
+	// 小写 .internal 域名；每条 ≥1 个合法 ULA AAAA；generation > 0。
+	seenName := map[string]bool{}
+	for i, r := range req.GetDns() {
+		if err := validateDnsRecord(r); err != nil {
+			return fmt.Errorf("dns[%d]: %w", i, err)
+		}
+		if seenName[r.GetName()] {
+			return fmt.Errorf("dns[%d].name %s duplicated", i, r.GetName())
+		}
+		seenName[r.GetName()] = true
+	}
+	return nil
+}
+
+// validateDnsRecord 校验单条 .internal 记录（ADR-0040 §16）。
+func validateDnsRecord(r *pb.DnsRecord) error {
+	name := r.GetName()
+	switch {
+	case name == "":
+		return errors.New("name is required")
+	case name != strings.ToLower(name):
+		return fmt.Errorf("name %q must be lowercase", name)
+	case len(r.GetAaaa()) == 0:
+		return errors.New("at least one aaaa is required")
+	case r.GetGeneration() == 0:
+		return errors.New("generation must be > 0")
+	}
+	// 合法 .internal 域名段：{app}.{project}.internal（app/project 单段、
+	// 字符集 [a-z0-9-]，禁止空段/点尾）。
+	parts := strings.Split(name, ".")
+	if len(parts) != 3 || parts[2] != "internal" {
+		return fmt.Errorf("name %q must be {app}.{project}.internal", name)
+	}
+	for _, p := range parts {
+		if p == "" || strings.HasPrefix(p, "-") || strings.HasSuffix(p, "-") {
+			return fmt.Errorf("name %q has empty or dash-affixed label", name)
+		}
+		for _, c := range p {
+			if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
+				return fmt.Errorf("name %q has invalid character %q", name, c)
+			}
+		}
+	}
+	for _, a := range r.GetAaaa() {
+		addr, err := netip.ParseAddr(a)
+		if err != nil || !ulanet.IsULAAddr(addr) {
+			return fmt.Errorf("aaaa %q is not a ULA IPv6 address", a)
+		}
+	}
+	return nil
+}
+
+// ParseULANodePrefix 解析并校验节点 /64 ULA 前缀（RFC 4193 fd00::/8；
+// 单一实现 shared/pkg/ulanet，禁止在本包重复位运算）。
+func ParseULANodePrefix(raw string) (netip.Prefix, error) {
+	return ulanet.ValidatePrefix(raw, 64)
 }

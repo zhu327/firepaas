@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l4-ha  PREREQ: bootstrap-lab,ha-lib  DESTRUCTIVE: no  FROZEN: no
 # Proves scheduler placement across two compute nodes and anti-affinity from API evidence.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; source "$HERE/ha-lib.sh"

@@ -75,6 +75,13 @@ message ServiceInfoResponse {
   string protocol_version = 12;
   repeated string feature_ids = 13;
   string snapshot_compatibility_key = 14;
+  // ADR-0040 §18：节点 WG 公钥（observed 上报，控制面入 wg_peers.pubkey）。
+  // 私钥永不离开节点；空 = 节点未启用 fabric（旧 agent / mesh disabled）。
+  string fabric_pubkey = 15;
+  // ADR-0040 §9/G1：节点 WG 监听端口（observed 上报；控制面据此组 peer
+  // endpoint，异构/同主机多节点不再强制全局同端口）。0 = 未上报（控制面
+  // 回落 FIREPAAS_MESH_WG_PORT 默认）。
+  uint32 fabric_wg_port = 16;
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +167,9 @@ message AutoStandbyPolicy {
 message ServiceSpec {
   string name = 1;          // service 名（deployment 内唯一）
   uint32 internal_port = 2; // guest 侧监听端口；v1.1 public_port = internal_port
+  // ADR-0040 §15：本服务可被 mesh 直连（与 EastWestPolicy 声明缺一不可）。
+  // 只有声明 mesh_direct 的 service，edge 才读 catalog 中的 ULA 字段。
+  bool mesh_direct = 3;
 }
 
 // SecretRef 引用控制面 secrets 表中的一个版本化 secret(ADR-0010)。
@@ -190,6 +200,26 @@ message NetworkSpec {
   //（历史 CIDR-only 语义不变）。policy_generation 随 deployment generation
   // 单调递增，agent 只接受不早于已应用 generation 的全量替换。
   EgressPolicySpec egress = 5;
+  // ADR-0040 §15/§18：本 execution（src identity）生效的东西向放行规则
+  // 全量快照。nil = default deny（无东西向放行；G2 数据面执行前 agent 不消费）。
+  EastWestPolicySpec eastwest = 6;
+}
+
+// EastWestPolicySpec 是东西向 L3/L4 放行快照（ADR-0040 §15）：只表达
+// “谁能连谁的哪个服务端口”，全量替换 + generation fencing。与
+// ServiceSpec.mesh_direct（dst 侧声明）缺一不可。
+message EastWestPolicySpec {
+  uint64 generation = 1;                    // 全量替换 fencing 水位（只升不降）
+  repeated EastWestPolicyRule rules = 2;
+}
+
+message EastWestPolicyRule {
+  string src_project = 1;
+  string src_app = 2;
+  string dst_project = 3;
+  string dst_app = 4;
+  string dst_service = 5;
+  repeated uint32 ports = 6;                // dst service 端口（internal_port）
 }
 
 // EgressPolicySpec 声明一个 execution 的出站网络策略（ADR-0027）。
@@ -459,6 +489,76 @@ message ExecOutput {
     int32 exit_code = 3;
     string error = 4; // 会话级错误(stale execution、machine 不存在等)
   }
+}
+
+// ---------------------------------------------------------------------------
+// Network fabric（ADR-0040 §18）：控制面 → agent 的节点级 fabric 快照下发。
+// 立项决定（2026-09-08）：unary ApplyFabric 全量快照 + 控制面主动推送；
+// 节点级 fencing 键 = node_id + fabric_generation + operation_id，纳入 agent
+// ledger 持久化与重启重放（G0-2）。
+// ---------------------------------------------------------------------------
+
+service FabricService {
+  rpc ApplyFabric(ApplyFabricRequest) returns (ApplyFabricResponse);
+}
+
+// FabricPeer 是一条 WG peer 路由（ADR-0040 §9：按 node /64 聚合的
+// AllowedIPs；peer 数 = 节点数 + 网关/edge hub 数，与 VM 数解耦）。
+message FabricPeer {
+  string node_id = 1;
+  string pubkey = 2;            // WireGuard 公钥（base64）
+  string endpoint = 3;          // host:port
+  string node_prefix = 4;       // 节点 /64（CIDR 文本）
+  uint64 fabric_generation = 5; // 该 peer 的最新 generation
+}
+
+// IdentityMapping 是 ULA ↔ identity 映射（ADR-0040 §6/§7）：稳定层身份作
+// 策略键，execution 绑定作活性/fence 水位。只包含本节点在役 execution。
+message IdentityMapping {
+  uint32 identity_id = 1;       // 稳定层身份（eBPF policy map key）
+  string trust_domain = 2;
+  string project_id = 3;
+  string app_id = 4;
+  string service = 5;
+  string ula = 6;               // execution 域 /128（文本）
+  string machine_id = 7;
+  string execution_id = 8;
+  uint64 generation = 9;        // machine generation（绑定水位）
+  // ADR-0040 §15（G2a）：本 execution 主服务的 mesh 直连声明。agent 建
+  // policy 条目要求 EastWest 规则与 dst mesh_direct 缺一不可；false = 本
+  // execution 只可被南北链路到达（东西向默认 deny）。
+  bool mesh_direct = 10;
+}
+
+message ApplyFabricRequest {
+  string node_id = 1;
+  uint64 fabric_generation = 2; // 全量替换 fencing 水位（只升不降）
+  string operation_id = 3;      // 幂等键：同 operation 不同 request hash 拒绝
+  string node_prefix = 4;       // 本节点 /64（实例 /128 主机路由域）
+  repeated FabricPeer peers = 5;
+  repeated IdentityMapping identities = 6;
+  // ADR-0040 §15/§18（G2a）：东西向放行全表（nil = 无放行，默认 deny）。
+  // 随 fabric_generation 全量替换；generation 取表内规则最大水位（空表 0）。
+  EastWestPolicySpec eastwest = 7;
+  // ADR-0040 §16/§18（G2c）：.internal 服务发现全表（空 = 无记录）。
+  // 记录源与 route backend set 同源（仅 READY 非 draining 的 mesh_direct
+  // execution）；随 fabric_generation 全量替换，节点本地 DNS 直接服务。
+  repeated DnsRecord dns = 8;
+}
+
+// DnsRecord 是一条 .internal 服务发现记录（ADR-0040 §16）。
+// name 形如 "{app}.{project}.internal"（全小写）；aaaa 是 ULA 裸地址集
+//（IPv4-only 应用不发布——.internal 只回 AAAA）；generation 与 route 发布
+// revision 同源（单调，观测/诊断用）。
+message DnsRecord {
+  string name = 1;
+  repeated string aaaa = 2;
+  uint64 generation = 3;
+}
+
+message ApplyFabricResponse {
+  uint64 applied_generation = 1;
+  bool replayed = 2;            // 幂等命中（operation_id 已在 ledger）
 }
 
 // ---------------------------------------------------------------------------

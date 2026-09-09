@@ -115,7 +115,7 @@ Validation：`go test ./internal/edge/... ./internal/security/... ./cmd/edge-pro
 
 Goal：客户端不可操纵 fence 字段（P0#3）、错误映射收敛（P0#4 控制面半）、HTTP 超时+recover（P1#8/#11）、PG 池治理（P1#9）、apikey 缓存与 503 语义（P1#12）、rollout 时间解析（P1#13）。
 Acceptance criteria：
-1. createMachine（M2 legacy 端点）拒绝客户端提交的 `machine_id`/`execution_id`/`generation`（400，服务端正生成）；检查 `scripts/lab/e2e-m2.sh` 是否依赖传参，若依赖则在当前内容基础上更新脚本（该脚本含用户改动，不得回退）。
+1. createMachine（M2 legacy 端点）拒绝客户端提交的 `machine_id`/`execution_id`/`generation`（400，服务端正生成）；检查 `(scripts/lab/archive/)e2e-m2.sh` 是否依赖传参，若依赖则在当前内容基础上更新脚本（该脚本含用户改动，不得回退）。
 2. 统一错误映射 helper：PG/内部错误 log 全文、500 body 为固定文案不吐原文；`setNodeDraining`、`getOperation` 等仅在确证 not-found 时 404，其余错误 500/503；扫描 cmd/api 全部 handler 的裸 `err.Error()` 回吐并收敛。
 3. API `http.Server` 设 `ReadHeaderTimeout`（留 streaming 端点语义注释）；HTTP 中间件 panic recover（log + 500）。
 4. `db` 包：连接池显式配置（MaxConns/MinConns/MaxConnLifetime/HealthCheck，env 可调带默认）；leader 选主改为**独立专用连接**（不经业务池，池耗尽不卡选主）；`leader.go` 解锁加超时。

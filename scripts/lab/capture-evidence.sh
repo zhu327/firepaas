@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: evidence  PREREQ: provisioned-env  DESTRUCTIVE: no  FROZEN: no
 # Capture immutable, environment-linked evidence. Does not imply an acceptance result.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

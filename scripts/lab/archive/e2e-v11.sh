@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l2-archived  PREREQ: nomad,agentd,root  DESTRUCTIVE: yes  FROZEN: yes
 # v1.1 e2e harness（单机实验室）：docs/v1.1-plan.md 工作包验收
 #   A) auto-standby（ADR-0017）：空闲 standby（VMM 释放）→ curl 唤醒 <5s；
 #      探针不清闲（健康探针运行中仍能 standby）；默认关闭回归；多轮无泄漏
@@ -18,9 +19,9 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "$HERE/../.." && pwd)"
+ROOT_DIR="$(cd "$HERE/../../.." && pwd)"
 LAB_BIN="$HOME/.local/firepaas-lab/bin"
-CERT_DIR="$HERE/certs"
+CERT_DIR="$HERE/../certs"
 RUN_DIR="/var/lib/firepaas-p0/e2e-v11"
 RUN_ID="v11-$(date +%s)"
 API_TOKEN="v11-token-$RUN_ID"
@@ -50,7 +51,7 @@ cur() { curl -s -m 20 "$@"; }
 mark() { log "    (累计 $(( $(date +%s) - T0 ))s) $*"; }
 
 # ontime 探针镜像（含 /slow 端点）。
-ONLINE_OUT=$(bash "$HERE/push-ontime.sh") || fail "push-ontime 失败"
+ONLINE_OUT=$(bash "$HERE/../push-ontime.sh") || fail "push-ontime 失败"
 ONTIME_REF=$(echo "$ONLINE_OUT" | grep '^REF=' | cut -d= -f2-)
 [[ -n "$ONTIME_REF" ]] || fail "ontime REF 解析失败"
 
@@ -59,8 +60,8 @@ ONTIME_REF=$(echo "$ONLINE_OUT" | grep '^REF=' | cut -d= -f2-)
 
 log "0) 启动：agentd（autostandby + metrics）+ API/edge（hard=2 + extra ports）"
 T0=$(date +%s)
-"$HERE/root-setup.sh" >/dev/null
-"$HERE/run-agentd.sh" >/dev/null || fail "agentd 未就绪"
+"$HERE/../root-setup.sh" >/dev/null
+"$HERE/../run-agentd.sh" >/dev/null || fail "agentd 未就绪"
 for _ in $(seq 1 60); do "$LAB_BIN/agentctl" info >/dev/null 2>&1 && break; sleep 2; done
 mark "agentd ready"
 

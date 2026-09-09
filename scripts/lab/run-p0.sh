@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l1-base  PREREQ: nomad,root  DESTRUCTIVE: no  FROZEN: no
 # 部署 hypeman P0 job（root）。用法: sudo bash scripts/lab/run-p0.sh
 # 前置：Nomad 已由 scripts/lab/start.sh 启动；hypeman 已由 build-hypeman.sh 构建。
 set -euo pipefail

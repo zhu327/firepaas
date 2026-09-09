@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l0-ci  PREREQ: -  DESTRUCTIVE: no  FROZEN: no
 # Shared helpers for single-node runtime E2E scenarios. Callers provide
 # LAB_BIN, API_PORT, API_TOKEN and authed_raw.
 

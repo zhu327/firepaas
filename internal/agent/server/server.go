@@ -18,6 +18,7 @@ import (
 	"github.com/zhu327/firepaas/internal/agent/info"
 	"github.com/zhu327/firepaas/internal/agent/machine"
 	"github.com/zhu327/firepaas/internal/agent/mutation"
+	"github.com/zhu327/firepaas/internal/agent/network/api"
 	"github.com/zhu327/firepaas/internal/agent/state"
 	contracts "github.com/zhu327/firepaas/internal/contracts/agentv1"
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
@@ -35,6 +36,7 @@ type Server struct {
 	pb.UnimplementedImageServiceServer
 	pb.UnimplementedSnapshotServiceServer
 	pb.UnimplementedVolumeServiceServer
+	pb.UnimplementedFabricServiceServer
 
 	machines  *machine.Adapter
 	ledger    *state.Ledger
@@ -42,6 +44,15 @@ type Server struct {
 	mutations *mutation.Protocol
 	info      *info.Provider
 	creds     *state.Creds // M4：proxy credential 验证材料（仅摘要，ADR-0006）
+	// fabric 是节点级 fabric 快照状态（ADR-0040 §18；nil = FabricService
+	// 未启用，ApplyFabric 返回 Unimplemented）。
+	fabric *state.Fabric
+	// underlay 是跨节点连通插件缝（ADR-0040 §9；nil = mesh 未启用，
+	// ApplyFabric 只持久化快照不作用于数据面）。
+	underlay api.Underlay
+	// fabricPolicy 是 eBPF policy/ipcache 全量替换插件缝（ADR-0040 §15
+	// G2a；nil = 无 v6 数据面后端，快照只持久化不生效）。
+	fabricPolicy api.FabricPolicyWriter
 
 	// M4：强制要求 create 携带 proxy credential（兼容开关，默认 true）。
 	requireCredential bool
@@ -111,6 +122,16 @@ type Option func(*Server)
 
 // WithCreds 注入验证材料存储（nil 之外）。同时关闭强制校验时用 WithCredentialRequired。
 func WithCreds(c *state.Creds) Option { return func(s *Server) { s.creds = c } }
+
+// WithFabric 注入节点级 fabric 快照状态（ADR-0040 §18；缺省 = 服务未启用）。
+func WithFabric(f *state.Fabric) Option { return func(s *Server) { s.fabric = f } }
+
+// WithUnderlay 注入跨节点连通实现（ADR-0040 §9；缺省 = mesh 未启用）。
+func WithUnderlay(u api.Underlay) Option { return func(s *Server) { s.underlay = u } }
+
+// WithFabricPolicy 注入 eBPF policy 写入后端（ADR-0040 §15 G2a；缺省 =
+// 无 v6 数据面，快照只持久化）。
+func WithFabricPolicy(w api.FabricPolicyWriter) Option { return func(s *Server) { s.fabricPolicy = w } }
 
 // WithCredentialRequired 控制 create 是否强制携带 proxy credential。
 func WithCredentialRequired(v bool) Option { return func(s *Server) { s.requireCredential = v } }

@@ -68,7 +68,15 @@ operations(id, machine_id, execution_id, generation, kind, idempotency_key,
            status, result, ...)
 routes(id, app_id, hostname, active_generation, ...)
 route_backends(route_id, generation, machine_id, execution_id, port, weight,
-               readiness, draining, ...)
+               readiness, draining, ..., mesh_ula, mesh_identity_id, mesh_generation)
+                                                        -- ADR-0040: edge 直达提示列
+wg_peers(node_id, pubkey, endpoint, node_prefix, fabric_generation, ...)
+                                                        -- ADR-0040: mesh 成员与 /64 分配
+ipam_allocations(machine_id, execution_id, node_id, ula, released_at, ...)
+                                                        -- ADR-0040: workload ULA 分配（代际唯一）
+fabric_versions(node_id, generation, snapshot_hash)      -- ADR-0040: 推送水位与内容哈希
+eastwest_policies(src_project, src_app, dst_project, dst_app, dst_service, ports, ...)
+                                                        -- ADR-0040: 东西向放行全表（默认 deny）
 ```
 
 关键约束：
@@ -96,7 +104,7 @@ reservation 键空间按 epoch 命名（`resv:{epoch}:...`），active epoch 由
 
 **edge↔控制面 traffic token 耦合 SLA（R2 评审裁决：维持现状，仅文档化断流预算）**：edge 的 TokenClient 以 `(machine, execution)` 为键缓存 execution-bound credential，fresh TTL 30s；回源失败（控制面/PG 不可达）时，若缓存条目仍在 serve-stale 窗口内（默认 120s，`FIREPAAS_EDGE_STALE_WINDOW`，与 route 缓存同源）且 execution 匹配，降级复用 last-known-good，否则 fail-closed。因此控制面/PG 中断不超过该窗口时，已缓存的 `(machine, execution)` 继续服务；中断超过窗口后，edge 无法为冷（未缓存）的 `(machine, execution)` 对签发新凭证，而窗口内已缓存条目不受影响。该 serve-stale 窗口即数据面已文档化的控制面断流预算。
 
-`route` 的 backend 只包含 readiness=true 且非 draining 的 execution；每次发布带 generation。edge 拒绝 execution 不匹配的 location，catalog miss 只触发受限查询/恢复，不自行猜测后端。`slot_ip`、netns 名称和 TAP 等均属于 agent 内部实现，不进入 edge/Redis 契约；edge 只能访问 `node_proxy_endpoint`。
+`route` 的 backend 只包含 readiness=true 且非 draining 的 execution；每次发布带 generation。edge 拒绝 execution 不匹配的 location，catalog miss 只触发受限查询/恢复，不自行猜测后端。`slot_ip`、netns 名称和 TAP 等均属于 agent 内部实现，不进入 edge/Redis 契约；G2d 起 edge 可选经 mesh 直达节点 fabric ingress（ADR-0040 §14：`mesh:endpoint` 投影寻址，凭证唯一路由，`FIREPAAS_EDGE_MESH_DIRECT` 开关），legacy 主路径仍是 `node_proxy_endpoint`（`:5107`，保留为兼容与回滚面）。
 
 **Redis 故障语义（可用性，非仅数据）**：Redis 不可用不改变业务结论（ADR-0003），数据面可用性由 edge 的 route generation 本地缓存承担——TTL 窗口内 serve-stale，超窗受控失败；恢复后由 controller 在声明的时限内重建投影。MVP 接受 Redis 单实例（AOF）；是否引入 sentinel 依据 M4 验收决定（mvp-plan §8）。
 
@@ -136,6 +144,7 @@ MVP 最初以 round-robin 为基线；当前 edge 已按 ADR-0020 使用 least-i
 - secret 值与引用分离（ADR-0010）：`secret_refs` 引用、值仅在 `CreateMachine.secret_env` 一次性下发；observed state（agent 重启扫描重建的 `Machine`）不携带秘密。
 - execution-bound proxy credential 仅在 `CreateMachine.proxy_credential` 单向下发；不得进入会被返回的 `MachineSpec`、Redis、日志或 operation result，agent 只保存验证材料/摘要。
 - 运行时交互（logs/exec）属于 agent 契约：`StreamLogs`/`Exec` 流式 RPC 同样受 mTLS 身份与 execution fencing 约束，由控制面代理 CLI/用户调用（属运维通道，不是 app 流量）；`Machine.log_url` 仅指向归档日志，不承担实时通道。MVP 的 Exec 断线即终止，只保证会话创建幂等，不承诺输出续传或重新 attach。
+- fabric 快照（ADR-0040 §18）：`ApplyFabric(NodeId, FabricGeneration, OperationId, Peers, Identities, Eastwest, Dns)` 是全量替换式推送；agent 按 `fabric_versions` 水位 fencing（拒绝低代/乱序）、原子落盘 durable 快照后重建 WG/ipcache/policy map——重启后按 durable 快照自恢复，控制面按内容哈希门控不重复推送。
 
 mTLS workload identity 的实现现状（2026-09）：静态证书 + 调用方 CN 白名单 + `internal/security/mtls` CertManager 热重载（契约 C-1；agentd、edge-proxy、agentclient 均接入），各进程导出 `firepaas_tls_cert_not_after_seconds` 并配 30d/7d 到期告警（`iac/observability/prometheus-alerts.yml`）。证书轮换、per-node 身份与吊销仍为延期项，见 ADR-0006 后果更新。
 
@@ -148,8 +157,8 @@ mTLS workload identity 的实现现状（2026-09）：静态证书 + 调用方 C
 ## 8. 网络与安全基线
 
 - M1 即建立唯一正式流量边界 `edge → agent proxy → workload endpoint`；M1 的 workload endpoint 可由 bridge adapter 提供，M3 切换为 netns slot 时不改变 edge/catalog 契约；
-- M3 起每个 VM 使用独立 netns slot、cgroup v2、nftables 默认拒绝宿主机与私网；
-- 不做 overlay 或跨节点 VM 私网直连；跨节点业务流量经 edge/agent proxy；
+- M3 起每个 VM 使用独立 netns slot、cgroup v2、nftables 默认拒绝宿主机与私网（ADR-0040 后默认 eBPF datapath，nft 仅 emergency 回落）；
+- 跨节点私网直连按 ADR-0040 引入（WireGuard mesh + ULA + eBPF identity 策略，东西向 `VM → eBPF → WG → 对端 eBPF → VM`）；南北向业务主路径保持 `edge → agent proxy → workload endpoint`，edge 可选经 mesh 直达（ADR-0040 §14）；
 - agent 以 root 运行，是受 mTLS、网络 ACL 和最小 RPC 授权保护的可信组件；
 - MVP 面向受信内部租户，仍必须拒绝跨 project API/路由访问与 guest→host 访问；
 - edge 入口：M1–M3 DNS 轮询、M4 keepalived VIP；TLS 由 step-ca 内部 CA 经 Caddy ACME 集成按需签发泛域名证书，客户端根证书预置是运维前置而不是平台功能（ADR-0011）。

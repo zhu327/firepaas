@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l4-ha  PREREQ: bootstrap-lab,ha-lib  DESTRUCTIVE: no  FROZEN: no
 # Runs continuous HA probes for exactly the requested duration; any failed probe fails the gate.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; source "$HERE/ha-lib.sh"

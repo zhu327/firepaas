@@ -703,6 +703,108 @@ var MachineService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
+	FabricService_ApplyFabric_FullMethodName = "/firepaas.agent.v1.FabricService/ApplyFabric"
+)
+
+// FabricServiceClient is the client API for FabricService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+type FabricServiceClient interface {
+	ApplyFabric(ctx context.Context, in *ApplyFabricRequest, opts ...grpc.CallOption) (*ApplyFabricResponse, error)
+}
+
+type fabricServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewFabricServiceClient(cc grpc.ClientConnInterface) FabricServiceClient {
+	return &fabricServiceClient{cc}
+}
+
+func (c *fabricServiceClient) ApplyFabric(ctx context.Context, in *ApplyFabricRequest, opts ...grpc.CallOption) (*ApplyFabricResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ApplyFabricResponse)
+	err := c.cc.Invoke(ctx, FabricService_ApplyFabric_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// FabricServiceServer is the server API for FabricService service.
+// All implementations must embed UnimplementedFabricServiceServer
+// for forward compatibility.
+type FabricServiceServer interface {
+	ApplyFabric(context.Context, *ApplyFabricRequest) (*ApplyFabricResponse, error)
+	mustEmbedUnimplementedFabricServiceServer()
+}
+
+// UnimplementedFabricServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedFabricServiceServer struct{}
+
+func (UnimplementedFabricServiceServer) ApplyFabric(context.Context, *ApplyFabricRequest) (*ApplyFabricResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ApplyFabric not implemented")
+}
+func (UnimplementedFabricServiceServer) mustEmbedUnimplementedFabricServiceServer() {}
+func (UnimplementedFabricServiceServer) testEmbeddedByValue()                       {}
+
+// UnsafeFabricServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to FabricServiceServer will
+// result in compilation errors.
+type UnsafeFabricServiceServer interface {
+	mustEmbedUnimplementedFabricServiceServer()
+}
+
+func RegisterFabricServiceServer(s grpc.ServiceRegistrar, srv FabricServiceServer) {
+	// If the following call pancis, it indicates UnimplementedFabricServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&FabricService_ServiceDesc, srv)
+}
+
+func _FabricService_ApplyFabric_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ApplyFabricRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FabricServiceServer).ApplyFabric(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FabricService_ApplyFabric_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FabricServiceServer).ApplyFabric(ctx, req.(*ApplyFabricRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// FabricService_ServiceDesc is the grpc.ServiceDesc for FabricService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var FabricService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "firepaas.agent.v1.FabricService",
+	HandlerType: (*FabricServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "ApplyFabric",
+			Handler:    _FabricService_ApplyFabric_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "agent/v1/agent.proto",
+}
+
+const (
 	ImageService_PullImage_FullMethodName               = "/firepaas.agent.v1.ImageService/PullImage"
 	ImageService_ListImages_FullMethodName              = "/firepaas.agent.v1.ImageService/ListImages"
 	ImageService_DeleteImage_FullMethodName             = "/firepaas.agent.v1.ImageService/DeleteImage"

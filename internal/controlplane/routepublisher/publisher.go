@@ -6,8 +6,11 @@ package routepublisher
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sort"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/zhu327/firepaas/internal/controlplane/catalog"
 	"github.com/zhu327/firepaas/internal/controlplane/store"
@@ -18,6 +21,9 @@ type Store interface {
 	ActiveRouteMachines(context.Context) ([]store.Machine, error)
 	ListActiveRollouts(context.Context) ([]store.Rollout, error)
 	ListDeployments(context.Context, string) ([]store.Deployment, error)
+	// FabricIdentities 返回集群在役 execution 的 ULA↔identity 映射（G2b：
+	// mesh_direct 服务的 route backend 提示来源；同 fabric 快照权威）。
+	FabricIdentities(context.Context) ([]store.FabricIdentityRow, error)
 	// SyncRoutes 提交权威 route 集合并同事务分配各 hostname 的发布
 	// revision（D-2，单调，leader 换届不回退）。
 	SyncRoutes(context.Context, []store.RouteRow) (map[string]int64, error)
@@ -29,6 +35,8 @@ type Catalog interface {
 	// （旧乱序快照，安全丢弃）。
 	ReplaceHostRoutes(context.Context, string, int64, []catalog.HostRoute, int) (bool, error)
 	PruneRoutes(context.Context, map[string]bool, map[string]bool) error
+	// ReplaceInternalDNS（G2c）：.internal 投影全量替换（TTL = stale 预算）。
+	ReplaceInternalDNS(context.Context, []catalog.InternalDNSRecord, time.Duration) error
 }
 
 // Publisher is the controller's sole route writer.
@@ -42,11 +50,28 @@ type Publisher struct {
 	catalog         Catalog
 	defaultAppPort  int
 	legacyProxyAddr string
-	mu              sync.Mutex
+	// dnsStaleWindow（G2c）：dns:internal 键 TTL = serve-stale 预算。
+	dnsStaleWindow time.Duration
+	mu             sync.Mutex
 }
 
 func New(st Store, cat Catalog, defaultAppPort int, legacyProxyAddr string) *Publisher {
-	return &Publisher{store: st, catalog: cat, defaultAppPort: defaultAppPort, legacyProxyAddr: legacyProxyAddr}
+	return &Publisher{
+		store: st, catalog: cat, defaultAppPort: defaultAppPort,
+		legacyProxyAddr: legacyProxyAddr, dnsStaleWindow: defaultDNSStaleWindow,
+	}
+}
+
+// defaultDNSStaleWindow 与 edge stale 窗口同源（ADR-0040 §16：
+// FIREPAAS_EDGE_STALE_WINDOW 同值，默认 120s）。
+const defaultDNSStaleWindow = 120 * time.Second
+
+// SetDNSStaleWindow 配置 .internal 投影 TTL（<=0 恢复默认）。
+func (p *Publisher) SetDNSStaleWindow(d time.Duration) {
+	if d <= 0 {
+		d = defaultDNSStaleWindow
+	}
+	p.dnsStaleWindow = d
 }
 
 // Input is the complete in-memory snapshot consumed by deterministic derivation.
@@ -57,6 +82,9 @@ type Input struct {
 	ProxyByNode     map[string]string
 	DefaultAppPort  int
 	LegacyProxyAddr string
+	// FabricByIdentity（G2b）：在役 execution 的 fabric 身份，键 =
+	// machineID+"\x00"+executionID。nil/缺项 = 无 mesh 提示（零回归）。
+	FabricByIdentity map[string]store.FabricIdentityRow
 }
 
 // Projection contains PostgreSQL route facts and the primary-port information
@@ -64,6 +92,9 @@ type Input struct {
 type Projection struct {
 	Routes       []store.RouteRow
 	PrimaryPorts map[string]int
+	// InternalDNS（G2c，ADR-0040 §16）：{app}.{project}.internal → AAAA
+	// 集，与 backend ULA 提示同源（mesh_direct ∧ serving ∧ 有在役身份）。
+	InternalDNS []catalog.InternalDNSRecord
 }
 
 // Rebuild loads route inputs, derives one projection without I/O, commits the
@@ -101,17 +132,37 @@ func (p *Publisher) Rebuild(ctx context.Context, proxyByNode map[string]string) 
 		}
 		deployments = append(deployments, deps...)
 	}
+	// G2b：在役 fabric 身份（mesh_direct 服务提示；失败不阻断发布——缺
+	// 提示只影响未来的 mesh 路径，旧路径不受损，降级记日志）。
+	fabricByIdentity := map[string]store.FabricIdentityRow{}
+	if ids, err := p.store.FabricIdentities(ctx); err != nil {
+		slog.Warn("route rebuild: fabric identities unavailable, mesh hints skipped", "error", err)
+	} else {
+		for _, id := range ids {
+			fabricByIdentity[id.MachineID+"\x00"+id.ExecutionID] = id
+		}
+	}
 
 	projection := Derive(Input{
 		Machines: machines, Deployments: deployments, Rollouts: rollouts,
 		ProxyByNode: proxyByNode, DefaultAppPort: p.defaultAppPort,
-		LegacyProxyAddr: p.legacyProxyAddr,
+		LegacyProxyAddr:  p.legacyProxyAddr,
+		FabricByIdentity: fabricByIdentity,
 	})
 	revisions, err := p.store.SyncRoutes(ctx, projection.Routes)
 	if err != nil {
 		return err
 	}
-	return p.publishRedis(ctx, projection, revisions)
+	return p.publishAll(ctx, projection, revisions)
+}
+
+// publishAll 追加 G2c .internal 投影发布（route 发布完成后；失败上抛，
+// 下轮重建重试——投影可重建，无一致性窗口问题）。
+func (p *Publisher) publishAll(ctx context.Context, projection Projection, revisions map[string]int64) error {
+	if err := p.publishRedis(ctx, projection, revisions); err != nil {
+		return err
+	}
+	return p.publishInternalDNS(ctx, projection)
 }
 
 // Derive applies readiness, rollout, generation, and multiport policy without I/O.
@@ -151,6 +202,9 @@ func Derive(in Input) Projection {
 	}
 	grouped := make(map[routeKey]*store.RouteRow)
 	primaryPorts := make(map[string]int)
+	// G2c：.internal 记录聚合（app 粒度）。
+	dnsSet := make(map[string][]string)
+	dnsGen := make(map[string]int64)
 	for _, m := range in.Machines {
 		port := m.IngressPort
 		if port == 0 {
@@ -202,11 +256,32 @@ func Derive(in Input) Projection {
 			if serviceIndex == 0 && (primaryPorts[m.Hostname] == 0 || service.InternalPort < primaryPorts[m.Hostname]) {
 				primaryPorts[m.Hostname] = service.InternalPort
 			}
-			route.Backends = append(route.Backends, store.RouteBackendRow{
+			backend := store.RouteBackendRow{
 				MachineID: m.ID, ExecutionID: m.CurrentExecutionID,
 				NodeProxyEndpoint: proxy, AppPort: service.InternalPort, Weight: 100,
 				Readiness: m.ObservedReadiness,
-			})
+			}
+			// G2b/G2c（ADR-0040 §16）：mesh_direct 服务才发布 ULA 提示与
+			// .internal AAAA，且仅 READY 非 draining（严格于 route backend 的
+			// serving 判定——UNCONFIGURED 的健康探测未确认服务在听，东向
+			// 客户端连不上；非 serving/draining 已在上游 continue）。无身份
+			//（未入 mesh/分配未落）= 无提示，零回归。
+			hint := fabricHint(in.FabricByIdentity,
+				service.MeshDirect && m.ObservedReadiness == "READY", m.ID, m.CurrentExecutionID)
+			if hint.ULA.IsValid() {
+				backend.ULA = hint.ULA.String()
+				backend.IdentityID = hint.IdentityID
+				backend.Generation = hint.Generation
+				// G2c：同名 .internal 记录聚合（app 粒度 AAAA 集，去重；
+				// generation 取该 execution 的 fabric 分配代；project 取
+				// 身份行，与 fabric 快照同源）。
+				dnsName := fmt.Sprintf("%s.%s.internal", strings.ToLower(m.AppID), strings.ToLower(hint.ProjectID))
+				dnsSet[dnsName] = appendUniqueAAA(dnsSet[dnsName], backend.ULA)
+				if hint.Generation > dnsGen[dnsName] {
+					dnsGen[dnsName] = hint.Generation
+				}
+			}
+			route.Backends = append(route.Backends, backend)
 			if generation > route.Generation {
 				route.Generation = generation
 			}
@@ -229,7 +304,15 @@ func Derive(in Input) Projection {
 		}
 		return routes[i].Port < routes[j].Port
 	})
-	return Projection{Routes: routes, PrimaryPorts: primaryPorts}
+	internalDNS := make([]catalog.InternalDNSRecord, 0, len(dnsSet))
+	for name, aaaas := range dnsSet {
+		sort.Strings(aaaas)
+		internalDNS = append(internalDNS, catalog.InternalDNSRecord{
+			Name: name, AAAA: aaaas, Generation: dnsGen[name],
+		})
+	}
+	sort.Slice(internalDNS, func(i, j int) bool { return internalDNS[i].Name < internalDNS[j].Name })
+	return Projection{Routes: routes, PrimaryPorts: primaryPorts, InternalDNS: internalDNS}
 }
 
 func (p *Publisher) publishRedis(ctx context.Context, projection Projection, revisions map[string]int64) error {
@@ -248,6 +331,9 @@ func (p *Publisher) publishRedis(ctx context.Context, projection Projection, rev
 				MachineID: backend.MachineID, ExecutionID: backend.ExecutionID,
 				NodeProxyEndpoint: backend.NodeProxyEndpoint, AppPort: backend.AppPort,
 				Readiness: backend.Readiness, Weight: backend.Weight, Draining: backend.Draining,
+				// G2b（ADR-0040 §16）：mesh 直连提示（mesh_direct ∧ READY 才填；
+				// 零值 = 无提示，旧 edge 忽略未知字段）。
+				ULA: backend.ULA, IdentityID: backend.IdentityID, Generation: backend.Generation,
 			})
 		}
 		hostRoutes[route.Hostname] = append(
@@ -271,9 +357,42 @@ func (p *Publisher) publishRedis(ctx context.Context, projection Projection, rev
 	return p.catalog.PruneRoutes(ctx, keepRoutes, keepHosts)
 }
 
+// publishInternalDNS（G2c，ADR-0040 §16/§18）：.internal 投影全量替换。
+// TTL = FIREPAAS_AGENT_DNS_STALE_WINDOW（与 edge stale 窗口同值 120s）：
+// 发布器每轮刷新；leader 死亡后键在预算内过期，reconciler 下一轮快照
+// 摘除记录，节点本地 DNS 随之停服（断流降级语义）。空集也发布（合法
+// 状态：全部 mesh_direct 关闭）——只清键不写新键。
+func (p *Publisher) publishInternalDNS(ctx context.Context, projection Projection) error {
+	return p.catalog.ReplaceInternalDNS(ctx, projection.InternalDNS, p.dnsStaleWindow)
+}
+
+// appendUniqueAAA 有序去重追加（ULA /128 全局唯一，重复来自同 execution
+// 的多 mesh_direct 服务）。保持首次出现顺序（调用方最终统一排序）。
+func appendUniqueAAA(list []string, ula string) []string {
+	for _, v := range list {
+		if v == ula {
+			return list
+		}
+	}
+	return append(list, ula)
+}
+
 func machineServing(m store.Machine) bool {
 	if m.ObservedState != "RUNNING" && m.ObservedState != "PAUSED" {
 		return false
 	}
 	return m.ObservedReadiness == "READY" || m.ObservedReadiness == "UNCONFIGURED"
+}
+
+// fabricHint 取 mesh_direct 服务的 backend 提示（G2b，ADR-0040 §16）。
+// 非直连服务或无在役身份（未入 mesh/分配未落）→ 零值（不发布提示）。
+func fabricHint(
+	in map[string]store.FabricIdentityRow,
+	meshDirect bool,
+	machineID, executionID string,
+) store.FabricIdentityRow {
+	if !meshDirect {
+		return store.FabricIdentityRow{}
+	}
+	return in[machineID+"\x00"+executionID]
 }

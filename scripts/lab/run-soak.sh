@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l2-regression  PREREQ: nomad,root  DESTRUCTIVE: no  FROZEN: no
 # 启动 soak 专用 API/edge（M5 60min 排练用；与 e2e-m5 同拓扑，token 固定）。
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

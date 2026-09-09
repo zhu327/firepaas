@@ -27,7 +27,7 @@ import (
 
 	"github.com/zhu327/firepaas/internal/agent/egress"
 	"github.com/zhu327/firepaas/internal/agent/health"
-	"github.com/zhu327/firepaas/internal/agent/network/slot"
+	"github.com/zhu327/firepaas/internal/agent/network/api"
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -281,18 +281,14 @@ const secretFileMode = 0o400
 var ErrSecretSnapshotForbidden = errors.New(
 	"execution received one-shot secrets; memory snapshot/standby forbidden (ADR-0024)")
 
-type slotManager interface {
-	Attach(ctx context.Context, machineID, tap, guestIP string) (slot.Slot, error)
-	Release(ctx context.Context, machineID string) error
-	SlotFor(machineID string) (slot.Slot, bool)
-}
-
-// Adapter 包装 hypeman 的 instance/image manager。slots 非空时启用 slot
+// Adapter 包装 hypeman 的 instance/image manager。network 非空时启用 slot
 // 网络后端（ADR-0004）：create 后把 hypeman TAP 移入 slot netns，delete 后回收。
+// network 是 internal/agent/network/api.Datapath 插件缝（ADR-0040 §11）：
+// 本包不 import 具体后端。
 type Adapter struct {
 	instances InstanceManager
 	images    ImageManager
-	slots     slotManager
+	network   api.Datapath
 	health    *health.Tracker
 	// M4.5：GetEndpoint 遇 Standby 实例时同步唤醒（autoresume，<5s SLO 来自
 	// M0 restore p95 基准）。默认开启；FIREPAAS_AGENT_AUTORESUME=false 关闭。
@@ -307,6 +303,12 @@ type Adapter struct {
 	// egressMgr（v1.3-A，ADR-0027）：egress 策略执行（slot 规则 + 透明代理）。
 	// nil = 未装配（桥接后端或单测）。
 	egressMgr *egress.Manager
+	// fabricULA（ADR-0040 T6）：按 machine+execution 查本节点 fabric 快照
+	// 中的 ULA。nil = 未装配（legacy 纯 v4，零回归）。
+	fabricULA FabricULALookup
+	// fabricDNS（G2c，§16）：节点本地 .internal DNS 地址（节点 ULA）。nil =
+	// 未装配（guest 沿用 v4 resolver）。
+	fabricDNS func() string
 	// volumes（v1.3-D，ADR-0029）：hypeman volumes.Manager（nil = 未装配）。
 	volumes volumeProvider
 	// imageUseMu protects the transition between image readiness and a durable
@@ -316,16 +318,16 @@ type Adapter struct {
 	imageUseMu sync.RWMutex
 }
 
-// New 构造 Adapter。slotManager 为 nil 时保持 M1 bridge 行为；
+// New 构造 Adapter。network 为 nil 时保持 M1 bridge 行为；
 // healthTracker 为 nil 时 readiness 退化为 UNKNOWN/UNCONFIGURED。
 func New(
 	instances InstanceManager,
 	images ImageManager,
-	slotManager slotManager,
+	network api.Datapath,
 	healthTracker *health.Tracker,
 ) *Adapter {
 	return &Adapter{
-		instances: instances, images: images, slots: slotManager,
+		instances: instances, images: images, network: network,
 		health: healthTracker, autoResume: true,
 	}
 }
@@ -342,14 +344,41 @@ func (a *Adapter) SetSecretInjection(mode string) { a.secretInjection = mode }
 // SetWakeObserver 注入 autoresume 唤醒观测回调（v1.1，ADR-0017 metrics）。
 func (a *Adapter) SetWakeObserver(fn func(machineID string, took time.Duration)) { a.wakeObserver = fn }
 
+// FabricULALookup 按 machine+execution 查本节点 fabric 快照中的 ULA。
+// 返回 (ula, true) = 快照已生效且有映射（注入）；("", false) = 快照未生效
+// （legacy 纯 v4）；("", true) = 快照已生效但本 execution 无映射——调用方
+// 按暂态失败处理（等 reconciler 推送，controller 重入列收敛）。
+type FabricULALookup func(machineID, executionID string) (ula string, active bool)
+
+// ErrFabricIdentityPending 表示 fabric 快照已生效但本 execution 的 ULA 映射
+// 尚未下发（T4c 分配 → reconciler 推送窗口）。暂态错误：server 映射为
+// gRPC Internal，controller 重入列后收敛（绝不在无 ULA 时建 mesh VM）。
+var ErrFabricIdentityPending = errors.New("fabric identity not yet available for execution")
+
+// SetFabricULA 注入 fabric ULA 查询（nil = 禁用，legacy 纯 v4）。
+func (a *Adapter) SetFabricULA(fn FabricULALookup) { a.fabricULA = fn }
+
+// SetFabricDNSAddr 注入节点本地 .internal DNS 地址查询（G2c，§16）。
+// 返回节点 ULA 裸地址（快照 NodePrefix /64 基址）；空 = 未启用/快照未
+// 生效（guest 沿用 v4 resolver，零回归）。nil = 未装配。
+func (a *Adapter) SetFabricDNSAddr(fn func() string) { a.fabricDNS = fn }
+
+// fabricDNSAddr 返回节点本地 DNS 地址（未装配/空 = ""）。
+func (a *Adapter) fabricDNSAddr() string {
+	if a.fabricDNS == nil {
+		return ""
+	}
+	return a.fabricDNS()
+}
+
 // SetEgressManager（v1.3-A，ADR-0027）注入 egress 策略执行层（nil = 禁用）。
 func (a *Adapter) SetEgressManager(mgr *egress.Manager) { a.egressMgr = mgr }
 
 // RebuildEgress（v1.3-A 重启恢复）：agentd 启动后按 hypeman 实例 tags 与
-// slot 持久化规则重建代理注册 + 幂等重放内核规则。策略不可重建（tags 只存
-// 身份）时记日志跳过，绝不静默放行：slot 侧规则仍按持久化状态生效。
+// 数据面持久化策略快照重建代理注册 + 幂等重放内核规则。策略不可重建（tags
+// 只存身份）时记日志跳过，绝不静默放行：数据面侧快照仍按持久化状态生效。
 func (a *Adapter) RebuildEgress(ctx context.Context) error {
-	if a.egressMgr == nil || a.slots == nil {
+	if a.egressMgr == nil || a.network == nil {
 		return nil
 	}
 	listed, err := a.instances.ListInstances(ctx, nil)
@@ -362,11 +391,11 @@ func (a *Adapter) RebuildEgress(ctx context.Context) error {
 		if machineID == "" {
 			machineID = inst.Id
 		}
-		s, ok := a.slots.SlotFor(machineID)
-		if !ok || s.Egress.Mode == "" {
+		state, ok := a.network.CurrentNetns(machineID)
+		if !ok || state.Snapshot.Mode == "" {
 			continue
 		}
-		policy, perr := egress.FromRuleSet(s.Egress)
+		policy, perr := egress.FromSnapshot(state.Snapshot)
 		if perr != nil {
 			return fmt.Errorf("rebuild egress %s: %w", machineID, perr)
 		}
@@ -620,6 +649,27 @@ func (a *Adapter) Create(ctx context.Context, req *pb.CreateMachineRequest) (*pb
 		}
 	}
 
+	// ADR-0040 T6：mesh 下为 guest 注入 ULA。位置在任何外部副作用之前：
+	// 查不到且快照已生效 = 暂态失败（controller 重入列，等 reconciler 推送
+	// 后收敛）；快照未生效 = legacy 纯 v4（零回归）。
+	var ula6, ula6gw string
+	if a.fabricULA != nil {
+		ula, active := a.fabricULA(req.MachineId, spec.GetExecutionId())
+		switch {
+		case ula != "":
+			ula6, ula6gw = ula, api.SlotBridgeLL6
+			hreq.IPv6Address = ula6
+			hreq.IPv6Prefix = 128
+			hreq.IPv6Gateway = ula6gw
+			// G2c（§16）：v6 resolver = 节点本地 .internal DNS（split-horizon
+			// 首位；公网 v4 仍为第二 nameserver，公网解析不受影响）。注入函数
+			// 空快照/未启用返回空（沿用 v4 resolver，零回归）。
+			hreq.IPv6DNS = a.fabricDNSAddr()
+		case active:
+			return nil, fmt.Errorf("%w: machine %s execution %s",
+				ErrFabricIdentityPending, req.MachineId, spec.GetExecutionId())
+		}
+	}
 	inst, err := a.instances.CreateInstance(ctx, hreq)
 	if err != nil && errors.Is(err, instances.ErrImageNotReady) {
 		// 冷镜像首创建：hypeman 已异步启动 pull 并即刻返回 ErrImageNotReady。
@@ -641,11 +691,11 @@ func (a *Adapter) Create(ctx context.Context, req *pb.CreateMachineRequest) (*pb
 	// DeleteImage's final ListInstances check is sufficient protection.
 	a.imageUseMu.RUnlock()
 	imageProtected = false
-	if a.slots != nil {
+	if a.network != nil {
 		// slot 后端：把 hypeman 刚创建的 TAP 移入 slot netns。失败时回收
 		// 刚创建的实例并返回错误（controller 会按退避重试）。
 		tap := network.GenerateTAPName(inst.Id)
-		if _, err := a.slots.Attach(ctx, req.MachineId, tap, inst.IP); err != nil {
+		if err := a.network.AttachNetns(ctx, api.NetnsSpec{MachineID: req.MachineId, Tap: tap, GuestIP: inst.IP, GuestIP6: ula6, GuestGW6: ula6gw}); err != nil {
 			a.deleteInstanceOrWarn(ctx, inst.Id, req.MachineId, "slot attach cleanup")
 			return nil, fmt.Errorf("slot attach: %w", err)
 		}
@@ -784,8 +834,8 @@ func (a *Adapter) Delete(ctx context.Context, machineID, expectedExecution strin
 			errs = append(errs, fmt.Errorf("hypeman delete: %w", err))
 		}
 	}
-	if a.slots != nil {
-		if err := a.slots.Release(ctx, machineID); err != nil {
+	if a.network != nil {
+		if err := a.network.DetachNetns(ctx, machineID); err != nil {
 			slog.Warn("delete phase slot release failed; remaining phases continue",
 				"machine_id", machineID, "error", err)
 			errs = append(errs, fmt.Errorf("slot release: %w", err))
@@ -1112,11 +1162,11 @@ func (a *Adapter) Pause(ctx context.Context, machineID, executionID string) (*pb
 // Attach 幂等（ensureKernel 会把 root ns 的 TAP 补移入 netns 并重加 /32 路由）。
 // 不重挂则 VM Running 但流量 502（M4 真机验收发现的 autoresume 盲区）。
 func (a *Adapter) reattachSlot(ctx context.Context, machineID string, inst *instances.Instance) error {
-	if a.slots == nil || inst == nil {
+	if a.network == nil || inst == nil {
 		return nil
 	}
 	tap := network.GenerateTAPName(inst.Id)
-	if _, err := a.slots.Attach(ctx, machineID, tap, inst.IP); err != nil {
+	if err := a.network.AttachNetns(ctx, api.NetnsSpec{MachineID: machineID, Tap: tap, GuestIP: inst.IP}); err != nil {
 		return fmt.Errorf("slot re-attach after restore: %w", err)
 	}
 	return nil

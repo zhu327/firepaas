@@ -8,24 +8,26 @@ import (
 
 	"github.com/kernel/hypeman/lib/instances"
 
-	"github.com/zhu327/firepaas/internal/agent/network/slot"
+	"github.com/zhu327/firepaas/internal/agent/network/api"
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 )
 
-// fakeSlots 是 slotManager 的可失败替身（staged delete 测试用）。
-type fakeSlots struct {
+// fakeDatapath 是 api.Datapath 的可失败替身（staged delete 测试用）。
+type fakeDatapath struct {
 	releaseErr   error
 	releaseCalls int
 	released     []string
 	attachCalls  int
+	lastSpec     api.NetnsSpec // 最近一次 Attach 输入（ULA 透传断言用）
 }
 
-func (f *fakeSlots) Attach(context.Context, string, string, string) (slot.Slot, error) {
+func (f *fakeDatapath) AttachNetns(_ context.Context, spec api.NetnsSpec) error {
 	f.attachCalls++
-	return slot.Slot{}, nil
+	f.lastSpec = spec
+	return nil
 }
 
-func (f *fakeSlots) Release(_ context.Context, machineID string) error {
+func (f *fakeDatapath) DetachNetns(_ context.Context, machineID string) error {
 	f.releaseCalls++
 	if f.releaseErr != nil {
 		return f.releaseErr
@@ -34,14 +36,18 @@ func (f *fakeSlots) Release(_ context.Context, machineID string) error {
 	return nil
 }
 
-func (f *fakeSlots) SlotFor(machineID string) (slot.Slot, bool) { return slot.Slot{}, false }
+func (f *fakeDatapath) Check(context.Context, api.NetnsSpec) error { return nil }
+
+func (f *fakeDatapath) Reconcile(context.Context, []api.LiveInstance) error { return nil }
+
+func (f *fakeDatapath) CurrentNetns(string) (api.NetnsState, bool) { return api.NetnsState{}, false }
 
 // TestDeletePhasesContinuePastRuntimeNotFound：R2-3——VM NotFound 只代表
 // runtime 阶段完成，slot release 等后续阶段照常执行；阶段失败聚合为可重试
 // 错误，重试在同一 machine 上补齐失败阶段后收敛成功。
 func TestDeletePhasesContinuePastRuntimeNotFound(t *testing.T) {
 	ctx := context.Background()
-	slots := &fakeSlots{releaseErr: errors.New("kernel busy")}
+	slots := &fakeDatapath{releaseErr: errors.New("kernel busy")}
 	im := &fakeInstances{}
 	a := New(im, &fakeImages{}, slots, nil)
 
@@ -69,7 +75,7 @@ func TestDeletePhasesContinuePastRuntimeNotFound(t *testing.T) {
 // 阶段失败时，实例依然被删（错误照旧上报，重试补做剩余阶段）。
 func TestDeletePhaseFailureDoesNotBlockRuntimeRemoval(t *testing.T) {
 	ctx := context.Background()
-	slots := &fakeSlots{releaseErr: errors.New("kernel busy")}
+	slots := &fakeDatapath{releaseErr: errors.New("kernel busy")}
 	im := &fakeInstances{}
 	a := New(im, &fakeImages{}, slots, nil)
 	if _, err := im.CreateInstance(ctx, instances.CreateInstanceRequest{Name: "m1"}); err != nil {
@@ -88,7 +94,7 @@ func TestDeletePhaseFailureDoesNotBlockRuntimeRemoval(t *testing.T) {
 // 当前实例属于更新的 execution，任何清理都会误伤 live VM。
 func TestDeleteExecutionMismatchAbortsAllPhases(t *testing.T) {
 	ctx := context.Background()
-	slots := &fakeSlots{}
+	slots := &fakeDatapath{}
 	im := &fakeInstances{}
 	a := New(im, &fakeImages{}, slots, nil)
 	if _, err := im.CreateInstance(ctx, instances.CreateInstanceRequest{

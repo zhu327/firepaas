@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l1-base  PREREQ: p0-job,root  DESTRUCTIVE: no  FROZEN: no
 # M0 P0 冒烟：OCI 镜像 → Firecracker VM → exec/logs → stop/delete + 主机残留检查。
 # 前置：hypeman 已运行（Nomad job firepaas-hypeman-p0 或手工直跑）。
 # 用法（建议 root）：sudo bash scripts/lab/smoke-p0.sh

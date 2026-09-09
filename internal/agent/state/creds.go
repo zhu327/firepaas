@@ -109,6 +109,28 @@ func (c *Creds) Verify(machineID, executionID, rawCredential string) bool {
 	return hmac.Equal(want, got[:])
 }
 
+// LookupByDigest 反查凭证归属（G2d fabric ingress：凭证是新路径的唯一
+// 路由依据，终结器只收凭证不收 X-Firepaas-Machine/Execution 头）。恒时
+// 比较每个候选；条目数 = 本节点在役 machine 数（同阶小集）。
+func (c *Creds) LookupByDigest(rawCredential string) (machineID, executionID string, ok bool) {
+	if rawCredential == "" {
+		return "", "", false
+	}
+	got := sha256.Sum256([]byte(rawCredential))
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for m, e := range c.entries {
+		want, err := hex.DecodeString(e.Digest)
+		if err != nil {
+			continue
+		}
+		if hmac.Equal(want, got[:]) {
+			return m, e.ExecutionID, true
+		}
+	}
+	return "", "", false
+}
+
 // persistLocked 使用崩溃安全序列（temp+fsync+rename+fsync(dir)，0600）——
 // 与 ledger persistLocked 同一纪律：验证材料丢一半 = 存活 machine 永久 403。
 func (c *Creds) persistLocked() error {

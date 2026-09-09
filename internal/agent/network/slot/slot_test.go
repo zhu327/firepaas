@@ -7,8 +7,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/zhu327/firepaas/internal/agent/network/api"
 )
 
 // TestPersistDurablePermissions 验证 slots.json 落盘纪律的可观测面：0600
@@ -53,12 +57,17 @@ func TestPersistDurablePermissions(t *testing.T) {
 // 用途：上次测试失败退出时可能残留无 TAP 的 slot，先清再跑。
 func cleanupStaleTestNetns(t *testing.T) {
 	t.Helper()
-	idxs, err := listStrayNetns()
+	// 默认前缀的 manager（仅用于名字推导；不落盘：路径用临时文件）。
+	m, err := New(Config{SubnetCIDR: "10.100.0.0/24", StatePath: filepath.Join(t.TempDir(), "slots.json")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	idxs, err := m.listStrayNetns()
 	if err != nil {
 		t.Fatalf("list netns: %v", err)
 	}
 	for _, idx := range idxs {
-		out, err := exec.Command("ip", "netns", "exec", nsName(idx),
+		out, err := exec.Command("ip", "netns", "exec", m.nsName(idx),
 			"ip", "-o", "link", "show").CombinedOutput()
 		if err != nil {
 			continue
@@ -66,7 +75,7 @@ func cleanupStaleTestNetns(t *testing.T) {
 		if strings.Contains(string(out), "hype-") {
 			continue // 有 TAP：live VM 的 slot，不碰
 		}
-		_ = deleteNetns(idx)
+		_ = m.deleteNetns(idx)
 	}
 }
 
@@ -90,14 +99,14 @@ func TestSlotCycleLeak(t *testing.T) {
 	for i := 0; i < n; i++ {
 		id := fmt.Sprintf("m-cycle-%d", i)
 		ip := fmt.Sprintf("10.100.7.%d", i%200+10)
-		if _, err := m.Attach(ctx, id, "", ip); err != nil {
+		if err := m.AttachNetns(ctx, api.NetnsSpec{MachineID: id, GuestIP: ip}); err != nil {
 			t.Fatalf("cycle %d attach: %v", i, err)
 		}
-		if err := m.Release(ctx, id); err != nil {
+		if err := m.DetachNetns(ctx, id); err != nil {
 			t.Fatalf("cycle %d release: %v", i, err)
 		}
 	}
-	strays, err := listStrayNetns()
+	strays, err := m.listStrayNetns()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,6 +122,10 @@ func TestSlotCycleLeak(t *testing.T) {
 }
 
 func TestVethAddrs(t *testing.T) {
+	m, err := New(Config{SubnetCIDR: "10.100.0.0/24", StatePath: filepath.Join(t.TempDir(), "slots.json")})
+	if err != nil {
+		t.Fatal(err)
+	}
 	cases := []struct {
 		idx  int
 		host string
@@ -125,7 +138,7 @@ func TestVethAddrs(t *testing.T) {
 		{126, "10.12.2.1", "10.12.2.2"},
 	}
 	for _, c := range cases {
-		host, ns, err := vethAddrs(c.idx)
+		host, ns, err := m.vethAddrs(c.idx)
 		if err != nil {
 			t.Fatalf("idx %d: %v", c.idx, err)
 		}
@@ -135,11 +148,11 @@ func TestVethAddrs(t *testing.T) {
 	}
 	// /30 块内不重叠：每 4 个地址一个块，host 与 ns 相邻。
 	for i := 0; i < 200; i++ {
-		h1, n1, err := vethAddrs(i)
+		h1, n1, err := m.vethAddrs(i)
 		if err != nil {
 			t.Fatal(err)
 		}
-		h2, n2, err := vethAddrs(i + 1)
+		h2, n2, err := m.vethAddrs(i + 1)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -219,16 +232,15 @@ func TestSlotLifecycle(t *testing.T) {
 		defer func() { _ = exec.Command("ip", "link", "del", "fp-testtap").Run() }()
 	}
 
-	s, err := m.Attach(ctx, "m-test", tap, guestIP)
-	if err != nil {
+	if err := m.AttachNetns(ctx, api.NetnsSpec{MachineID: "m-test", Tap: tap, GuestIP: guestIP}); err != nil {
 		t.Fatalf("attach: %v", err)
 	}
-	if s.Index != 0 {
-		t.Fatalf("index = %d", s.Index)
+	if s, ok := m.SlotFor("m-test"); !ok || s.Index != 0 {
+		t.Fatalf("index = %d ok=%v", s.Index, ok)
 	}
 
 	// 内核对象存在。
-	if exists, _ := netnsExists(0); !exists {
+	if exists, _ := m.netnsExists(0); !exists {
 		t.Fatal("netns fp-slot-0 missing")
 	}
 	if _, err := os.Stat("/sys/class/net/fp-vp0"); err != nil {
@@ -246,17 +258,17 @@ func TestSlotLifecycle(t *testing.T) {
 	}
 
 	// 幂等重复 attach。
-	if _, err := m.Attach(ctx, "m-test", tap, guestIP); err != nil {
+	if err := m.AttachNetns(ctx, api.NetnsSpec{MachineID: "m-test", Tap: tap, GuestIP: guestIP}); err != nil {
 		t.Fatalf("re-attach: %v", err)
 	}
 
 	// release → 全部消失（netlink 清理异步，轮询确认）。
-	if err := m.Release(ctx, "m-test"); err != nil {
+	if err := m.DetachNetns(ctx, "m-test"); err != nil {
 		t.Fatalf("release: %v", err)
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		exists, _ := netnsExists(0)
+		exists, _ := m.netnsExists(0)
 		_, vethErr := os.Stat("/sys/class/net/fp-vp0")
 		if !exists && os.IsNotExist(vethErr) {
 			break
@@ -273,14 +285,14 @@ func TestSlotLifecycle(t *testing.T) {
 	// 快循环泄漏测试：30 次 attach/release（完整 1000 次在 e2e-m3 脚本里跑）。
 	for i := 0; i < 30; i++ {
 		id := fmt.Sprintf("m-cycle-%d", i)
-		if _, err := m.Attach(ctx, id, "", "10.100.5."+fmt.Sprint(i+10)); err != nil {
+		if err := m.AttachNetns(ctx, api.NetnsSpec{MachineID: id, GuestIP: "10.100.5." + fmt.Sprint(i+10)}); err != nil {
 			t.Fatalf("cycle %d attach: %v", i, err)
 		}
-		if err := m.Release(ctx, id); err != nil {
+		if err := m.DetachNetns(ctx, id); err != nil {
 			t.Fatalf("cycle %d release: %v", i, err)
 		}
 	}
-	strays, err := listStrayNetns()
+	strays, err := m.listStrayNetns()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,12 +305,11 @@ func TestSlotLifecycle(t *testing.T) {
 // 的私网 drop 必含 canonical 集合关键段（CGNAT/loopback，与 dataset SSRF
 // 校验同源），且存在 ip6 family 的 slot veth 默认拒绝表。
 func TestIsolationRuleGeneration(t *testing.T) {
-	m, err := New(Config{SubnetCIDR: "10.100.0.0/24", StatePath: filepath.Join(t.TempDir(), "slots.json")})
-	if err != nil {
+	if _, err := New(Config{SubnetCIDR: "10.100.0.0/24", StatePath: filepath.Join(t.TempDir(), "slots.json")}); err != nil {
 		t.Fatal(err)
 	}
 	var v4 strings.Builder
-	for _, args := range m.isolationStepsIPv4() {
+	for _, args := range nftIsolationStepsIPv4(18080, 18443, VethRange) {
 		v4.WriteString(strings.Join(args, " ") + "\n")
 	}
 	for _, want := range []string{"100.64.0.0/10", "127.0.0.0/8", "daddr", "masquerade"} {
@@ -319,8 +330,125 @@ func TestIsolationRuleGeneration(t *testing.T) {
 			t.Fatalf("ip6 isolation steps missing %q:\n%s", want, v6.String())
 		}
 	}
-	// ip6 默认拒绝不得有意外放行口（无 established accept）。
-	if strings.Contains(v6.String(), "accept") {
-		t.Fatalf("ip6 isolation must be default-deny without accepts:\n%s", v6.String())
+	// ip6 默认拒绝：唯一放行口是 NDP（RS/RA/NS/NA/redirect——v6 邻居解析
+	// 是 slot v6 接线与 mesh 链路的前提，真机 G2c 验收抓到 fallback 下 NS
+	// 被 drop → NDP 恒 FAILED）；不得有其它 accept（无 established 口）。
+	if n := strings.Count(v6.String(), "accept"); n != 1 || !strings.Contains(v6.String(), "nd-neighbor-solicit") {
+		t.Fatalf("ip6 isolation must be default-deny with NDP-only accept:\n%s", v6.String())
+	}
+}
+
+// TestParseSlotULA6：ULA 校验 fail closed（非法输入拒绝 attach，绝不进内核）。
+func TestParseSlotULA6(t *testing.T) {
+	if _, err := parseSlotULA6("fd7a:9a55:1::5"); err != nil {
+		t.Fatalf("valid ULA rejected: %v", err)
+	}
+	for _, bad := range []string{"", "10.0.0.5", "not-an-ip", "fd7a:9a55:1::5/128", "::ffff:10.0.0.5"} {
+		if _, err := parseSlotULA6(bad); err == nil {
+			t.Fatalf("invalid ULA %q accepted", bad)
+		}
+	}
+}
+
+// TestSlotV6Plumbing 是 root-only 真机测试：attach（GuestIP6）→ root /128
+// 路由 + NDP 代理 + netns 默认路由存在 → detach 后无残留。
+// 需要 root + iproute2：sudo FIREPAAS_TEST_NETNS=1 go test ./internal/agent/network/slot/ -run TestSlotV6Plumbing -v
+func TestSlotV6Plumbing(t *testing.T) {
+	if os.Getenv("FIREPAAS_TEST_NETNS") != "1" {
+		t.Skip("set FIREPAAS_TEST_NETNS=1 (root) to run kernel networking test")
+	}
+	if os.Geteuid() != 0 {
+		t.Fatal("must run as root")
+	}
+	dir := t.TempDir()
+	m, err := New(Config{
+		SubnetCIDR: "10.12.0.0/16", Gateway: "10.12.0.1",
+		StatePath: filepath.Join(dir, "slots.json"),
+		Backend:   NewNftBackend(0, 0, ""),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	const ula = "fd7a:9a55:1::5"
+	machineID := fmt.Sprintf("v6-%d", os.Getpid())
+	// 真实 TAP：覆盖 ULA slot 的 TAP MTU 1280 接线（W5；与 guest eth0 对齐）。
+	tapName := fmt.Sprintf("tapv6%d", os.Getpid()%100000)
+	if out, err := exec.Command("ip", "tuntap", "add", "mode", "tap", "name", tapName).CombinedOutput(); err != nil {
+		t.Fatalf("create tap: %v: %s", err, out)
+	}
+	if err := m.AttachNetns(ctx, api.NetnsSpec{MachineID: machineID, Tap: tapName, GuestIP: "10.12.0.9", GuestIP6: ula}); err != nil {
+		t.Fatalf("attach v6: %v", err)
+	}
+	defer func() {
+		if err := m.DetachNetns(ctx, machineID); err != nil {
+			t.Fatalf("detach: %v", err)
+		}
+		if out, _ := exec.Command("ip", "-6", "route", "show", ula+"/128").CombinedOutput(); strings.Contains(
+			string(out),
+			ula,
+		) {
+			t.Fatalf("stale v6 route after detach: %s", out)
+		}
+	}()
+	// root 侧 /128 路由存在。
+	if out, err := exec.Command("ip", "-6", "route", "show", ula+"/128").CombinedOutput(); err != nil ||
+		!strings.Contains(string(out), ula) {
+		t.Fatalf("v6 host route missing: %v: %s", err, out)
+	}
+	// netns 内默认 v6 路由经 root。
+	st, ok := m.CurrentNetns(machineID)
+	if !ok {
+		t.Fatal("slot missing after attach")
+	}
+	out, err := exec.Command("ip", "netns", "exec", m.nsName(st.Index),
+		"ip", "-6", "route", "show", "default").CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "fe80::1") {
+		t.Fatalf("v6 default route missing in netns: %v: %s", err, out)
+	}
+	// TAP MTU 1280（W5：WG 封装开销下无分片黑洞；guest MSS 自动派生）。
+	out, err = exec.Command("ip", "netns", "exec", m.nsName(st.Index),
+		"ip", "link", "show", tapName).CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "mtu 1280") {
+		t.Fatalf("tap mtu 1280 missing: %v: %s", err, out)
+	}
+}
+
+// TestStateFileLockMutualExclusion（P1 独立评审）：跨（进程/描述符）互斥——
+// 后拿锁者必须阻塞到先持锁者释放之后；锁路径与 CNI 侧单实现同源。
+func TestStateFileLockMutualExclusion(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "slots.json")
+	if got := StateLockPath(state); got != state+".lock" {
+		t.Fatalf("lock path = %q", got)
+	}
+	acquired := make(chan struct{})
+	release := make(chan struct{})
+	var released atomic.Int64
+	var acquiredAfter atomic.Int64
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = WithStateFileLock(state, func() error {
+			close(acquired)
+			<-release // 持锁等待，制造确定性重叠窗口
+			released.Store(time.Now().UnixNano())
+			return nil
+		})
+	}()
+	<-acquired
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = WithStateFileLock(state, func() error {
+			acquiredAfter.Store(time.Now().UnixNano())
+			return nil
+		})
+	}()
+	time.Sleep(50 * time.Millisecond) // 确保第二个 goroutine 已阻塞在 flock
+	close(release)
+	wg.Wait()
+	if acquiredAfter.Load() < released.Load() {
+		t.Fatal("second holder acquired the lock before first holder released it")
 	}
 }

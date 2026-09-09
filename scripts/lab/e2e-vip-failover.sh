@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l4-ha  PREREQ: bootstrap-lab,ha-lib  DESTRUCTIVE: no  FROZEN: no
 # Validates two-edge VIP transfer using a client path independent of either edge host.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; source "$HERE/ha-lib.sh"

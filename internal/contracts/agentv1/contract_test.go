@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
 )
@@ -264,5 +265,248 @@ func TestValidateCreateRequest(t *testing.T) {
 	req.OperationId = ""
 	if err := ValidateCreateRequest(req); err == nil {
 		t.Fatal("expected error for missing operation_id")
+	}
+}
+
+func TestValidateEastWestPolicy(t *testing.T) {
+	valid := &pb.EastWestPolicySpec{
+		Generation: 3,
+		Rules: []*pb.EastWestPolicyRule{
+			{
+				SrcProject: "p1",
+				SrcApp:     "web",
+				DstProject: "p2",
+				DstApp:     "db",
+				DstService: "pg",
+				Ports:      []uint32{5432, 6432},
+			},
+			{
+				SrcProject: "p1",
+				SrcApp:     "web",
+				DstProject: "p2",
+				DstApp:     "cache",
+				DstService: "redis",
+				Ports:      []uint32{6379},
+			},
+		},
+	}
+	if err := ValidateEastWestPolicy(valid); err != nil {
+		t.Fatalf("valid eastwest rejected: %v", err)
+	}
+	if err := ValidateEastWestPolicy(nil); err != nil {
+		t.Fatalf("nil eastwest must be legal (default deny): %v", err)
+	}
+	for name, mutate := range map[string]func(*pb.EastWestPolicySpec){
+		"generation zero": func(p *pb.EastWestPolicySpec) { p.Generation = 0 },
+		"empty src_app":   func(p *pb.EastWestPolicySpec) { p.Rules[0].SrcApp = "" },
+		"empty dst service": func(p *pb.EastWestPolicySpec) {
+			p.Rules[1].DstService = ""
+		},
+		"empty ports": func(p *pb.EastWestPolicySpec) { p.Rules[0].Ports = nil },
+		"port zero":   func(p *pb.EastWestPolicySpec) { p.Rules[0].Ports = []uint32{0} },
+		"port dup":    func(p *pb.EastWestPolicySpec) { p.Rules[0].Ports = []uint32{80, 80} },
+		"rule dup dst": func(p *pb.EastWestPolicySpec) {
+			p.Rules = append(p.Rules, &pb.EastWestPolicyRule{
+				SrcProject: "p1", SrcApp: "web", DstProject: "p2", DstApp: "db", DstService: "pg", Ports: []uint32{5432},
+			})
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := &pb.EastWestPolicySpec{Generation: valid.Generation}
+			p.Rules = append(p.Rules, valid.Rules...)
+			mutate(p)
+			if err := ValidateEastWestPolicy(p); err == nil {
+				t.Fatal("expected validation failure")
+			}
+		})
+	}
+}
+
+func TestValidateEastWestPolicyTable(t *testing.T) {
+	// 全表允许多 src 声明同一 dst（与单快照的 dst 唯一不同，G2a）。
+	valid := &pb.EastWestPolicySpec{
+		Generation: 5,
+		Rules: []*pb.EastWestPolicyRule{
+			{SrcProject: "p1", SrcApp: "web", DstProject: "p1", DstApp: "db", DstService: "pg", Ports: []uint32{5432}},
+			{
+				SrcProject: "p1",
+				SrcApp:     "worker",
+				DstProject: "p1",
+				DstApp:     "db",
+				DstService: "pg",
+				Ports:      []uint32{5432},
+			},
+		},
+	}
+	if err := ValidateEastWestPolicyTable(valid); err != nil {
+		t.Fatalf("multi-src table rejected: %v", err)
+	}
+	if err := ValidateEastWestPolicyTable(nil); err != nil {
+		t.Fatalf("nil table must be legal (default deny): %v", err)
+	}
+	for name, mutate := range map[string]func(*pb.EastWestPolicySpec){
+		"generation zero": func(p *pb.EastWestPolicySpec) { p.Generation = 0 },
+		"dup src+dst": func(p *pb.EastWestPolicySpec) {
+			p.Rules = append(p.Rules, &pb.EastWestPolicyRule{
+				SrcProject: "p1", SrcApp: "web", DstProject: "p1", DstApp: "db", DstService: "pg", Ports: []uint32{5433},
+			})
+		},
+		"empty ports": func(p *pb.EastWestPolicySpec) { p.Rules[0].Ports = nil },
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := &pb.EastWestPolicySpec{Generation: valid.Generation}
+			p.Rules = append(p.Rules, valid.Rules...)
+			mutate(p)
+			if err := ValidateEastWestPolicyTable(p); err == nil {
+				t.Fatal("expected validation failure")
+			}
+		})
+	}
+}
+
+func TestValidateApplyFabricRequest(t *testing.T) {
+	valid := &pb.ApplyFabricRequest{
+		NodeId:           "node-1",
+		FabricGeneration: 7,
+		OperationId:      "op-fabric-7",
+		NodePrefix:       "fd7a:9a55:1::/64",
+		Peers: []*pb.FabricPeer{
+			{
+				NodeId: "node-2", Pubkey: "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE=", Endpoint: "10.0.0.2:51820",
+				NodePrefix: "fd7a:9a55:2::/64", FabricGeneration: 6,
+			},
+		},
+		Identities: []*pb.IdentityMapping{
+			{
+				IdentityId: 1, TrustDomain: "firepaas.local", ProjectId: "p", AppId: "a",
+				Service: "api", Ula: "fd7a:9a55:1::5", MachineId: "m1", ExecutionId: "e1", Generation: 3,
+			},
+		},
+	}
+	if err := ValidateApplyFabricRequest(valid); err != nil {
+		t.Fatalf("valid fabric rejected: %v", err)
+	}
+	// G2a 增量：eastwest 全表 + mesh_direct 声明必须通过。
+	withPolicy := proto.Clone(valid).(*pb.ApplyFabricRequest)
+	withPolicy.Identities[0].MeshDirect = true
+	withPolicy.Eastwest = &pb.EastWestPolicySpec{
+		Generation: 2,
+		Rules: []*pb.EastWestPolicyRule{
+			{SrcProject: "p", SrcApp: "web", DstProject: "p", DstApp: "a", DstService: "api", Ports: []uint32{8080}},
+			{SrcProject: "p", SrcApp: "cron", DstProject: "p", DstApp: "a", DstService: "api", Ports: []uint32{8080}},
+		},
+	}
+	if err := ValidateApplyFabricRequest(withPolicy); err != nil {
+		t.Fatalf("fabric with eastwest table rejected: %v", err)
+	}
+	// G2c 增量：.internal 记录全表必须通过。
+	withDNS := proto.Clone(withPolicy).(*pb.ApplyFabricRequest)
+	withDNS.Dns = []*pb.DnsRecord{
+		{Name: "a.p.internal", Aaaa: []string{"fd7a:9a55:1::5", "fd7a:9a55:2::5"}, Generation: 4},
+		{Name: "web.q.internal", Aaaa: []string{"fd7a:9a55:2::6"}, Generation: 9},
+	}
+	if err := ValidateApplyFabricRequest(withDNS); err != nil {
+		t.Fatalf("fabric with dns records rejected: %v", err)
+	}
+	for name, mutate := range map[string]func(*pb.ApplyFabricRequest){
+		"missing operation": func(r *pb.ApplyFabricRequest) { r.OperationId = "" },
+		"zero generation":   func(r *pb.ApplyFabricRequest) { r.FabricGeneration = 0 },
+		"bad node prefix":   func(r *pb.ApplyFabricRequest) { r.NodePrefix = "fd7a:9a55:1::/48" },
+		"non ULA prefix":    func(r *pb.ApplyFabricRequest) { r.NodePrefix = "2001:db8:1::/64" },
+		"fc00 reserved":     func(r *pb.ApplyFabricRequest) { r.NodePrefix = "fc00:1::/64" },
+		"host bits set":     func(r *pb.ApplyFabricRequest) { r.NodePrefix = "fd7a:9a55:1::5/64" },
+		"dup peer": func(r *pb.ApplyFabricRequest) {
+			r.Peers = append(r.Peers, &pb.FabricPeer{
+				NodeId: "node-2", Pubkey: "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE=",
+				Endpoint: "10.0.0.9:51820", NodePrefix: "fd7a:9a55:9::/64", FabricGeneration: 1,
+			})
+		},
+		"bad peer prefix": func(r *pb.ApplyFabricRequest) { r.Peers[0].NodePrefix = "fd7a:9a55:2::/63" },
+		"ula not ipv6":    func(r *pb.ApplyFabricRequest) { r.Identities[0].Ula = "10.0.0.5" },
+		"dup binding": func(r *pb.ApplyFabricRequest) {
+			r.Identities = append(r.Identities, &pb.IdentityMapping{
+				IdentityId:  2,
+				TrustDomain: "firepaas.local", ProjectId: "p", AppId: "a", Service: "api",
+				Ula: "fd7a:9a55:1::6", MachineId: "m1", ExecutionId: "e1", Generation: 3,
+			})
+		},
+		"bad eastwest rule": func(r *pb.ApplyFabricRequest) {
+			r.Eastwest = &pb.EastWestPolicySpec{Generation: 1, Rules: []*pb.EastWestPolicyRule{
+				{SrcProject: "p", SrcApp: "web", DstProject: "p", DstApp: "a", DstService: "api"},
+			}}
+		},
+		"bad dns name": func(r *pb.ApplyFabricRequest) {
+			r.Dns = []*pb.DnsRecord{{Name: "App.P.internal", Aaaa: []string{"fd7a:9a55:0:1::5"}, Generation: 1}}
+		},
+		"bad dns shape": func(r *pb.ApplyFabricRequest) {
+			r.Dns = []*pb.DnsRecord{{Name: "app.internal", Aaaa: []string{"fd7a:9a55:0:1::5"}, Generation: 1}}
+		},
+		"dns non-ula": func(r *pb.ApplyFabricRequest) {
+			r.Dns = []*pb.DnsRecord{{Name: "app.p.internal", Aaaa: []string{"2001:db8::1"}, Generation: 1}}
+		},
+		"dns no aaaa": func(r *pb.ApplyFabricRequest) {
+			r.Dns = []*pb.DnsRecord{{Name: "app.p.internal", Generation: 1}}
+		},
+		"dns zero gen": func(r *pb.ApplyFabricRequest) {
+			r.Dns = []*pb.DnsRecord{{Name: "app.p.internal", Aaaa: []string{"fd7a:9a55:0:1::5"}}}
+		},
+		"dup dns name": func(r *pb.ApplyFabricRequest) {
+			r.Dns = []*pb.DnsRecord{
+				{Name: "app.p.internal", Aaaa: []string{"fd7a:9a55:0:1::5"}, Generation: 1},
+				{Name: "app.p.internal", Aaaa: []string{"fd7a:9a55:0:1::6"}, Generation: 1},
+			}
+		},
+		"eastwest dup src+dst": func(r *pb.ApplyFabricRequest) {
+			r.Eastwest = &pb.EastWestPolicySpec{Generation: 1, Rules: []*pb.EastWestPolicyRule{
+				{SrcProject: "p", SrcApp: "web", DstProject: "p", DstApp: "a", DstService: "api", Ports: []uint32{8080}},
+				{SrcProject: "p", SrcApp: "web", DstProject: "p", DstApp: "a", DstService: "api", Ports: []uint32{8081}},
+			}}
+		},
+		"eastwest zero generation": func(r *pb.ApplyFabricRequest) {
+			r.Eastwest = &pb.EastWestPolicySpec{Rules: []*pb.EastWestPolicyRule{
+				{SrcProject: "p", SrcApp: "web", DstProject: "p", DstApp: "a", DstService: "api", Ports: []uint32{8080}},
+			}}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := proto.Clone(valid).(*pb.ApplyFabricRequest)
+			mutate(r)
+			if err := ValidateApplyFabricRequest(r); err == nil {
+				t.Fatal("expected validation failure")
+			}
+		})
+	}
+}
+
+func TestValidateMachineSpecWithEastWestAndMeshDirect(t *testing.T) {
+	spec := &pb.MachineSpec{
+		ProjectId: "p", AppId: "a", DeploymentId: "d", ExecutionId: "e",
+		ImageRef: "registry.local/nginx:1.27", Vcpu: 1, MemMib: 512,
+		Network: &pb.NetworkSpec{
+			IngressPort: 8080,
+			Eastwest: &pb.EastWestPolicySpec{
+				Generation: 2,
+				Rules: []*pb.EastWestPolicyRule{
+					{
+						SrcProject: "p",
+						SrcApp:     "a",
+						DstProject: "p",
+						DstApp:     "db",
+						DstService: "pg",
+						Ports:      []uint32{5432},
+					},
+				},
+			},
+		},
+		Services: []*pb.ServiceSpec{
+			{Name: "http", InternalPort: 8080, MeshDirect: true},
+		},
+	}
+	if err := ValidateMachineSpecForCreate(spec); err != nil {
+		t.Fatalf("valid mesh spec rejected: %v", err)
+	}
+	spec.Network.Eastwest.Generation = 0
+	if err := ValidateMachineSpecForCreate(spec); err == nil {
+		t.Fatal("eastwest generation 0 must fail")
 	}
 }

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l1-base  PREREQ: network  DESTRUCTIVE: no  FROZEN: no
 # 构建 hypeman 二进制（嵌入 Cloud Hypervisor / Firecracker v1.14.2 / Caddy v2.10.2）。
 # 本机无 make/gcc，本脚本等价执行 hypeman Makefile 的 build-linux（当前架构），
 # 全程 CGO_ENABLED=0。产物复制到 $LAB_ROOT/bin/hypeman。

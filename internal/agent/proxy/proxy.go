@@ -42,7 +42,7 @@ type targetKey struct{}
 // ReverseProxy 与 Transport 在构造时创建一次并复用（评审 P3：连接池不得
 // 每请求新建）；每次请求仅解析目标并挂到 request context。
 type Proxy struct {
-	machines *machine.Adapter
+	machines endpointResolver
 	creds    credentialVerifier // nil = 不校验凭证（测试/过渡期）
 	reverse  *httputil.ReverseProxy
 }
@@ -50,6 +50,19 @@ type Proxy struct {
 // credentialVerifier 校验 execution-bound proxy credential（M4）。
 type credentialVerifier interface {
 	Verify(machineID, executionID, rawCredential string) bool
+	// LookupByDigest（G2d fabric ingress）：凭证反查归属。实现方：
+	// *state.Creds。
+	LookupByDigest(rawCredential string) (machineID, executionID string, ok bool)
+}
+
+// endpointResolver 是 Proxy 对机器端点解析的依赖（*machine.Adapter 实现；
+// 测试注入替身）。
+type endpointResolver interface {
+	GetEndpointForPort(
+		ctx context.Context,
+		machineID, executionID string,
+		wantPort int,
+	) (ip string, port int, err error)
 }
 
 // New 构造 Proxy（不校验凭证：仅测试用）。
@@ -57,10 +70,35 @@ func New(machines *machine.Adapter) *Proxy {
 	return NewWithVerifier(machines, nil)
 }
 
+// NewForTest 构造带替身 resolver 的 Proxy（终结器/代理层测试）。
+func NewForTest(
+	creds credentialVerifier,
+	resolve func(machineID, executionID string, wantPort int) (string, int, error),
+) *Proxy {
+	return &Proxy{
+		machines: resolverFunc(resolve),
+		creds:    creds,
+		reverse:  newReverseProxy(),
+	}
+}
+
+type resolverFunc func(machineID, executionID string, wantPort int) (string, int, error)
+
+func (f resolverFunc) GetEndpointForPort(
+	_ context.Context,
+	machineID, executionID string,
+	wantPort int,
+) (string, int, error) {
+	return f(machineID, executionID, wantPort)
+}
+
 // NewWithVerifier 构造带 credential 校验的 Proxy。
 func NewWithVerifier(machines *machine.Adapter, creds credentialVerifier) *Proxy {
-	p := &Proxy{machines: machines, creds: creds}
-	p.reverse = &httputil.ReverseProxy{
+	return &Proxy{machines: machines, creds: creds, reverse: newReverseProxy()}
+}
+
+func newReverseProxy() *httputil.ReverseProxy {
+	return &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			target, _ := req.Context().Value(targetKey{}).(*url.URL)
 			if target == nil {
@@ -97,7 +135,6 @@ func NewWithVerifier(machines *machine.Adapter, creds credentialVerifier) *Proxy
 			MaxIdleConnsPerHost: 64,
 		},
 	}
-	return p
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -127,6 +164,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		wantPort = port
 	}
 
+	p.serveTarget(w, r, machineID, executionID, wantPort)
+}
+
+// serveTarget 是两条入口共享的转发路径（legacy :5107 头路由与 G2d
+// fabric ingress 凭证路由）：endpoint 解析 → 反向代理到 guest。
+func (p *Proxy) serveTarget(w http.ResponseWriter, r *http.Request, machineID, executionID string, wantPort int) {
 	ip, port, err := p.machines.GetEndpointForPort(r.Context(), machineID, executionID, wantPort)
 	if err != nil {
 		// Endpoint lookup failure means this agent cannot serve the catalogued
@@ -140,4 +183,20 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	target := &url.URL{Scheme: "http", Host: fmt.Sprintf("%s:%d", ip, port)}
 	r = r.WithContext(context.WithValue(r.Context(), targetKey{}, target))
 	p.reverse.ServeHTTP(w, r)
+}
+
+// ServeCredential 是 G2d fabric ingress 入口（ADR-0040 §14）：凭证是唯一
+// 路由依据（无 X-Firepaas-Machine/Execution 头）；由 creds 反查归属后走
+// 共享转发路径。wantPort = 目标 service 端口（0 = 主端口）。
+func (p *Proxy) ServeCredential(w http.ResponseWriter, r *http.Request, rawCredential string, wantPort int) {
+	if p.creds == nil {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	machineID, executionID, ok := p.creds.LookupByDigest(rawCredential)
+	if !ok {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	p.serveTarget(w, r, machineID, executionID, wantPort)
 }

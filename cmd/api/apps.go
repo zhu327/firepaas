@@ -64,6 +64,9 @@ type egressPolicyBody struct {
 type serviceBody struct {
 	Name         string `json:"name"`
 	InternalPort int    `json:"internal_port"`
+	// MeshDirect（ADR-0040 §15，G2a）：本服务可被 mesh 直连（需 EastWest
+	// 规则配合，缺一不可）；缺省 false。
+	MeshDirect bool `json:"mesh_direct"`
 }
 
 // autoStandbyBody 是 auto_standby 策略声明（v1.1，ADR-0017）。
@@ -198,7 +201,11 @@ func (a *API) createApp(w http.ResponseWriter, r *http.Request) {
 	}
 	depID := "dep-" + body.AppID + "-1"
 	// v1.2-A（ADR-0023）：启动必需能力由平台从 deployment 语义推导。
-	requiredFeatures := requiredFeaturesForSecretRefs(body.SecretRefs)
+	// W3：mesh_direct 服务的调度硬约束（§12）与 secrets 同源推导，口径与
+	// appcommand deploy 单点一致（任一 service direct → mesh+ebpf 双能力）。
+	requiredFeatures := append(
+		requiredFeaturesForSecretRefs(body.SecretRefs),
+		appcommand.MeshDirectFeatures(services)...)
 	// app 与其初始 deployment 必须作为一个业务单元提交；否则请求在两次
 	// 写之间失败会留下没有 ACTIVE deployment 的 app。
 	if err := a.store.CreateAppAndDeployment(r.Context(), body.ProjectID, store.App{
@@ -315,7 +322,7 @@ func deploymentIntent(appID, projectID string, body deployBody, inheritAll bool)
 	if body.Services != nil {
 		services = make([]appcommand.Service, len(body.Services))
 		for i, svc := range body.Services {
-			services[i] = appcommand.Service{Name: svc.Name, InternalPort: svc.InternalPort}
+			services[i] = appcommand.Service{Name: svc.Name, InternalPort: svc.InternalPort, MeshDirect: svc.MeshDirect}
 		}
 	}
 	var healthCheck *appcommand.HealthCheck
@@ -588,7 +595,7 @@ func resolveServices(services []serviceBody, port int) ([]store.ServiceSpec, int
 		}
 		seenPort[svc.InternalPort] = true
 		seenName[name] = true
-		out = append(out, store.ServiceSpec{Name: name, InternalPort: svc.InternalPort})
+		out = append(out, store.ServiceSpec{Name: name, InternalPort: svc.InternalPort, MeshDirect: svc.MeshDirect})
 	}
 	return out, out[0].InternalPort, nil
 }

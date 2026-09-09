@@ -218,9 +218,9 @@ M1 内部子排序（关键路径；任何单项延期不得顺延 proto 冻结�
   ID 贯穿 slog。
 - M2.6 tools/sim：100k 放置断言 PASS（过滤先于打分/硬准入/反亲和 distinct/
   失联排除；`make sim`）。
-- 验收：`sudo bash scripts/lab/e2e-m2.sh` PASS（1000 并发重试→1 machine、
+- 验收：`sudo bash (scripts/lab/archive/)e2e-m2.sh` PASS（1000 并发重试→1 machine、
   多 ordinal 并发、20 轮创建/删除零泄漏、节点投影+metrics）；
-  `sudo bash scripts/lab/chaos-m2.sh` PASS（ACK 丢失 32s、agent crash 16s、
+  `sudo bash (scripts/lab/archive/)chaos-m2.sh` PASS（ACK 丢失 32s、agent crash 16s、
   Redis 清空 3s、API crash 与在途 crash 均 <120s 收敛）。
 - 真机验收修掉的关键 bug：换代重建未清 observed 导致 R8 短路无限换代；
   create 退避重试 opID 撞历史幂等键；reap delete 误把 desired 置 DELETED；

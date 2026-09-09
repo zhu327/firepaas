@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,6 +18,7 @@ import (
 
 	"github.com/zhu327/firepaas/internal/controlplane/catalog"
 	"github.com/zhu327/firepaas/internal/controlplane/traffic"
+	"github.com/zhu327/firepaas/internal/edge/mesh"
 )
 
 type fakeCatalog struct {
@@ -626,5 +629,264 @@ func TestHandlerExportsLatencyHistograms(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Fatalf("metrics output missing %q:\n%s", want, body)
 		}
+	}
+}
+
+// G2d（ADR-0040 §14）：mesh 直达优先与回落。
+func testDirectHandler(t *testing.T, cat RouteCatalog, direct *mesh.Transport) *Handler {
+	t.Helper()
+	// W4：直达要求非空凭证（空凭证不再尝试直达，直接 legacy）。token 服务
+	// 按 machine 回放对应 execution（与 TokenClient 的 execution 一致性校验
+	// 对齐），终结器可断言凭证头非空。
+	tokens := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mid := strings.TrimPrefix(r.URL.Path, "/v1/machines/")
+		mid = strings.TrimSuffix(mid, "/traffic-token")
+		execID := "e-" + mid
+		if mid == "m1" {
+			execID = "e1"
+		}
+		_, _ = fmt.Fprintf(w, `{"token":"tok-%s","execution_id":%q}`, mid, execID)
+	}))
+	t.Cleanup(tokens.Close)
+	return NewHandler(Config{
+		Catalog:         cat,
+		Routes:          NewRouteCache(time.Minute, time.Minute),
+		Tokens:          NewTokenClient(tokens.URL, "bearer", time.Minute),
+		Limiter:         NewRateLimiter(0, 0),
+		HardConcurrency: 8,
+		EdgePorts:       map[int]bool{8081: true, 8447: true},
+		Direct:          direct,
+	})
+}
+
+// meshEndpointFor 把 endpoint 回源固定为指定 (ula, port)。
+func meshEndpointFor(ula string, port int) *mesh.Endpoints {
+	return mesh.NewEndpointsForTest(ula, port)
+}
+
+// TestHandlerMeshDirectServesAndFallsBack：mesh_direct backend（ULA 提示
+// 存在）走直达终结器；直达终结器不可达 → 回落 legacy :5107 代理，两个
+// 指标（direct/fallback）各自递增；非 mesh_direct backend 不尝试直达。
+func TestHandlerMeshDirectServesAndFallsBack(t *testing.T) {
+	// 直达终结器（真实 HTTP）：校验凭证是唯一路由依据。
+	type ingressReq struct {
+		cred    string
+		machine string
+		port    string
+	}
+	gotIngress := make(chan ingressReq, 4)
+	ingress := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotIngress <- ingressReq{
+			cred:    r.Header.Get(traffic.HeaderCredential),
+			machine: r.Header.Get("X-Firepaas-Machine-ID"),
+			port:    r.Header.Get("X-Firepaas-App-Port"),
+		}
+		_, _ = w.Write([]byte("via-mesh"))
+	}))
+	defer ingress.Close()
+	_, portStr, _ := strings.Cut(strings.TrimPrefix(ingress.URL, "http://"), ":")
+	ingressPort, _ := strconv.Atoi(portStr)
+
+	// legacy :5107 等价上游。
+	legacy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("via-legacy"))
+	}))
+	defer legacy.Close()
+
+	// token 客户端提供固定凭证（testDirectHandler 内建；空凭证不再尝试直达）。
+	h := testDirectHandler(t, &fakeCatalog{
+		route: &catalog.Route{Backends: []catalog.Backend{
+			{
+				MachineID: "m1", ExecutionID: "e1", NodeProxyEndpoint: strings.TrimPrefix(legacy.URL, "http://"),
+				AppPort: 80, Readiness: "READY", ULA: "fd7a:9a55:0:1::5",
+			},
+		}},
+	}, mesh.NewTransportForTest(meshEndpointFor("127.0.0.1", ingressPort)))
+
+	// 1) mesh_direct backend（m1）：直达。
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest("GET", "http://app.test/", nil))
+	if rr.Code != http.StatusOK || rr.Body.String() != "via-mesh" {
+		t.Fatalf("direct serve: code=%d body=%q", rr.Code, rr.Body.String())
+	}
+	select {
+	case req := <-gotIngress:
+		if req.machine != "" {
+			t.Fatalf("direct path must not carry routing headers, got machine=%q", req.machine)
+		}
+		if req.cred != "tok-m1" {
+			t.Fatalf("direct path credential = %q, want tok-m1 (sole routing basis)", req.cred)
+		}
+		if req.port != "80" {
+			t.Fatalf("app port = %q, want 80", req.port)
+		}
+	default:
+		t.Fatal("ingress not hit")
+	}
+	if n := h.cnt.meshDirect.Load(); n != 1 {
+		t.Fatalf("mesh direct counter = %d", n)
+	}
+	if n := h.cnt.meshFallback.Load(); n != 0 {
+		t.Fatalf("unexpected fallback: %d", n)
+	}
+
+	// 2) 非 mesh_direct backend（m2）：不尝试直达（counter 不变）。
+	h2 := testDirectHandler(t, &fakeCatalog{
+		route: &catalog.Route{
+			Backends: []catalog.Backend{testBackend("m2", strings.TrimPrefix(legacy.URL, "http://"))},
+		},
+	}, mesh.NewTransportForTest(meshEndpointFor("127.0.0.1", ingressPort)))
+	rr2 := httptest.NewRecorder()
+	h2.ServeHTTP(rr2, httptest.NewRequest("GET", "http://app.test/", nil))
+	if rr2.Body.String() != "via-legacy" {
+		t.Fatalf("non-mesh backend: body=%q", rr2.Body.String())
+	}
+	if n := h2.cnt.meshDirect.Load(); n != 0 {
+		t.Fatalf("non-mesh backend must not attempt direct: %d", n)
+	}
+
+	// 3) 直达不可达（endpoint miss → ErrNoDirect）→ 回落 legacy。
+	h3 := testDirectHandler(t, &fakeCatalog{
+		route: &catalog.Route{Backends: []catalog.Backend{
+			{
+				MachineID: "m1", ExecutionID: "e1", NodeProxyEndpoint: strings.TrimPrefix(legacy.URL, "http://"),
+				AppPort: 80, Readiness: "READY", ULA: "fd7a:9a55:0:1::5",
+			},
+		}},
+	}, mesh.NewTransportForTest(meshEndpointFor("", 0))) // 恒 miss → ErrNoDirect → 回落
+	rr3 := httptest.NewRecorder()
+	h3.ServeHTTP(rr3, httptest.NewRequest("GET", "http://app.test/", nil))
+	if rr3.Code != http.StatusOK || rr3.Body.String() != "via-legacy" {
+		t.Fatalf("fallback serve: code=%d body=%q", rr3.Code, rr3.Body.String())
+	}
+	if n := h3.cnt.meshDirect.Load(); n != 1 || h3.cnt.meshFallback.Load() != 1 {
+		t.Fatalf("counters direct=%d fallback=%d", h3.cnt.meshDirect.Load(), h3.cnt.meshFallback.Load())
+	}
+}
+
+// TestHandlerMeshDirectSkipsWithoutCredential（W4）：凭证缺失不尝试直达
+// （终结器必 403），直接走 legacy；直达计数不增加。
+func TestHandlerMeshDirectSkipsWithoutCredential(t *testing.T) {
+	legacy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("via-legacy"))
+	}))
+	defer legacy.Close()
+	h := NewHandler(Config{
+		Catalog: &fakeCatalog{route: &catalog.Route{Backends: []catalog.Backend{
+			{
+				MachineID: "m1", ExecutionID: "e1", NodeProxyEndpoint: strings.TrimPrefix(legacy.URL, "http://"),
+				AppPort: 80, Readiness: "READY", ULA: "fd7a:9a55:0:1::5",
+			},
+		}}},
+		Routes:          NewRouteCache(time.Minute, time.Minute),
+		Tokens:          NewTokenClient("", "", time.Minute), // 禁用 = 恒空凭证
+		Limiter:         NewRateLimiter(0, 0),
+		HardConcurrency: 8,
+		Direct:          mesh.NewTransportForTest(meshEndpointFor("127.0.0.1", 1)),
+	})
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest("GET", "http://app.test/", nil))
+	if rr.Body.String() != "via-legacy" {
+		t.Fatalf("body=%q, want via-legacy", rr.Body.String())
+	}
+	if n := h.cnt.meshDirect.Load(); n != 0 {
+		t.Fatalf("empty credential must not attempt direct: %d", n)
+	}
+}
+
+// TestHandlerMeshDirectBodyFallbackOnDialError（W4）：拨号期失败 body 未消耗，
+// 带 body 的 POST 仍可回落 legacy 且 body 完整。
+func TestHandlerMeshDirectBodyFallbackOnDialError(t *testing.T) {
+	legacy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_, _ = w.Write(append([]byte("legacy:"), body...))
+	}))
+	defer legacy.Close()
+	// 已关闭端口：拨号被拒（retriable）。
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedPort := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	h := testDirectHandler(t, &fakeCatalog{route: &catalog.Route{Backends: []catalog.Backend{
+		{
+			MachineID: "m1", ExecutionID: "e1", NodeProxyEndpoint: strings.TrimPrefix(legacy.URL, "http://"),
+			AppPort: 80, Readiness: "READY", ULA: "fd7a:9a55:0:1::5",
+		},
+	}}}, mesh.NewTransportForTest(meshEndpointFor("127.0.0.1", closedPort)))
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "http://app.test/", bytes.NewBufferString("payload-123"))
+	h.ServeHTTP(rr, req)
+	if rr.Body.String() != "legacy:payload-123" {
+		t.Fatalf("body=%q, want legacy with intact body", rr.Body.String())
+	}
+	if n := h.cnt.meshFallback.Load(); n != 1 {
+		t.Fatalf("dial failure must fall back: %d", n)
+	}
+}
+
+// TestHandlerMeshDirectBodyTerminalOnMidstreamError（W4）：body 已消耗的中段
+// 失败不再重放（防静默丢数据），显式 502；不回落 legacy。
+func TestHandlerMeshDirectBodyTerminalOnMidstreamError(t *testing.T) {
+	legacy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("via-legacy"))
+	}))
+	defer legacy.Close()
+	direct := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body) // 消耗 body
+		hj, _ := w.(http.Hijacker)
+		conn, _, _ := hj.Hijack() // 无响应直接断连（中段失败）
+		_ = conn.Close()
+	}))
+	defer direct.Close()
+	_, portStr, _ := strings.Cut(strings.TrimPrefix(direct.URL, "http://"), ":")
+	directPort, _ := strconv.Atoi(portStr)
+	h := testDirectHandler(t, &fakeCatalog{route: &catalog.Route{Backends: []catalog.Backend{
+		{
+			MachineID: "m1", ExecutionID: "e1", NodeProxyEndpoint: strings.TrimPrefix(legacy.URL, "http://"),
+			AppPort: 80, Readiness: "READY", ULA: "fd7a:9a55:0:1::5",
+		},
+	}}}, mesh.NewTransportForTest(meshEndpointFor("127.0.0.1", directPort)))
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "http://app.test/", bytes.NewBufferString("payload-123"))
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("code=%d body=%q, want 502 terminal (no silent drop, no replay)", rr.Code, rr.Body.String())
+	}
+	if n := h.cnt.meshFallback.Load(); n != 0 {
+		t.Fatalf("consumed body must not fall back: %d", n)
+	}
+	if n := h.cnt.meshErrors.Load(); n != 1 {
+		t.Fatalf("mesh errors = %d, want 1", n)
+	}
+}
+
+// TestHandlerMeshDirectBodyFallbackOnEndpointMiss（P1 独立评审）：endpoint
+// 投影缺口（pre-dial 应用层 miss，body 未消耗）→ 带 body 的 POST 仍回落
+// legacy 且 body 完整（不可误判终态 502）。
+func TestHandlerMeshDirectBodyFallbackOnEndpointMiss(t *testing.T) {
+	legacy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_, _ = w.Write(append([]byte("legacy:"), body...))
+	}))
+	defer legacy.Close()
+	h := testDirectHandler(t, &fakeCatalog{route: &catalog.Route{Backends: []catalog.Backend{
+		{
+			MachineID: "m1", ExecutionID: "e1", NodeProxyEndpoint: strings.TrimPrefix(legacy.URL, "http://"),
+			AppPort: 80, Readiness: "READY", ULA: "fd7a:9a55:0:1::5",
+		},
+	}}}, mesh.NewTransportForTest(meshEndpointFor("", 0))) // 恒 miss → ErrNoDirect
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "http://app.test/", bytes.NewBufferString("payload-123"))
+	h.ServeHTTP(rr, req)
+	if rr.Body.String() != "legacy:payload-123" {
+		t.Fatalf("body=%q, want legacy with intact body", rr.Body.String())
+	}
+	if n := h.cnt.meshFallback.Load(); n != 1 {
+		t.Fatalf("endpoint miss with body must fall back: %d", n)
+	}
+	if n := h.cnt.meshErrors.Load(); n != 0 {
+		t.Fatalf("endpoint miss must not count as mesh error: %d", n)
 	}
 }

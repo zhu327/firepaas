@@ -89,7 +89,7 @@ Pause/Resume/Checkpoint/Image/Exec 保持实验状态（mvp-plan §5.2）。
 
 ### ⑦ e2e harness
 
-- `scripts/lab/e2e-m1.sh`：一键起 dev 依赖 + agentd + api + edge，跑 U1 冒烟。
+- `(scripts/lab/archive/)e2e-m1.sh`：一键起 dev 依赖 + agentd + api + edge，跑 U1 冒烟。
 - 验收：脚本重复执行结果一致；作为后续里程碑复用入口。
 
 ## 本轮可并行/串行策略
@@ -120,7 +120,7 @@ Pause/Resume/Checkpoint/Image/Exec 保持实验状态（mvp-plan §5.2）。
   U1 通过：hostname → edge → Redis catalog → proxy → Firecracker nginx → HTTP 200。
 - M1.3 完成：静态 mTLS（scripts/lab/gen-certs.sh + internal/security/mtls）；
   无证书访问 5108/5107 拒绝，持证书 API/agentctl/edge 全链路可用。
-- ⑦ 完成：`sudo bash scripts/lab/e2e-m1.sh` 一键 PASS。
+- ⑦ 完成：`sudo bash (scripts/lab/archive/)e2e-m1.sh` 一键 PASS。
 
 ## 已知遗留（进入 M2 前记录）
 

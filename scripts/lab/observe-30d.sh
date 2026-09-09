@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l4-ha  PREREQ: provisioned-env  DESTRUCTIVE: no  FROZEN: no
 # Daily 30-day observation gate. State is append-only; missed days fail rather than being backfilled.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; source "$HERE/ha-lib.sh"

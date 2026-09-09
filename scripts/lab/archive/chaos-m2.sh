@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l2-archived  PREREQ: nomad,agentd,root  DESTRUCTIVE: yes  FROZEN: yes
 # M2 chaos harness（单机）：mvp-plan §6 验收
 #   - ACK 丢失（agent 侧直接删 VM，PG/op 不知情）→ R3 重建
 #   - agent crash（Nomad 重启 agentd，VM 全部死亡）→ 2 分钟内收敛重建
@@ -9,7 +10,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAB_BIN="$HOME/.local/firepaas-lab/bin"
-CERT_DIR="$HERE/certs"
+CERT_DIR="$HERE/../certs"
 RUN_DIR="/var/lib/firepaas-p0/chaos-m2"
 RUN_ID="chaos-$(date +%s)"
 API_TOKEN="chaos-token-$RUN_ID"
@@ -82,7 +83,7 @@ wait_edge() { # $1 hostname $2 timeout
 [[ -f "$CERT_DIR/ca.crt" ]] || fail "证书未生成"
 
 log "0) 环境：Nomad/agentd/edge + API（新 token）"
-"$HERE/run-agentd.sh" >/dev/null || fail "agentd 未就绪"
+"$HERE/../run-agentd.sh" >/dev/null || fail "agentd 未就绪"
 pkill -f "$LAB_BIN/edge-proxy" 2>/dev/null || true
 sleep 1
 nohup env FIREPAAS_REDIS_ADDR=127.0.0.1:6379 FIREPAAS_EDGE_PORT=8081 \

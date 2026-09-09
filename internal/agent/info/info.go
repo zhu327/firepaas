@@ -51,6 +51,12 @@ type Provider struct {
 	serviceInstance   string
 	status            pb.ServiceInfoResponse_Status
 	statusChangedAt   time.Time
+	// fabricPubkey（ADR-0040 §18，T4）：本节点 WG 公钥（observed 上报；
+	// mesh 未启用时为空）。
+	fabricPubkey func() string
+	// fabricWGPort（ADR-0040 §9，G1）：本节点 WG 监听端口（observed 上报，
+	// 控制面组 peer endpoint 用）；mesh 未启用时为 0。
+	fabricWGPort uint16
 }
 
 // New 构造 Provider。dataDir 用于磁盘容量/用量统计（评审 P3：不得用 / 代替
@@ -93,6 +99,13 @@ func (p *Provider) SetCapabilities(protocolVersion string, featureIDs []string, 
 // SetImageDigestsFunc 注入镜像缓存 digest 采集函数（v1.1，ADR-0018）。
 // 由 agentd 装配：从 hypeman ListImages 派生 ready 镜像的 digest 集合。
 func (p *Provider) SetImageDigestsFunc(f func() []string) { p.cachedImageDigests = f }
+
+// SetFabricPubkeyFunc 注入节点 WG 公钥采集（ADR-0040 §18：只上报公钥）。
+func (p *Provider) SetFabricPubkeyFunc(f func() string) { p.fabricPubkey = f }
+
+// SetFabricWGPort 注入本节点 WG 监听端口（ADR-0040 §9：observed 上报，
+// 异构/同主机多节点不再强制全局同端口）。
+func (p *Provider) SetFabricWGPort(port uint16) { p.fabricWGPort = port }
 
 // SetResourcesValidFunc 注入资源采集有效性判定（R2，契约 D-1）：inventory
 // 采集失败且没有 ≤60s 新鲜的 last-known-good 时返回 false。agentd 装配；
@@ -176,11 +189,20 @@ func (p *Provider) Response() *pb.ServiceInfoResponse {
 		},
 		NetworkCidr:        p.NetworkCIDR,
 		CachedImageDigests: p.cachedImageDigestsList(),
+		FabricPubkey:       p.fabricPubkeyValue(),
+		FabricWgPort:       uint32(p.fabricWGPort),
 		// v1.2-A（ADR-0023）：runtime capability 投影。
 		ProtocolVersion:          p.protocolVersion,
 		FeatureIds:               p.featureIDs,
 		SnapshotCompatibilityKey: p.snapshotCompatKey,
 	}
+}
+
+func (p *Provider) fabricPubkeyValue() string {
+	if p.fabricPubkey == nil {
+		return ""
+	}
+	return p.fabricPubkey()
 }
 
 // cachedImageDigestsList 返回镜像缓存 digest（nil func = 不上报）。

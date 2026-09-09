@@ -625,6 +625,9 @@ func TestCreateDispatchedToAgent(t *testing.T) {
 	if err := st.EnsureProject(ctx, project, project); err != nil {
 		t.Fatal(err)
 	}
+	// 固定 machine/op ID：不清理会让下一次运行撞残留行（幂等路径读到旧
+	// dispatch_node_id，断言全链路受污染）。
+	t.Cleanup(func() { cleanupProject(t, st, project) })
 	_, err := st.EnqueueReapDelete(ctx, project, "m-disp", "exec-x", "op-disp-x", 1, []byte(`{}`))
 	if err != nil {
 		t.Fatal(err)
@@ -660,6 +663,7 @@ func TestSecretCleanupDischarged(t *testing.T) {
 	if err := st.EnsureProject(ctx, project, project); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { cleanupProject(t, st, project) })
 	ok, err := st.SecretCleanupDischarged(ctx, "op-create-x")
 	if err != nil || ok {
 		t.Fatalf("no cleanup op: ok=%v err=%v", ok, err)

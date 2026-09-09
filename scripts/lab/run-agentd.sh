@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l2-regression  PREREQ: nomad,root  DESTRUCTIVE: no  FROZEN: no
 # 部署 M1 单机 agentd system job（root）。用法: sudo bash scripts/lab/run-agentd.sh
 # 前置：Nomad 已 root 运行（root-setup.sh）；agentd 二进制已构建（见 build-agentd.sh 或 make build）。
 set -euo pipefail

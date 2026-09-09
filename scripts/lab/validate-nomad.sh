@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l0-ci  PREREQ: nomad-bin  DESTRUCTIVE: no  FROZEN: no
 # Validate all Nomad jobs and assert that lab path variables render literally.
 set -euo pipefail
 

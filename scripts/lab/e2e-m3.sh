@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l2-regression  PREREQ: nomad,agentd,root  DESTRUCTIVE: no  FROZEN: no
 # M3 e2e harness（单机）：mvp-plan §7 验收（ADR-0014/0015）
 #   1) U1：app create（nginx）→ scale 3 → hostname → edge → slot → VM 200
 #   2) 隔离：guest → host/私网/跨 slot 全部拒绝（slot netns + nftables）

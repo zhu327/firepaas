@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l2-ops  PREREQ: root  DESTRUCTIVE: no  FROZEN: no
 # host-hardening-check.sh：M5.1 内部生产就绪 —— 只读安全审计（mvp-plan §9.1）。
 #
 # 约定：本脚本绝不写 /etc 或改任何系统状态；只输出 PASS/WARN/FAIL + 修复 runbook

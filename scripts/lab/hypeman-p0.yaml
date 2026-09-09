@@ -1,3 +1,4 @@
+# LAYER: l1-base  PREREQ: -  DESTRUCTIVE: -  FROZEN: no
 # hypeman P0 配置（单机实验室）。
 # 重要约束（mvp-plan §4.7）：不设置任何 ingress（无 caddy/api hostname），
 # 内嵌 Caddy/DNS 不启动，避免与 Nomad/Consul 及未来 edge 端口冲突。

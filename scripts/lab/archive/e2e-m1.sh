@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l2-archived  PREREQ: nomad,agentd,root  DESTRUCTIVE: yes  FROZEN: yes
 # M1 e2e harness（单机）：一键验证
 #   authenticated API → PG operations → controller → agent mTLS → observed
 #   → Redis route catalog → edge → agent proxy(TLS) → Firecracker VM → HTTP 200
@@ -8,9 +9,9 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "$HERE/../.." && pwd)"
+ROOT_DIR="$(cd "$HERE/../../.." && pwd)"
 LAB_BIN="$HOME/.local/firepaas-lab/bin"
-CERT_DIR="$HERE/certs"
+CERT_DIR="$HERE/../certs"
 RUN_DIR="/var/lib/firepaas-p0/e2e"
 RUN_ID="e2e-$(date +%s)"
 HOSTNAME="$RUN_ID.local"
@@ -53,8 +54,8 @@ restart_agentd() {
 [[ -f "$CERT_DIR/ca.crt" ]] || fail "证书未生成：bash scripts/lab/gen-certs.sh"
 
 log "0) root setup + Nomad/agentd"
-"$HERE/root-setup.sh" >/dev/null
-"$HERE/run-agentd.sh" >/dev/null || fail "agentd 未就绪"
+"$HERE/../root-setup.sh" >/dev/null
+"$HERE/../run-agentd.sh" >/dev/null || fail "agentd 未就绪"
 # 强制重启 alloc：raw_exec 不感知磁盘上的二进制更新，必须重新拉起
 # 才能保证本脚本测试的是最新构建。
 restart_agentd || fail "agentd 强制重启失败（二进制更新）"

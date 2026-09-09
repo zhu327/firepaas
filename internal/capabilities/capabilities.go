@@ -42,9 +42,35 @@ const (
 	SnapshotScrubV1           = "snapshot.scrub.v1"
 	ImageQuarantineV1         = "image.quarantine.v1"
 	VolumeDatasetQuarantineV1 = "volume.dataset_quarantine.v1"
+
+	// ADR-0040 §12：网络 fabric 数据面能力。
+	// NetworkEbpfV1：节点具备 eBPF datapath（tc-ingress isolation +
+	// tc-egress CIDR/redirect/conn-limit + ipcache/policy maps + BTF/CO-RE）。
+	// NetworkNftFallbackV1：eBPF 探测不满足、自动回落 legacy nft 后端的
+	// emergency 模式。两者二选一上报（ebpf 数据面落地前 agent 不上报任何
+	// 一个：nft 仍是现役默认，不是“回落”，虚报会误导调度硬过滤）。
+	NetworkEbpfV1        = "network.ebpf.v1"
+	NetworkNftFallbackV1 = "network.nftfallback.v1"
+	// MeshEastWestV1（ADR-0040 §18）：节点具备东西向 WG mesh 数据面
+	//（G2 才可上报；RequiredFeatures 推导必须显式依赖 NetworkEbpfV1，
+	// mesh 服务永不调度到回退节点）。§0 gate 满足前不存在任何上报方。
+	MeshEastWestV1 = "mesh.eastwest.v1"
 )
 
-// All 返回 v1.2 已知 feature ID 列表（文档用途与校验）。
+// Requires 返回 capability 的硬依赖（ADR-0023 能力推导用）。无依赖返回 nil。
+// 注意：当前尚无生产调用方——G2 落地 mesh 调度时必须接入
+// controlplane/placement.RequiredFeatures 的推导（对 feature ID 做闭包展开），
+// 否则 mesh 服务可能被调度到回退节点。
+func Requires(id string) []string {
+	switch id {
+	case MeshEastWestV1:
+		return []string{NetworkEbpfV1}
+	default:
+		return nil
+	}
+}
+
+// All 返回已知 feature ID 列表（文档用途与校验）。
 func All() []string {
 	return []string{
 		GuestExecV1, GuestCopyV1, GuestLogsV1,
@@ -52,6 +78,7 @@ func All() []string {
 		EgressDomainV1, EgressCidrV1, VolumeLocalRWV1,
 		VolumeDatasetROV1, VolumeDatasetOverlayV1, LocalInventoryV1,
 		SnapshotScrubV1, ImageQuarantineV1, VolumeDatasetQuarantineV1,
+		NetworkEbpfV1, NetworkNftFallbackV1, MeshEastWestV1,
 	}
 }
 

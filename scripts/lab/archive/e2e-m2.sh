@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l2-archived  PREREQ: nomad,agentd,root  DESTRUCTIVE: yes  FROZEN: yes
 # M2 e2e harness（单机）：mvp-plan §6 验收
 #   1) 同一 replica ordinal 1000 次并发重试 → 1 machine / 1 execution
 #   2) 同一 deployment 不同 ordinal 并发创建 → 各 1 个 machine
@@ -10,7 +11,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAB_BIN="$HOME/.local/firepaas-lab/bin"
-CERT_DIR="$HERE/certs"
+CERT_DIR="$HERE/../certs"
 RUN_DIR="/var/lib/firepaas-p0/e2e-m2"
 RUN_ID="e2e-m2-$(date +%s)"
 API_TOKEN="e2e-m2-token-$RUN_ID"
@@ -48,8 +49,8 @@ print(m["ObservedState"] if m else "")')
 [[ -f "$CERT_DIR/ca.crt" ]] || fail "证书未生成：bash scripts/lab/gen-certs.sh"
 
 log "0) root setup + Nomad/agentd（最新二进制）"
-"$HERE/root-setup.sh" >/dev/null
-"$HERE/run-agentd.sh" >/dev/null || fail "agentd 未就绪"
+"$HERE/../root-setup.sh" >/dev/null
+"$HERE/../run-agentd.sh" >/dev/null || fail "agentd 未就绪"
 nomad job restart -on-error fail firepaas-agentd >/dev/null 2>&1 || true
 for _ in $(seq 1 60); do
   "$LAB_BIN/agentctl" info >/dev/null 2>&1 && break

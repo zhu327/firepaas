@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/zhu327/firepaas/internal/agent/network/slot"
+	"github.com/zhu327/firepaas/internal/agent/network/api"
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 )
 
@@ -190,17 +190,17 @@ func TestNormalizeHost(t *testing.T) {
 	}
 }
 
-func TestRuleSetRoundTrip(t *testing.T) {
+func TestSnapshotRoundTrip(t *testing.T) {
 	p := policyFor(pb.EgressPolicySpec_ALLOWLIST,
 		[]string{"93.184.216.0/24"}, []string{"198.51.100.0/24"}, []string{"*.example.com"})
 	p.MaxTCPConns = 128
 	p.AuditAll = true
-	rs := (&Manager{port80: 18080, port443: 18443}).ruleSetFor(p)
-	if rs.Mode != "allowlist" || rs.ProxyPort80 != 18080 || rs.ProxyPort443 != 18443 ||
-		rs.MaxTCPConns != 128 || !rs.AuditAll {
-		t.Fatalf("rule set = %+v", rs)
+	snap := (&Manager{port80: 18080, port443: 18443}).snapshotFor(p)
+	if snap.Mode != "allowlist" || snap.ProxyPort80 != 18080 || snap.ProxyPort443 != 18443 ||
+		snap.MaxTCPConns != 128 || !snap.AuditAll {
+		t.Fatalf("rule set = %+v", snap)
 	}
-	back, err := FromRuleSet(rs)
+	back, err := FromSnapshot(snap)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,11 +208,11 @@ func TestRuleSetRoundTrip(t *testing.T) {
 		!back.matchesDomain("x.example.com") || !containsCIDR(back.AllowedCIDRs, netip.MustParseAddr("93.184.216.4")) {
 		t.Fatalf("round-trip mismatch: %+v", back)
 	}
-	if _, err := FromRuleSet(slot.EgressRuleSet{Mode: "bogus"}); err == nil ||
+	if _, err := FromSnapshot(api.PolicySnapshot{Mode: "bogus"}); err == nil ||
 		!strings.Contains(err.Error(), "unknown mode") {
 		t.Fatalf("unknown mode must error: %v", err)
 	}
-	if p2, err := FromRuleSet(slot.EgressRuleSet{}); err != nil || p2 != nil {
+	if p2, err := FromSnapshot(api.PolicySnapshot{}); err != nil || p2 != nil {
 		t.Fatalf("empty rule set must yield nil policy")
 	}
 }

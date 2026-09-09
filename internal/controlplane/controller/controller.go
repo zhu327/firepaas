@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"sort"
 	"strings"
 	"sync"
@@ -34,6 +35,7 @@ import (
 	"github.com/zhu327/firepaas/internal/observability/metrics"
 	"github.com/zhu327/firepaas/internal/scheduler"
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
+	"github.com/zhu327/firepaas/shared/pkg/ulanet"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -41,8 +43,11 @@ import (
 
 // Config 是 controller 运行参数。
 type Config struct {
-	DefaultAppPort                 int
-	LegacyAgentProxyAddr           string           // 节点视图缺失时的兜底（M1 单节点兼容）
+	DefaultAppPort       int
+	LegacyAgentProxyAddr string // 节点视图缺失时的兜底（M1 单节点兼容）
+	// DNSStaleWindow（G2c，P1 独立评审）：dns:internal 投影 TTL = serve-stale
+	// 预算，与 edge FIREPAAS_EDGE_STALE_WINDOW 同源（默认 120s）；0 = 默认。
+	DNSStaleWindow                 time.Duration
 	OpPollInterval                 time.Duration    // 默认 1s
 	SyncInterval                   time.Duration    // 默认 5s
 	RebuildInterval                time.Duration    // 预约/投影重建，默认 30s
@@ -61,6 +66,12 @@ type Config struct {
 	RolloutDrainGrace              time.Duration    // M3 CUTOVER 后旧代 drain 期限，默认 30s
 	Secrets                        *secrets.Manager // M4：信封加密（nil = secret 引用不可用）
 	Traffic                        *traffic.Signer  // M4：execution-bound proxy credential（nil = 不下发）
+	// FabricMesh（ADR-0040 T4c）：mesh 启用时的身份/ULA 生命周期接线。
+	// Enabled=false（默认）时派发跳过分配，legacy 路径零回归。
+	FabricMesh FabricMeshConfig
+	// FabricGCInterval（W2 P0）：死亡 execution 的 ULA 泄漏兜底巡检周期，
+	// 默认 5m。只释放 positive 死亡证据的行（见 sweepFabricULA），fail-closed。
+	FabricGCInterval time.Duration
 	// PrefetchTopK（v1.1，ADR-0018）：部署预取向 top-K 候选节点异步 PullImage。
 	// 默认 3；0 取默认。失败/超时不阻塞 rollout（尽力而为）。
 	PrefetchTopK int
@@ -79,6 +90,23 @@ type Config struct {
 	GC    GCConfig
 	Scrub ScrubConfig
 }
+
+// FabricMeshConfig 是 mesh 身份/地址分配的控制面开关（ADR-0040 T4c）。
+type FabricMeshConfig struct {
+	// Enabled 为 true 时 create 派发为新 execution 分配稳定身份与 ULA
+	//（PG desired；fabric reconciler 随快照下发）。false = 跳过分配。
+	Enabled bool
+	// CellPrefix 是本 cell /40 ULA（与 fabric reconciler 同值，默认 fd7a:9a55::/40）。
+	CellPrefix string
+}
+
+// fabricTrustDomain 是 workload 稳定身份的信任域（ADR-0040 §6）。
+const fabricTrustDomain = "firepaas.local"
+
+// fabricDefaultService 是无 services 声明时的主 service 名，与
+// store.FabricIdentities 的 COALESCE(services->0->>'name','default')
+// 同口径（有声明时取 deployments.services 首条 Name，原样保留空串）。
+const fabricDefaultService = "default"
 
 // Controller 执行 reconcile。
 type Controller struct {
@@ -177,6 +205,9 @@ func New(st *store.Store, cat *catalog.Catalog, nm *nodemanager.Manager,
 		// 的退避窗口）。上限后停手等人工/rollout 干预，事件流可见。
 		cfg.MaxCreateRetryAttempts = 8
 	}
+	if cfg.FabricGCInterval <= 0 {
+		cfg.FabricGCInterval = 5 * time.Minute
+	}
 	if cfg.ClaimStaleAfter == 0 {
 		cfg.ClaimStaleAfter = 2*cfg.AgentRPCTimeout + time.Minute
 	}
@@ -200,10 +231,14 @@ func New(st *store.Store, cat *catalog.Catalog, nm *nodemanager.Manager,
 	if cfg.OperationRetention <= 0 {
 		cfg.OperationRetention = 7 * 24 * time.Hour
 	}
+	// P1（独立评审）：dns:internal 投影 TTL 与 edge stale 窗口同源接线
+	//（FIREPAAS_DNS_STALE_WINDOW，默认 120s；0 = 默认）。
+	routesPub := routepublisher.New(st, cat, cfg.DefaultAppPort, cfg.LegacyAgentProxyAddr)
+	routesPub.SetDNSStaleWindow(cfg.DNSStaleWindow)
 	return &Controller{
 		store: st, nodes: nm, resv: resv, placer: placer,
 		placement: placement.New(st, nm, resv, placer, reg, cfg.ReservationCompensationTimeout), metrics: reg,
-		routes: routepublisher.New(st, cat, cfg.DefaultAppPort, cfg.LegacyAgentProxyAddr), cfg: cfg,
+		routes: routesPub, cfg: cfg,
 		nodeListFailures:   map[string]int{},
 		prefetchedRollouts: map[string]bool{}, evacuatedNodes: map[string]bool{},
 		reportedOrphans: map[string]bool{}, machineLocks: map[string]*machineDispatchLock{},
@@ -220,6 +255,7 @@ func (c *Controller) Run(ctx context.Context) error {
 	leaseTicker := time.NewTicker(60 * time.Second) // v1.2-B：secret lease 回收
 	gcTicker := time.NewTicker(c.gc.Interval)       // v1.2-F：镜像 GC 巡检
 	scrubTicker := time.NewTicker(c.scrub.Interval)
+	fabricGCTicker := time.NewTicker(c.cfg.FabricGCInterval) // W2 P0：ULA 泄漏兜底
 	defer opTicker.Stop()
 	defer syncTicker.Stop()
 	defer rebuildTicker.Stop()
@@ -227,6 +263,7 @@ func (c *Controller) Run(ctx context.Context) error {
 	defer leaseTicker.Stop()
 	defer gcTicker.Stop()
 	defer scrubTicker.Stop()
+	defer fabricGCTicker.Stop()
 
 	if c.nodeListFailures == nil { // 防御：New 已初始化，测试可直接构造
 		c.nodeListFailures = map[string]int{}
@@ -356,6 +393,10 @@ func (c *Controller) Run(ctx context.Context) error {
 			c.runGC(ctx)
 		case <-scrubTicker.C:
 			c.runScrub(ctx)
+		case <-fabricGCTicker.C:
+			if err := c.sweepFabricULA(ctx); err != nil {
+				slog.Error("fabric ula gc", "error", err)
+			}
 		}
 	}
 }
@@ -874,6 +915,29 @@ func (c *Controller) processCreate(ctx context.Context, op store.Operation) erro
 		}
 
 		c.metrics.Inc("firepaas_placements_total", nil, 1)
+		if c.cfg.FabricMesh.Enabled {
+			// ADR-0040 T4c：mesh 下为新 execution 分配稳定身份与 ULA（PG
+			// desired；fabric reconciler 随快照下发到节点）。分配失败 = 暂态
+			// （op 重入列）；节点未入 mesh = 跳过走 legacy（灰度 fail-open）。
+			// 位置在 lease CLAIM 与 agent RPC 之前：失败时无任何外部副作用，
+			// 重试干净。AllocateULA 对同 machine+execution 幂等收敛。
+			if err := c.ensureFabricAllocation(ctx, choice.NodeID, op, &req); err != nil {
+				// 已有分配绑定其它节点（前次尝试落在那）→ 本 execution 的
+				// ULA 不变（§7 稳定域），改回那台重试而非在别的节点重分配
+				// （重分配会与已推送快照竞争，真机 spike 抓到 guest 拿到旧
+				// ULA 而库内已换新，路由永不可达）。
+				var pinned *store.ErrFabricNodePinned
+				if errors.As(err, &pinned) && !excluded[pinned.NodeID] {
+					_ = c.resv.Release(ctx, op.ID)
+					excluded[choice.NodeID] = true
+					c.recordEvent(ctx, "reservation", op.MachineID, op.ID, pinned.NodeID,
+						"fabric allocation pinned to node, retrying there", nil)
+					continue
+				}
+				_ = c.resv.Release(ctx, op.ID)
+				return fmt.Errorf("fabric allocation: %w", err)
+			}
+		}
 		if leaseID != "" {
 			// CLAIMED is a durable pre-send fence. It is deliberately not replayable:
 			// after a crash or ambiguous result the only legal next RPC is fenced delete.
@@ -946,6 +1010,152 @@ func (c *Controller) processCreate(ctx context.Context, op store.Operation) erro
 		lastErr = fmt.Errorf("placement attempts exhausted")
 	}
 	return lastErr
+}
+
+// fabricServiceName 取 deployments.services 首条 Name（ADR-0022 主 service），
+// 与 store.FabricIdentities 的 COALESCE(services->0->>'name','default')
+// 同口径：无声明（nil/空）= 'default'；有声明则原样取首条 Name（含空串，
+// 与 jsonb ->> 语义一致——store 层 Name 无 omitempty，空串会原样落库）。
+func fabricServiceName(dep *store.Deployment) string {
+	if dep == nil || len(dep.Services) == 0 {
+		return fabricDefaultService
+	}
+	return dep.Services[0].Name
+}
+
+// ensureFabricAllocation 在 mesh 启用时为一次 create 派发分配稳定身份与
+// ULA（ADR-0040 §6-§8，T4c），供 fabric reconciler 随节点快照下发。
+//
+// 幂等：同 machine+execution 的重放收敛到同一 /128（store 唯一索引仲裁），
+// 先 EnsureWorkloadIdentity 再 AllocateULA——顺序反转会让快照查询 fail closed
+// （FabricIdentities 要求分配必有身份行）。
+//
+// 节点尚未入 mesh（无 wg_peers 行）时返回 nil 跳过，派发走 legacy 路径
+// （灰度 fail-open）；其他错误上抛使 op 重入列（暂态，不终态 FAILED）。
+func (c *Controller) ensureFabricAllocation(
+	ctx context.Context,
+	nodeID string,
+	op store.Operation,
+	req *pb.CreateMachineRequest,
+) error {
+	peers, err := c.store.ListWGPeers(ctx)
+	if err != nil {
+		return err
+	}
+	var nodePrefix *netip.Prefix
+	for i := range peers {
+		if peers[i].NodeID == nodeID {
+			p := peers[i].NodePrefix
+			nodePrefix = &p
+			break
+		}
+	}
+	if nodePrefix == nil {
+		slog.Debug("fabric allocation skipped: node not in mesh",
+			"machine_id", op.MachineID, "node_id", nodeID)
+		return nil
+	}
+	cell, err := ulanet.ValidatePrefix(c.cfg.FabricMesh.CellPrefix, 40)
+	if err != nil {
+		return fmt.Errorf("cell prefix: %w", err)
+	}
+	project := req.Spec.GetProjectId()
+	if project == "" {
+		project = op.ProjectID
+	}
+	service := fabricDefaultService
+	if depID := req.Spec.GetDeploymentId(); depID != "" {
+		dep, derr := c.store.GetDeployment(ctx, depID)
+		if derr != nil {
+			return fmt.Errorf("load deployment for fabric identity: %w", derr)
+		}
+		service = fabricServiceName(dep)
+	}
+	if _, err := c.store.EnsureWorkloadIdentity(ctx, fabricTrustDomain, project, req.Spec.GetAppId(), service); err != nil {
+		return fmt.Errorf("ensure workload identity: %w", err)
+	}
+	ula, err := c.store.AllocateULA(
+		ctx,
+		cell,
+		*nodePrefix,
+		project,
+		nodeID,
+		op.MachineID,
+		op.ExecutionID,
+		op.Generation,
+	)
+	if err != nil {
+		return fmt.Errorf("allocate ULA: %w", err)
+	}
+	slog.Info("fabric ULA allocated", "machine_id", op.MachineID,
+		"execution_id", op.ExecutionID, "node_id", nodeID, "ula", ula.String())
+	return nil
+}
+
+// sweepFabricULA 释放已死亡 execution 的 ULA 行（W2 P0 兜底：create 终态失败、
+// AlreadyExists/FailedPrecondition 等无法证明“无 VM”的错误码路径、mesh 关闭期
+// 残留、mismatch 收敛跳过释放的残留）。
+//
+// fail-closed：任一整表查询失败整轮跳过；只在 positive 死亡证据下释放：
+//   - machine 行不存在（部署已删）且无该 (machine,execution) 的在途 op；
+//   - machine desired=DELETED 且无该 (machine,execution) 的在途 op（终删
+//     后残留；含 current 仍指被删 execution 的常规终删情况）；
+//   - machine desired=CREATED 但当前 execution 不是该行，且无在途 op
+//     （create 终态失败/旧代 superseded 的残留；同 execution 重试中的 op
+//     受 in-flight 保护——无论重试复用还是重 mint execution 都正确）。
+//
+// 当前 execution 的行永不释放（重试/重入列安全）。
+// 不做 wg_peers 自动 GC：短暂失联节点被摘除后重注册可能换 /64，全网重编号
+// 抖动；退役用 store.DeleteWGPeer 显式执行。
+func (c *Controller) sweepFabricULA(ctx context.Context) error {
+	rows, err := c.store.ListActiveULAs(ctx, "", "")
+	if err != nil {
+		return fmt.Errorf("fabric gc list: %w", err)
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	liveOps, err := c.store.ListInFlightOperations(ctx)
+	if err != nil {
+		return fmt.Errorf("fabric gc live ops: %w", err)
+	}
+	live := make(map[string]bool, len(liveOps))
+	for _, op := range liveOps {
+		if op.MachineID != "" && op.ExecutionID != "" {
+			live[op.MachineID+"\x00"+op.ExecutionID] = true
+		}
+	}
+	var released int
+	for _, row := range rows {
+		key := row.MachineID + "\x00" + row.ExecutionID
+		if live[key] {
+			continue
+		}
+		m, err := c.store.GetMachine(ctx, row.MachineID)
+		if err != nil {
+			return fmt.Errorf("fabric gc get machine: %w", err)
+		}
+		if m == nil {
+			// 部署已删：无未来 op 会引用该 execution（execution 服务端 mint）。
+		} else if m.DesiredState == "DELETED" {
+			// 终删：含 current 仍指被删 execution 的常规终删残留（delete
+			// 完成后不清 current_execution_id）；在途 op 已被 liveOps 保护。
+		} else if m.CurrentExecutionID == row.ExecutionID {
+			continue // 现役 execution：重试/重入列安全起见永不释放。
+		} else if m.DesiredState != "CREATED" {
+			continue // 未知 desired：保守跳过。
+		}
+		if err := c.store.ReleaseULA(ctx, row.MachineID, row.ExecutionID); err != nil {
+			slog.Warn("fabric gc release", "machine_id", row.MachineID,
+				"execution_id", row.ExecutionID, "error", err)
+			continue
+		}
+		released++
+	}
+	if released > 0 {
+		slog.Info("fabric gc released stale ULAs", "count", released)
+	}
+	return nil
 }
 
 func (c *Controller) cleanupUncertainSecretCreate(ctx context.Context, op store.Operation,
@@ -1087,6 +1297,15 @@ func (c *Controller) processDelete(ctx context.Context, op store.Operation, mark
 	if !mismatchConverged {
 		if _, err := c.store.ReleaseTerminalExecutionAttachments(ctx, del.MachineId, del.ExecutionId); err != nil {
 			return err
+		}
+		// ADR-0040 T4c：execution 权威删除后释放其 ULA（行保留供审计/重放，
+		// 下一轮快照即不再携带）。尽力而为：失败不阻塞 delete op——快照侧
+		// 以 released_at 为准收敛，ReleaseULA 本身幂等。
+		// W2：不再以 FabricMesh.Enabled 为门控——mesh 关闭期发生的删除同样
+		// 产生幽灵行（开关翻转即泄漏）；ReleaseULA 对无行/已释放幂等成功。
+		if err := c.store.ReleaseULA(ctx, del.MachineId, del.ExecutionId); err != nil {
+			slog.Warn("fabric ULA release", "machine_id", del.MachineId,
+				"execution_id", del.ExecutionId, "error", err)
 		}
 	}
 	c.metrics.Inc("firepaas_operations_total", map[string]string{"kind": "delete", "result": "succeeded"}, 1)
@@ -1893,6 +2112,25 @@ func (c *Controller) recreateMachine(ctx context.Context, m store.Machine, bump 
 	//（R3/evacuate 重建与首次 create 共用同一请求体派生路径，幂等链路一致）。
 	if dep, derr := c.store.GetDeployment(ctx, m.DeploymentID); derr == nil && dep != nil {
 		applyDeploymentSpecExtras(dep, req.Spec)
+		// 同源还原 health_check / egress：首次 create（enqueueAppMachineCreate）
+		// 会携带，重建路径漏掉会让重试/换代副本永久丢失探针（readiness 恒
+		// UNCONFIGURED，不达 READY 门控）与 egress 策略——真机 G2c 验收
+		// 抓到（agent 重启后 recreate 的 dns-* 机器探针全丢）。
+		if len(dep.HealthCheck) > 0 && string(dep.HealthCheck) != "null" {
+			var h pb.HealthCheckSpec
+			if err := protojson.Unmarshal(dep.HealthCheck, &h); err == nil {
+				req.Spec.HealthCheck = &h
+			}
+		}
+		if len(dep.EgressPolicy) > 0 && string(dep.EgressPolicy) != "null" {
+			var ep pb.EgressPolicySpec
+			if err := protojson.Unmarshal(dep.EgressPolicy, &ep); err == nil {
+				if req.Spec.Network == nil {
+					req.Spec.Network = &pb.NetworkSpec{}
+				}
+				req.Spec.Network.Egress = &ep
+			}
+		}
 	}
 	project, err := c.store.ProjectForApp(ctx, m.AppID)
 	if err != nil || project == "" {

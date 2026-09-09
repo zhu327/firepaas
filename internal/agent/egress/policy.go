@@ -9,8 +9,10 @@
 //   - per-execution TCP 连接限额；
 //   - 连接决策审计（结构化 sink；不含 URL path/query/header/body）。
 //
-// nftables 强制由 internal/agent/network/slot 完成：slot 把 80/443 重定向到
-// 本包 Proxy 的监听端口，其余 TCP/UDP 由 CIDR 规则与模式默认拒绝执行。
+// nftables 落地由数据面后端（现役 internal/agent/network/slot，经
+// internal/agent/network/api.PolicyEngine 插件缝，ADR-0040 §11）完成：后端把
+// 80/443 重定向到本包 Proxy 的监听端口，其余 TCP/UDP 由 CIDR 规则与模式默认
+// 拒绝执行。
 package egress
 
 import (
@@ -20,7 +22,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/zhu327/firepaas/internal/agent/network/slot"
+	"github.com/zhu327/firepaas/internal/agent/network/api"
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 	"google.golang.org/protobuf/encoding/protojson"
 )
@@ -380,14 +382,14 @@ func UnmarshalProto(raw []byte) (*Policy, error) {
 	return FromProto(&spec)
 }
 
-// FromRuleSet（v1.3-A 重启恢复）：从 slot 持久化的规则集重建 Policy。
+// FromSnapshot（v1.3-A 重启恢复）：从数据面持久化的策略快照重建 Policy。
 // 只用于在役 machine 的幂等重放；生成无效时返回 error（fail closed）。
-func FromRuleSet(rs slot.EgressRuleSet) (*Policy, error) {
-	if rs.Mode == "" {
+func FromSnapshot(snap api.PolicySnapshot) (*Policy, error) {
+	if snap.Mode == "" {
 		return nil, nil
 	}
 	var spec pb.EgressPolicySpec
-	switch rs.Mode {
+	switch snap.Mode {
 	case "unrestricted":
 		spec.Mode = pb.EgressPolicySpec_UNRESTRICTED
 	case "deny_all":
@@ -395,14 +397,14 @@ func FromRuleSet(rs slot.EgressRuleSet) (*Policy, error) {
 	case "allowlist":
 		spec.Mode = pb.EgressPolicySpec_ALLOWLIST
 	default:
-		return nil, fmt.Errorf("egress restore: unknown mode %q", rs.Mode)
+		return nil, fmt.Errorf("egress restore: unknown mode %q", snap.Mode)
 	}
-	spec.AllowedCidrs = append([]string(nil), rs.AllowedCIDRs...)
-	spec.DeniedCidrs = append([]string(nil), rs.DeniedCIDRs...)
-	spec.AllowedDomains = append([]string(nil), rs.Domains...)
-	spec.MaxTcpConnections = rs.MaxTCPConns
-	spec.PolicyGeneration = rs.Generation
-	spec.AuditAll = rs.AuditAll
+	spec.AllowedCidrs = append([]string(nil), snap.AllowedCIDRs...)
+	spec.DeniedCidrs = append([]string(nil), snap.DeniedCIDRs...)
+	spec.AllowedDomains = append([]string(nil), snap.Domains...)
+	spec.MaxTcpConnections = snap.MaxTCPConns
+	spec.PolicyGeneration = snap.Generation
+	spec.AuditAll = snap.AuditAll
 	return FromProto(&spec)
 }
 

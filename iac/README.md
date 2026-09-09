@@ -1,5 +1,9 @@
 # iac：Nomad + Terraform
 
+> 实验室当前默认拓扑为 ADR-0040 双节点 fabric：`iac/nomad/agentd-fabric-dual.hcl`
+>（node-a/node-b，同主机两个 Nomad client）+ `control-plane.hcl` + `edge.hcl`；
+> 单机基线（`agentd-single.hcl`，同参 node-a 形态）与 dual 互斥使用。
+
 原则见 [ADR-0001](../docs/adr/0001-nomad-infra-only.md)：Nomad 只编排基础设施；用户 VM 由 control-plane 通过 agent gRPC 创建。
 
 ## 作业和发现契约

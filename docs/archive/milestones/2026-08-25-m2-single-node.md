@@ -80,10 +80,10 @@ INITIALIZING 状态不算缺失，不触发重建。
 
 ## 验收映射（mvp-plan §6）
 
-- 同一 ordinal 1000 次并发重试 → 1 machine/execution；不同 ordinal 并发创建：`scripts/lab/e2e-m2.sh` ✅ PASS
+- 同一 ordinal 1000 次并发重试 → 1 machine/execution；不同 ordinal 并发创建：`(scripts/lab/archive/)e2e-m2.sh` ✅ PASS
 - 10 万次仿真断言：`make sim` ✅ PASS
-- API/agent crash、ACK 丢失、Redis 清空后 2 分钟内收敛且审计可解释：`scripts/lab/chaos-m2.sh` ✅ PASS
-- 20 轮创建/删除无 VM/TAP/bridge endpoint/Redis lease 泄漏：`scripts/lab/e2e-m2.sh`（单机；跨节点 DEFERRED-MULTI-NODE）✅ PASS
+- API/agent crash、ACK 丢失、Redis 清空后 2 分钟内收敛且审计可解释：`(scripts/lab/archive/)chaos-m2.sh` ✅ PASS
+- 20 轮创建/删除无 VM/TAP/bridge endpoint/Redis lease 泄漏：`(scripts/lab/archive/)e2e-m2.sh`（单机；跨节点 DEFERRED-MULTI-NODE）✅ PASS
 
 ## 执行记录（2026-08-26）
 

@@ -1,6 +1,7 @@
 package edge
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/zhu327/firepaas/internal/controlplane/catalog"
 	"github.com/zhu327/firepaas/internal/controlplane/traffic"
+	"github.com/zhu327/firepaas/internal/edge/mesh"
 )
 
 const (
@@ -42,6 +44,10 @@ type Counters struct {
 	staleServes, beyondStale, redisErrors, tokenErrors atomic.Uint64
 	tokenStaleServes, rateLimited, proxiedReqs         atomic.Uint64
 	forbiddenRetry, hardRejected, pinHits, pinMisses   atomic.Uint64
+	// G2d（ADR-0040 §14）：mesh 直达与回落观测——direct 请求、回落
+	// legacy 次数、直达终态失败。回落计数与 direct 计数分母一致：
+	// direct_requests = direct 成功 + fallback + errors（直达尝试总数）。
+	meshDirect, meshFallback, meshErrors atomic.Uint64
 	// 非服务态 readiness 被过滤的 backend 观测计数（审视 publisher 契约
 	// 偏差；reason 见 selectBackend）。
 	backendIneligibleEmpty, backendIneligibleNotReady, backendIneligibleUnknown atomic.Uint64
@@ -145,6 +151,21 @@ func (c *Counters) WritePrometheus(w http.ResponseWriter) {
 	}
 	write("firepaas_edge_stale_serves_total", "requests served from last-known-good route cache", c.staleServes.Load())
 	write("firepaas_edge_beyond_stale_total", "requests rejected 503 beyond serve-stale window", c.beyondStale.Load())
+	write(
+		"firepaas_edge_mesh_direct_requests_total",
+		"requests attempted over the mesh direct path (G2d)",
+		c.meshDirect.Load(),
+	)
+	write(
+		"firepaas_edge_mesh_direct_fallback_total",
+		"mesh direct attempts that fell back to the legacy agent-proxy path",
+		c.meshFallback.Load(),
+	)
+	write(
+		"firepaas_edge_mesh_direct_errors_total",
+		"mesh direct attempts that failed terminally (no legacy fallback possible)",
+		c.meshErrors.Load(),
+	)
 	write("firepaas_edge_redis_errors_total", "route catalog origin fetch failures", c.redisErrors.Load())
 	write("firepaas_edge_token_errors_total", "traffic token fetch failures", c.tokenErrors.Load())
 	write("firepaas_edge_token_stale_serves_total", "requests using last-known-good token", c.tokenStaleServes.Load())
@@ -313,6 +334,9 @@ type Config struct {
 	AgentTLS        *tls.Config
 	HardConcurrency int64
 	EdgePorts       map[int]bool
+	// Direct（G2d，ADR-0040 §14）：mesh 直达 Transport（FIREPAAS_EDGE_MESH_DIRECT
+	// 开启时注入）。nil = 功能关闭（全部流量走 legacy :5107，回滚即关）。
+	Direct *mesh.Transport
 }
 
 type Handler struct {
@@ -323,6 +347,7 @@ type Handler struct {
 	cnt             *Counters
 	agentTLS        *tls.Config
 	proxy           *httputil.ReverseProxy
+	direct          *httputil.ReverseProxy // G2d：mesh 直达（nil = 关）
 	inflight        *inflightTracker
 	hardConcurrency int64
 	edgePorts       map[int]bool
@@ -373,6 +398,37 @@ func NewHandler(cfg Config) *Handler {
 		inflight:        newInflightTracker(),
 		hardConcurrency: cfg.HardConcurrency,
 		edgePorts:       cfg.EdgePorts,
+	}
+	// G2d（§14）：mesh 直达代理。URL 占位由 Transport 按凭证/endpoint 改写；
+	// 错误处理同 legacy（P0#4：固定文案，不泄内部拓扑）。
+	if cfg.Direct != nil {
+		h.direct = &httputil.ReverseProxy{
+			Director: func(req *http.Request) {
+				// 占位：mesh.Transport.RoundTrip 按 DirectInfo 改写目标。
+				req.URL.Scheme = "http"
+				req.URL.Host = "mesh-direct.invalid"
+				req.Host = "mesh-direct.invalid"
+			},
+			ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+				if d, ok := r.Context().Value(directAttemptKey{}).(*directAttempt); ok {
+					d.failed = true
+					// P1（独立评审）：ErrNoDirect 是纯 pre-dial 应用层 miss
+					//（未发一字节，body 未消耗）→ 回落重放安全，与拨
+					// 号期失败同等 retriable；否则投影抖动窗口的 POST
+					// 会被误判终态 502。
+					d.retriable = isDialError(err) || errors.Is(err, mesh.ErrNoDirect)
+				}
+				if errors.Is(err, mesh.ErrNoDirect) {
+					// 无入口：tryServe 探测后回落，不写响应。
+					return
+				}
+				slog.Warn("edge mesh direct transport error",
+					"method", r.Method, "path", r.URL.Path, "error", err)
+				// 响应未开始时同样交回落路径；已开始的流错误由
+				// ReverseProxy 以 ErrAbortHandler 终结（不进入本 handler）。
+			},
+			Transport: cfg.Direct,
+		}
 	}
 	h.proxy = &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
@@ -738,11 +794,102 @@ func (h *Handler) tryServe(
 	if stale {
 		w.Header().Set("X-Firepaas-Stale", "stale")
 	}
+	// G2d（§14）：mesh 直达优先（仅 mesh_direct 服务——backend ULA 提示
+	// 存在；凭证路由 + WG peer 准入）。凭证缺失不尝试直达（终结器必 403，
+	// 不消耗直达计数；过渡期 token 未配置时全量走 legacy）。失败且响应未
+	// 开始 → 按 body/错误类型回落 legacy（拨号期失败 body 未消耗，可无损
+	// 重试；已消耗 body 的中段失败不再重放，回终态避免静默丢数据）。
+	if h.direct != nil && b.ULA != "" && cred != "" {
+		h.cnt.meshDirect.Add(1)
+		dstate := &directAttempt{}
+		dctx := context.WithValue(ctx, directAttemptKey{}, dstate)
+		dctx = mesh.WithDirectInfo(dctx, mesh.DirectInfo{
+			MachineID: b.MachineID, ExecutionID: b.ExecutionID,
+			Credential: cred, AppPort: b.AppPort,
+		})
+		tracker := &firstWriteTracker{ResponseWriter: w}
+		h.direct.ServeHTTP(tracker, r.WithContext(dctx))
+		if dstate.failed && !tracker.started() && (requestHasNoBody(r) || dstate.retriable) {
+			h.cnt.meshFallback.Add(1)
+			// 回落 legacy：tracker 未写任何字节，legacy 代理接管。
+		} else {
+			if dstate.failed {
+				h.cnt.meshErrors.Add(1)
+				if !tracker.started() {
+					// body 已消耗的中段失败：不可回落重放，显式 502
+					//（不可静默 200 空回；拨号期失败已在上分支回落）。
+					w.WriteHeader(http.StatusBadGateway)
+				}
+			}
+			return retryNone // 直达成功（含终结器业务响应）或已开始的流失败
+		}
+	}
 	upstreamStart := time.Now()
 	h.proxy.ServeHTTP(w, r.WithContext(ctx))
 	h.cnt.observeUpstreamRTT(time.Since(upstreamStart).Seconds())
 	return state.reason
 }
+
+// firstWriteTracker 探测直达响应是否已开始（首字节已写给客户端）——
+// 已开始则不可回落（body 重放不可行），未开始则 legacy 代理接管。
+// Unwrap/Flush/Hijack 透传底层实现（SSE 分块增量 flush 与 WebSocket
+// 劫持走直达时不断流；B 评审：缺失会导致流式语义异常）。
+type firstWriteTracker struct {
+	http.ResponseWriter
+	wrote bool
+}
+
+func (t *firstWriteTracker) WriteHeader(code int) {
+	t.wrote = true
+	t.ResponseWriter.WriteHeader(code)
+}
+
+func (t *firstWriteTracker) Write(b []byte) (int, error) {
+	t.wrote = true
+	return t.ResponseWriter.Write(b)
+}
+
+func (t *firstWriteTracker) started() bool { return t.wrote }
+
+// Unwrap 暴露底层 ResponseWriter（ResponseController/类型断言兼容）。
+func (t *firstWriteTracker) Unwrap() http.ResponseWriter { return t.ResponseWriter }
+
+// Flush 透传（未开始写时先记 started：flush 本身即响应开始）。
+func (t *firstWriteTracker) Flush() {
+	t.wrote = true
+	if f, ok := t.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Hijack 透传（WebSocket 等劫持型升级；劫持即响应开始，不可回落）。
+func (t *firstWriteTracker) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	t.wrote = true
+	if h, ok := t.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, fmt.Errorf("mesh direct: underlying writer does not support hijack")
+}
+
+// isDialError 判定 transport 错误发生在拨号期（body 未消耗，回落重放安全）。
+func isDialError(err error) bool {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return opErr.Op == "dial"
+	}
+	var dnsErr *net.DNSError
+	return errors.As(err, &dnsErr)
+}
+
+// directAttempt 是直达尝试的失败信号（ErrorHandler → tryServe；
+// ReverseProxy 的 ErrorHandler 无法直接返回值，经 context 传递）。
+// retriable = 拨号期失败（body 未消耗，回落重放安全）。
+type directAttempt struct {
+	failed    bool
+	retriable bool
+}
+
+type directAttemptKey struct{}
 
 // getToken 拉取 backend 凭证并打 token 获取延迟点；返回值同
 // TokenClient.Get（凭证, 是否 stale 降级, 错误）。

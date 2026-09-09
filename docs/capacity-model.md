@@ -22,6 +22,11 @@
   agent 硬准入需同时校验收带宽/磁盘。
 - 本机为共享 k8s 节点，密度数据不用于生产容量承诺。
 
+> ⚠️ ADR-0040 后网络路径已变更（eBPF 数据面 + WG mesh 东西向，bridge 已
+> 删除）：上表及公式中的 bridge 上限口径不再对应现行数据面；eBPF/WG 路径
+> 的吞吐与密度上限需重新标定（含 mesh 加密开销与 MTU 1280），标定前上述
+> 数值仅作历史基线，不用于生产容量承诺。
+
 ## 磁盘水位与回收(M3 依赖,agent 守护职责)
 
 - **镜像缓存 GC**:节点磁盘使用率 ≥ 70% 触发 LRU 驱逐(从未被任何在用 machine 引用
@@ -41,7 +46,7 @@ agentd 依赖 firecracker 二进制、内核与 guest rootfs 基件;分发与版
 
 | 项 | 决策 |
 |---|---|
-| 分发渠道 | 正式构建通过 `github.com/zhu327/hypeman v0.4.0-firepaas` Go module 消费嵌入式 runtime；Nomad raw_exec 执行已构建的 agentd。`build-hypeman.sh` 仅保留为历史 P0 复现工具，不是发布链路。 |
+| 分发渠道 | 正式构建通过 `github.com/zhu327/hypeman v0.4.1-firepaas` Go module 消费嵌入式 runtime；Nomad raw_exec 执行已构建的 agentd。`build-hypeman.sh` 仅保留为历史 P0 复现工具，不是发布链路。 |
 | 版本 pin | module/tag 和 `go.sum` 固定 hypeman；Firecracker compatibility key 由 agentd 从实际嵌入 runtime 检测，不再以本文历史版本常量上报。 |
 | 升级路径 | 先 drain 节点，替换并校验 agent artifact，再恢复调度；实验室入口见 `scripts/lab/upgrade-agentd.sh`。 |
 | snapshot compatibility key | 实际 Firecracker/runtime 版本 + kernel/rootfs/snapshot 格式 + CPU/KVM 特征；不兼容时禁止 restore，并回退到 digest-pinned image cold-start。 |

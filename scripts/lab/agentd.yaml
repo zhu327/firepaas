@@ -1,3 +1,4 @@
+# LAYER: l1-base  PREREQ: -  DESTRUCTIVE: -  FROZEN: no
 # agentd M1 配置（复用 P0 数据目录：系统内核/initrd 与镜像缓存已就绪）。
 # P0 hypeman job 与 agentd 不得同时运行（共享 data_dir 会互相覆盖实例状态）。
 
@@ -10,7 +11,6 @@ hypervisor:
   default: firecracker
 
 network:
-  bridge_name: firepaas0
   subnet_cidr: 10.100.0.0/16
   dns_server: 223.5.5.5
 

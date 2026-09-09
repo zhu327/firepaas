@@ -1,3 +1,4 @@
+# LAYER: l1-base  PREREQ: -  DESTRUCTIVE: -  FROZEN: no
 # firepaas 单机 Nomad 配置（M0 基线，ADR-0012）。
 # 与 scripts/bootstrap-lab.sh 写出的 3-server 配置互斥；本文件只服务单机实验室。
 # 多机实验室请继续使用 bootstrap-lab.sh 生成的 /etc/nomad.d/nomad.hcl。

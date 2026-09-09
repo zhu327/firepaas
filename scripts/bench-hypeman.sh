@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l1-bench  PREREQ: p0-job,root  DESTRUCTIVE: no  FROZEN: no
 # M0 P0.3 基准 runner：对 hypeman(单机 P0 job) 做冷启动/未缓存冷启动/standby-restore/密度基准。
 # 输出原始样本 JSONL + CSV 到 scripts/lab/results/，并打印 p50/p95 汇总。
 #

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l1-base  PREREQ: nomad-bin  DESTRUCTIVE: no  FROZEN: no
 # 启动单机 Nomad 实验室（可选 Consul）。用法: bash scripts/lab/start.sh [--with-consul]
 # 幂等：已运行时直接复用。Nomad 以普通用户运行；raw_exec job 的运行需要 root（见 README）。
 set -euo pipefail

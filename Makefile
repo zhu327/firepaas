@@ -2,7 +2,7 @@
 
 SHELL := /bin/bash
 
-.PHONY: help build test lint proto dev-up check tidy-check clean
+.PHONY: help build test lint proto ebpf dev-up check tidy-check clean
 
 help: ## 列出可用目标
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -48,6 +48,9 @@ proto: ## 生成 protobuf 代码（需要 scripts/lab/install-protoc.sh 先执�
 		--go_out=shared/gen --go_opt=paths=source_relative \
 		--go-grpc_out=shared/gen --go-grpc_opt=paths=source_relative \
 		protos/agent/v1/agent.proto
+
+ebpf: ## 重新生成 eBPF 对象（bpfel.o 提交仓库；需要 clang + libbpf-dev）
+	cd internal/agent/network/ebpf && GOPACKAGE=ebpf go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -Wall -Werror -D__TARGET_ARCH_x86" -target amd64 tc bpf/tc.c -- -I bpf
 	@echo "generated: shared/gen/agent/v1/*.pb.go"
 
 sim: ## M2.6 调度仿真：10 万次放置断言（过滤先于打分/硬准入/反亲和/失联排除）

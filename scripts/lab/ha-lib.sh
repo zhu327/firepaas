@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l4-ha  PREREQ: -  DESTRUCTIVE: -  FROZEN: no
 # Shared fail-closed helpers for provisioned multi-node HA validation.
 # Source this file; it intentionally has no defaults for topology or credentials.
 set -euo pipefail

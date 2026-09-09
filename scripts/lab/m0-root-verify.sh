@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l1-base  PREREQ: root  DESTRUCTIVE: no  FROZEN: no
 # 单机 M0 一键 root 验证（HITL）：准备 → root Nomad → P0 job → 冒烟。
 # 用法: sudo bash scripts/lab/m0-root-verify.sh
 # 基准单独跑（耗时较长）:

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l2-regression  PREREQ: nomad,agentd,root  DESTRUCTIVE: no  FROZEN: no
 # M5 soak：每轮实际 create → 200 → scale(2) → deploy → fault → delete-state 检查。
 # 所有 API/状态断言 fail closed；单轮失败也会尽力删除，再以非零退出。
 set -euo pipefail

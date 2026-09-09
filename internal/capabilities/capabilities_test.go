@@ -28,3 +28,20 @@ func TestSetOf(t *testing.T) {
 		t.Fatalf("want deduped valid set, got %v", s)
 	}
 }
+
+func TestFabricCapabilityDependencies(t *testing.T) {
+	// ADR-0040 §12/§18：mesh 硬依赖 eBPF 数据面；回退节点永不调度 mesh 服务。
+	deps := Requires(MeshEastWestV1)
+	if len(deps) != 1 || deps[0] != NetworkEbpfV1 {
+		t.Fatalf("mesh.eastwest.v1 deps = %v, want [network.ebpf.v1]", deps)
+	}
+	if Requires(NetworkEbpfV1) != nil || Requires(NetworkNftFallbackV1) != nil {
+		t.Fatal("datapath IDs must have no declared dependencies")
+	}
+	// 二选一上报互斥性由上报方（agentd）保证；ID 本身形态必须符合 name.vN。
+	for _, id := range []string{NetworkEbpfV1, NetworkNftFallbackV1, MeshEastWestV1} {
+		if !Valid(id) {
+			t.Fatalf("fabric capability %q must be a valid feature ID", id)
+		}
+	}
+}

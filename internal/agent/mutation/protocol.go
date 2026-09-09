@@ -212,9 +212,20 @@ type Recovery[T any] struct {
 type ClaimedMutation[T any] struct {
 	Identity
 	SerializationKey string
-	Recover          func() (Recovery[T], error)
-	Effect           func() (T, error)
-	Codec            Codec[T]
+	// Fence 为 nil 时沿用默认 machine generation fence（p.fences.Check）；
+	// 非 nil 时在同一个串行化锁下、Begin 前调用，作为该 mutation 专属的
+	// generation 检查（如节点级 fabric 高水位）。
+	Fence   func() error
+	Recover func() (Recovery[T], error)
+	Effect  func() (T, error)
+	Codec   Codec[T]
+}
+
+// RunFabricMutation runs a node-scoped claimed mutation（如 ApplyFabric）
+// 串行化于 op.SerializationKey；generation fence 由 op.Fence 提供（必须非
+// nil），在 Begin 前、同一串行化锁下执行。
+func RunFabricMutation[T any](p *Protocol, op ClaimedMutation[T]) (T, error) {
+	return runClaimed(p, op, true, nil, nil)
 }
 
 // RunResourceMutation runs an inventory-recoverable mutation serialized by a
@@ -253,7 +264,13 @@ func runClaimed[T any](
 		return op.Codec.Decode(rec.Result)
 	}
 	if checkFence {
-		if err := p.fences.Check(op.MachineID, op.Generation); err != nil {
+		var err error
+		if op.Fence != nil {
+			err = op.Fence()
+		} else {
+			err = p.fences.Check(op.MachineID, op.Generation)
+		}
+		if err != nil {
 			return zero, err
 		}
 	}

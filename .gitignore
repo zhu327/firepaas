@@ -1,6 +1,13 @@
 # Binaries
 /bin/
 **/bin/
+# go build ./... 落产物到仓库根（agentd/cni-firepaas 等，不误入库）
+/cni-firepaas
+/agentd
+/edge-proxy
+/firepaas-api
+/fpctl
+/agentctl
 
 # Env / secrets
 .env
@@ -16,6 +23,11 @@ scripts/lab/certs/
 vendor/
 *.test
 *.out
+
+# Local dev workspace for unpublished hypeman changes (kept outside version
+# control per the root go.work comment; CI and releases always use GOWORK=off).
+go.work.local
+go.work.local.sum
 
 # Codegen
 # Generated protobuf code is committed: CI diffs it to enforce contract generation.

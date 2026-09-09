@@ -1,0 +1,20 @@
+# LAYER: l1-base  PREREQ: -  DESTRUCTIVE: -  FROZEN: no
+# agentd node-b 配置（ADR-0040 G1 双节点 spike；与 agentd.yaml 仅 data_dir /
+# subnet_cidr 不同——同主机端口与 node-a（agentd.yaml）隔离）。
+# 注：bridge 已随 ADR-0040 §24 删除，backend 由 nomad job 的
+# FIREPAAS_NETWORK_BACKEND（ebpf|nft-fallback）决定。
+jwt_secret: "dev-agentd-m1"
+
+data_dir: /var/lib/firepaas-p0/hypeman-b
+
+hypervisor:
+  default: firecracker
+
+network:
+  subnet_cidr: 10.101.0.0/16
+  dns_server: 223.5.5.5
+
+logging:
+  level: info
+
+env: lab

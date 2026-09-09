@@ -85,3 +85,52 @@ func TestSyncRoutesAllocatesMonotoneRevisions(t *testing.T) {
 		t.Fatalf("high-water row for deleted hostname = %d, want 1", rev)
 	}
 }
+
+// W3 §17：SyncRoutes 同事务持久化 mesh 直连提示（ULA/identity/generation），
+// PG 成为已发布 backend set 的完整权威（审计/重建可见）。
+func TestSyncRoutesPersistsMeshHints(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	project := "test-r2-meshhints"
+	cleanupProject(t, s, project)
+	t.Cleanup(func() { cleanupProject(t, s, project) })
+	if err := s.EnsureProject(ctx, project, "t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnsureApp(ctx, project, "app-meshhints", "meshhints.test", "img:v1", 1, 512, 80, 1); err != nil {
+		t.Fatal(err)
+	}
+	route := RouteRow{
+		Hostname: "meshhints.test", Port: 80, AppID: "app-meshhints", Generation: 1,
+		Backends: []RouteBackendRow{{
+			MachineID: "m1", ExecutionID: "e1", NodeProxyEndpoint: "10.0.0.1:5107", AppPort: 80,
+			Weight: 100, Readiness: "READY",
+			ULA: "fd7a:9a55:0:1::5", IdentityID: 42, Generation: 7,
+		}, {
+			MachineID: "m2", ExecutionID: "e2", NodeProxyEndpoint: "10.0.0.2:5107", AppPort: 80,
+			Weight: 100, Readiness: "READY",
+		}},
+	}
+	if _, err := s.SyncRoutes(ctx, []RouteRow{route}); err != nil {
+		t.Fatal(err)
+	}
+	var ula string
+	var iid uint32
+	var gen int64
+	if err := s.pool.QueryRow(ctx, `
+		SELECT mesh_ula, mesh_identity_id, mesh_generation FROM route_backends
+		WHERE machine_id='m1' AND execution_id='e1'`).Scan(&ula, &iid, &gen); err != nil {
+		t.Fatal(err)
+	}
+	if ula != "fd7a:9a55:0:1::5" || iid != 42 || gen != 7 {
+		t.Fatalf("mesh hints = (%q, %d, %d)", ula, iid, gen)
+	}
+	if err := s.pool.QueryRow(ctx, `
+		SELECT mesh_ula, mesh_identity_id, mesh_generation FROM route_backends
+		WHERE machine_id='m2' AND execution_id='e2'`).Scan(&ula, &iid, &gen); err != nil {
+		t.Fatal(err)
+	}
+	if ula != "" || iid != 0 || gen != 0 {
+		t.Fatalf("non-mesh backend hints must be zero: (%q, %d, %d)", ula, iid, gen)
+	}
+}

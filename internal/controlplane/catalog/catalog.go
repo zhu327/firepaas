@@ -16,8 +16,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -31,6 +33,14 @@ type Backend struct {
 	Readiness         string `json:"readiness"`
 	Weight            int    `json:"weight"`
 	Draining          bool   `json:"draining"`
+	// G2b（ADR-0040 §16）：mesh 直连提示。仅当服务声明 mesh_direct 且
+	// execution 在役时由发布器填充；omitempty 保证旧发布器写出的字节形态
+	// 可逆（旧 edge 反序列化忽略未知字段，新旧共存）。ULA 是裸地址；
+	// identity_id/generation 随 fabric 快照同源（观测/诊断用，edge 选路
+	// 不读——G2d 前唯一路径仍是 node_proxy_endpoint）。
+	ULA        string `json:"ula,omitempty"`
+	IdentityID uint32 `json:"identity_id,omitempty"`
+	Generation int64  `json:"generation,omitempty"`
 }
 
 // Route 是 hostname+port 对应的版本化 backend set。
@@ -325,4 +335,246 @@ func (c *Catalog) WipeProjections(ctx context.Context) (int64, error) {
 		}
 	}
 	return total, nil
+}
+
+// InternalDNSRecord 是一条 .internal 服务发现投影（G2c，ADR-0040 §16/§18）。
+// 键：dns:internal:{app}.{project}（name 去掉 .internal 后缀的段序即键序）。
+// TTL 即 serve-stale 预算（默认与 FIREPAAS_EDGE_STALE_WINDOW 同值 120s）：
+// 发布器每轮刷新，leader 死亡后键在预算内过期 → reconciler 快照收敛摘除。
+type InternalDNSRecord struct {
+	Name string   // "{app}.{project}.internal"（完整名，小写）
+	AAAA []string // ULA 裸地址（排序去重）
+	// Generation 是该 app 在本轮聚合中的最大 fabric 分配代（ipam machine
+	// generation，非 route revision；跨 app 无单调性，仅供观测/诊断与快照
+	// 透传——agent 不用它排序/去重，fencing 只看 fabric_generation）。
+	Generation int64
+}
+
+const internalDNSPattern = "dns:internal:*"
+
+// ReplaceInternalDNS 以当前全量替换 .internal 投影：写入新键（带 TTL）、
+// 删除本轮缺席的旧键。幂等；唯一写者是 route publisher（进程内串行 +
+// leader 单写者）。TTL 到期未刷新的键自然消失（stale 预算的权威机制），
+// 键过期与删除等价——不做 generation Lua 守卫（发布器是唯一写者，
+// 乱序窗口由 TTL 收敛；§18 的 epoch 指针语义由 route revision 在值内
+// 承载，供观测/诊断）。
+func (c *Catalog) ReplaceInternalDNS(ctx context.Context, records []InternalDNSRecord, ttl time.Duration) error {
+	if ttl <= 0 {
+		return fmt.Errorf("replace internal dns: ttl must be > 0")
+	}
+	seen := make(map[string]bool, len(records))
+	for _, r := range records {
+		if r.Name == "" || len(r.AAAA) == 0 {
+			return fmt.Errorf("replace internal dns: record %q invalid", r.Name)
+		}
+		raw, err := json.Marshal(r)
+		if err != nil {
+			return fmt.Errorf("marshal internal dns %s: %w", r.Name, err)
+		}
+		if err := c.rdb.Set(ctx, internalDNSKey(r.Name), raw, ttl).Err(); err != nil {
+			return fmt.Errorf("set internal dns %s: %w", r.Name, err)
+		}
+		seen[r.Name] = true
+	}
+	// 删除本轮缺席的键（app 下线/回滚停 mesh_direct）。
+	it := c.rdb.Scan(ctx, 0, internalDNSPattern, 100).Iterator()
+	var stale []string
+	for it.Next(ctx) {
+		name := strings.TrimPrefix(it.Val(), "dns:internal:")
+		if !seen[name+".internal"] {
+			stale = append(stale, it.Val())
+		}
+	}
+	if err := it.Err(); err != nil {
+		return fmt.Errorf("scan internal dns: %w", err)
+	}
+	if len(stale) > 0 {
+		if err := c.rdb.Del(ctx, stale...).Err(); err != nil {
+			return fmt.Errorf("prune internal dns: %w", err)
+		}
+	}
+	return nil
+}
+
+// ListInternalDNS 读取当前 .internal 投影全量（fabric reconciler 消费，
+// 随快照下发到节点本地 DNS）。键已过期（stale 预算）自然缺席。
+func (c *Catalog) ListInternalDNS(ctx context.Context) ([]InternalDNSRecord, error) {
+	it := c.rdb.Scan(ctx, 0, internalDNSPattern, 100).Iterator()
+	var keys []string
+	for it.Next(ctx) {
+		keys = append(keys, it.Val())
+	}
+	if err := it.Err(); err != nil {
+		return nil, fmt.Errorf("scan internal dns: %w", err)
+	}
+	out := make([]InternalDNSRecord, 0, len(keys))
+	for _, key := range keys {
+		raw, err := c.rdb.Get(ctx, key).Bytes()
+		if err == redis.Nil {
+			continue // TTL 竞态：扫描后过期
+		}
+		if err != nil {
+			return nil, fmt.Errorf("get internal dns: %w", err)
+		}
+		var r InternalDNSRecord
+		if err := json.Unmarshal(raw, &r); err != nil {
+			return nil, fmt.Errorf("parse internal dns %s: %w", key, err)
+		}
+		out = append(out, r)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+func internalDNSKey(name string) string {
+	return "dns:internal:" + strings.TrimSuffix(name, ".internal")
+}
+
+// ---- mesh 投影（ADR-0040 §18，G2d：edge 经 mesh 直达的寻址面）----
+//
+// 键空间（全可重建；fabric reconciler 唯一写者）：
+//   mesh:peer:{node}     节点 WG 公网寻址（pubkey 公钥，无秘密）
+//   mesh:endpoint:{machine}:{execution}  execution 的 mesh 入口
+//（节点 ULA + fabric ingress 端口 + workload ULA）
+// TTL 同 dns:internal 的 serve-stale 预算（120s）：发布器每轮刷新，
+// leader 死亡后键在预算内过期 → edge 回落 legacy :5107 路径（而非用过期
+// 寻址拨错节点）。edge 侧另持 last-known-good（budget 内降级复用）。
+
+// MeshPeerRecord 是 mesh:peer:{node} 的值（节点 WG 寻址；公钥非秘密）。
+type MeshPeerRecord struct {
+	NodeID     string `json:"node_id"`
+	Pubkey     string `json:"pubkey"`
+	Endpoint   string `json:"endpoint"`
+	NodePrefix string `json:"node_prefix"` // /64；节点 ULA = 基址
+	UpdatedAt  int64  `json:"updated_at"`  // unix 秒（观测用）
+}
+
+// MeshEndpointRecord 是 mesh:endpoint:{machine}:{execution} 的值：
+// execution 的 mesh 直达入口（edge 消费）。
+type MeshEndpointRecord struct {
+	MachineID   string `json:"machine_id"`
+	ExecutionID string `json:"execution_id"`
+	NodeID      string `json:"node_id"`
+	NodeULA     string `json:"node_ula"`     // 终结器监听地址（节点 /64 基址）
+	IngressPort int    `json:"ingress_port"` // fabric ingress 端口（5109）
+	WorkloadULA string `json:"workload_ula"` // guest ULA（诊断/未来直连）
+	Generation  int64  `json:"generation"`   // fabric 分配代（观测）
+}
+
+const (
+	meshPeerPattern     = "mesh:peer:*"
+	meshEndpointPattern = "mesh:endpoint:*"
+)
+
+// ReplaceMeshProjection 全量替换 mesh:peer / mesh:endpoint 投影（TTL =
+// stale 预算）。缺席键删除。幂等。
+func (c *Catalog) ReplaceMeshProjection(
+	ctx context.Context,
+	peers []MeshPeerRecord,
+	endpoints []MeshEndpointRecord,
+	ttl time.Duration,
+) error {
+	if ttl <= 0 {
+		return fmt.Errorf("replace mesh projection: ttl must be > 0")
+	}
+	seenPeer := make(map[string]bool, len(peers))
+	for _, p := range peers {
+		if p.NodeID == "" || p.Pubkey == "" || p.Endpoint == "" || p.NodePrefix == "" {
+			return fmt.Errorf("replace mesh projection: peer %q incomplete", p.NodeID)
+		}
+		p.UpdatedAt = time.Now().Unix()
+		raw, err := json.Marshal(p)
+		if err != nil {
+			return fmt.Errorf("marshal mesh peer: %w", err)
+		}
+		if err := c.rdb.Set(ctx, "mesh:peer:"+p.NodeID, raw, ttl).Err(); err != nil {
+			return fmt.Errorf("set mesh peer %s: %w", p.NodeID, err)
+		}
+		seenPeer[p.NodeID] = true
+	}
+	seenEp := make(map[string]bool, len(endpoints))
+	for _, e := range endpoints {
+		if e.MachineID == "" || e.ExecutionID == "" || e.NodeULA == "" || e.IngressPort <= 0 {
+			return fmt.Errorf("replace mesh projection: endpoint %s/%s incomplete", e.MachineID, e.ExecutionID)
+		}
+		raw, err := json.Marshal(e)
+		if err != nil {
+			return fmt.Errorf("marshal mesh endpoint: %w", err)
+		}
+		key := fmt.Sprintf("mesh:endpoint:%s:%s", e.MachineID, e.ExecutionID)
+		if err := c.rdb.Set(ctx, key, raw, ttl).Err(); err != nil {
+			return fmt.Errorf("set mesh endpoint: %w", err)
+		}
+		seenEp[key] = true
+	}
+	// 删除缺席键。
+	for _, pattern := range []string{meshPeerPattern, meshEndpointPattern} {
+		it := c.rdb.Scan(ctx, 0, pattern, 100).Iterator()
+		var stale []string
+		for it.Next(ctx) {
+			k := it.Val()
+			if strings.HasPrefix(k, "mesh:peer:") {
+				if !seenPeer[strings.TrimPrefix(k, "mesh:peer:")] {
+					stale = append(stale, k)
+				}
+			} else if !seenEp[k] {
+				stale = append(stale, k)
+			}
+		}
+		if err := it.Err(); err != nil {
+			return fmt.Errorf("scan %s: %w", pattern, err)
+		}
+		if len(stale) > 0 {
+			if err := c.rdb.Del(ctx, stale...).Err(); err != nil {
+				return fmt.Errorf("prune %s: %w", pattern, err)
+			}
+		}
+	}
+	return nil
+}
+
+// ListMeshPeers 返回 mesh:peer 投影全量（edge WG peer 集来源）。
+func (c *Catalog) ListMeshPeers(ctx context.Context) ([]MeshPeerRecord, error) {
+	it := c.rdb.Scan(ctx, 0, meshPeerPattern, 100).Iterator()
+	var keys []string
+	for it.Next(ctx) {
+		keys = append(keys, it.Val())
+	}
+	if err := it.Err(); err != nil {
+		return nil, fmt.Errorf("scan mesh peers: %w", err)
+	}
+	out := make([]MeshPeerRecord, 0, len(keys))
+	for _, key := range keys {
+		raw, err := c.rdb.Get(ctx, key).Bytes()
+		if err == redis.Nil {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("get mesh peer: %w", err)
+		}
+		var p MeshPeerRecord
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, fmt.Errorf("parse %s: %w", key, err)
+		}
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
+	return out, nil
+}
+
+// GetMeshEndpoint 按 (machine, execution) 读取直达入口；键缺失/过期返回
+// nil（edge 回落 legacy 路径）。
+func (c *Catalog) GetMeshEndpoint(ctx context.Context, machineID, executionID string) (*MeshEndpointRecord, error) {
+	raw, err := c.rdb.Get(ctx, fmt.Sprintf("mesh:endpoint:%s:%s", machineID, executionID)).Bytes()
+	if err == redis.Nil {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get mesh endpoint: %w", err)
+	}
+	var e MeshEndpointRecord
+	if err := json.Unmarshal(raw, &e); err != nil {
+		return nil, fmt.Errorf("parse mesh endpoint: %w", err)
+	}
+	return &e, nil
 }

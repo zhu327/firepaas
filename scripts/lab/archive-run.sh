@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: evidence  PREREQ: evidence-dir  DESTRUCTIVE: no  FROZEN: no
 # Package evidence only after every required result is explicitly PASS.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; source "$HERE/ha-lib.sh"

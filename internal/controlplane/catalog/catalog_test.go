@@ -2,9 +2,12 @@ package catalog
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -303,5 +306,189 @@ func TestLegacyEntryWithoutRevisionUpgrades(t *testing.T) {
 	route, _ = c.GetRoute(ctx, "legacyup.test", 8080)
 	if route == nil || route.Revision != 1 || route.Backends[0].MachineID != "m2" {
 		t.Fatalf("post-upgrade entry: %+v", route)
+	}
+}
+
+// TestBackendULAHintJSONCompat（G2b，ADR-0040 §16）：
+//   - 无提示 backend 的 JSON 与旧形态字节一致（新增字段全部 omitempty）；
+//   - 带提示 backend 往返无损；
+//   - 提示经 ReplaceHostRoutes 全链路（序列化进 route 条目、revision 高
+//     水位守卫不受影响）。
+func TestBackendULAHintJSONCompat(t *testing.T) {
+	old := Backend{
+		MachineID: "m1", ExecutionID: "e1", NodeProxyEndpoint: "p:5107",
+		AppPort: 8080, Readiness: "READY", Weight: 100,
+	}
+	raw, err := json.Marshal(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 旧形态基准（draining 无 omitempty，本就在旧 JSON 中）。
+	const wantOld = `{"machine_id":"m1","execution_id":"e1","node_proxy_endpoint":"p:5107","app_port":8080,"readiness":"READY","weight":100,"draining":false}`
+	if string(raw) != wantOld {
+		t.Fatalf("old-form JSON changed: %s", raw)
+	}
+	hinted := old
+	hinted.ULA = "fd7a:9a55:0:1::7"
+	hinted.IdentityID = 42
+	hinted.Generation = 3
+	raw2, err := json.Marshal(hinted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back Backend
+	if err := json.Unmarshal(raw2, &back); err != nil {
+		t.Fatal(err)
+	}
+	if back.ULA != hinted.ULA || back.IdentityID != 42 || back.Generation != 3 {
+		t.Fatalf("hint roundtrip lost: %+v", back)
+	}
+
+	rdb := testRedis(t)
+	cat := New(rdb)
+	ctx := context.Background()
+	// 共享 lab Redis：hostname 带运行标识，避免上次运行的高水位键挡住本次。
+	hostname := fmt.Sprintf("hints-%d.test", time.Now().UnixNano())
+	route := Route{RouteGeneration: 1, Backends: []Backend{hinted}}
+	applied, err := cat.ReplaceHostRoutes(ctx, hostname, 1,
+		[]HostRoute{{Port: 8080, Route: route}}, 8080)
+	if err != nil || !applied {
+		t.Fatalf("replace = (%v, %v)", applied, err)
+	}
+	got, err := cat.GetRoute(ctx, hostname, 8080)
+	if err != nil || got == nil {
+		t.Fatalf("get route = (%+v, %v)", got, err)
+	}
+	b := got.Backends[0]
+	if b.ULA != "fd7a:9a55:0:1::7" || b.IdentityID != 42 || b.Generation != 3 {
+		t.Fatalf("hint lost through projection: %+v", b)
+	}
+	// 旧 revision 重放（即便带提示）被高水位拒。
+	stale := Route{RouteGeneration: 1, Backends: []Backend{hinted}}
+	applied2, err := cat.ReplaceHostRoutes(ctx, hostname, 1,
+		[]HostRoute{{Port: 8080, Route: stale}}, 8080)
+	if err != nil || applied2 {
+		t.Fatalf("stale revision accepted: (%v, %v)", applied2, err)
+	}
+}
+
+// TestInternalDNSProjectionLifecycle（G2c，ADR-0040 §16/§18）：全量替换、
+// 缺席键删除、TTL = serve-stale 预算（键过期自然消失——ListInternalDNS
+// 不再返回，reconciler 快照随之摘除）。
+func TestInternalDNSProjectionLifecycle(t *testing.T) {
+	rdb := testRedis(t)
+	cat := New(rdb)
+	ctx := context.Background()
+
+	recs := []InternalDNSRecord{
+		{Name: "a.p.internal", AAAA: []string{"fd7a:9a55:0:1::1"}, Generation: 1},
+		{Name: "b.p.internal", AAAA: []string{"fd7a:9a55:0:1::2", "fd7a:9a55:0:1::3"}, Generation: 5},
+	}
+	if err := cat.ReplaceInternalDNS(ctx, recs, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	got, err := cat.ListInternalDNS(ctx)
+	if err != nil || len(got) != 2 {
+		t.Fatalf("list = (%+v, %v)", got, err)
+	}
+	if got[0].Name != "a.p.internal" || got[1].Name != "b.p.internal" || got[1].Generation != 5 {
+		t.Fatalf("list content = %+v", got)
+	}
+
+	// 全量替换：a 下线（缺席即删）、b 更新。
+	if err := cat.ReplaceInternalDNS(ctx, []InternalDNSRecord{
+		{Name: "b.p.internal", AAAA: []string{"fd7a:9a55:0:1::9"}, Generation: 6},
+	}, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	got, err = cat.ListInternalDNS(ctx)
+	if err != nil || len(got) != 1 || got[0].Name != "b.p.internal" || got[0].AAAA[0] != "fd7a:9a55:0:1::9" {
+		t.Fatalf("after replace = (%+v, %v)", got, err)
+	}
+
+	// TTL 过期（stale 预算）：短 TTL 写入后等待过期 → 键消失。
+	if err := cat.ReplaceInternalDNS(ctx, []InternalDNSRecord{
+		{Name: "c.p.internal", AAAA: []string{"fd7a:9a55:0:2::1"}, Generation: 7},
+	}, 150*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	got, err = cat.ListInternalDNS(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range got {
+		if r.Name == "c.p.internal" {
+			t.Fatal("expired key must disappear (stale budget)")
+		}
+	}
+
+	// 空集发布（全部下线）= 只清不写。
+	if err := cat.ReplaceInternalDNS(ctx, nil, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if got, err = cat.ListInternalDNS(ctx); err != nil || len(got) != 0 {
+		t.Fatalf("empty publish must clear: (%+v, %v)", got, err)
+	}
+}
+
+// TestMeshProjectionLifecycle（G2d，ADR-0040 §18）：mesh:peer / mesh:endpoint
+// 全量替换、缺席删除、TTL 预算（键过期消失）、edge hub 自身不发布 endpoint。
+func TestMeshProjectionLifecycle(t *testing.T) {
+	rdb := testRedis(t)
+	cat := New(rdb)
+	ctx := context.Background()
+
+	if err := cat.ReplaceMeshProjection(ctx,
+		[]MeshPeerRecord{
+			{NodeID: "n1", Pubkey: "PUB1", Endpoint: "10.0.0.1:51820", NodePrefix: "fd7a:9a55:0:1::/64"},
+			{NodeID: "edge-hub", Pubkey: "PUB-E", Endpoint: "10.9.9.9:51821", NodePrefix: "fd7a:9a55:0:9::/64"},
+		},
+		[]MeshEndpointRecord{
+			{
+				MachineID: "m1", ExecutionID: "e1", NodeID: "n1", NodeULA: "fd7a:9a55:0:1::",
+				IngressPort: 5109, WorkloadULA: "fd7a:9a55:0:1::5", Generation: 3,
+			},
+		},
+		time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	peers, err := cat.ListMeshPeers(ctx)
+	if err != nil || len(peers) != 2 {
+		t.Fatalf("peers = (%+v, %v)", peers, err)
+	}
+	if peers[0].NodeID != "edge-hub" || peers[1].NodeID != "n1" {
+		t.Fatalf("peer order = %+v", peers)
+	}
+	ep, err := cat.GetMeshEndpoint(ctx, "m1", "e1")
+	if err != nil || ep == nil || ep.NodeULA != "fd7a:9a55:0:1::" || ep.IngressPort != 5109 {
+		t.Fatalf("endpoint = (%+v, %v)", ep, err)
+	}
+	if miss, err := cat.GetMeshEndpoint(ctx, "m-none", "e-none"); err != nil || miss != nil {
+		t.Fatalf("miss = (%+v, %v)", miss, err)
+	}
+
+	// 全量替换：peer 下线 + endpoint 摘除。
+	if err := cat.ReplaceMeshProjection(ctx,
+		[]MeshPeerRecord{{NodeID: "n2", Pubkey: "PUB2", Endpoint: "10.0.0.2:51820", NodePrefix: "fd7a:9a55:0:2::/64"}},
+		nil, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if peers, err = cat.ListMeshPeers(ctx); err != nil || len(peers) != 1 || peers[0].NodeID != "n2" {
+		t.Fatalf("after replace peers = (%+v, %v)", peers, err)
+	}
+	if ep, err = cat.GetMeshEndpoint(ctx, "m1", "e1"); err != nil || ep != nil {
+		t.Fatalf("endpoint must be pruned: (%+v, %v)", ep, err)
+	}
+
+	// TTL 预算：短 TTL 过期 → 键消失。
+	if err := cat.ReplaceMeshProjection(ctx, nil,
+		[]MeshEndpointRecord{{MachineID: "m2", ExecutionID: "e2", NodeID: "n2", NodeULA: "fd7a:9a55:0:2::", IngressPort: 5109}},
+		150*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if ep, err = cat.GetMeshEndpoint(ctx, "m2", "e2"); err != nil || ep != nil {
+		t.Fatalf("expired endpoint must disappear: (%+v, %v)", ep, err)
 	}
 }

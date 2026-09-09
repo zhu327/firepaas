@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l4-ha  PREREQ: bootstrap-lab,ha-lib  DESTRUCTIVE: yes  FROZEN: no
 # Stops one of three Nomad/Consul servers and verifies server quorum only.
 # The current API writer deployment is intentionally count=1; this script must
 # never report an API write as high-availability evidence.

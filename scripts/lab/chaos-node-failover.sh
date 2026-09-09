@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l4-ha  PREREQ: bootstrap-lab,ha-lib  DESTRUCTIVE: yes  FROZEN: no
 # Fences the node holding a known logical replica and proves that exact ordinal
 # is detected and recreated under a new execution on a different compute node.
 set -euo pipefail

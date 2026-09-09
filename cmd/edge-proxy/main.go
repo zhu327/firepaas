@@ -22,6 +22,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/zhu327/firepaas/internal/controlplane/catalog"
 	edgesvc "github.com/zhu327/firepaas/internal/edge"
+	edgemesh "github.com/zhu327/firepaas/internal/edge/mesh"
 	"github.com/zhu327/firepaas/internal/security/mtls"
 )
 
@@ -103,9 +104,34 @@ func run() error {
 	if n := envIntOr("FIREPAAS_EDGE_RATELIMIT_BUCKETS_MAX", 0); n > 0 { // P1-16 容量上限
 		limiter.MaxBuckets = n
 	}
+	// G2d（ADR-0040 §14）：edge 经 mesh 直达节点（凭证路由终结器）。
+	// 开关 FIREPAAS_EDGE_MESH_DIRECT（默认关——回滚即关，全量回落 legacy
+	// :5107 路径）。开启需要：WG 密钥目录（首启生成，公钥打日志供运维配
+	// 置到控制面 FIREPAAS_MESH_EDGE_PUBKEY）+ mesh:peer/mesh:endpoint 投影
+	//（fabric reconciler 写）。
+	var direct *edgemesh.Transport
+	if strings.EqualFold(envOr("FIREPAAS_EDGE_MESH_DIRECT", "false"), "true") {
+		wgHub := edgemesh.NewWG(
+			envOr("FIREPAAS_EDGE_MESH_IFACE", "fp-edge0"),
+			envOr("FIREPAAS_EDGE_MESH_KEYDIR", "/var/lib/firepaas/edge/mesh"),
+			uint16(envIntOr("FIREPAAS_EDGE_MESH_PORT", 51821)),
+		)
+		pub, err := wgHub.PublicKey(ctx)
+		if err != nil {
+			return fmt.Errorf("edge mesh wg key: %w", err)
+		}
+		slog.Info("edge mesh wg public key (configure as FIREPAAS_MESH_EDGE_PUBKEY)", "pubkey", pub)
+		go edgemesh.SyncLoop(ctx, wgHub, rdb, envDurOr("FIREPAAS_EDGE_MESH_SYNC_INTERVAL", 10*time.Second),
+			envOr("FIREPAAS_MESH_EDGE_ID", "edge-hub"))
+		endpoints := edgemesh.NewEndpoints(rdb,
+			envDurOr("FIREPAAS_EDGE_MESH_ENDPOINT_TTL", 5*time.Second),
+			staleWindow)
+		direct = edgemesh.NewTransport(endpoints)
+	}
 	handler := edgesvc.NewHandler(edgesvc.Config{
 		Catalog: catalog.New(rdb), Routes: routes, Tokens: tokens, Limiter: limiter,
 		Counters: counters, AgentTLS: agentTLS, HardConcurrency: hardConcurrency, EdgePorts: edgePorts,
+		Direct: direct,
 	})
 
 	if err := startMetrics(counters, handler, gauges); err != nil {

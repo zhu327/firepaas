@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -42,11 +43,16 @@ import (
 	"go.opentelemetry.io/otel/metric/noop"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 
+	"github.com/zhu327/firepaas/internal/agent/dnsserver"
 	"github.com/zhu327/firepaas/internal/agent/egress"
+	"github.com/zhu327/firepaas/internal/agent/fabricingress"
 	"github.com/zhu327/firepaas/internal/agent/health"
 	"github.com/zhu327/firepaas/internal/agent/info"
 	"github.com/zhu327/firepaas/internal/agent/machine"
+	"github.com/zhu327/firepaas/internal/agent/network/api"
+	"github.com/zhu327/firepaas/internal/agent/network/ebpf"
 	"github.com/zhu327/firepaas/internal/agent/network/slot"
+	"github.com/zhu327/firepaas/internal/agent/network/wg"
 	"github.com/zhu327/firepaas/internal/agent/probeflow"
 	"github.com/zhu327/firepaas/internal/agent/proxy"
 	"github.com/zhu327/firepaas/internal/agent/runtime"
@@ -127,6 +133,13 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// 节点级 fabric 快照与高水位（ADR-0040 §18，T3）：ApplyFabric 全量替换
+	// 后崩溃安全落盘；重启后旧代请求继续被拒。
+	fabricPath := envOr("FIREPAAS_AGENT_FABRIC_PATH", filepath.Join(cfg.DataDir, "agent", "fabric.json"))
+	fabric, err := state.OpenFabric(fabricPath)
+	if err != nil {
+		return err
+	}
 
 	// ledger/fences 年龄 GC（mvp-plan §5.5 可配置去重窗口，评审 P2-5）：
 	// 启动时清理一次，之后每小时一次。fence 侧额外绑定 machine 存活（R2-6）：
@@ -176,51 +189,102 @@ func run() error {
 		}
 	}()
 
-	// slot 网络后端（ADR-0004 feature flag：bridge|slot，默认 bridge）。
-	// slot 模式启动时先对账：回收孤儿 netns，为存活实例补齐 slot。
-	networkBackend := envOr("FIREPAAS_NETWORK_BACKEND", "bridge")
+	// 网络数据面后端（ADR-0040 §24）：ebpf（默认）→ 探测失败按
+	// FIREPAAS_EBPF_FALLBACK（默认 true）回落 nft-fallback；显式
+	// nft-fallback = emergency 模式。bridge 已删除（§24 兼容性行为变更：
+	// 移除 slotManager == nil 的 M1 遗留路径）。能力二选一上报：
+	// network.ebpf.v1 / network.nftfallback.v1（§12）。
+	networkBackend := envOr("FIREPAAS_NETWORK_BACKEND", "ebpf")
 	egressPort80 := envIntDefault("FIREPAAS_EGRESS_PROXY_PORT80", 18080)
 	egressPort443 := envIntDefault("FIREPAAS_EGRESS_PROXY_PORT443", 18443)
-	var slotManager *slot.Manager
-	if networkBackend == "slot" {
-		slotManager, err = slot.New(slot.Config{
-			SubnetCIDR:         cfg.Network.SubnetCIDR,
-			Gateway:            cfg.Network.SubnetGateway,
-			StatePath:          filepath.Join(cfg.DataDir, "agent", "slots.json"),
-			EgressProxyPort80:  egressPort80,
-			EgressProxyPort443: egressPort443,
-		})
-		if err != nil {
-			return err
+	var slotBackend slot.Backend
+	// 同主机多 agent（ADR-0040 双节点 spike）：slot 名字/veth 地址池可配。
+	// 注意：nft fallback 后端使用全局 fp-isolation 表名，仅单 agent 主机支持；
+	// 双节点必须双双 ebpf。
+	slotNamePrefix := envOr("FIREPAAS_SLOT_NAME_PREFIX", "fp")
+	slotVethCIDR := envOr("FIREPAAS_SLOT_VETH_CIDR", slot.VethRange)
+	var fabricPolicyBackend api.FabricPolicyWriter
+	netCapability := capabilities.NetworkNftFallbackV1
+	// ebpfActive：fabric（mesh）数据面只在 eBPF 后端可用（§12：nft fallback
+	// 无 v6 源绑定/东西向策略/ipcache，mesh 节点回落 nft = 策略静默失效，
+	// 绝不允入 mesh——不上报 fabric 公钥即不注册）。
+	ebpfActive := false
+	switch networkBackend {
+	case "ebpf":
+		if err := ebpf.Probe(); err != nil {
+			if !strings.EqualFold(envOr("FIREPAAS_EBPF_FALLBACK", "true"), "true") {
+				return fmt.Errorf("ebpf datapath unavailable and FIREPAAS_EBPF_FALLBACK=false (fail closed): %w", err)
+			}
+			slog.Warn("ebpf probe failed, falling back to nft (emergency mode)", "error", err)
+			newEbpfObserver(meter).Fallback()
+			slotBackend = slot.NewNftBackend(egressPort80, egressPort443, slotVethCIDR)
+		} else {
+			ebpfActive = true
+			b, err := ebpf.New(ebpf.Options{
+				EgressProxy80:  egressPort80,
+				EgressProxy443: egressPort443,
+				// 同主机多节点：bpffs 固定目录可配（默认 /sys/fs/bpf/firepaas）。
+				PinDir: envOr("FIREPAAS_EBPF_PIN_DIR", ""),
+				// G3（§21）：低基数指标（attach 失败/回落事件/策略代）。
+				Observer: newEbpfObserver(meter),
+			})
+			if err != nil {
+				return fmt.Errorf("ebpf datapath: %w", err)
+			}
+			slotBackend = b
+			netCapability = capabilities.NetworkEbpfV1
+			fabricPolicyBackend = b
+			slog.Info("ebpf datapath active", "pin_dir", ebpf.PinRoot)
 		}
-		if err := slotManager.Load(); err != nil {
-			return err
-		}
-		live, err := liveSlotInstances(ensureCtx, set.Instances)
-		if err != nil {
-			// 实例清单不可得时跳过启动对账：空清单会被 reconcile 解读为
-			// “全部 VM 已死”而误删 live slot。降级运行，周期 reconcile 补偿。
-			slog.Warn("slot startup reconcile skipped: instance inventory unavailable", "error", err)
-		} else if err := slotManager.Reconcile(ensureCtx, live); err != nil {
-			return fmt.Errorf("slot reconcile: %w", err)
-		}
-		slog.Info("slot network backend active", "slots", slotManager.Count())
-		startSlotReconcileLoop(ctx, set.Instances, slotManager, slotReconcileInterval())
+	case "nft-fallback":
+		slotBackend = slot.NewNftBackend(egressPort80, egressPort443, slotVethCIDR)
+	default:
+		return fmt.Errorf(
+			"FIREPAAS_NETWORK_BACKEND=%s unsupported (accepts: ebpf, nft-fallback; bridge removed per ADR-0040 §24)",
+			networkBackend,
+		)
 	}
+	slotManager, err := slot.New(slot.Config{
+		SubnetCIDR:         cfg.Network.SubnetCIDR,
+		Gateway:            cfg.Network.SubnetGateway,
+		StatePath:          filepath.Join(cfg.DataDir, "agent", "slots.json"),
+		EgressProxyPort80:  egressPort80,
+		EgressProxyPort443: egressPort443,
+		Backend:            slotBackend,
+		NamePrefix:         slotNamePrefix,
+		VethCIDR:           slotVethCIDR,
+	})
+	if err != nil {
+		return err
+	}
+	if err := slotManager.Load(); err != nil {
+		return err
+	}
+	live, err := liveSlotInstances(ensureCtx, set.Instances)
+	if err != nil {
+		// 实例清单不可得时跳过启动对账：空清单会被 reconcile 解读为
+		// “全部 VM 已死”而误删 live slot。降级运行，周期 reconcile 补偿。
+		slog.Warn("slot startup reconcile skipped: instance inventory unavailable", "error", err)
+	} else if err := slotManager.Reconcile(ensureCtx, live); err != nil {
+		return fmt.Errorf("slot reconcile: %w", err)
+	}
+	slog.Info("slot network backend active", "slots", slotManager.Count(),
+		"requested", networkBackend, "effective", map[bool]string{true: "ebpf", false: "nft-fallback"}[ebpfActive])
+	startSlotReconcileLoop(ctx, set.Instances, slotManager, slotReconcileInterval())
 
 	tracker := health.New()
 	// v1.3-A（ADR-0027）：egress 策略执行层（slot 规则 + 透明代理）。
-	// slot 后端下启用；proxy 启动失败即整体退出（fail closed：不能报告
-	// egress 能力却不具备执行层）。
+	// proxy 启动失败即整体退出（fail closed：不能报告 egress 能力却不具备
+	// 执行层）。bridge 路径已随 ADR-0040 §24 删除，slot 后端始终装配。
 	var egressMgr *egress.Manager
 	var egressFeatureIDs []string
-	if slotManager != nil {
+	{
 		dnsUpstreams := splitNonEmpty(os.Getenv("FIREPAAS_EGRESS_DNS"), ",")
 		resolver, rerr := egress.NewResolver(dnsUpstreams, 0)
 		if rerr != nil {
 			return fmt.Errorf("egress resolver: %w", rerr)
 		}
-		reserved, rerr := egress.NewReservedChecker(slot.VethRange, cfg.Network.SubnetCIDR)
+		reserved, rerr := egress.NewReservedChecker(slotManager.VethCIDR(), cfg.Network.SubnetCIDR)
 		if rerr != nil {
 			return fmt.Errorf("egress reserved checker: %w", rerr)
 		}
@@ -241,6 +305,36 @@ func run() error {
 		healthcheck.DefaultProbeRunner{HTTPClient: health.ProbeHTTPClient()}, probeReg))
 	adapter := machine.New(set.Instances, set.Images, slotManager, tracker)
 	adapter.SetEgressManager(egressMgr)
+	// ADR-0040 T6：fabric 快照 → guest ULA 注入。快照未生效（generation 0）
+	// 时返回 inactive 走 legacy 纯 v4；生效后无映射返回 active+"" 使创建暂态
+	// 失败等推送（方案 A）。只读快照，无秘密材料出境。
+	adapter.SetFabricULA(func(machineID, executionID string) (string, bool) {
+		snap := fabric.Current()
+		if snap.Generation == 0 {
+			return "", false
+		}
+		for i := range snap.Identities {
+			id := &snap.Identities[i]
+			if id.MachineID == machineID && id.ExecutionID == executionID && id.ULA != "" {
+				return id.ULA, true
+			}
+		}
+		return "", true
+	})
+	// G2c（§16）：节点本地 .internal DNS 地址 = 本节点 /64 基址（快照
+	// NodePrefix；WG 设备地址，与 DNS 服务监听同址）。快照未生效 = 空
+	//（guest 沿用 v4 resolver，零回归）。
+	adapter.SetFabricDNSAddr(func() string {
+		snap := fabric.Current()
+		if snap.Generation == 0 || snap.NodePrefix == "" {
+			return ""
+		}
+		prefix, err := netip.ParsePrefix(snap.NodePrefix)
+		if err != nil || prefix.Addr().Is4In6() {
+			return ""
+		}
+		return prefix.Addr().String()
+	})
 	// v1.3-D（ADR-0029）：注入 hypeman volumes.Manager（LOCAL_RW）。
 	adapter.SetVolumes(set.Volumes)
 	// v1.4-D（ADR-0030）：启动时清理崩溃遗留的 dataset 导入 spool（导入授权
@@ -399,9 +493,19 @@ func run() error {
 	// 兑现的能力；未完成 one-shot secret 安全通道前绝不上报
 	// secret.oneshot.v1（fail closed）。默认 guest 运维能力（logs/exec/cp）
 	// 由 hypeman guest agent + serial log 提供。
+	// W3（§12/§24）：meshMode 单次解析后复用（与下发开关同值，避免双读漂移）；
+	// mesh.eastwest.v1 只在 ebpf 可用且显式 eastwest 时广告（WG 建联失败走
+	// fail-closed 退出，不静默缺席）。
+	meshMode := strings.ToLower(strings.TrimSpace(envOr("FIREPAAS_MESH", "disabled")))
+	meshCapability := ""
+	if ebpfActive && meshMode == "eastwest" {
+		meshCapability = capabilities.MeshEastWestV1
+	}
 	infoProvider.SetCapabilities(agentProtocolVersion, agentFeatureIDs(
 		injectionMode,
 		egressFeatureIDs,
+		netCapability,
+		meshCapability,
 		set.Volumes != nil,
 		adapter.SnapshotScrubAvailable(),
 		adapter.ImageQuarantineAvailable(),
@@ -428,8 +532,89 @@ func run() error {
 		v <= 1 {
 		diskWatermark = v
 	}
+	// fabricIngressPort（G2d，§14）：fabric ingress 终结器端口（与控制面
+	// FIREPAAS_AGENT_FABRIC_INGRESS_PORT 同值，mesh:endpoint 投影寻址用）。
+	fabricIngressPort := envIntDefault("FIREPAAS_AGENT_FABRIC_INGRESS_PORT", 5109)
+	// WG underlay（ADR-0040 §9，T4）：FIREPAAS_MESH=disabled 时不建设备、不
+	// 上报公钥（ApplyFabric 仍持久化快照，后续启用时从快照恢复）；G1 只接受
+	// eastwest 级别。私钥只落盘，绝不进日志/上报。
+	var underlay api.Underlay
+	switch meshMode {
+	case "disabled":
+	case "eastwest":
+		// W1：nft fallback + mesh=eastwest 时不建 WG 设备、不装 /64 路由、不上报
+		// 公钥（只摘路由；建设备会留下单向出向黑洞）。快照仍持久化（server 层
+		// underlay==nil 即跳过生效，见 server.go nil = mesh 未启用）。
+		// DNS/flows 是节点本地能力，与 WG 设备无关，保持启动（现状不变）。
+		if !ebpfActive {
+			slog.Error(
+				"mesh=eastwest requires the eBPF datapath; nft fallback node will NOT join the mesh (no WG device, no mesh routes, fabric policy unavailable)",
+			)
+		} else {
+			wgPort, err := strconv.ParseUint(envOr("FIREPAAS_MESH_WG_PORT", "51820"), 10, 16)
+			if err != nil || wgPort == 0 {
+				return fmt.Errorf("invalid FIREPAAS_MESH_WG_PORT: %v", envOr("FIREPAAS_MESH_WG_PORT", "51820"))
+			}
+			wgMgr, err := wg.New(wg.Options{
+				// 同主机多节点（双节点 spike）：WG 设备名可配，避免共享内核设备。
+				Iface:      envOr("FIREPAAS_MESH_WG_IFACE", "fp-wg0"),
+				KeyDir:     filepath.Join(cfg.DataDir, "agent", "fabric"),
+				ListenPort: uint16(wgPort),
+				Fabric:     fabric,
+			})
+			if err != nil {
+				return err
+			}
+			if err := wgMgr.Ensure(ensureCtx); err != nil {
+				return fmt.Errorf("wg underlay: %w", err)
+			}
+			// 公钥/端口上报（observed；私钥永不离开节点）。不上报 = 不入 mesh
+			//（策略静默失效比缺席更危险，见 netCapability 旁注释）。
+			infoProvider.SetFabricPubkeyFunc(wgMgr.PublicKey)
+			infoProvider.SetFabricWGPort(uint16(wgPort))
+			// 启动恢复：WG 设备不跨重启存活，按已应用快照重放（幂等）。
+			if snap := fabric.Current(); snap.Generation > 0 {
+				peers, err := wg.PeersFromSnapshot(snap)
+				if err != nil {
+					return err
+				}
+				if err := wgMgr.UpdatePeers(ensureCtx, snap.Generation, peers); err != nil {
+					return fmt.Errorf("wg underlay restore: %w", err)
+				}
+			}
+			underlay = wgMgr
+		}
+		// G2c（ADR-0040 §16）：节点本地 .internal DNS。随快照 NodePrefix 幂
+		// 等绑定（首拍前不启动）；失败降级记日志，绝不阻断 agentd。
+		dnsSrv := dnsserver.New(func() []state.DnsRecord { return fabric.Current().DNS })
+		defer dnsSrv.Close()
+		go watchFabricDNS(ctx, dnsSrv, fabric)
+		// G3（§21）：东西向 flow 事件（ringbuf → 关联 → sink）。读取失败
+		// 降级记日志（观测缺失不阻断数据面）。
+		if ebpfBackend, ok := fabricPolicyBackend.(*ebpf.Backend); ok && ebpfBackend != nil {
+			// 启动恢复：eBPF ipcache/policy map 不跨重启存活（随程序重建），
+			// 而控制面快照推送是 hash 门控的——内容未变不重推。缺此重放时，
+			// agent 重启后 v6 东西向静默断流直到下一次快照内容变更（真机实
+			// 测教训）。重放幂等全量，与 WG peers 重放同型。
+			if snap := fabric.Current(); snap.Generation > 0 {
+				if err := ebpfBackend.ApplyFabricPolicy(ctx, fabricPolicyReplay(snap)); err != nil {
+					slog.Warn("fabric policy replay failed; waiting next snapshot push", "error", err)
+				} else {
+					slog.Info("fabric policy replayed from durable snapshot", "generation", snap.Generation)
+				}
+			}
+			if err := ebpfBackend.StartFlows(ctx, fabricIdentityResolver{fabric: fabric}, &flowLogSink{}); err != nil {
+				slog.Warn("fabric flow events disabled", "error", err)
+			}
+		}
+	default:
+		return fmt.Errorf("FIREPAAS_MESH=%s unsupported in G1 (accepts: disabled, eastwest)", meshMode)
+	}
 	srv := server.New(adapter, ledger, fences, infoProvider,
 		server.WithCreds(creds), server.WithCredentialRequired(requireCred),
+		server.WithFabric(fabric),
+		server.WithUnderlay(underlay),
+		server.WithFabricPolicy(fabricPolicyBackend),
 		server.WithDiskWatermark(diskWatermark),
 		server.WithAdmissionDiskWatermark(envFloat("FIREPAAS_ADMISSION_DISK_WATERMARK", 0.9)),
 		server.WithRuntimeLimits(
@@ -455,7 +640,15 @@ func run() error {
 	if certMgr != nil {
 		defer certMgr.Close()
 	}
-	proxyHandler := http.Handler(proxy.NewWithVerifier(adapter, creds))
+	workloadProxy := proxy.NewWithVerifier(adapter, creds)
+	proxyHandler := http.Handler(workloadProxy)
+	// G2d（§14）：fabric ingress 终结器复用同一 proxy（endpoint 解析与
+	// autoresume 语义一致）；仅 mesh=eastwest 时随快照绑定节点 ULA。
+	if strings.EqualFold(meshMode, "eastwest") {
+		ing := fabricingress.New(workloadProxy, fabricIngressPort)
+		defer ing.Close()
+		go watchFabricIngress(ctx, ing, fabric)
+	}
 	if tlsConf != nil {
 		// mTLS 已保证“持本 CA 证书才能连”；这里进一步按证书 CN 做最小授权：
 		// gRPC（5108）只接受控制面身份，proxy（5107）只接受 edge 身份
@@ -478,6 +671,7 @@ func run() error {
 	pb.RegisterImageServiceServer(grpcServer, srv)    // v1.1（ADR-0018）：部署预取
 	pb.RegisterSnapshotServiceServer(grpcServer, srv) // v1.3-B（ADR-0028）
 	pb.RegisterVolumeServiceServer(grpcServer, srv)   // v1.3-D（ADR-0029）
+	pb.RegisterFabricServiceServer(grpcServer, srv)   // ADR-0040 §18（T3）：节点级 fabric 快照下发
 
 	errCh := make(chan error, 2)
 	go func() {
@@ -595,22 +789,67 @@ func envInt(key string, def int) int {
 }
 
 // liveSlotInstances 从 hypeman 实例清单构建 slot 对账的存活实例视图。
-func liveSlotInstances(ctx context.Context, mgr instances.Manager) ([]slot.LiveInstance, error) {
+// fabricPolicyReplay 把持久化快照转换为 eBPF policy 重放输入（与
+// server.fabricPolicyFromSnapshot 同构：规则按 (project,app) 映射到
+// identity，附对称回程条目；无 ports 的正向规则无意义，不重放）。
+func fabricPolicyReplay(snap state.FabricSnapshot) api.FabricPolicySnapshot {
+	out := api.FabricPolicySnapshot{
+		Generation: snap.Generation,
+		Identities: make([]api.IdentityMapEntry, 0, len(snap.Identities)),
+	}
+	if p, err := netip.ParsePrefix(snap.NodePrefix); err == nil {
+		out.NodeULA = p.Addr().String()
+	}
+	type identityKey struct{ project, app string }
+	byCoord := make(map[identityKey]uint32, len(snap.Identities))
+	for _, m := range snap.Identities {
+		out.Identities = append(out.Identities, api.IdentityMapEntry{
+			IdentityID: m.IdentityID,
+			ULA:        m.ULA,
+		})
+		byCoord[identityKey{m.ProjectID, m.AppID}] = m.IdentityID
+	}
+	for _, r := range snap.EastWest {
+		dstID, ok := byCoord[identityKey{r.DstProject, r.DstApp}]
+		if !ok {
+			continue
+		}
+		srcID, ok := byCoord[identityKey{r.SrcProject, r.SrcApp}]
+		if !ok {
+			continue
+		}
+		out.Entries = append(out.Entries, api.FabricPolicyEntry{
+			SrcIdentity: srcID, DstIdentity: dstID,
+			Generation: snap.EastWestGeneration,
+			Ports:      append([]uint32(nil), r.Ports...),
+		})
+		out.Entries = append(out.Entries, api.FabricPolicyEntry{
+			SrcIdentity: dstID, DstIdentity: srcID,
+			Generation: snap.EastWestGeneration,
+		})
+	}
+	return out
+}
+
+func liveSlotInstances(ctx context.Context, mgr instances.Manager) ([]api.LiveInstance, error) {
 	listed, err := mgr.ListInstances(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
-	live := make([]slot.LiveInstance, 0, len(listed))
+	live := make([]api.LiveInstance, 0, len(listed))
 	for i := range listed {
 		inst := &listed[i]
 		id := inst.Name
 		if id == "" {
 			id = inst.Id
 		}
-		live = append(live, slot.LiveInstance{
+		live = append(live, api.LiveInstance{
 			MachineID: id,
 			Tap:       network.GenerateTAPName(inst.Id),
 			GuestIP:   inst.IP,
+			// GuestIP6 暂不从 hypeman 实例填充：v0.4.0-fork 的 Instance 无
+			// IPv6Address 字段（GOWORK=off 必须保持可构建）；新 tag 发布后
+			// 改为 inst.IPv6Address。内核态以 slot 持久化 GuestIP6 为准。
 		})
 	}
 	return live, nil
@@ -636,8 +875,51 @@ func slotReconcileInterval() time.Duration {
 // startSlotReconcileLoop 周期性执行 slot 对账（回收孤儿 netns、为存活实例
 // 补接线）。错误一律降级为日志（M3 真机事故教训：slot 异常绝不能让 agentd
 // 退出）；实例清单不可得时跳过本轮——空清单会让 reconcile 误判 VM 已死
-// 而误删 live slot。
-func startSlotReconcileLoop(ctx context.Context, mgr instances.Manager, m *slot.Manager, interval time.Duration) {
+// 而误删 live slot。datapath 是 api.Datapath（ADR-0040 §11）：对账逻辑与
+// 具体后端解耦，为 eBPF datapath 复用。
+// watchFabricDNS 周期把 fabric 快照的 NodePrefix 映射为节点本地 DNS 监听
+// 地址（"[基址]:53"，幂等重绑）。快照无前缀（首拍前/mesh 未生效）不启动；
+// 错误降级记日志（下轮重试）。
+func watchFabricDNS(ctx context.Context, srv *dnsserver.Server, fabric *state.Fabric) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		snap := fabric.Current()
+		if snap.NodePrefix != "" {
+			if prefix, err := netip.ParsePrefix(snap.NodePrefix); err == nil {
+				addr := net.JoinHostPort(prefix.Addr().String(), "53")
+				if err := srv.Ensure(ctx, addr); err != nil {
+					slog.Warn("node-local dns ensure", "addr", addr, "error", err)
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// watchFabricIngress 周期把 fabric 快照的 NodePrefix 映射为 fabric ingress
+// 监听（"[节点 ULA]:port"，幂等重绑）。快照无前缀（首拍前）不启动；错误
+// 降级记日志（下轮重试）——edge 会因 mesh:endpoint 不可达回落 legacy。
+func watchFabricIngress(ctx context.Context, srv *fabricingress.Server, fabric *state.Fabric) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		if err := srv.Ensure(ctx, fabric.Current().NodePrefix); err != nil {
+			slog.Warn("fabric ingress ensure", "error", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func startSlotReconcileLoop(ctx context.Context, mgr instances.Manager, datapath api.Datapath, interval time.Duration) {
 	if interval <= 0 {
 		slog.Info("periodic slot reconcile disabled", "interval", interval)
 		return
@@ -659,7 +941,7 @@ func startSlotReconcileLoop(ctx context.Context, mgr instances.Manager, m *slot.
 					continue
 				}
 				reconcileCtx, cancel := context.WithTimeout(ctx, time.Minute)
-				err = m.Reconcile(reconcileCtx, live)
+				err = datapath.Reconcile(reconcileCtx, live)
 				cancel()
 				if err != nil {
 					slog.Warn("slot reconcile failed (degraded; retried next round)", "error", err)
@@ -694,10 +976,18 @@ func splitNonEmpty(raw, sep string) []string {
 	return out
 }
 
-// agentFeatureIDs 从实际 secret 注入模式与 egress 装配推导安全能力。环境变量
+// agentFeatureIDs 从实际 secret 注入模式与 egress/网络装配推导安全能力。环境变量
 // 只是默认能力的减法 allowlist，不能在 unsafe/off/unknown 模式伪造
 // secret.oneshot.v1，也不能在 egress 未装配时伪造 egress 能力。
-func agentFeatureIDs(secretMode string, egressIDs []string, optional ...bool) []string {
+// meshCapability（W3 §12）：ebpf 可用且显式 eastwest 才传 mesh.eastwest.v1；
+// 空串 = 不上报（§0 gate 前/回退节点绝不广告，避免 mesh 服务被调度过去）。
+func agentFeatureIDs(
+	secretMode string,
+	egressIDs []string,
+	networkCapability string,
+	meshCapability string,
+	optional ...bool,
+) []string {
 	available := []string{
 		capabilities.GuestExecV1,
 		capabilities.GuestCopyV1,
@@ -707,6 +997,12 @@ func agentFeatureIDs(secretMode string, egressIDs []string, optional ...bool) []
 		available = append(available, capabilities.SecretOneShotV1)
 	}
 	available = append(available, egressIDs...)
+	if networkCapability != "" {
+		available = append(available, networkCapability)
+	}
+	if meshCapability != "" {
+		available = append(available, meshCapability)
+	}
 	// v1.4-B：本 agent 的 ListSnapshots/ListVolumes 响应携带 complete 标志
 	// 与观测 generation/time（inventory 对账输入）。
 	available = append(available, capabilities.LocalInventoryV1)
@@ -855,6 +1151,94 @@ func startAutoStandby(
 func mustNoopHistogram() otelmetric.Float64Histogram {
 	h, _ := noop.Meter{}.Float64Histogram("firepaas_agent_autostandby_wake_seconds")
 	return h
+}
+
+// ebpfObserverMetrics（G3，ADR-0040 §21）：eBPF 数据面低基数指标的 OTel
+// 实现。meter nil = noop（接口方法退化为丢弃——观测不阻断数据面）。
+type ebpfObserverMetrics struct {
+	attachErr otelmetric.Int64Counter
+	fallback  otelmetric.Int64Counter
+	policyGen otelmetric.Int64Gauge
+}
+
+func newEbpfObserver(meter otelmetric.Meter) *ebpfObserverMetrics {
+	if meter == nil {
+		return &ebpfObserverMetrics{}
+	}
+	o := &ebpfObserverMetrics{}
+	if c, err := meter.Int64Counter("firepaas_agent_ebpf_attach_errors_total",
+		otelmetric.WithDescription("ebpf slot attach/ensure failures")); err == nil {
+		o.attachErr = c
+	}
+	if c, err := meter.Int64Counter("firepaas_agent_ebpf_fallback_total",
+		otelmetric.WithDescription("ebpf probe failures falling back to nft emergency mode")); err == nil {
+		o.fallback = c
+	}
+	if g, err := meter.Int64Gauge("firepaas_agent_ebpf_policy_gen",
+		otelmetric.WithDescription("currently applied fabric policy generation")); err == nil {
+		o.policyGen = g
+	}
+	return o
+}
+
+func (o *ebpfObserverMetrics) AttachError() {
+	if o.attachErr != nil {
+		o.attachErr.Add(context.Background(), 1)
+	}
+}
+
+func (o *ebpfObserverMetrics) Fallback() {
+	if o.fallback != nil {
+		o.fallback.Add(context.Background(), 1)
+	}
+}
+
+func (o *ebpfObserverMetrics) PolicyGen(gen uint64) {
+	if o.policyGen != nil {
+		o.policyGen.Record(context.Background(), int64(gen))
+	}
+}
+
+// fabricIdentityResolver（G3，§21）：fabric 快照 identity_id → 坐标
+// （flow 关联源；读侧快照副本，无锁）。
+type fabricIdentityResolver struct {
+	fabric *state.Fabric
+}
+
+func (r fabricIdentityResolver) Resolve(id uint32) (ebpf.FlowIdentity, bool) {
+	snap := r.fabric.Current()
+	for i := range snap.Identities {
+		if snap.Identities[i].IdentityID == id {
+			return ebpf.FlowIdentity{
+				ProjectID:   snap.Identities[i].ProjectID,
+				AppID:       snap.Identities[i].AppID,
+				MachineID:   snap.Identities[i].MachineID,
+				ExecutionID: snap.Identities[i].ExecutionID,
+			}, true
+		}
+	}
+	return ebpf.FlowIdentity{}, false
+}
+
+// flowLogSink（G3，§21）：flow 事件消费——deny 全量日志（审计面）+ allow
+// 采样日志（1/128，噪声预算）；域名/IP/机器不进 label。
+type flowLogSink struct {
+	allowSeen uint64 // 采样计数（原子；无锁快路径）
+}
+
+func (s *flowLogSink) Observe(rec ebpf.FlowRecord) {
+	if rec.Verdict == ebpf.FlowAllow {
+		s.allowSeen++
+		if s.allowSeen%128 != 0 {
+			return
+		}
+	}
+	slog.Info("fabric flow",
+		"verdict", rec.Verdict.String(),
+		"proto", int(rec.Proto), "dport", int(rec.DPort),
+		"src", rec.SrcProject+"/"+rec.SrcApp+"/"+rec.SrcMachine,
+		"dst", rec.DstProject+"/"+rec.DstApp+"/"+rec.DstMachine,
+		"pkt_len", int(rec.PktLen))
 }
 
 // agentWakeMetrics 构造 autoresume 唤醒计数/耗时（v1.1，ADR-0017 metrics）。

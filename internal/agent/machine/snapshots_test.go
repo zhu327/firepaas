@@ -8,7 +8,7 @@ import (
 	"github.com/kernel/hypeman/lib/instances"
 	"github.com/kernel/hypeman/lib/tags"
 
-	"github.com/zhu327/firepaas/internal/agent/network/slot"
+	"github.com/zhu327/firepaas/internal/agent/network/api"
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 )
 
@@ -22,18 +22,26 @@ func TestMapSnapshotInfoDefaultsEmptyCompressionStateToNone(t *testing.T) {
 	}
 }
 
-type snapshotSlotFake struct {
+type snapshotDatapathFake struct {
 	attachErr error
 	attached  int
 	released  int
 }
 
-func (s *snapshotSlotFake) Attach(context.Context, string, string, string) (slot.Slot, error) {
+func (s *snapshotDatapathFake) AttachNetns(context.Context, api.NetnsSpec) error {
 	s.attached++
-	return slot.Slot{}, s.attachErr
+	return s.attachErr
 }
-func (s *snapshotSlotFake) Release(context.Context, string) error { s.released++; return nil }
-func (s *snapshotSlotFake) SlotFor(string) (slot.Slot, bool)      { return slot.Slot{}, false }
+
+func (s *snapshotDatapathFake) DetachNetns(context.Context, string) error  { s.released++; return nil }
+func (s *snapshotDatapathFake) Check(context.Context, api.NetnsSpec) error { return nil }
+func (s *snapshotDatapathFake) Reconcile(context.Context, []api.LiveInstance) error {
+	return nil
+}
+
+func (s *snapshotDatapathFake) CurrentNetns(string) (api.NetnsState, bool) {
+	return api.NetnsState{}, false
+}
 
 type restoreSnapshotFake struct {
 	fakeInstances
@@ -131,7 +139,7 @@ func TestForkSnapshotExplicitlyClearsInheritedVolumes(t *testing.T) {
 
 func TestForkSnapshotReattachesSlotAndCleansUpOnFailure(t *testing.T) {
 	f := &restoreSnapshotFake{snapshots: []instances.Snapshot{{Id: "artifact"}}}
-	slots := &snapshotSlotFake{attachErr: errors.New("attach failed")}
+	slots := &snapshotDatapathFake{attachErr: errors.New("attach failed")}
 	a := New(f, &fakeImages{}, slots, nil)
 	_, err := a.ForkSnapshot(context.Background(), &pb.ForkSnapshotRequest{
 		SnapshotId: "snap", MachineId: "fork", ExecutionId: "exec", Generation: 1,
@@ -156,7 +164,7 @@ func TestRestoreSnapshotReattachesSlotAndStopsReplacementOnFailure(t *testing.T)
 		},
 		snapshots: []instances.Snapshot{{Id: "artifact", CompatibilityKey: "same"}},
 	}
-	slots := &snapshotSlotFake{attachErr: errors.New("attach failed")}
+	slots := &snapshotDatapathFake{attachErr: errors.New("attach failed")}
 	a := New(f, &fakeImages{}, slots, nil)
 	_, _, _, err := a.RestoreSnapshot(context.Background(), &pb.RestoreSnapshotRequest{
 		SnapshotId: "snap", MachineId: "m1", ExecutionId: "new", Generation: 2,

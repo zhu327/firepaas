@@ -119,6 +119,11 @@ type RouteBackendRow struct {
 	Weight            int
 	Readiness         string
 	Draining          bool
+	// Fabric 直连提示（G2b，ADR-0040 §16）：仅 mesh_direct 服务且在役
+	// execution 填充；零值 = 无 mesh 提示（旧路径不受影响）。
+	ULA        string
+	IdentityID uint32
+	Generation int64
 }
 
 // RouteRow 是 controller 计算出的一个活跃 route（hostname+port 及其 backend set）。
@@ -1799,10 +1804,12 @@ func (s *Store) SyncRoutes(ctx context.Context, active []RouteRow) (map[string]i
 			for _, b := range r.Backends {
 				if _, err := tx.Exec(ctx, `
 					INSERT INTO route_backends(route_id, generation, machine_id, execution_id,
-						node_proxy_endpoint, app_port, weight, readiness, draining)
-					VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+						node_proxy_endpoint, app_port, weight, readiness, draining,
+						mesh_ula, mesh_identity_id, mesh_generation)
+					VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
 					id, r.Generation, b.MachineID, b.ExecutionID,
-					b.NodeProxyEndpoint, b.AppPort, b.Weight, b.Readiness, b.Draining); err != nil {
+					b.NodeProxyEndpoint, b.AppPort, b.Weight, b.Readiness, b.Draining,
+					b.ULA, b.IdentityID, b.Generation); err != nil {
 					return fmt.Errorf("insert backend for %s: %w", id, err)
 				}
 			}

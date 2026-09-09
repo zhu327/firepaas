@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l2-ops  PREREQ: dev-pg  DESTRUCTIVE: no  FROZEN: no
 # pg-backup.sh：M5.4（mvp-plan §9.4）PostgreSQL 全库备份。
 #
 # 用法：sudo bash scripts/lab/pg-backup.sh [备份目录]

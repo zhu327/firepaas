@@ -40,6 +40,8 @@ type ImageValidator interface {
 type Service struct {
 	Name         string
 	InternalPort int
+	// MeshDirect（ADR-0040 §15，G2a）：透传 deploy 声明，缺省 false。
+	MeshDirect bool
 }
 
 type HealthCheck struct {
@@ -223,7 +225,7 @@ func prepare(active *store.Deployment, in Intent, generation int64) (store.Deplo
 		if len(active.Services) > 0 {
 			in.Services = make([]Service, len(active.Services))
 			for i, svc := range active.Services {
-				in.Services[i] = Service{Name: svc.Name, InternalPort: svc.InternalPort}
+				in.Services[i] = Service{Name: svc.Name, InternalPort: svc.InternalPort, MeshDirect: svc.MeshDirect}
 			}
 		} else {
 			in.Port = active.Port
@@ -285,7 +287,7 @@ func prepare(active *store.Deployment, in Intent, generation int64) (store.Deplo
 		Generation: generation, ImageRef: in.Image, VCPU: in.VCPU, MemMIB: in.MemMIB,
 		Port: port, Services: services, Strategy: strategy, Env: in.Env, SecretRefs: in.SecretRefs,
 		Placement: placement, HealthCheck: healthCheck, AutoStandby: autoJSON,
-		RequiredFeatures: requiredFeatures(in.SecretRefs), EgressPolicy: egressJSON,
+		RequiredFeatures: requiredFeatures(in.SecretRefs, services), EgressPolicy: egressJSON,
 	}, nil
 }
 
@@ -320,7 +322,7 @@ func resolveServices(services []Service, port int) ([]store.ServiceSpec, int, er
 			return nil, 0, fmt.Errorf("services[%d].name %q duplicated", i, name)
 		}
 		seenPort[svc.InternalPort], seenName[name] = true, true
-		out = append(out, store.ServiceSpec{Name: name, InternalPort: svc.InternalPort})
+		out = append(out, store.ServiceSpec{Name: name, InternalPort: svc.InternalPort, MeshDirect: svc.MeshDirect})
 	}
 	return out, out[0].InternalPort, nil
 }
@@ -480,9 +482,24 @@ func marshalEgress(policy *EgressPolicy, generation int64) (json.RawMessage, err
 	return json.RawMessage(raw), err
 }
 
-func requiredFeatures(refs map[string]store.SecretRef) []string {
-	if len(refs) == 0 {
-		return nil
+func requiredFeatures(refs map[string]store.SecretRef, services []store.ServiceSpec) []string {
+	var out []string
+	if len(refs) > 0 {
+		out = append(out, capabilities.SecretOneShotV1)
 	}
-	return []string{capabilities.SecretOneShotV1}
+	out = append(out, MeshDirectFeatures(services)...)
+	return out
+}
+
+// MeshDirectFeatures 返回 mesh 直连服务的调度硬能力（ADR-0040 §12，W3）：
+// 任一 service 声明 mesh_direct → 要求 mesh.eastwest.v1 并显式依赖
+// network.ebpf.v1（missingFeatures 只做精确匹配，不展开 Requires 闭包；
+// mesh 服务永不调度到 nftfallback 节点）。
+func MeshDirectFeatures(services []store.ServiceSpec) []string {
+	for _, s := range services {
+		if s.MeshDirect {
+			return []string{capabilities.MeshEastWestV1, capabilities.NetworkEbpfV1}
+		}
+	}
+	return nil
 }

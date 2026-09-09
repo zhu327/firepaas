@@ -22,6 +22,9 @@ var ErrAppDeleted = errors.New("app deleted")
 type ServiceSpec struct {
 	Name         string `json:"name"`
 	InternalPort int    `json:"internal_port"`
+	// MeshDirect（ADR-0040 §15，G2a）：本服务可被 mesh 直连。omitempty 保持
+	// 存量行字节形态可逆；缺省 false = 仅南北到达（东西向默认 deny）。
+	MeshDirect bool `json:"mesh_direct,omitempty"`
 }
 
 // Deployment 是 deployments 表行（不可变发布目标）。

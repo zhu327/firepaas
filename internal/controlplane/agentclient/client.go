@@ -25,6 +25,7 @@ type Client struct {
 	Machines pb.MachineServiceClient
 	Info     pb.InfoServiceClient
 	Images   pb.ImageServiceClient
+	Fabric   pb.FabricServiceClient
 }
 
 // NotAfterHook 在客户端证书每次成功加载（含热重载）后被调用，进程级
@@ -73,14 +74,21 @@ func Dial(addr string) (*Client, error) {
 		}
 		return nil, fmt.Errorf("dial agent %s: %w", addr, err)
 	}
+	c := NewFromConn(conn, addr)
+	c.certMgr = clientCertMgr
+	return c, nil
+}
+
+// NewFromConn 用既有连接构造 Client（测试注入 / 连接池派生用；生产走 Dial）。
+func NewFromConn(conn *grpc.ClientConn, addr string) *Client {
 	return &Client{
 		conn:     conn,
 		addr:     addr,
-		certMgr:  clientCertMgr,
 		Machines: pb.NewMachineServiceClient(conn),
 		Info:     pb.NewInfoServiceClient(conn),
 		Images:   pb.NewImageServiceClient(conn),
-	}, nil
+		Fabric:   pb.NewFabricServiceClient(conn),
+	}
 }
 
 // Addr 返回连接目标地址（nodemanager 判断是否需要重拨）。
@@ -209,6 +217,12 @@ func (c *Client) Resume(
 		MachineId: machineID, ExecutionId: executionID, Generation: generation,
 		OperationId: opID, ExpectedState: pb.MachineState_PAUSED,
 	}})
+}
+
+// ApplyFabric 推送节点级 fabric 全量快照（ADR-0040 §18，T3）：agent 侧按
+// node_id + fabric_generation + operation_id fencing，同 operation 幂等重放。
+func (c *Client) ApplyFabric(ctx context.Context, req *pb.ApplyFabricRequest) (*pb.ApplyFabricResponse, error) {
+	return c.Fabric.ApplyFabric(ctx, req)
 }
 
 // Snapshots 是 agent SnapshotService 客户端（v1.3-B，ADR-0028）。

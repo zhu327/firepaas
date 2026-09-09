@@ -17,7 +17,8 @@ import (
 
 type fakeInstances struct {
 	created *instances.Instance
-	got     *instances.Instance // GetInstance 固定返回（endpoint 测试用）
+	lastReq instances.CreateInstanceRequest // 最近一次 Create 请求（注入断言用）
+	got     *instances.Instance             // GetInstance 固定返回（endpoint 测试用）
 	listed  []instances.Instance
 	deleted string
 	err     error
@@ -30,6 +31,7 @@ func (f *fakeInstances) CreateInstance(
 	if f.err != nil {
 		return nil, f.err
 	}
+	f.lastReq = req
 	inst := &instances.Instance{
 		StoredMetadata: instances.StoredMetadata{
 			Id:          "internal-1",

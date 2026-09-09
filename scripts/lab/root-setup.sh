@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l1-base  PREREQ: root  DESTRUCTIVE: yes  FROZEN: no
 # 单机实验室 root 准备步骤（HITL）。用法: sudo bash scripts/lab/root-setup.sh
 # 只做最小必要变更：/var/lib 数据目录、docker/kvm 组、ip_forward 确认。
 # 不写 /etc、不开巨页、不动 systemd-resolved，避免影响本机 k8s。

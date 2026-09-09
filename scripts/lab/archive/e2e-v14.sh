@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l2-archived  PREREQ: nomad,agentd,root  DESTRUCTIVE: yes  FROZEN: yes
 # v1.4 单机 smoke（docs/v1.4-plan.md §5/§7/§8）：
 #   A) capability 真值：inventory.local.v1 已发布、volume.dataset_overlay.v1
 #      未发布（未验收的 CoW 不得广告）；
@@ -18,7 +19,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAB_BIN="$HOME/.local/firepaas-lab/bin"
-CERT_DIR="$HERE/certs"
+CERT_DIR="$HERE/../certs"
 RUN_DIR="/var/lib/firepaas-p0/e2e-v14"
 RUN_ID="v14-$(date +%s)"
 API_TOKEN="v14-token-$RUN_ID"
@@ -49,8 +50,8 @@ mark() { log "    (累计 $(( $(date +%s) - T0 ))s) $*"; }
 
 log "0) 启动 agentd + API/edge"
 T0=$(date +%s)
-"$HERE/root-setup.sh" >/dev/null || fail "root-setup 失败"
-"$HERE/run-agentd.sh" >/dev/null || fail "agentd 未就绪"
+"$HERE/../root-setup.sh" >/dev/null || fail "root-setup 失败"
+"$HERE/../run-agentd.sh" >/dev/null || fail "agentd 未就绪"
 MASTER_KEY="$(openssl rand -base64 32)"
 TRAFFIC_KEY="$(openssl rand -base64 32)"
 pkill -f "$LAB_BIN/firepaas-api" 2>/dev/null || true
@@ -80,7 +81,7 @@ done
 authed_curl "http://127.0.0.1:$API_PORT/v1/health" >/dev/null || { tail -5 "$RUN_DIR/v14-api.log"; fail "API 未就绪"; }
 mark "api/edge up"
 
-ONLINE_OUT=$(bash "$HERE/push-ontime.sh") || fail "push-ontime 失败"
+ONLINE_OUT=$(bash "$HERE/../push-ontime.sh") || fail "push-ontime 失败"
 ONTIME_REF=$(echo "$ONLINE_OUT" | grep '^REF=' | cut -d= -f2-)
 [[ -n "$ONTIME_REF" ]] || fail "ontime REF 解析失败"
 DIGEST=$(echo "$ONTIME_REF" | sed 's/.*@//')

@@ -3,6 +3,7 @@ package routepublisher
 import (
 	"context"
 	"errors"
+	"net/netip"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -360,9 +361,11 @@ type fakeStore struct {
 	machines    []store.Machine
 	rollouts    []store.Rollout
 	deployments map[string][]store.Deployment
-	synced      []store.RouteRow
-	calls       *[]string
-	syncErr     error
+	// identities（G2b）：FabricIdentities 返回值（nil = 空集）。
+	identities []store.FabricIdentityRow
+	synced     []store.RouteRow
+	calls      *[]string
+	syncErr    error
 	// revs 是 SynnRoutes 返回的 hostname → revision（缺省按序递增分配）。
 	revs map[string]int64
 	mu   sync.Mutex
@@ -371,6 +374,10 @@ type fakeStore struct {
 
 func (f *fakeStore) ActiveRouteMachines(context.Context) ([]store.Machine, error) {
 	return f.machines, nil
+}
+
+func (f *fakeStore) FabricIdentities(context.Context) ([]store.FabricIdentityRow, error) {
+	return f.identities, nil
 }
 
 func (f *fakeStore) ListActiveRollouts(context.Context) ([]store.Rollout, error) {
@@ -408,6 +415,22 @@ type fakeCatalog struct {
 	pruned     bool
 	replaced   []catalog.HostRoute
 	revisions  map[string]int64
+	// dnsRecords（G2c）：ReplaceInternalDNS 收到的全量（nil 后无断言则空）。
+	dnsRecords []catalog.InternalDNSRecord
+	dnsTTL     time.Duration
+}
+
+func (f *fakeCatalog) ReplaceInternalDNS(
+	_ context.Context,
+	records []catalog.InternalDNSRecord,
+	ttl time.Duration,
+) error {
+	if f.replaceErr != nil {
+		return f.replaceErr
+	}
+	f.dnsRecords = records
+	f.dnsTTL = ttl
+	return nil
 }
 
 func (f *fakeCatalog) ReplaceHostRoutes(
@@ -513,5 +536,250 @@ func TestRebuildPassesAllocatedRevisionToCatalog(t *testing.T) {
 	}
 	if cat.revisions["app.test"] != 42 {
 		t.Fatalf("catalog revision = %d, want 42 (allocated by SyncRoutes)", cat.revisions["app.test"])
+	}
+}
+
+// TestDeriveMeshDirectULAHints（G2b，ADR-0040 §16）：mesh_direct 服务的
+// backend 携带在役 execution 的 ULA/identity/generation 提示；非直连服务、
+// 无身份（未入 mesh）与旧行为一致为零值。
+func TestDeriveMeshDirectULAHints(t *testing.T) {
+	machines := []store.Machine{{
+		ID: "m1", AppID: "app", DeploymentID: "dep", Hostname: "app.test",
+		CurrentExecutionID: "exec-1", NodeID: "node-a",
+		ObservedState: "RUNNING", ObservedReadiness: "READY",
+	}}
+	deployments := map[string][]store.Deployment{
+		"app": {{
+			ID: "dep", AppID: "app", Generation: 1,
+			Services: []store.ServiceSpec{
+				{Name: "direct", InternalPort: 8080, MeshDirect: true},
+				{Name: "proxy-only", InternalPort: 9090},
+			},
+		}},
+	}
+	ula := netip.MustParseAddr("fd7a:9a55:0:1::7")
+	identities := map[string]store.FabricIdentityRow{
+		"m1\x00exec-1": {
+			IdentityID: 42, ProjectID: "p", AppID: "app",
+			Service: "direct", ULA: ula, MachineID: "m1", ExecutionID: "exec-1", Generation: 3,
+		},
+	}
+
+	proj := Derive(Input{
+		Machines: machines, Deployments: flattenDeployments(deployments),
+		ProxyByNode:    map[string]string{"node-a": "10.0.0.1:5107"},
+		DefaultAppPort: 8080, LegacyProxyAddr: "legacy:5107",
+		FabricByIdentity: identities,
+	})
+
+	byPort := map[int]store.RouteRow{}
+	for _, r := range proj.Routes {
+		byPort[r.Port] = r
+	}
+	direct := byPort[8080]
+	if len(direct.Backends) != 1 {
+		t.Fatalf("direct backends = %+v", direct.Backends)
+	}
+	b := direct.Backends[0]
+	if b.ULA != "fd7a:9a55:0:1::7" || b.IdentityID != 42 || b.Generation != 3 {
+		t.Fatalf("mesh_direct hint missing: ula=%q id=%d gen=%d", b.ULA, b.IdentityID, b.Generation)
+	}
+	proxyOnly := byPort[9090]
+	if len(proxyOnly.Backends) != 1 {
+		t.Fatalf("proxy-only backends = %+v", proxyOnly.Backends)
+	}
+	b2 := proxyOnly.Backends[0]
+	if b2.ULA != "" || b2.IdentityID != 0 || b2.Generation != 0 {
+		t.Fatalf("non-mesh_direct service must not carry hints: %+v", b2)
+	}
+
+	// 无身份（未入 mesh / 分配未落）：mesh_direct 服务也无提示（零回归）。
+	proj2 := Derive(Input{
+		Machines: machines, Deployments: flattenDeployments(deployments),
+		ProxyByNode:    map[string]string{"node-a": "10.0.0.1:5107"},
+		DefaultAppPort: 8080, LegacyProxyAddr: "legacy:5107",
+	})
+	for _, r := range proj2.Routes {
+		for _, b := range r.Backends {
+			if b.ULA != "" || b.IdentityID != 0 || b.Generation != 0 {
+				t.Fatalf("no-identity input must yield zero hints: %+v", b)
+			}
+		}
+	}
+}
+
+func flattenDeployments(m map[string][]store.Deployment) []store.Deployment {
+	var out []store.Deployment
+	for _, deps := range m {
+		out = append(out, deps...)
+	}
+	return out
+}
+
+// TestDeriveInternalDNSGating（G2c，ADR-0040 §16）：.internal 记录与 backend
+// ULA 提示同源——非 READY / draining / 非 mesh_direct / 无身份的 execution
+// 一律不发布 AAAA。
+func TestDeriveInternalDNSGating(t *testing.T) {
+	ula := func(s string) netip.Addr { return netip.MustParseAddr(s) }
+	deployments := []store.Deployment{{
+		ID: "dep", AppID: "app", Generation: 1,
+		Services: []store.ServiceSpec{{Name: "svc", InternalPort: 8080, MeshDirect: true}},
+	}}
+	identities := map[string]store.FabricIdentityRow{
+		"ready\x00e-ready": {
+			IdentityID:  1,
+			ProjectID:   "p",
+			AppID:       "app",
+			ULA:         ula("fd7a:9a55:0:1::1"),
+			MachineID:   "ready",
+			ExecutionID: "e-ready",
+			Generation:  2,
+		},
+		"booting\x00e-boot": {
+			IdentityID:  2,
+			ProjectID:   "p",
+			AppID:       "app",
+			ULA:         ula("fd7a:9a55:0:1::2"),
+			MachineID:   "booting",
+			ExecutionID: "e-boot",
+			Generation:  2,
+		},
+		"draining\x00e-dr": {
+			IdentityID:  3,
+			ProjectID:   "p",
+			AppID:       "app",
+			ULA:         ula("fd7a:9a55:0:1::3"),
+			MachineID:   "draining",
+			ExecutionID: "e-dr",
+			Generation:  2,
+		},
+		"noident\x00e-noid": {
+			IdentityID:  4,
+			ProjectID:   "p",
+			AppID:       "app",
+			ULA:         ula("fd7a:9a55:0:1::4"),
+			MachineID:   "noident",
+			ExecutionID: "e-noid",
+			Generation:  2,
+		},
+	}
+	mk := func(id, exec, state, readiness string) store.Machine {
+		return store.Machine{
+			ID: id, AppID: "app", DeploymentID: "dep", Hostname: "app.test",
+			CurrentExecutionID: exec, NodeID: "node-a", ObservedState: state, ObservedReadiness: readiness,
+		}
+	}
+	machines := []store.Machine{
+		mk("ready", "e-ready", "RUNNING", "READY"),
+		mk("booting", "e-boot", "RUNNING", "UNCONFIGURED"), // 未 READY
+		mk("stopped", "e-stop", "STOPPED", "READY"),        // 非 serving
+	}
+	proj := Derive(Input{
+		Machines: machines, Deployments: deployments,
+		ProxyByNode:    map[string]string{"node-a": "p:5107"},
+		DefaultAppPort: 8080, LegacyProxyAddr: "legacy:5107",
+		FabricByIdentity: identities,
+	})
+	if len(proj.InternalDNS) != 1 {
+		t.Fatalf("internal dns = %+v, want single record", proj.InternalDNS)
+	}
+	rec := proj.InternalDNS[0]
+	if rec.Name != "app.p.internal" || len(rec.AAAA) != 1 || rec.AAAA[0] != "fd7a:9a55:0:1::1" || rec.Generation != 2 {
+		t.Fatalf("record = %+v", rec)
+	}
+
+	// 非 mesh_direct 服务（同 app）→ 无记录。
+	depsNoDirect := []store.Deployment{{
+		ID: "dep", AppID: "app", Generation: 1,
+		Services: []store.ServiceSpec{{Name: "svc", InternalPort: 8080}},
+	}}
+	proj2 := Derive(Input{
+		Machines:       []store.Machine{mk("ready", "e-ready", "RUNNING", "READY")},
+		Deployments:    depsNoDirect,
+		ProxyByNode:    map[string]string{"node-a": "p:5107"},
+		DefaultAppPort: 8080, LegacyProxyAddr: "legacy:5107",
+		FabricByIdentity: identities,
+	})
+	if len(proj2.InternalDNS) != 0 {
+		t.Fatalf("non-mesh_direct must yield no dns records: %+v", proj2.InternalDNS)
+	}
+
+	// 多副本：去重聚合（两个 READY execution 同 app → 2 AAAA）。
+	identities["ready2\x00e-ready2"] = store.FabricIdentityRow{
+		IdentityID: 5, ProjectID: "p",
+		AppID: "app", ULA: ula("fd7a:9a55:0:1::9"), MachineID: "ready2", ExecutionID: "e-ready2", Generation: 4,
+	}
+	proj3 := Derive(Input{
+		Machines: []store.Machine{
+			mk("ready", "e-ready", "RUNNING", "READY"),
+			mk("ready2", "e-ready2", "RUNNING", "READY"),
+		},
+		Deployments:    deployments,
+		ProxyByNode:    map[string]string{"node-a": "p:5107"},
+		DefaultAppPort: 8080, LegacyProxyAddr: "legacy:5107",
+		FabricByIdentity: identities,
+	})
+	if len(proj3.InternalDNS) != 1 || len(proj3.InternalDNS[0].AAAA) != 2 ||
+		proj3.InternalDNS[0].AAAA[0] != "fd7a:9a55:0:1::1" || proj3.InternalDNS[0].AAAA[1] != "fd7a:9a55:0:1::9" ||
+		proj3.InternalDNS[0].Generation != 4 {
+		t.Fatalf("aggregate record = %+v", proj3.InternalDNS)
+	}
+}
+
+// TestRebuildPublishesBackendHints（G2b 回归）：Derive 产出的 ULA 提示必须
+// 经 publishRedis 落进 catalog.Backend（曾因转换层漏字段而丢失——真机
+// G2d 验收抓到：DNS 记录有 ULA 而 route backend 没有）。
+func TestRebuildPublishesBackendHints(t *testing.T) {
+	ula := netip.MustParseAddr("fd7a:9a55:0:1::7")
+	st := &fakeStore{
+		machines: []store.Machine{{
+			ID: "m1", AppID: "app", DeploymentID: "dep", Hostname: "app.test",
+			CurrentExecutionID: "e1", NodeID: "node-a",
+			ObservedState: "RUNNING", ObservedReadiness: "READY",
+		}},
+		deployments: map[string][]store.Deployment{
+			"app": {{
+				ID: "dep", AppID: "app", Generation: 1,
+				Services: []store.ServiceSpec{{Name: "svc", InternalPort: 8080, MeshDirect: true}},
+			}},
+		},
+		identities: []store.FabricIdentityRow{{
+			IdentityID: 42, ProjectID: "p", AppID: "app", Service: "svc",
+			ULA: ula, MachineID: "m1", ExecutionID: "e1", Generation: 5,
+		}},
+	}
+	calls := []string{}
+	st.calls = &calls
+	cat := &fakeCatalog{calls: &calls}
+	p := New(st, cat, 8080, "legacy:5107")
+	if err := p.Rebuild(context.Background(), map[string]string{"node-a": "10.0.0.1:5107"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(cat.replaced) != 1 || len(cat.replaced[0].Route.Backends) != 1 {
+		t.Fatalf("replaced = %+v", cat.replaced)
+	}
+	b := cat.replaced[0].Route.Backends[0]
+	if b.ULA != "fd7a:9a55:0:1::7" || b.IdentityID != 42 || b.Generation != 5 {
+		t.Fatalf("published backend hint missing: %+v", b)
+	}
+}
+
+// TestDNSStaleWindowDefaultsMatchEdge（P1 独立评审）：dns:internal 投影 TTL
+// 默认必须与 edge FIREPAAS_EDGE_STALE_WINDOW 默认同源（ADR-0040 §16，均为
+// 120s）；运维侧两端 env（FIREPAAS_DNS_STALE_WINDOW / FIREPAAS_EDGE_STALE_WINDOW）
+// 分别接线，默认值分叉即本测试失败。
+func TestDNSStaleWindowDefaultsMatchEdge(t *testing.T) {
+	const edgeStaleDefault = 120 * time.Second // cmd/edge-proxy staleDefault 同值
+	p := New(nil, nil, 8080, "")
+	if p.dnsStaleWindow != edgeStaleDefault {
+		t.Fatalf("publisher default TTL = %v, want edge default %v", p.dnsStaleWindow, edgeStaleDefault)
+	}
+	p.SetDNSStaleWindow(0)
+	if p.dnsStaleWindow != edgeStaleDefault {
+		t.Fatalf("SetDNSStaleWindow(0) must restore default, got %v", p.dnsStaleWindow)
+	}
+	p.SetDNSStaleWindow(60 * time.Second)
+	if p.dnsStaleWindow != 60*time.Second {
+		t.Fatalf("SetDNSStaleWindow(60s) = %v", p.dnsStaleWindow)
 	}
 }

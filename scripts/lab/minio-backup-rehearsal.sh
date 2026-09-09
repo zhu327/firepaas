@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l2-ops  PREREQ: dev-minio  DESTRUCTIVE: no  FROZEN: no
 # minio-backup-rehearsal.sh：M5.4（mvp-plan §9.4）对象存储备份演练。
 #
 # 实验室 MinIO 容器是 distroless（无 find/tar/ls -R），无法在容器内做树对照。

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l4-ha  PREREQ: provisioned-multinode,root  DESTRUCTIVE: yes  FROZEN: no
 # firepaas 实验室引导脚本(P0.1)
 # 在每台 Ubuntu 24.04 节点上运行:安装基础依赖、Nomad/Consul、系统调优、写入节点池配置。
 #

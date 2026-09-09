@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l1-base  PREREQ: network  DESTRUCTIVE: no  FROZEN: no
 # 安装用户态 protoc 与 Go 生成插件到 $LAB_ROOT（M1.1 proto 生成工具链）。
 # 用法: bash scripts/lab/install-protoc.sh
 set -euo pipefail

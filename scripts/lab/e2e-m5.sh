@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l2-regression  PREREQ: nomad,agentd,root  DESTRUCTIVE: no  FROZEN: no
 # M5 e2e harness（单机）：mvp-plan §9 内部生产就绪验收
 #   A) 安全负路径：API key（错/撤销/scope/跨 project）+ 镜像准入（digest 强制/允许列表）
 #   B) 运行时稳定性：20 循环 pause/resume guest 时钟漂移 + 宿主 entropy/FD/conntrack 采样

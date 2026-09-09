@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l2-regression  PREREQ: nomad,agentd,root  DESTRUCTIVE: no  FROZEN: no
 # M4 e2e harness（单机）：mvp-plan §8 验收（ADR-0006/0010/0011）
 #   A) secrets v1：写入/版本/绑定/下发（PG 与本地状态零明文，无 reveal）
 #   B) execution-bound credential：traffic-token 认证；无/错/跨 execution 凭证 403

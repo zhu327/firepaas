@@ -38,6 +38,8 @@ func mutationError(err error) error {
 		return status.Error(codes.AlreadyExists, err.Error())
 	case errors.Is(err, state.ErrStaleGeneration):
 		return status.Error(codes.FailedPrecondition, err.Error())
+	case errors.Is(err, state.ErrStaleFabricGeneration):
+		return status.Error(codes.FailedPrecondition, err.Error())
 	default:
 		return status.Error(codes.Internal, err.Error())
 	}

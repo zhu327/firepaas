@@ -69,7 +69,7 @@ nomad job run -var-file=<env>.vars.hcl \
 1. `nomad job status` 全部 alloc running/healthy；deployment 状态
    `successful`。
 2. 冒烟：`fpctl ops ls --status FAILED | head` 无新增；对一个 app 走完
-   create → HTTP 200（可复用 `scripts/lab/e2e-m2.sh` 的最短路径）。
+   create → HTTP 200（可复用 `(scripts/lab/archive/)e2e-m2.sh` 的最短路径）。
 3. 观测：`firepaas_operations_pending` 回落 0；edge
    `firepaas_edge_token_errors_total`/`firepaas_edge_beyond_stale_total`
    无异常增长；新进程导出 `firepaas_tls_cert_not_after_seconds`。

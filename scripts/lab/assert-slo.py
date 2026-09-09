@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# LAYER: evidence  PREREQ: -  DESTRUCTIVE: no  FROZEN: no
 """Fail-closed SLO evaluator for JSONL observations; emits result.json."""
 
 import argparse

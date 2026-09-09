@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LAYER: l2-ops  PREREQ: nomad,agentd,root  DESTRUCTIVE: yes  FROZEN: no
 # evacuate/rebuild agentd 升级演练（v1.1，ADR-0021）。
 # 与 M5.5 版的区别：drain 时带 {"evacuate": true}——controller 逐实例驱离
 # 存量 machine（换代重建到其它节点）→ 节点 machine 归零后才重启 Nomad job，
