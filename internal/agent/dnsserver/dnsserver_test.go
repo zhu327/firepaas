@@ -3,12 +3,32 @@ package dnsserver
 import (
 	"context"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/miekg/dns"
 	"github.com/zhu327/firepaas/internal/agent/state"
 )
+
+// recordSet 是测试用线程安全快照：DNS handler 在 serve goroutine 中读取，
+// 测试主 goroutine 替换快照，必须同步避免 data race。
+type recordSet struct {
+	mu      sync.Mutex
+	records []state.DnsRecord
+}
+
+func (s *recordSet) get() []state.DnsRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.records
+}
+
+func (s *recordSet) set(records []state.DnsRecord) {
+	s.mu.Lock()
+	s.records = records
+	s.mu.Unlock()
+}
 
 // freeUDPAddr 取一个可绑定的 [::1]:0 地址（同端口 UDP+TCP 双监听用；
 // 取端口后立即释放存在竞态，实测可接受——失败即重试一次）。
@@ -43,10 +63,10 @@ func query(t *testing.T, addr, name string, qtype uint16) *dns.Msg {
 }
 
 func TestNodeLocalDNS(t *testing.T) {
-	current := []state.DnsRecord{
+	current := &recordSet{records: []state.DnsRecord{
 		{Name: "web.dev.internal", AAAA: []string{"fd7a:9a55:0:1::5", "fd7a:9a55:0:1::6"}, Generation: 3},
-	}
-	srv := New(func() []state.DnsRecord { return current })
+	}}
+	srv := New(current.get)
 	defer srv.Close()
 	addr := freeUDPAddr(t)
 	if err := srv.Ensure(context.Background(), addr); err != nil {
@@ -92,7 +112,7 @@ func TestNodeLocalDNS(t *testing.T) {
 	}
 
 	// 快照变更即时生效（记录摘除 → NXDOMAIN；新记录 → 命中）。
-	current = []state.DnsRecord{{Name: "api.dev.internal", AAAA: []string{"fd7a:9a55:0:2::9"}, Generation: 4}}
+	current.set([]state.DnsRecord{{Name: "api.dev.internal", AAAA: []string{"fd7a:9a55:0:2::9"}, Generation: 4}})
 	if r := query(t, addr, "web.dev.internal", dns.TypeAAAA); r.Rcode != dns.RcodeNameError {
 		t.Fatalf("stale record still served: %d", r.Rcode)
 	}
@@ -101,7 +121,7 @@ func TestNodeLocalDNS(t *testing.T) {
 	}
 
 	// 空快照（全部下线）→ 区内一律 NXDOMAIN，区外仍 REFUSED。
-	current = nil
+	current.set(nil)
 	if r := query(t, addr, "api.dev.internal", dns.TypeAAAA); r.Rcode != dns.RcodeNameError {
 		t.Fatalf("empty snapshot must NXDOMAIN: %d", r.Rcode)
 	}
@@ -153,8 +173,8 @@ func queryErr(t *testing.T, addr, name string, qtype uint16) (*dns.Msg, error) {
 // → reconciler 摘除 → 快照收敛），本服务无独立计时器——这里锁定语义：
 // 快照不变更时持续应答（与 fabric 其余投影一致），快照摘除即停。
 func TestServeStaleBudgetDocumented(t *testing.T) {
-	current := []state.DnsRecord{{Name: "x.p.internal", AAAA: []string{"fd7a:9a55::2"}}}
-	srv := New(func() []state.DnsRecord { return current })
+	current := &recordSet{records: []state.DnsRecord{{Name: "x.p.internal", AAAA: []string{"fd7a:9a55::2"}}}}
+	srv := New(current.get)
 	defer srv.Close()
 	addr := freeUDPAddr(t)
 	if err := srv.Ensure(context.Background(), addr); err != nil {
@@ -164,7 +184,7 @@ func TestServeStaleBudgetDocumented(t *testing.T) {
 	if r := query(t, addr, "x.p.internal", dns.TypeAAAA); r.Rcode != dns.RcodeSuccess {
 		t.Fatalf("frozen snapshot must keep serving: %d", r.Rcode)
 	}
-	current = nil // 快照收敛（预算耗尽后的形态）
+	current.set(nil) // 快照收敛（预算耗尽后的形态）
 	if r := query(t, addr, "x.p.internal", dns.TypeAAAA); r.Rcode != dns.RcodeNameError {
 		t.Fatalf("converged snapshot must stop serving: %d", r.Rcode)
 	}

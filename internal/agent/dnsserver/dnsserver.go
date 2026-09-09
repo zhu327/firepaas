@@ -103,9 +103,18 @@ func (s *Server) Close() {
 func (s *Server) closeLocked() {
 	if s.udp != nil {
 		_ = s.udp.Shutdown()
+		// Shutdown 在 serve goroutine 尚未 ActivateAndServe 时不会关闭
+		// PacketConn（返回 "server not started"），直接关闭兜底，避免重绑
+		// 后旧 socket 仍应答。
+		if s.udp.PacketConn != nil {
+			_ = s.udp.PacketConn.Close()
+		}
 	}
 	if s.tcp != nil {
 		_ = s.tcp.Shutdown()
+		if s.tcp.Listener != nil {
+			_ = s.tcp.Listener.Close()
+		}
 	}
 	s.udp, s.tcp, s.bind = nil, nil, ""
 }
