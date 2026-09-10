@@ -23,6 +23,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
@@ -77,6 +79,53 @@ type Backend struct {
 	priv4            *ebpf.Map
 	// snapshots 记录已应用的 egress 快照（重启/Reconcile 重放）。
 	snapshots map[int]api.PolicySnapshot
+	// fabricStats 是最近一次成功应用的 fabric 策略统计（状态面；
+	// 双 map 原子切换落地前，用于回答“当前生效的是哪一代、规模多大”）。
+	// fabricApplyFailures 是 ApplyFabricPolicy 校验/落表失败累计（gauge
+	// 语义的单调计数；失败保持旧 map 不动——fail-closed，不断流）。
+	statsMu             sync.Mutex
+	fabricStats         FabricStats
+	fabricApplyFailures uint64
+}
+
+// FabricStats 是最近一次成功应用的 fabric 策略快照统计（纯观测）。
+type FabricStats struct {
+	Generation      uint64
+	IdentityEntries int
+	PolicyEntries   int
+	PortEntries     int
+	UpdatedAt       time.Time
+}
+
+// FabricStats 返回最近一次成功应用的 fabric 策略统计拷贝（零值 = 尚未应用）。
+func (b *Backend) FabricStats() FabricStats {
+	b.statsMu.Lock()
+	defer b.statsMu.Unlock()
+	return b.fabricStats
+}
+
+// FabricApplyFailures 返回 ApplyFabricPolicy 累计失败次数（单调增；
+// 失败时旧 map 保持不动——fail-closed，不断流，重试后收敛）。
+func (b *Backend) FabricApplyFailures() uint64 {
+	b.statsMu.Lock()
+	defer b.statsMu.Unlock()
+	return b.fabricApplyFailures
+}
+
+// summarizeFabricPolicy 把策略快照折叠为状态面统计（纯函数，可单测；
+// 内核落表仍由 ApplyFabricPolicy 完成——统计只在落表成功后更新）。
+func summarizeFabricPolicy(snap api.FabricPolicySnapshot, now time.Time) FabricStats {
+	ports := 0
+	for _, e := range snap.Entries {
+		ports += len(e.Ports)
+	}
+	return FabricStats{
+		Generation:      snap.Generation,
+		IdentityEntries: len(snap.Identities),
+		PolicyEntries:   len(snap.Entries),
+		PortEntries:     ports,
+		UpdatedAt:       now,
+	}
 }
 
 // compile-time 契约：Backend 实现 slot.Backend 与 api.FabricPolicyWriter。
@@ -592,7 +641,16 @@ func clearHashMap[K any, V any](m *ebpf.Map) error {
 // policy_ports 三表先清后写（快照是全集；下线 execution 的映射/条目必须
 // 消失，否则已撤销身份仍被信任）。输入先整体校验再落 map：非法端口直接
 // 拒绝整快照（fail closed，调用方 ledger claim 保持 in-progress 重试）。
-func (b *Backend) ApplyFabricPolicy(ctx context.Context, snap api.FabricPolicySnapshot) error {
+func (b *Backend) ApplyFabricPolicy(ctx context.Context, snap api.FabricPolicySnapshot) (err error) {
+	defer func() {
+		b.statsMu.Lock()
+		defer b.statsMu.Unlock()
+		if err != nil {
+			b.fabricApplyFailures++
+			return
+		}
+		b.fabricStats = summarizeFabricPolicy(snap, time.Now().UTC())
+	}()
 	for _, id := range snap.Identities {
 		if _, err := netip.ParseAddr(id.ULA); err != nil {
 			return fmt.Errorf("ebpf: ula %q: %w", id.ULA, err)

@@ -14,13 +14,16 @@ import (
 )
 
 func newEndpointsForTest(fresh, stale time.Duration,
-	fetch func(ctx context.Context, machine, exec string) (*catalog.MeshEndpointRecord, error)) *Endpoints {
+	fetch func(ctx context.Context, machine, exec string) (*catalog.MeshEndpointRecord, error),
+) *Endpoints {
 	return &Endpoints{fresh: fresh, stale: stale, cache: map[string]endpointEntry{}, fetchFn: fetch}
 }
 
 func TestEndpointsFreshAndStale(t *testing.T) {
-	rec := &catalog.MeshEndpointRecord{MachineID: "m1", ExecutionID: "e1",
-		NodeULA: "fd7a:9a55:0:1::", IngressPort: 5109}
+	rec := &catalog.MeshEndpointRecord{
+		MachineID: "m1", ExecutionID: "e1",
+		NodeULA: "fd7a:9a55:0:1::", IngressPort: 5109,
+	}
 	var fail bool
 	ep := newEndpointsForTest(50*time.Millisecond, 300*time.Millisecond,
 		func(ctx context.Context, machine, exec string) (*catalog.MeshEndpointRecord, error) {
@@ -80,8 +83,10 @@ func TestTransportRoutingAndHeaders(t *testing.T) {
 
 	tr := NewTransport(newEndpointsForTest(time.Minute, time.Minute,
 		func(ctx context.Context, machine, exec string) (*catalog.MeshEndpointRecord, error) {
-			return &catalog.MeshEndpointRecord{MachineID: machine, ExecutionID: exec,
-				NodeULA: "127.0.0.1", IngressPort: port}, nil
+			return &catalog.MeshEndpointRecord{
+				MachineID: machine, ExecutionID: exec,
+				NodeULA: "127.0.0.1", IngressPort: port,
+			}, nil
 		}))
 
 	req, _ := http.NewRequestWithContext(

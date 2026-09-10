@@ -411,12 +411,12 @@ func resolveAutoStandby(policy *AutoStandby, raw json.RawMessage, strict bool) (
 		return nil, nil, nil
 	}
 	return append(
-			json.RawMessage(nil),
-			raw...), &AutoStandby{
-			Enabled:                inherited.GetEnabled(),
-			IdleTimeoutSeconds:     inherited.GetIdleTimeoutSeconds(),
-			IgnoreDestinationPorts: append([]uint32(nil), inherited.GetIgnoreDestinationPorts()...),
-		}, nil
+		json.RawMessage(nil),
+		raw...), &AutoStandby{
+		Enabled:                inherited.GetEnabled(),
+		IdleTimeoutSeconds:     inherited.GetIdleTimeoutSeconds(),
+		IgnoreDestinationPorts: append([]uint32(nil), inherited.GetIgnoreDestinationPorts()...),
+	}, nil
 }
 
 func resolveEgress(policy *EgressPolicy, raw json.RawMessage) (*EgressPolicy, error) {

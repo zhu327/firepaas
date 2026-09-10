@@ -23,10 +23,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net"
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/zhu327/firepaas/internal/controlplane/agentclient"
@@ -95,12 +97,87 @@ type MeshProjectionWriter interface {
 }
 
 // Reconciler 执行周期推送（单线程顺序执行；dnsCache 等轮内状态无需加锁）。
+// statuses 是 per-node 发布状态面（Status/Statuses 读取；Sync 内单线程写，
+// 读侧加锁——为 fpctl fabric status / 排障提供 desired/applied/last-error
+// 分层视图；不参与 fencing 决策）。
 type Reconciler struct {
 	cfg  Config
 	cell netip.Prefix
 	// dnsCache：per-node 上次成功读取的 DNS 全表（W2 serve-stale：Redis
 	// 抖动时用缓存继续推送全量快照，避免空表闪断全网 .internal；注释见 syncNode）。
 	dnsCache map[string][]*pb.DnsRecord
+
+	statusMu sync.Mutex
+	statuses map[string]*NodeFabricStatus
+}
+
+// NodeFabricStatus 是单节点的 fabric 发布状态（纯观测，不参与 fencing）。
+// DesiredGeneration = 本轮期望推送代（内容未变时 = 当前已应用代）；
+// AppliedGeneration = agent 已 ack 代（推送成功后推进）；
+// SectionHashes = 各分面独立内容哈希（peers/identities/eastwest/dns），
+// 用于回答“这次推送是谁变的”，并为后续 underlay/policy/DNS 独立 generation
+// 拆分预留数据源（契约未拆前 fencing 仍以单一总 generation 为准）。
+type NodeFabricStatus struct {
+	NodeID            string
+	DesiredGeneration int64
+	AppliedGeneration int64
+	LastHash          string
+	SectionHashes     map[string]string
+	ChangedSections   []string
+	LastError         string
+	LastSuccess       time.Time
+	LastAttempt       time.Time
+}
+
+// Status 返回单节点发布状态的拷贝（不存在时 ok=false）。
+func (r *Reconciler) Status(nodeID string) (NodeFabricStatus, bool) {
+	r.statusMu.Lock()
+	defer r.statusMu.Unlock()
+	st, ok := r.statuses[nodeID]
+	if !ok {
+		return NodeFabricStatus{}, false
+	}
+	out := *st
+	out.SectionHashes = maps.Clone(st.SectionHashes)
+	out.ChangedSections = append([]string(nil), st.ChangedSections...)
+	return out, true
+}
+
+// Statuses 返回全节点发布状态的拷贝（按 NodeID 排序由调用方完成）。
+func (r *Reconciler) Statuses() []NodeFabricStatus {
+	r.statusMu.Lock()
+	defer r.statusMu.Unlock()
+	out := make([]NodeFabricStatus, 0, len(r.statuses))
+	for _, st := range r.statuses {
+		cp := *st
+		cp.SectionHashes = maps.Clone(st.SectionHashes)
+		cp.ChangedSections = append([]string(nil), st.ChangedSections...)
+		out = append(out, cp)
+	}
+	return out
+}
+
+// recordStatus 原子更新单节点发布状态（Sync 单线程写，读侧并发安全）。
+func (r *Reconciler) recordStatus(st NodeFabricStatus) {
+	r.statusMu.Lock()
+	defer r.statusMu.Unlock()
+	if r.statuses == nil {
+		r.statuses = map[string]*NodeFabricStatus{}
+	}
+	cp := st
+	cp.SectionHashes = maps.Clone(st.SectionHashes)
+	cp.ChangedSections = append([]string(nil), st.ChangedSections...)
+	r.statuses[st.NodeID] = &cp
+}
+
+// lastSectionHashes 返回上次记录的分面哈希（首轮无记录时 nil）。
+func (r *Reconciler) lastSectionHashes(nodeID string) map[string]string {
+	r.statusMu.Lock()
+	defer r.statusMu.Unlock()
+	if st, ok := r.statuses[nodeID]; ok {
+		return maps.Clone(st.SectionHashes)
+	}
+	return nil
 }
 
 // New 校验配置并构造（cell 必须为规范化 /40 ULA）。
@@ -115,7 +192,7 @@ func New(cfg Config) (*Reconciler, error) {
 	if err != nil {
 		return nil, fmt.Errorf("fabric: cell_prefix: %w", err)
 	}
-	r := &Reconciler{cfg: cfg, cell: cell, dnsCache: map[string][]*pb.DnsRecord{}}
+	r := &Reconciler{cfg: cfg, cell: cell, dnsCache: map[string][]*pb.DnsRecord{}, statuses: map[string]*NodeFabricStatus{}}
 	if r.cfg.WgPort == 0 {
 		r.cfg.WgPort = 51820
 	}
@@ -362,11 +439,22 @@ func (r *Reconciler) syncNode(ctx context.Context, it nodeItem, round roundSnaps
 		}
 	}
 	hash := snapshotHash(prefix, meshPeers, identities, eastwest, dnsRecords)
+	// 分面独立哈希：只用于状态面“谁变的”归因与日志，不参与推送决策
+	// （fencing 仍以单一总 hash 为准；契约子 generation 拆分前保持语义稳定）。
+	sections := snapshotSectionHashes(prefix, meshPeers, identities, eastwest, dnsRecords)
+	changed := changedSections(r.lastSectionHashes(nodeID), sections)
 	version, lastHash, err := r.cfg.Store.FabricVersion(ctx, nodeID)
 	if err != nil {
+		r.recordStatus(NodeFabricStatus{
+			NodeID: nodeID, LastError: err.Error(), LastAttempt: time.Now().UTC(),
+		})
 		return err
 	}
 	if version > 0 && lastHash == hash {
+		r.recordStatus(NodeFabricStatus{
+			NodeID: nodeID, DesiredGeneration: version, AppliedGeneration: version,
+			LastHash: lastHash, SectionHashes: sections, LastAttempt: time.Now().UTC(),
+		})
 		return nil // 内容未变：不推送
 	}
 	gen := version + 1
@@ -405,29 +493,175 @@ func (r *Reconciler) syncNode(ctx context.Context, it nodeItem, round roundSnaps
 	pushCtx, cancel := context.WithTimeout(ctx, r.cfg.PushTimeout)
 	resp, err := it.client.ApplyFabric(pushCtx, req)
 	cancel()
+	attemptAt := time.Now().UTC()
 	if err != nil {
 		if status.Code(err) == codes.FailedPrecondition {
 			// agent 水位高于本侧（丢更新/外部干预）：强制推进水位并清空
 			// 内容哈希，下一轮以更高代重推，自动收敛。
 			if aerr := r.cfg.Store.AdvanceFabricVersion(ctx, nodeID, gen+1, ""); aerr != nil {
+				r.recordStatus(NodeFabricStatus{
+					NodeID: nodeID, DesiredGeneration: gen + 1,
+					SectionHashes: sections, ChangedSections: changed,
+					LastError:   fmt.Sprintf("stale push, bump version: %v", aerr),
+					LastAttempt: attemptAt,
+				})
 				return fmt.Errorf("stale push, bump version: %w", aerr)
 			}
+			r.recordStatus(NodeFabricStatus{
+				NodeID: nodeID, DesiredGeneration: gen + 1,
+				SectionHashes: sections, ChangedSections: changed,
+				LastError:   fmt.Sprintf("agent watermark ahead: %v", err),
+				LastAttempt: attemptAt,
+			})
 			slog.Warn("fabric push rejected as stale; version bumped",
 				"node", nodeID, "next_generation", gen+1)
 			return fmt.Errorf("agent fabric watermark ahead of control plane: %v", err)
 		}
+		r.recordStatus(NodeFabricStatus{
+			NodeID: nodeID, DesiredGeneration: gen,
+			SectionHashes: sections, ChangedSections: changed,
+			LastError: err.Error(), LastAttempt: attemptAt,
+		})
 		return fmt.Errorf("apply fabric: %w", err)
 	}
 	if resp.GetAppliedGeneration() != uint64(gen) {
+		r.recordStatus(NodeFabricStatus{
+			NodeID: nodeID, DesiredGeneration: gen,
+			SectionHashes: sections, ChangedSections: changed,
+			LastError: fmt.Sprintf("agent applied generation %d, want %d",
+				resp.GetAppliedGeneration(), gen),
+			LastAttempt: attemptAt,
+		})
 		return fmt.Errorf("agent applied generation %d, want %d", resp.GetAppliedGeneration(), gen)
 	}
 	if err := r.cfg.Store.AdvanceFabricVersion(ctx, nodeID, gen, hash); err != nil {
+		r.recordStatus(NodeFabricStatus{
+			NodeID: nodeID, DesiredGeneration: gen,
+			SectionHashes: sections, ChangedSections: changed,
+			LastError:   fmt.Sprintf("advance fabric version: %v", err),
+			LastAttempt: attemptAt,
+		})
 		return fmt.Errorf("advance fabric version: %w", err)
 	}
+	r.recordStatus(NodeFabricStatus{
+		NodeID: nodeID, DesiredGeneration: gen, AppliedGeneration: gen,
+		LastHash: hash, SectionHashes: sections, ChangedSections: changed,
+		LastSuccess: attemptAt, LastAttempt: attemptAt,
+	})
 	slog.Info("fabric snapshot pushed", "node", nodeID, "generation", gen,
 		"peers", len(req.Peers), "identities", len(req.Identities),
-		"eastwest_rules", len(req.GetEastwest().GetRules()), "dns_records", len(req.GetDns()))
+		"eastwest_rules", len(req.GetEastwest().GetRules()), "dns_records", len(req.GetDns()),
+		"changed_sections", strings.Join(changed, ","))
 	return nil
+}
+
+// snapshotSectionHashes 计算各分面独立内容哈希（状态面归因用；哈希口径与
+// snapshotHash 的各分片同源，任一分面变化即该分面哈希变化）。
+func snapshotSectionHashes(
+	prefix netip.Prefix,
+	peers []store.WGPeer,
+	identities []store.FabricIdentityRow,
+	eastwest *pb.EastWestPolicySpec,
+	dns []*pb.DnsRecord,
+) map[string]string {
+	sections := map[string]string{
+		"node_prefix": hashJSON(map[string]string{"node_prefix": prefix.String()}),
+	}
+	type peerHash struct {
+		NodeID           string `json:"node_id"`
+		Pubkey           string `json:"pubkey"`
+		Endpoint         string `json:"endpoint"`
+		NodePrefix       string `json:"node_prefix"`
+		FabricGeneration int64  `json:"fabric_generation"`
+	}
+	ph := make([]peerHash, 0, len(peers))
+	for _, p := range peers {
+		ph = append(ph, peerHash{
+			NodeID: p.NodeID, Pubkey: p.Pubkey, Endpoint: p.Endpoint,
+			NodePrefix: p.NodePrefix.String(), FabricGeneration: p.FabricGeneration,
+		})
+	}
+	sections["peers"] = hashJSON(ph)
+	type identityHash struct {
+		IdentityID  uint32 `json:"identity_id"`
+		TrustDomain string `json:"trust_domain"`
+		ProjectID   string `json:"project_id"`
+		AppID       string `json:"app_id"`
+		Service     string `json:"service"`
+		ULA         string `json:"ula"`
+		MachineID   string `json:"machine_id"`
+		ExecutionID string `json:"execution_id"`
+		Generation  int64  `json:"generation"`
+		MeshDirect  bool   `json:"mesh_direct"`
+	}
+	ih := make([]identityHash, 0, len(identities))
+	for _, id := range identities {
+		ih = append(ih, identityHash{
+			IdentityID: id.IdentityID, TrustDomain: id.TrustDomain, ProjectID: id.ProjectID,
+			AppID: id.AppID, Service: id.Service, ULA: id.ULA.String(),
+			MachineID: id.MachineID, ExecutionID: id.ExecutionID, Generation: id.Generation,
+			MeshDirect: id.MeshDirect,
+		})
+	}
+	sections["identities"] = hashJSON(ih)
+	type ruleHash struct {
+		SrcProject string   `json:"src_project"`
+		SrcApp     string   `json:"src_app"`
+		DstProject string   `json:"dst_project"`
+		DstApp     string   `json:"dst_app"`
+		DstService string   `json:"dst_service"`
+		Ports      []uint32 `json:"ports"`
+	}
+	ew := map[string]any{"generation": eastwest.GetGeneration()}
+	if eastwest != nil {
+		rules := make([]ruleHash, 0, len(eastwest.GetRules()))
+		for _, rr := range eastwest.GetRules() {
+			rules = append(rules, ruleHash{
+				SrcProject: rr.GetSrcProject(), SrcApp: rr.GetSrcApp(),
+				DstProject: rr.GetDstProject(), DstApp: rr.GetDstApp(),
+				DstService: rr.GetDstService(), Ports: append([]uint32(nil), rr.GetPorts()...),
+			})
+		}
+		ew["rules"] = rules
+	}
+	sections["eastwest"] = hashJSON(ew)
+	type dnsHash struct {
+		Name       string   `json:"name"`
+		AAAA       []string `json:"aaaa"`
+		Generation uint64   `json:"generation"`
+	}
+	dh := make([]dnsHash, 0, len(dns))
+	for _, d := range dns {
+		dh = append(dh, dnsHash{
+			Name: d.GetName(), AAAA: append([]string(nil), d.GetAaaa()...),
+			Generation: d.GetGeneration(),
+		})
+	}
+	sections["dns"] = hashJSON(dh)
+	return sections
+}
+
+// hashJSON 对输入做确定性 JSON→SHA256（哈希只用于变更检测，不承载秘密）。
+func hashJSON(v any) string {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Sprintf("hash-error-%v", err)
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+
+// changedSections 对比上次分面哈希，返回本轮变化的分面名（首轮全视为变化；
+// node_prefix 变化单独列出——它意味着节点重注册）。顺序固定，便于日志断言。
+func changedSections(last, cur map[string]string) []string {
+	order := []string{"node_prefix", "peers", "identities", "eastwest", "dns"}
+	var out []string
+	for _, k := range order {
+		if last == nil || last[k] != cur[k] {
+			out = append(out, k)
+		}
+	}
+	return out
 }
 
 // buildEastWestSnapshot 把 PG 全表转为快照形态（nil = 空表）。规则已按
