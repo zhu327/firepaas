@@ -46,7 +46,7 @@ agentd 依赖 firecracker 二进制、内核与 guest rootfs 基件;分发与版
 
 | 项 | 决策 |
 |---|---|
-| 分发渠道 | 正式构建通过 `github.com/zhu327/hypeman v0.4.1-firepaas` Go module 消费嵌入式 runtime；Nomad raw_exec 执行已构建的 agentd。`build-hypeman.sh` 仅保留为历史 P0 复现工具，不是发布链路。 |
+| 分发渠道 | 正式构建通过 `github.com/zhu327/hypeman v0.4.2-firepaas` Go module 消费嵌入式 runtime；Nomad raw_exec 执行已构建的 agentd。`build-hypeman.sh` 仅保留为历史 P0 复现工具，不是发布链路。 |
 | 版本 pin | module/tag 和 `go.sum` 固定 hypeman；Firecracker compatibility key 由 agentd 从实际嵌入 runtime 检测，不再以本文历史版本常量上报。 |
 | 升级路径 | 先 drain 节点，替换并校验 agent artifact，再恢复调度；实验室入口见 `scripts/lab/upgrade-agentd.sh`。 |
 | snapshot compatibility key | 实际 Firecracker/runtime 版本 + kernel/rootfs/snapshot 格式 + CPU/KVM 特征；不兼容时禁止 restore，并回退到 digest-pinned image cold-start。 |

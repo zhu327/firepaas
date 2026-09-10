@@ -2,7 +2,7 @@
 
 基于 Firecracker 的私有 PaaS 平台（目标形态：私有化 Fly.io）。
 
-- 数据面复用 [hypeman](https://github.com/zhu327/hypeman) 的 VM/镜像/快照能力（`firepaas-lib` 分支，tag `v0.4.1-firepaas`，作为 Go module 直接消费）
+- 数据面复用 [hypeman](https://github.com/zhu327/hypeman) 的 VM/镜像/快照能力（`firepaas-lib` 分支，tag `v0.4.2-firepaas`，作为 Go module 直接消费）
 - 管控面与调度模式参考 [e2b-dev/infra](https://github.com/e2b-dev/infra)：控制面/数据面分离、Best-of-K 自研调度、Nomad 只编排基础设施作业
 - 当前状态：MVP 主体（M1–M5）及 v1.1–v1.4 的主要代码路径已实现；ADR-0040 网络
   fabric（G1–G3）已落地并在双节点同主机实验室通过 spike/chaos/soak 验收
@@ -107,7 +107,7 @@ nomad node pool create iac/nomad/pools/compute.hcl
 
 单根 module（`github.com/zhu327/firepaas`）：`go.mod` + 多个 `cmd/*` + `internal/*`。
 
-hypeman 依赖经 `go.mod` replace 指向公开 fork 的 `v0.4.1-firepaas` tag（`github.com/zhu327/hypeman`，`firepaas-lib` 分支）：该系列 tag 提交了 go:embed 必需的 firecracker/guest-agent/init 二进制与 ADR-0040 v6 中间层 API（`CreateInstanceRequest.IPv6Address`），可远程作为 module 消费，clone 后无需 sibling checkout。上游 [kernel/hypeman](https://github.com/kernel/hypeman) 发布包含所需 API 的正式 tag 后，可切换 require 并删除 replace。
+hypeman 依赖经 `go.mod` replace 指向公开 fork 的 `v0.4.2-firepaas` tag（`github.com/zhu327/hypeman`，`firepaas-lib` 分支，已合并上游 main）：该系列 tag 提交了 go:embed 必需的 firecracker/guest-agent/init 二进制与 ADR-0040 v6 中间层 API（`CreateInstanceRequest.IPv6Address`），可远程作为 module 消费，clone 后无需 sibling checkout。上游 [kernel/hypeman](https://github.com/kernel/hypeman) 发布包含所需 API 的正式 tag 后，可切换 require 并删除 replace。
 
 本地如需联调未发布的 hypeman 改动，可创建不入库的 `go.work.local` 覆盖 replace；CI 与 release 始终以 `GOWORK=off` 走根 `go.mod`。
 

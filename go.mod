@@ -121,8 +121,8 @@ require (
 )
 
 // hypeman：firepaas 依赖的 lib 扩展（quarantine/integrity/snapshot artifact 等）
-// 发布在公开 fork 的 firepaas-lib 分支 tag v0.4.1-firepaas；该系列 tag 提交了
-// go:embed 必需的 firecracker/guest-agent/init 二进制，可远程作为 module 消费
-//（v0.4.1 起 IPv6Address/GuestIP6 等中间层 API 已入 tag，本地 replace 摘除）。
+// 发布在公开 fork 的 firepaas-lib 分支 tag v0.4.2-firepaas（已合并上游 main）；
+// 该系列 tag 提交了 go:embed 必需的 firecracker/guest-agent/init 二进制，可远程
+// 作为 module 消费（v0.4.1 起 IPv6Address/GuestIP6 等中间层 API 已入 tag，本地 replace 摘除）。
 // 上游 kernel/hypeman 发布包含所需 API 的正式 tag 后，可切换 require 并删除本 replace。
-replace github.com/kernel/hypeman => github.com/zhu327/hypeman v0.4.1-firepaas
+replace github.com/kernel/hypeman => github.com/zhu327/hypeman v0.4.2-firepaas

@@ -15,7 +15,7 @@ internal/agent/mutation/    # typed fenced-mutation protocol（post-effect/recov
 
 设计红线:
 - hypeman 作为远程 module 经根 `go.mod` replace 消费:
-  `replace github.com/kernel/hypeman => github.com/zhu327/hypeman v0.4.0-firepaas`
+  `replace github.com/kernel/hypeman => github.com/zhu327/hypeman v0.4.2-firepaas`
   (公开 fork 的 firepaas-lib 分支 tag,提交了 go:embed 必需的 firecracker/guest-agent/init
   二进制,可远程拉取,无需同级 checkout)。只 import `lib/*`,不改 hypeman 上游行为;
   agent 本地变化只落在本仓库。
@@ -24,7 +24,7 @@ internal/agent/mutation/    # typed fenced-mutation protocol（post-effect/recov
   完整性校验(sha256)等(见根 go.mod 注释)。规则:不得删除 replace 或改为浮动版本;
   上游 kernel/hypeman 发布包含所需 API 的正式 tag 后,切换 require 并删除 replace(先评审)。
 - **版本 pin 策略**:发布/生产构建不依赖同级 checkout——消费的是 fork 的固定 tag
-  `v0.4.0-firepaas`,升级是有意识动作并跑 agent 回归。本地联调未发布变更可创建不入库的
+  `v0.4.2-firepaas`,升级是有意识动作并跑 agent 回归。本地联调未发布变更可创建不入库的
   `go.work.local`;CI 与发布始终以 `GOWORK=off` 走根 go.mod。
 - agent 本地 runtime metadata 只是 observed 恢复缓存，业务权威状态在 PG；Redis 仅为投影。operation ledger 是节点侧幂等权威，必须原子持久化 request hash/result 并可在重启后重放。
 - `internal/agent/mutation` 明确区分三种协议族：无 pre-effect claim 的 post-effect 操作、可从 inventory 恢复的 durable-claim 操作，以及 Exec 的 non-reattachable tombstone。它只编排 ledger/fence/serialization 原语，不用 flags 或通用 effect callback 隐藏 runtime、credential 与 recovery 的顺序。create/delete、pause/resume、snapshot create/delete/fork/restore、volume create/import/attach/detach/delete、Exec claim 与 CopyTo 均由 typed family 方法编排；server 只保留验证、gRPC error mapping、adapter effect/recovery 和 credential hook。
