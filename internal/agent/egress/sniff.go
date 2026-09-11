@@ -25,12 +25,15 @@ type PeekResult struct {
 // ErrNoHostInfo 表示首包不含 Host/SNI（ECH、非 HTTP、畸形请求等）。
 var ErrNoHostInfo = errors.New("no host/sni information")
 
+// errSniffTooLarge 是嗅探读取超限（fail closed；不发往 upstream）。
+var errSniffTooLarge = errors.New("http header too large")
+
 // PeekHTTPHost 从 reader 读取一个 HTTP 请求头，提取 Host（大小写归一）。
 // 无 Host（HTTP/1.0）返回 ErrNoHostInfo；prefix 包含读到的全部字节。
 func PeekHTTPHost(r *bufio.Reader) (*PeekResult, error) {
 	var buf bytes.Buffer
 	host := ""
-	line, err := readCRLFLine(r, &buf)
+	line, err := readCRLFLine(r, &buf, maxHTTPHeaderBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -51,7 +54,7 @@ func PeekHTTPHost(r *bufio.Reader) (*PeekResult, error) {
 		}
 	}
 	for {
-		line, err = readCRLFLine(r, &buf)
+		line, err = readCRLFLine(r, &buf, maxHTTPHeaderBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -64,9 +67,6 @@ func PeekHTTPHost(r *bufio.Reader) (*PeekResult, error) {
 			if name == "host" {
 				host = NormalizeHost(trimmed[i+1:])
 			}
-		}
-		if buf.Len() > maxHTTPHeaderBytes {
-			return nil, errors.New("http header too large")
 		}
 	}
 	prefix := append([]byte(nil), buf.Bytes()...)
@@ -92,19 +92,33 @@ func hostFromURI(uri string) (string, bool) {
 	return NormalizeHost(host), true
 }
 
-// readCRLFLine 读取一行（\r\n 或 \n），写入 buf。EOF 且 buf 空 → io.EOF。
-func readCRLFLine(r *bufio.Reader, buf *bytes.Buffer) (string, error) {
-	line, err := r.ReadString('\n')
-	buf.WriteString(line)
-	if err != nil && err != io.EOF {
-		return "", err
+// readCRLFLine 读取一行（\r\n 或 \n）写入 buf，总累计长度硬上界 max。
+// 不能用单次 ReadString：无换行的恶意长行会让它无限增长内存（8KB 检查
+// 只能事后做）。ReadSlice 分块读、逐块累计检查，超限立即出错。
+func readCRLFLine(r *bufio.Reader, buf *bytes.Buffer, max int) (string, error) {
+	var line []byte
+	for {
+		chunk, err := r.ReadSlice('\n')
+		if len(chunk) > 0 {
+			buf.Write(chunk)
+			line = append(line, chunk...)
+			if buf.Len() > max {
+				return "", errSniffTooLarge
+			}
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue // 行未结束，继续读下一块
+		}
+		if err != nil && !errors.Is(err, io.EOF) {
+			return "", err
+		}
+		s := strings.TrimSuffix(string(line), "\n")
+		s = strings.TrimSuffix(s, "\r")
+		if errors.Is(err, io.EOF) && s == "" && buf.Len() == 0 {
+			return "", io.EOF
+		}
+		return s, nil
 	}
-	line = strings.TrimSuffix(line, "\n")
-	line = strings.TrimSuffix(line, "\r")
-	if err == io.EOF && line == "" && buf.Len() == 0 {
-		return "", io.EOF
-	}
-	return line, nil
 }
 
 // PeekTLSSNI 读取 TLS 记录层 + ClientHello，提取 SNI 扩展（server_name）。

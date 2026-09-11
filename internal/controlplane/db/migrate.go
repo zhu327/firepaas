@@ -3,12 +3,16 @@ package db
 
 import (
 	"context"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -101,6 +105,17 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	if err != nil {
 		return fmt.Errorf("begin migration lock: %w", err)
 	}
+	// 会话级 advisory lock 不随事务回滚释放，且可能在 `pg_advisory_lock`
+	// 已生效、读结果阶段才报错（如 context 取消）。释放必须无条件注册在
+	// 锁语句之前；未持锁时 pg_advisory_unlock 是 no-op（返回 false）。
+	// review 2026-09-10：旧实现把 defer 注册在 lockTx.Commit 之后，commit
+	// 失败时连接带着锁回池，后续所有迁移永久阻塞。
+	defer func() {
+		_, _ = conn.Exec(
+			context.WithoutCancel(ctx),
+			`SELECT pg_advisory_unlock(hashtext('firepaas-schema-migrations'))`,
+		)
+	}()
 	if _, err := lockTx.Exec(ctx, `SET LOCAL statement_timeout = 0`); err != nil {
 		_ = lockTx.Rollback(ctx)
 		return fmt.Errorf("prepare migration lock: %w", err)
@@ -112,12 +127,6 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	if err := lockTx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit migration lock: %w", err)
 	}
-	defer func() {
-		_, _ = conn.Exec(
-			context.WithoutCancel(ctx),
-			`SELECT pg_advisory_unlock(hashtext('firepaas-schema-migrations'))`,
-		)
-	}()
 
 	if _, err := conn.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -125,6 +134,12 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 			applied_at timestamptz NOT NULL DEFAULT now()
 		)`); err != nil {
 		return fmt.Errorf("create schema_migrations: %w", err)
+	}
+	// checksum（review 2026-09-10）：本次升级前的已应用行 checksum 为 NULL，
+	// 首次运行时按当前文件内容回填；之后内容不一致即 fail closed。
+	// 已发布 migration 视为不可变历史（AGENTS.md），此处是机器强制。
+	if _, err := conn.Exec(ctx, `ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS checksum text`); err != nil {
+		return fmt.Errorf("add schema_migrations.checksum: %w", err)
 	}
 
 	entries, err := migrationsFS.ReadDir("migrations")
@@ -140,17 +155,35 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	sort.Strings(versions)
 
 	for _, version := range versions {
-		var exists bool
-		if err := conn.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=$1)`, version).Scan(&exists); err != nil {
-			return fmt.Errorf("check migration %s: %w", version, err)
-		}
-		if exists {
-			continue
-		}
-
 		sqlBytes, err := migrationsFS.ReadFile("migrations/" + version)
 		if err != nil {
 			return fmt.Errorf("read migration %s: %w", version, err)
+		}
+		sum := sha256.Sum256(sqlBytes)
+		checksum := hex.EncodeToString(sum[:])
+
+		var stored string
+		err = conn.QueryRow(ctx,
+			`SELECT coalesce(checksum,'') FROM schema_migrations WHERE version=$1`, version).Scan(&stored)
+		switch {
+		case err == nil:
+			if stored != "" && stored != checksum {
+				return fmt.Errorf(
+					"migration %s checksum mismatch (applied=%s current=%s): 已应用 migration 不可重写",
+					version, stored, checksum)
+			}
+			if stored == "" {
+				// 升级前的历史行：首次回填，无法追溯此前是否被改动。
+				if _, err := conn.Exec(ctx,
+					`UPDATE schema_migrations SET checksum=$2 WHERE version=$1`, version, checksum); err != nil {
+					return fmt.Errorf("backfill migration checksum %s: %w", version, err)
+				}
+			}
+			continue
+		case errors.Is(err, pgx.ErrNoRows):
+			// 未应用，下面执行。
+		default:
+			return fmt.Errorf("check migration %s: %w", version, err)
 		}
 
 		tx, err := conn.Begin(ctx)
@@ -166,7 +199,8 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 			_ = tx.Rollback(ctx)
 			return fmt.Errorf("apply migration %s: %w", version, err)
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version) VALUES($1)`, version); err != nil {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO schema_migrations(version, checksum) VALUES($1,$2)`, version, checksum); err != nil {
 			_ = tx.Rollback(ctx)
 			return fmt.Errorf("record migration %s: %w", version, err)
 		}

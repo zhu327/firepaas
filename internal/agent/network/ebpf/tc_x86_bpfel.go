@@ -12,19 +12,6 @@ import (
 	"github.com/cilium/ebpf"
 )
 
-type tcConnKey struct {
-	Saddr uint32
-	Daddr uint32
-	Sport uint16
-	Dport uint16
-}
-
-type tcConnVal struct {
-	Lock  struct{ Val uint32 }
-	_     [4]byte
-	Count uint64
-}
-
 type tcEgressModeVal struct {
 	Drop     uint8
 	Proxy80  uint8
@@ -43,15 +30,15 @@ type tcPolicyKey struct {
 }
 
 type tcPolicyPortKey struct {
-	Src   uint32
-	Dst   uint32
-	Dport uint16
-	_     [2]byte
+	Src  uint32
+	Dst  uint32
+	Port uint16
+	Dir  uint16
 }
 
 type tcPolicyVal struct {
 	Generation uint64
-	HasPorts   uint64
+	Flags      uint64
 }
 
 // loadTc returns the embedded CollectionSpec for tc.
@@ -104,22 +91,26 @@ type tcProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type tcMapSpecs struct {
-	ConnCap     *ebpf.MapSpec `ebpf:"conn_cap"`
-	ConnCount   *ebpf.MapSpec `ebpf:"conn_count"`
-	EgressAllow *ebpf.MapSpec `ebpf:"egress_allow"`
-	EgressDeny  *ebpf.MapSpec `ebpf:"egress_deny"`
-	EgressMode  *ebpf.MapSpec `ebpf:"egress_mode"`
-	EgressSlot  *ebpf.MapSpec `ebpf:"egress_slot"`
-	FlowEvents  *ebpf.MapSpec `ebpf:"flow_events"`
-	Host4       *ebpf.MapSpec `ebpf:"host4"`
-	HostAddrs4  *ebpf.MapSpec `ebpf:"host_addrs4"`
-	Ipcache     *ebpf.MapSpec `ebpf:"ipcache"`
-	NodeUla     *ebpf.MapSpec `ebpf:"node_ula"`
-	Policy      *ebpf.MapSpec `ebpf:"policy"`
-	PolicyPorts *ebpf.MapSpec `ebpf:"policy_ports"`
-	Private4    *ebpf.MapSpec `ebpf:"private4"`
-	ProxyPorts  *ebpf.MapSpec `ebpf:"proxy_ports"`
-	SynSeen     *ebpf.MapSpec `ebpf:"syn_seen"`
+	EgressAllow   *ebpf.MapSpec `ebpf:"egress_allow"`
+	EgressDeny    *ebpf.MapSpec `ebpf:"egress_deny"`
+	EgressMode    *ebpf.MapSpec `ebpf:"egress_mode"`
+	EgressSlot    *ebpf.MapSpec `ebpf:"egress_slot"`
+	FabricActive  *ebpf.MapSpec `ebpf:"fabric_active"`
+	FlowEvents    *ebpf.MapSpec `ebpf:"flow_events"`
+	FlowSample    *ebpf.MapSpec `ebpf:"flow_sample"`
+	Host4         *ebpf.MapSpec `ebpf:"host4"`
+	HostAddrs4    *ebpf.MapSpec `ebpf:"host_addrs4"`
+	IpcacheV0     *ebpf.MapSpec `ebpf:"ipcache_v0"`
+	IpcacheV1     *ebpf.MapSpec `ebpf:"ipcache_v1"`
+	NodeUlaV0     *ebpf.MapSpec `ebpf:"node_ula_v0"`
+	NodeUlaV1     *ebpf.MapSpec `ebpf:"node_ula_v1"`
+	PolicyPortsV0 *ebpf.MapSpec `ebpf:"policy_ports_v0"`
+	PolicyPortsV1 *ebpf.MapSpec `ebpf:"policy_ports_v1"`
+	PolicyV0      *ebpf.MapSpec `ebpf:"policy_v0"`
+	PolicyV1      *ebpf.MapSpec `ebpf:"policy_v1"`
+	Private4      *ebpf.MapSpec `ebpf:"private4"`
+	ProxyPorts    *ebpf.MapSpec `ebpf:"proxy_ports"`
+	SlotUla       *ebpf.MapSpec `ebpf:"slot_ula"`
 }
 
 // tcVariableSpecs contains global variables before they are loaded into the kernel.
@@ -148,42 +139,50 @@ func (o *tcObjects) Close() error {
 //
 // It can be passed to loadTcObjects or ebpf.CollectionSpec.LoadAndAssign.
 type tcMaps struct {
-	ConnCap     *ebpf.Map `ebpf:"conn_cap"`
-	ConnCount   *ebpf.Map `ebpf:"conn_count"`
-	EgressAllow *ebpf.Map `ebpf:"egress_allow"`
-	EgressDeny  *ebpf.Map `ebpf:"egress_deny"`
-	EgressMode  *ebpf.Map `ebpf:"egress_mode"`
-	EgressSlot  *ebpf.Map `ebpf:"egress_slot"`
-	FlowEvents  *ebpf.Map `ebpf:"flow_events"`
-	Host4       *ebpf.Map `ebpf:"host4"`
-	HostAddrs4  *ebpf.Map `ebpf:"host_addrs4"`
-	Ipcache     *ebpf.Map `ebpf:"ipcache"`
-	NodeUla     *ebpf.Map `ebpf:"node_ula"`
-	Policy      *ebpf.Map `ebpf:"policy"`
-	PolicyPorts *ebpf.Map `ebpf:"policy_ports"`
-	Private4    *ebpf.Map `ebpf:"private4"`
-	ProxyPorts  *ebpf.Map `ebpf:"proxy_ports"`
-	SynSeen     *ebpf.Map `ebpf:"syn_seen"`
+	EgressAllow   *ebpf.Map `ebpf:"egress_allow"`
+	EgressDeny    *ebpf.Map `ebpf:"egress_deny"`
+	EgressMode    *ebpf.Map `ebpf:"egress_mode"`
+	EgressSlot    *ebpf.Map `ebpf:"egress_slot"`
+	FabricActive  *ebpf.Map `ebpf:"fabric_active"`
+	FlowEvents    *ebpf.Map `ebpf:"flow_events"`
+	FlowSample    *ebpf.Map `ebpf:"flow_sample"`
+	Host4         *ebpf.Map `ebpf:"host4"`
+	HostAddrs4    *ebpf.Map `ebpf:"host_addrs4"`
+	IpcacheV0     *ebpf.Map `ebpf:"ipcache_v0"`
+	IpcacheV1     *ebpf.Map `ebpf:"ipcache_v1"`
+	NodeUlaV0     *ebpf.Map `ebpf:"node_ula_v0"`
+	NodeUlaV1     *ebpf.Map `ebpf:"node_ula_v1"`
+	PolicyPortsV0 *ebpf.Map `ebpf:"policy_ports_v0"`
+	PolicyPortsV1 *ebpf.Map `ebpf:"policy_ports_v1"`
+	PolicyV0      *ebpf.Map `ebpf:"policy_v0"`
+	PolicyV1      *ebpf.Map `ebpf:"policy_v1"`
+	Private4      *ebpf.Map `ebpf:"private4"`
+	ProxyPorts    *ebpf.Map `ebpf:"proxy_ports"`
+	SlotUla       *ebpf.Map `ebpf:"slot_ula"`
 }
 
 func (m *tcMaps) Close() error {
 	return _TcClose(
-		m.ConnCap,
-		m.ConnCount,
 		m.EgressAllow,
 		m.EgressDeny,
 		m.EgressMode,
 		m.EgressSlot,
+		m.FabricActive,
 		m.FlowEvents,
+		m.FlowSample,
 		m.Host4,
 		m.HostAddrs4,
-		m.Ipcache,
-		m.NodeUla,
-		m.Policy,
-		m.PolicyPorts,
+		m.IpcacheV0,
+		m.IpcacheV1,
+		m.NodeUlaV0,
+		m.NodeUlaV1,
+		m.PolicyPortsV0,
+		m.PolicyPortsV1,
+		m.PolicyV0,
+		m.PolicyV1,
 		m.Private4,
 		m.ProxyPorts,
-		m.SynSeen,
+		m.SlotUla,
 	)
 }
 

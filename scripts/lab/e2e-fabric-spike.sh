@@ -119,6 +119,24 @@ case "$stage" in
     MID_A=$(pg "SELECT m.id FROM machines m WHERE m.app_id='$APP_A' AND m.desired_state!='DELETED' LIMIT 1")
     MID_B=$(pg "SELECT m.id FROM machines m WHERE m.app_id='$APP_B' AND m.desired_state!='DELETED' LIMIT 1")
     log "pair: $APP_A(${ULA_A%%/*}) → $APP_B(${ULA_B%%/*}) svc=$SVC"
+    # 反向断言前置：历史/并发 run 可能留下 B→A（角色互换）规则，会让
+    # “未授权反向必须被拒”因一条真实授权而假失败（2026-09-11 真机证据：
+    # dns-w→spike-edge 的旧规则使反向 wget 成功）。先清掉全部 B→A 规则。
+    curl -fsS -m 20 -H "Authorization: Bearer $API_TOKEN" \
+      "$API/v1/eastwest-policies?dst_project=dev&dst_app=$APP_A" \
+      | python3 -c '
+import json, sys
+src_app = sys.argv[1]
+for rule in json.load(sys.stdin):
+    if rule.get("src_app") == src_app:
+        print(rule.get("src_project", "dev"), rule.get("dst_service", ""))
+' "$APP_B" \
+      | while read -r src_proj svc_a; do
+          [ -n "$svc_a" ] || continue
+          curl -fsS -m 20 -H "Authorization: Bearer $API_TOKEN" -X DELETE \
+            "$API/v1/eastwest-policies?src_project=$src_proj&src_app=$APP_B&dst_project=dev&dst_app=$APP_A&dst_service=$svc_a" >/dev/null \
+            || fail "DELETE reverse eastwest policy failed"
+        done
     # EastWest 规则（租户 API，dst 归属 dev）。
     curl -fsS -m 20 -H "Authorization: Bearer $API_TOKEN" -X PUT "$API/v1/eastwest-policies" \
       -H 'Content-Type: application/json' \

@@ -91,7 +91,7 @@ func runProjectQuota(args []string) error {
 			var cur struct {
 				Revision int64 `json:"revision"`
 			}
-			if err := do("GET", "/v1/projects/"+url.PathEscape(id)+"/quota", nil, &cur); err != nil {
+			if err := doSilent("GET", "/v1/projects/"+url.PathEscape(id)+"/quota", nil, &cur); err != nil {
 				return err
 			}
 			revision = cur.Revision

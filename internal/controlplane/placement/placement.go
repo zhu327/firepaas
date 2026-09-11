@@ -271,14 +271,47 @@ func (s *Service) Place(ctx context.Context, op store.Operation, req *pb.CreateM
 		required = append(required, capabilities.VolumeLocalRWV1)
 	}
 
+	// review 2026-09-10：已派发过的 operation 在重试/leader 切换后必须优先
+	// 回原 agent 重放（agent operation ledger 是单节点的，换节点可能造成同一
+	// execution 双 VM）。原节点不可达时保留换节点能力，但记录 rehome 指标/事件，
+	// 并由 controller 的重复副本回收兜底。
+	pin, rehome := dispatchPin(op.DispatchNodeID, live, excluded)
+	if rehome != "" {
+		s.metric("firepaas_dispatch_rehomes_total", map[string]string{"reason": rehome})
+		s.recordEvent(ctx, op, "dispatch_rehome", op.DispatchNodeID,
+			"recorded dispatch node unusable ("+rehome+"); re-electing placement")
+	}
+
 	schedReq := scheduler.Request{
 		VCPU: vcpu, MemMib: memMib,
 		DiskMib: agentv1.EffectiveDiskMib(spec.GetDiskMib()), DeploymentID: spec.GetDeploymentId(),
 		Pool: pool, Labels: labels, AntiAffinity: antiAffinity,
 		ExistingDeploymentNodes: deployNodes[spec.GetDeploymentId()], ExcludedNodes: excluded,
 		ImageDigest: ImageDigest(spec.GetImageRef()), RequiredFeatures: required, RequiredNodeID: localNode,
+		PinnedNodeID: pin,
 	}
-	result, err := s.placer.Place(schedReq, assembleSchedulerNodes(live, allocated, pendingMap(pending), stored), nil)
+	schedNodes := assembleSchedulerNodes(live, allocated, pendingMap(pending), stored)
+	result, err := s.placer.Place(schedReq, schedNodes, nil)
+	if err != nil && pin != "" {
+		// 先记录 pinned 尝试的拒绝原因（否则 pin 失败的可见性全部丢失）。
+		s.recordSchedulerEvents(ctx, op, result.Events)
+		if strings.HasPrefix(pinnedRejectionReason(result.Events, pin), "resources:") {
+			// 资源不足是暂态：pinned 节点仍健康且 discovery 可见，只是暂时放不下。
+			// 此时换节点会把 fencing 丢在最危险的窗口（原 RPC 可能已落地），
+			// 因此保留 pin、返回可重试错误，等容量释放或人工介入。
+			s.metric("firepaas_dispatch_pin_holds_total", map[string]string{"reason": "no_capacity"})
+			s.recordEvent(ctx, op, "dispatch_pin_hold", pin,
+				"pinned node lacks capacity; holding dispatch on original agent")
+			return nil, err
+		}
+		// 永久性原因（pool/labels/capability/draining 等）：等待不可能成功，
+		// 降级为普通调度并记 rehome。
+		s.metric("firepaas_dispatch_rehomes_total", map[string]string{"reason": "no_candidates"})
+		s.recordEvent(ctx, op, "dispatch_rehome", pin,
+			"pinned node no longer a candidate; re-electing placement")
+		schedReq.PinnedNodeID = ""
+		result, err = s.placer.Place(schedReq, schedNodes, nil)
+	}
 	s.recordSchedulerEvents(ctx, op, result.Events)
 	if err != nil {
 		return nil, err
@@ -302,6 +335,12 @@ func (s *Service) Place(ctx context.Context, op store.Operation, req *pb.CreateM
 	if err != nil {
 		return nil, err
 	}
+	// ProjectUsage 已包含本次在途请求：machine 行在 EnsureAppAndEnqueueCreate
+	// 内先落库（node_id=''，desired_state=CREATED），create operation 状态为
+	// PENDING/CLAIMED，而 ProjectUsage 的 pending 分支统计的正是这一形态。
+	// 因此边界是 used > quota（used 含本次申请量），不能再加一次 requested，
+	// 否则任何“恰好用满”的部署都会被误拒。并发窗口（两个请求同时读到未含
+	// 对方的快照）由下方 AcquireR 的 Redis Lua 以 pending+requested 原子兜底。
 	usedVCPU, usedMem, usedDisk, err := s.store.ProjectUsage(ctx, op.ProjectID)
 	if err != nil {
 		return nil, err
@@ -313,6 +352,8 @@ func (s *Service) Place(ctx context.Context, op store.Operation, req *pb.CreateM
 	if err != nil {
 		return nil, err
 	}
+	// ProjectMachineUsage 与 ProjectUsage 同形：allocated + 在途 create，
+	// 已含本次 machine。limit > 0 时 usage > limit 即“含本台已超额”。
 	if detail.MachineConcurrency > 0 {
 		usage, err := s.store.ProjectMachineUsage(ctx, op.ProjectID)
 		if err != nil {
@@ -351,6 +392,42 @@ func (s *Service) recordSchedulerEvents(ctx context.Context, op store.Operation,
 		}
 		s.recordEvent(ctx, op, kind, ev.NodeID, ev.Reason)
 	}
+}
+
+// dispatchPin 决定本次放置是否固定到 operation 已记录的目标节点。
+// 返回 (pin, rehomeReason)：pin 非空表示硬固定；rehomeReason 非空表示原
+// 节点不可用（excluded / 状态非 HEALTHY / 已不在发现集），调用方继续走
+// 普通调度并必须记录 rehome。
+func dispatchPin(dispatchNodeID string, live []liveNode, excluded map[string]bool) (string, string) {
+	if dispatchNodeID == "" {
+		return "", ""
+	}
+	if excluded[dispatchNodeID] {
+		// 例如 agent 明确拒绝（ResourceExhausted）后的换节点重试：原节点没有
+		// 产生任何 VM，换节点是安全且有意的。
+		return "", "excluded"
+	}
+	for i := range live {
+		if live[i].NodeID != dispatchNodeID {
+			continue
+		}
+		if live[i].Status != scheduler.StatusHealthy {
+			return "", "status=" + live[i].Status
+		}
+		return dispatchNodeID, ""
+	}
+	return "", "not_discovered"
+}
+
+// pinnedRejectionReason 返回 pinned 节点在本次放置中被过滤的原因（空 = 未被过滤）。
+// 调用方用它区分暂态（resources:）与永久（pool/labels/capability/...）失败。
+func pinnedRejectionReason(events []scheduler.Event, nodeID string) string {
+	for _, e := range events {
+		if e.Kind == "filter_rejection" && e.NodeID == nodeID {
+			return e.Reason
+		}
+	}
+	return ""
 }
 
 func (s *Service) recordEvent(ctx context.Context, op store.Operation, kind, nodeID, reason string) {

@@ -24,7 +24,7 @@ func runVolume(args []string) error {
 	switch args[0] {
 	case "create":
 		fs := flag.NewFlagSet("volume create", flag.ExitOnError)
-		project := fs.String("project", "dev", "project id")
+		project := fs.String("project", defaultProject("dev"), "project id")
 		name := fs.String("name", "", "volume name (required)")
 		mode := fs.String("mode", "LOCAL_RW", "LOCAL_RW|DATASET_RO")
 		sizeGib := fs.Int("size-gib", 0, "size GiB (required, > 0)")
@@ -43,7 +43,7 @@ func runVolume(args []string) error {
 		return do("POST", "/v1/volumes", body, nil)
 	case "ls":
 		fs := flag.NewFlagSet("volume ls", flag.ExitOnError)
-		project := fs.String("project", "", "filter by project id")
+		project := fs.String("project", defaultProject(""), "filter by project id")
 		_ = fs.Parse(args[1:])
 		path := "/v1/volumes"
 		if *project != "" {

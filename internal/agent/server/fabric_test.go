@@ -128,6 +128,15 @@ func TestApplyFabricAppliesReplaysAndFences(t *testing.T) {
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("stale err = %v, want FailedPrecondition", err)
 	}
+	wm := int64(-1)
+	for _, detail := range status.Convert(err).Details() {
+		if d, ok := detail.(*pb.FabricWatermarkDetail); ok {
+			wm = int64(d.GetAppliedGeneration())
+		}
+	}
+	if wm != 2 {
+		t.Fatalf("stale watermark detail = %d, want 2 (control plane can jump to applied+1)", wm)
+	}
 	if _, ok, err := ledger.Get("op-stale", hashRequest(stale)); err != nil || ok {
 		t.Fatalf("stale request left a ledger claim: ok=%v err=%v", ok, err)
 	}
@@ -322,7 +331,124 @@ func TestFabricPolicyFromSnapshotCarriesAssembledRules(t *testing.T) {
 		t.Fatalf("forward = %+v", fwd)
 	}
 	ret := snap.Entries[1]
-	if ret.SrcIdentity != 9 || ret.DstIdentity != 7 || len(ret.Ports) != 0 {
-		t.Fatalf("return = %+v", ret)
+	if ret.SrcIdentity != 9 || ret.DstIdentity != 7 || !ret.SrcPorts ||
+		len(ret.Ports) != 1 || ret.Ports[0] != 9000 {
+		t.Fatalf("return = %+v (reverse must carry same ports with SrcPorts)", ret)
+	}
+}
+
+// TestFabricPolicyFromSnapshotServiceGranularity：identity 解析必须保留
+// service 维度（同 app 多 service 各自 identity），且 src 侧规则按 app
+// 语义展开到该 app 的全部 service identity。旧 (project, app) 折叠实现下，
+// dst 会绑到最后遍历到的 identity（这里会导致越权/漏授权）。
+func TestFabricPolicyFromSnapshotServiceGranularity(t *testing.T) {
+	req := &pb.ApplyFabricRequest{
+		NodeId:           "test-node",
+		FabricGeneration: 9,
+		OperationId:      "op-gran",
+		NodePrefix:       "fd7a:9a55:1::/64",
+		Identities: []*pb.IdentityMapping{
+			// 注意顺序：worker 在前，api 在后——旧实现后者覆盖前者。
+			{
+				IdentityId:  21,
+				ProjectId:   "p1",
+				AppId:       "a2",
+				Service:     "worker",
+				Ula:         "fd7a:9a55:1::21",
+				MachineId:   "m2",
+				ExecutionId: "e2",
+			},
+			{
+				IdentityId:  22,
+				ProjectId:   "p1",
+				AppId:       "a2",
+				Service:     "api",
+				Ula:         "fd7a:9a55:1::22",
+				MachineId:   "m3",
+				ExecutionId: "e3",
+			},
+			{
+				IdentityId:  31,
+				ProjectId:   "p1",
+				AppId:       "a1",
+				Service:     "web",
+				Ula:         "fd7a:9a55:1::31",
+				MachineId:   "m1",
+				ExecutionId: "e1",
+			},
+			{
+				IdentityId:  32,
+				ProjectId:   "p1",
+				AppId:       "a1",
+				Service:     "admin",
+				Ula:         "fd7a:9a55:1::32",
+				MachineId:   "m1",
+				ExecutionId: "e1",
+			},
+		},
+		Eastwest: &pb.EastWestPolicySpec{Generation: 4, Rules: []*pb.EastWestPolicyRule{
+			{
+				SrcProject: "p1",
+				SrcApp:     "a1",
+				DstProject: "p1",
+				DstApp:     "a2",
+				DstService: "worker",
+				Ports:      []uint32{9000},
+			},
+			{SrcProject: "p1", SrcApp: "a1", DstProject: "p1", DstApp: "a2", DstService: "ghost", Ports: []uint32{1}},
+		}},
+	}
+	snap := fabricPolicyFromSnapshot(req)
+	// worker 规则：src a1 的两个 service 各正向+回程 = 4 条；ghost 跳过。
+	type pair struct{ src, dst uint32 }
+	got := map[pair]bool{}
+	for _, e := range snap.Entries {
+		got[pair{e.SrcIdentity, e.DstIdentity}] = true
+	}
+	for _, want := range []pair{{31, 21}, {21, 31}, {32, 21}, {21, 32}} {
+		if !got[want] {
+			t.Fatalf("missing entry %+v in %+v", want, snap.Entries)
+		}
+	}
+	if len(snap.Entries) != 4 {
+		t.Fatalf("entries = %+v, want exactly 4", snap.Entries)
+	}
+	// dst 必须绑 worker(21)，不能落到 api(22)。
+	for _, e := range snap.Entries {
+		if e.SrcIdentity == 31 && e.DstIdentity != 21 {
+			t.Fatalf("dst_service=worker resolved to identity %d, want 21", e.DstIdentity)
+		}
+	}
+}
+
+// TestFabricPolicyFromStateReplay：agentd 重启重放与接收路径共用
+// BuildFabricPolicy——回程条目必须带 SrcPorts 端口集，identity 按 service
+// 解析（旧重放实现按 app 折叠且回程无端口，重启后策略会松/错）。
+func TestFabricPolicyFromStateReplay(t *testing.T) {
+	snap := state.FabricSnapshot{
+		NodeID: "n1", Generation: 7, NodePrefix: "fd7a:9a55:1::/64",
+		EastWestGeneration: 3,
+		Identities: []state.FabricIdentity{
+			{IdentityID: 7, ProjectID: "p1", AppID: "a1", Service: "web", ULA: "fd7a:9a55:1::5"},
+			{IdentityID: 9, ProjectID: "p1", AppID: "a2", Service: "worker", ULA: "fd7a:9a55:1::9"},
+		},
+		EastWest: []state.EastWestRule{{
+			SrcProject: "p1", SrcApp: "a1", DstProject: "p1", DstApp: "a2",
+			DstService: "worker", Ports: []uint32{9000},
+		}},
+	}
+	out := FabricPolicyFromState(snap)
+	if out.Generation != 7 || out.NodeULA != "fd7a:9a55:1::" {
+		t.Fatalf("snapshot header = gen %d ula %q", out.Generation, out.NodeULA)
+	}
+	if len(out.Entries) != 2 {
+		t.Fatalf("entries = %+v, want forward+reverse", out.Entries)
+	}
+	fwd, rev := out.Entries[0], out.Entries[1]
+	if fwd.SrcIdentity != 7 || fwd.DstIdentity != 9 || fwd.SrcPorts || len(fwd.Ports) != 1 {
+		t.Fatalf("forward = %+v", fwd)
+	}
+	if rev.SrcIdentity != 9 || rev.DstIdentity != 7 || !rev.SrcPorts || len(rev.Ports) != 1 || rev.Ports[0] != 9000 {
+		t.Fatalf("reverse = %+v (must carry ports with SrcPorts)", rev)
 	}
 }

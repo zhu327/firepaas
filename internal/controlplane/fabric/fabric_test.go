@@ -2,6 +2,7 @@ package fabric
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
@@ -75,6 +76,12 @@ func (f *fakeNodeSource) ClientForNodeID(nodeID string) *agentclient.Client {
 	return f.clients[nodeID]
 }
 
+// fabricTestStore 返回跑过迁移的 PG store；未设置 FIREPAAS_TEST_POSTGRES 时跳过。
+//
+// review 2026-09-10：用独立 schema（search_path）隔离——共享 lab 库里
+// 残留的 eastwest_policies / wg_peers / ipam 行会让“全表快照”类断言
+// （如 TestSyncCarriesEastWestAndMeshDirect）误判，且测试自身不应清理
+// 别人的历史数据。每个测试进程一个 schema，t.Cleanup 里 CASCADE 删除。
 func fabricTestStore(t *testing.T) *store.Store {
 	t.Helper()
 	dsn := os.Getenv("FIREPAAS_TEST_POSTGRES")
@@ -82,7 +89,28 @@ func fabricTestStore(t *testing.T) *store.Store {
 		t.Skip("set FIREPAAS_TEST_POSTGRES to run fabric tests")
 	}
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, dsn)
+	schema := fmt.Sprintf("fabric_test_%d", os.Getpid())
+
+	boot, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := boot.Exec(ctx, `DROP SCHEMA IF EXISTS `+schema+` CASCADE`); err != nil {
+		boot.Close()
+		t.Fatal(err)
+	}
+	if _, err := boot.Exec(ctx, `CREATE SCHEMA `+schema); err != nil {
+		boot.Close()
+		t.Fatal(err)
+	}
+	boot.Close()
+
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ConnConfig.RuntimeParams["search_path"] = schema
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +118,15 @@ func fabricTestStore(t *testing.T) *store.Store {
 		pool.Close()
 		t.Fatal(err)
 	}
-	t.Cleanup(pool.Close)
+	t.Cleanup(func() {
+		pool.Close()
+		cleanup, cerr := pgxpool.New(context.Background(), dsn)
+		if cerr != nil {
+			return
+		}
+		defer cleanup.Close()
+		_, _ = cleanup.Exec(context.Background(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
+	})
 	return store.New(pool)
 }
 
@@ -150,6 +186,15 @@ func makeFixture(t *testing.T, s *store.Store, suffix, nodeID, service string) f
 }
 
 func mustPrefix(raw string) netip.Prefix { return netip.MustParsePrefix(raw) }
+
+// wgTestPubkey 生成契约合法的 32 字节 WG 公钥（base64；测试键材料无秘密）。
+func wgTestPubkey(fill byte) string {
+	b := make([]byte, 32)
+	for i := range b {
+		b[i] = fill
+	}
+	return base64.StdEncoding.EncodeToString(b)
+}
 
 func cleanupProjectSQL(t *testing.T, s *store.Store, projectID string) {
 	t.Helper()
@@ -229,6 +274,62 @@ func TestSyncPushesAndSkipsUnchanged(t *testing.T) {
 	gen, hash, err := s.FabricVersion(ctx, fix.nodeID)
 	if err != nil || gen != 1 || hash == "" {
 		t.Fatalf("version = (%d, %q, %v)", gen, hash, err)
+	}
+}
+
+// TestSyncForceResyncAfterWindow：内容哈希未变时默认不推；距上次成功推送
+// 超过 ForceSyncEvery 后即使内容未变也强制推进一代重推（agent 无水位查询，
+// 此窗口是 agent 状态丢失后的自愈上限）。
+func TestSyncForceResyncAfterWindow(t *testing.T) {
+	s := fabricTestStore(t)
+	ctx := context.Background()
+	suffix := fmt.Sprint(os.Getpid())
+	fix := makeFixture(t, s, suffix, "node-force-"+suffix, "api")
+	agent := newFakeAgent()
+	client := startAgent(t, agent)
+	src := &fakeNodeSource{
+		nodes:   []nodemanager.Node{nodeInfo(fix.nodeID, "pk-"+suffix, "10.0.0.1:5108")},
+		clients: map[string]*agentclient.Client{fix.nodeID: client},
+	}
+	r, err := New(Config{
+		Store: s, NodeSource: src, CellPrefix: "fd7a:9a55::/40",
+		ForceSyncEvery: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if agent.count() != 1 {
+		t.Fatalf("pushes = %d, want 1", agent.count())
+	}
+	// 窗口内：内容未变不推。
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if agent.count() != 1 {
+		t.Fatalf("unchanged within window pushed again: %d", agent.count())
+	}
+	// 把上次成功推送时刻拨到窗口之外（确定性，不 sleep 依赖时钟）→ 强制重推。
+	r.statusMu.Lock()
+	r.lastPushAt[fix.nodeID] = time.Now().Add(-2 * time.Hour)
+	r.statusMu.Unlock()
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if agent.count() != 2 {
+		t.Fatalf("force resync did not push: %d", agent.count())
+	}
+	if got := agent.requests[1].GetFabricGeneration(); got != 2 {
+		t.Fatalf("force resync generation = %d, want 2", got)
+	}
+	// 强制推送后再入窗口：内容未变不再推。
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if agent.count() != 2 {
+		t.Fatalf("post-force unchanged pushed again: %d", agent.count())
 	}
 }
 
@@ -366,8 +467,8 @@ func TestSyncPeerSetExcludesSelf(t *testing.T) {
 	clientA, clientB := startAgent(t, agentA), startAgent(t, agentB)
 	src := &fakeNodeSource{
 		nodes: []nodemanager.Node{
-			nodeInfo(nodeA, "pk-a-"+suffix, "10.0.0.1:5108"),
-			nodeInfo(nodeB, "pk-b-"+suffix, "10.0.0.2:5108"),
+			nodeInfo(nodeA, wgTestPubkey(0x0a), "10.0.0.1:5108"),
+			nodeInfo(nodeB, wgTestPubkey(0x0b), "10.0.0.2:5108"),
 		},
 		clients: map[string]*agentclient.Client{nodeA: clientA, nodeB: clientB},
 	}
@@ -393,6 +494,53 @@ func TestSyncPeerSetExcludesSelf(t *testing.T) {
 	reqB := agentB.requests[0]
 	if !peerSetHas(reqB, nodeA, "10.0.0.1:51820") || peerSetHas(reqB, nodeB, "") {
 		t.Fatalf("B peers = %+v", reqB.GetPeers())
+	}
+}
+
+// TestSyncRejectsInvalidPeerPubkey：快照 peer 公钥 base64 合法但不足 32 字节
+// 时，发送前被契约校验拦截：不出网、不推进水位、状态记录错误（否则 agent 以
+// InvalidArgument 拒收，控制面把失败当可重试，形成全网永久重试）。
+func TestSyncRejectsInvalidPeerPubkey(t *testing.T) {
+	s := fabricTestStore(t)
+	ctx := context.Background()
+	suffix := fmt.Sprint(os.Getpid())
+	fix := makeFixture(t, s, suffix, "node-badkey-"+suffix, "api")
+	badNode := "node-badkey-peer-" + suffix
+	t.Cleanup(func() {
+		_, _ = s.Pool().Exec(ctx, `DELETE FROM wg_peers WHERE node_id=$1`, badNode)
+		_, _ = s.Pool().Exec(ctx, `DELETE FROM fabric_versions WHERE node_id=$1`, badNode)
+	})
+	// base64 合法但解码为 9 字节，非 32 字节 WireGuard 公钥。
+	badPubkey := base64.StdEncoding.EncodeToString([]byte("short-key"))
+	if _, _, err := s.EnsureNodeFabric(ctx, mustPrefix("fd7a:9a55::/40"), badNode, badPubkey, "10.0.0.7:51820"); err != nil {
+		t.Fatal(err)
+	}
+	agent := newFakeAgent()
+	client := startAgent(t, agent)
+	src := &fakeNodeSource{
+		nodes:   []nodemanager.Node{nodeInfo(fix.nodeID, "pk-"+suffix, "10.0.0.1:5108")},
+		clients: map[string]*agentclient.Client{fix.nodeID: client},
+	}
+	r, err := New(Config{Store: s, NodeSource: src, CellPrefix: "fd7a:9a55::/40"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err) // 单节点错误降级，不整体失败
+	}
+	if agent.count() != 0 {
+		t.Fatalf("invalid snapshot must not be sent: %d", agent.count())
+	}
+	st, ok := r.Status(fix.nodeID)
+	if !ok || st.LastError == "" {
+		t.Fatalf("status must carry validation error: ok=%v status=%+v", ok, st)
+	}
+	if st.AppliedGeneration != 0 {
+		t.Fatalf("watermark must not advance: %+v", st)
+	}
+	gen, hash, err := s.FabricVersion(ctx, fix.nodeID)
+	if err != nil || gen != 0 || hash != "" {
+		t.Fatalf("fabric version = (%d, %q, %v), want 0/empty", gen, hash, err)
 	}
 }
 
@@ -723,7 +871,7 @@ func TestSyncRegistersEdgeHubAndPublishesMeshProjection(t *testing.T) {
 		Store: s, NodeSource: src, CellPrefix: "fd7a:9a55::/40",
 		EdgeHub: EdgeHubConfig{
 			NodeID:   "edge-hub",
-			Pubkey:   "RURHRUdFR0VHRUdFR0VHRUdFR0dFR0VHR0c=",
+			Pubkey:   wgTestPubkey(0x2a),
 			Endpoint: "10.9.9.9:51821",
 		},
 		IngressPort:    5199,
@@ -800,7 +948,7 @@ func TestNewRejectsBrokenEdgeHubConfig(t *testing.T) {
 		},
 		"bad endpoint": {
 			Store: s, NodeSource: src, CellPrefix: "fd7a:9a55::/40",
-			EdgeHub: EdgeHubConfig{Pubkey: "RURHRUdFR0VHRUdFR0dFR0dFR0dFR0dFR0VHR0c=", Endpoint: "no-port"},
+			EdgeHub: EdgeHubConfig{Pubkey: wgTestPubkey(0x2a), Endpoint: "no-port"},
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -808,5 +956,73 @@ func TestNewRejectsBrokenEdgeHubConfig(t *testing.T) {
 				t.Fatal("expected config rejection")
 			}
 		})
+	}
+}
+
+// TestSyncStaleJumpsToAgentWatermark：agent 随 FailedPrecondition 返回
+// FabricWatermarkDetail 时，控制面一步跳到 applied+1 重推，而不是逐代 +1
+// 爬升（DB 水位回退/丢更新场景的长窗口冻结）。
+func TestSyncStaleJumpsToAgentWatermark(t *testing.T) {
+	s := fabricTestStore(t)
+	ctx := context.Background()
+	suffix := fmt.Sprint(os.Getpid())
+	fix := makeFixture(t, s, suffix, "node-wm-"+suffix, "api")
+	agent := newFakeAgent()
+	calls := 0
+	agent.respond = func(req *pb.ApplyFabricRequest) (*pb.ApplyFabricResponse, error) {
+		calls++
+		if calls == 1 {
+			st, err := status.New(codes.FailedPrecondition, "stale fabric generation").
+				WithDetails(&pb.FabricWatermarkDetail{AppliedGeneration: 9})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return nil, st.Err()
+		}
+		return &pb.ApplyFabricResponse{AppliedGeneration: req.GetFabricGeneration()}, nil
+	}
+	client := startAgent(t, agent)
+	src := &fakeNodeSource{
+		nodes:   []nodemanager.Node{nodeInfo(fix.nodeID, "pk-"+suffix, "10.0.0.1:5108")},
+		clients: map[string]*agentclient.Client{fix.nodeID: client},
+	}
+	r, err := New(Config{Store: s, NodeSource: src, CellPrefix: "fd7a:9a55::/40"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if agent.count() != 2 {
+		t.Fatalf("pushes = %d, want 2", agent.count())
+	}
+	if got := agent.requests[0].GetFabricGeneration(); got != 1 {
+		t.Fatalf("first gen = %d, want 1", got)
+	}
+	if got := agent.requests[1].GetFabricGeneration(); got != 11 {
+		t.Fatalf("second gen = %d, want 11 (agent watermark 9 + 1)", got)
+	}
+	gen, hash, err := s.FabricVersion(ctx, fix.nodeID)
+	if err != nil || gen != 11 || hash == "" {
+		t.Fatalf("version = (%d, %q, %v), want (11, non-empty)", gen, hash, err)
+	}
+}
+
+// TestWatermarkRegressionForcesPush：DB 水位低于本进程最近成功推送世代时，
+// 即使内容哈希未变也必须立即重推（不能等 ForceSyncEvery 窗口）。
+func TestWatermarkRegressionForcesPush(t *testing.T) {
+	r := &Reconciler{}
+	r.markPushed("n1", 42, time.Now())
+	if !r.watermarkRegressed("n1", 1) {
+		t.Fatal("version below in-memory last push must be detected as regression")
+	}
+	if r.watermarkRegressed("n1", 42) {
+		t.Fatal("equal watermark must not be treated as regression")
+	}
+	if r.watermarkRegressed("n2", 1) {
+		t.Fatal("unknown node must not be treated as regression")
 	}
 }

@@ -9,14 +9,10 @@
 package main
 
 import (
-	"bytes"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"strings"
 )
@@ -43,47 +39,5 @@ func resolveIdemKey(flagVal string) string {
 
 // doIdem 与 do 同语义，额外透传 Idempotency-Key 请求头（key 为空则不发）。
 func doIdem(method, path string, body, out any, key string) error {
-	addr := os.Getenv("FP_API_ADDR")
-	if addr == "" {
-		addr = "http://127.0.0.1:8080"
-	}
-	token := os.Getenv("FP_API_TOKEN")
-	var reader io.Reader
-	if body != nil {
-		raw, err := json.Marshal(body)
-		if err != nil {
-			return err
-		}
-		reader = bytes.NewReader(raw)
-	}
-	req, err := http.NewRequest(method, strings.TrimRight(addr, "/")+path, reader)
-	if err != nil {
-		return err
-	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	if key != "" {
-		req.Header.Set("Idempotency-Key", key)
-	}
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode >= 300 {
-		return fmt.Errorf("%s %s: %s (%s)", method, path, resp.Status, strings.TrimSpace(string(raw)))
-	}
-	if out != nil {
-		return json.Unmarshal(raw, out)
-	}
-	fmt.Println(string(raw))
-	return nil
+	return doRequest(apiClient, method, path, body, out, key, true)
 }

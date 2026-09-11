@@ -14,8 +14,8 @@
 | 文档 | 说明 |
 |---|---|
 | [docs/architecture.md](docs/architecture.md) | 目标架构、状态权威、路由与 fencing 契约 |
-| [docs/adr/](docs/adr/) | 关键设计决策（Nomad 边界、调度、状态分层、网络、route catalog、内部身份、secret 路径、edge 入口、网络 fabric 等 40 篇；ADR-0040 为网络 fabric G1–G3 契约） |
-| [docs/releases/README.md](docs/releases/README.md) | MVP–v1.4 的范围、实现记录与证据状态索引 |
+| [docs/adr/](docs/adr/) | 关键设计决策（Nomad 边界、调度、状态分层、网络、route catalog、内部身份、secret 路径、edge 入口、网络 fabric 等 41 篇；ADR-0040 为网络 fabric G1–G3 契约，ADR-0041 为基于并发的自动弹性） |
+| [docs/releases/README.md](docs/releases/README.md) | MVP–v1.5 的范围、实现记录与证据状态索引 |
 | [docs/mvp-plan.md](docs/mvp-plan.md) | MVP 范围、实现记录、出口和降级策略 |
 | [docs/v1.1-plan.md](docs/v1.1-plan.md) | v1.1 范围与验收契约；实现状态另见同版本 implementation notes |
 | [docs/v1.2-plan.md](docs/v1.2-plan.md) | v1.2 范围与验收契约；当前发布门禁尚未全部满足 |
@@ -29,13 +29,14 @@
 ```
 firepaas/
 ├── cmd/agentd/          # 每节点 gRPC agent（VM/镜像/网络数据面）
-├── cmd/api/             # 控制面 API + 调度器 + 节点管理 + 预约
+├── cmd/api/             # 控制面入口：依赖装配 + 进程生命周期（HTTP 层在 httpapi）
 ├── cmd/edge-proxy/      # 边缘路由（TLS + catalog 路由 + 自动唤醒）
 ├── cmd/fpctl/           # 运维 CLI
 ├── cmd/agentctl/        # agent 侧运维 CLI
 ├── internal/agent/      # agent 实现（server/machine/network/proxy/state；网络含
 │                         eBPF 数据面、WG mesh、fabric ingress、节点本地 DNS）
-├── internal/controlplane/ # 控制面实现（api/db/store/controllers/...）
+├── internal/controlplane/ # 控制面实现（httpapi/db/store/routepublisher/controller/...；
+│                         # controller 为独立调和环，每环自有 goroutine 与节拍）
 ├── internal/edge/       # edge 实现（router/catalog/autoresume/tls）
 ├── internal/scheduler/  # Best-of-K 放置算法
 ├── shared/pkg/          # ID/错误等公共库

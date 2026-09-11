@@ -236,7 +236,8 @@ func (s *Server) CreateMachine(ctx context.Context, req *pb.CreateMachineRequest
 	if err != nil {
 		if errors.Is(err, machine.ErrImageNotFound) || errors.Is(err, machine.ErrImageTooBig) ||
 			errors.Is(err, machine.ErrSecretEnvInjectionUnsupported) ||
-			errors.Is(err, machine.ErrSecretSnapshotForbidden) {
+			errors.Is(err, machine.ErrSecretSnapshotForbidden) ||
+			errors.Is(err, machine.ErrUnsupportedHealthCheck) {
 			return nil, status.Error(codes.InvalidArgument, err.Error())
 		}
 		return nil, mutationError(err)
@@ -342,8 +343,20 @@ func (s *Server) admit(req *pb.CreateMachineRequest) error {
 			"mem admission: allocated %dMiB + inflight %dMiB exceeds %dMiB", memAllocated, inflMem, memTotal)
 	}
 	// 磁盘：requested 承诺（有效值与调度/预约同源，contracts.DefaultDiskMib）。
+	// 统一计数（review 2026-09-10）：create overlay（inflightDisk）与 volume/
+	// import/overlay attach（inflightVolumeDisk）必须互相可见，否则并发的
+	// create 与 volume create 在“检查→落地”窗口内各自只看自己的 counter，
+	// 可同时越过 diskTotal（ADR-0035 硬准入最后防线失效）。
 	diskTotal, diskAllocated := s.info.DiskAdmissionSnapshot()
-	inflDisk := uint64(s.inflightDisk.Load())
+	// review L1：计数器理论上成对增减，但 double-release 会让 int64 变负，
+	// uint64 转换后回绕成巨值反而可能让 `allocated+inflight` 溢出通过准入
+	// ——硬准入边界必须 fail closed。
+	inflSigned := s.inflightDisk.Load() + s.inflightVolumeDisk.Load()
+	if inflSigned < 0 {
+		return status.Error(codes.Unavailable,
+			"disk admission counter underflow; admission fail-closed")
+	}
+	inflDisk := uint64(inflSigned)
 	// inflDisk 已包含当前请求（CreateMachine 在调用 admit 前登记），不得再加
 	// diskMib；否则每个 create 的磁盘请求都会被双算。
 	if diskTotal > 0 && diskAllocated+inflDisk > diskTotal {

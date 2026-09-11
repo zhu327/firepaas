@@ -268,7 +268,10 @@ type RouteCache struct {
 
 	mu    sync.Mutex
 	cache *lruCache[CachedRoute]
-	nowFn func() time.Time
+	// flights 合并同 key 的并发回源（W2-6）：fresh 过期瞬间若所有请求
+	// 各自 load，会对 Redis 形成脉冲。首个请求执行 load，其余等同一结果。
+	flights map[string]*routeFlight
+	nowFn   func() time.Time
 	// revisionRejects 累计“回源投影 revision 低于缓存高水位而被拒”的次数
 	// （D-2；/metrics 出口为 firepaas_edge_route_revision_rejects_total，
 	// 由持有 RouteCache 的 handler/metrics 层读取本计数导出）。
@@ -278,10 +281,23 @@ type RouteCache struct {
 // RevisionRejects 返回 D-2 revision 守卫的拒绝计数（单调计数器）。
 func (c *RouteCache) RevisionRejects() uint64 { return c.revisionRejects.Load() }
 
+// routeLoadTimeout 是 RouteCache 回源的独立上界：leader 的 context 与请求
+// 解耦后仍需有界（Redis/控制面不可达时不能挂住 flight）。
+const routeLoadTimeout = 10 * time.Second
+
+// routeFlight 是一次在途回源的结果广播。字段在 close(done) 前写入，
+// 等待者收到 done 后读取（happens-before 由 channel close 保证）。
+type routeFlight struct {
+	done  chan struct{}
+	v     any
+	stale bool
+	err   error
+}
+
 func NewRouteCache(freshTTL, staleWindow time.Duration) *RouteCache {
 	return &RouteCache{
 		FreshTTL: freshTTL, StaleWindow: staleWindow, MaxEntries: defaultRouteCacheMaxEntries,
-		cache: newLRUCache[CachedRoute](), nowFn: time.Now,
+		cache: newLRUCache[CachedRoute](), flights: map[string]*routeFlight{}, nowFn: time.Now,
 	}
 }
 
@@ -325,22 +341,55 @@ func (c *RouteCache) Get(ctx context.Context, key string, load Load) (any, bool,
 	if negFresh || fresh {
 		c.cache.touch(key)
 	}
-	c.mu.Unlock()
 	if negFresh {
+		c.mu.Unlock()
 		return nil, false, ErrNotFound
 	}
 	if fresh {
 		// fresh 命中不是 stale：第二个返回值仅表示"本次是否在降级服务
 		//（last-known-good）"，fresh 命中是正常缓存行为，不打 stale 标记。
+		c.mu.Unlock()
 		return e.Value, false, nil
 	}
-	v, err := load(ctx, key)
+	// W2-6：fresh 未命中 → per-key singleflight。首个请求执行 load，其余
+	// 等待同一结果；否则 TTL 边界处所有并发请求各自回源形成 Redis 脉冲。
+	if fl, ok := c.flights[key]; ok {
+		c.mu.Unlock()
+		select {
+		case <-fl.done:
+			return fl.v, fl.stale, fl.err
+		case <-ctx.Done():
+			return nil, false, ctx.Err()
+		}
+	}
+	if c.flights == nil {
+		c.flights = map[string]*routeFlight{}
+	}
+	fl := &routeFlight{done: make(chan struct{})}
+	c.flights[key] = fl
+	c.mu.Unlock()
+
+	// 回源在锁外执行（不阻塞其它 key）。leader 用与单个客户端解耦的 context
+	// （WithoutCancel + 有界超时）：否则一个客户端断开会让同 key 等待者一起
+	// 收到 context.Canceled（Redis 慢时一个取消的请求可让整个 host 503）。
+	lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), routeLoadTimeout)
+	defer cancel()
+	v, err := load(lctx, key)
 	if err == nil && v == nil {
 		err = ErrNotFound // 规范化：无错误无值 = 权威不存在
 	}
-	if err == nil {
+
+	// load 完成后按既有 revision 守卫/负缓存/serve-stale 逻辑写回一次，
+	// 并把最终结果广播给同 key 的等待者。
+	var (
+		rv     any
+		rstale bool
+		rerr   error
+	)
+	c.mu.Lock()
+	switch {
+	case err == nil:
 		rev := snapshotRevision(v)
-		c.mu.Lock()
 		if cur, has := c.cache.get(key); has && cur.Value != nil && rev < cur.Revision {
 			// D-2 revision 回退守卫：回源拿到的是比缓存更旧的投影（乱序
 			// 发布/重放），绝不用旧快照回写高水位 entry——继续服务缓存的
@@ -350,46 +399,54 @@ func (c *RouteCache) Get(ctx context.Context, key string, load Load) (any, bool,
 			// 负缓存条目（权威 miss 的墓碑不是可服务投影，不适用新旧比较）。
 			c.revisionRejects.Add(1)
 			c.cache.touch(key)
-			c.mu.Unlock()
-			return cur.Value, true, nil
+			rv, rstale, rerr = cur.Value, true, nil
+		} else {
+			c.cache.set(key, CachedRoute{Value: v, FetchedAt: now, Revision: rev})
+			c.cache.evict(c.maxEntries())
+			rv, rstale, rerr = v, false, nil
 		}
-		c.cache.set(key, CachedRoute{Value: v, FetchedAt: now, Revision: rev})
-		c.cache.evict(c.maxEntries())
-		c.mu.Unlock()
-		return v, false, nil
-	}
-	if errors.Is(err, ErrNotFound) {
+	case errors.Is(err, ErrNotFound):
 		// 权威不存在：删除缓存条目并负缓存，绝不 serve last-known-good。
 		// 墓碑保留原 entry 的 revision 高水位：随后到到的低 revision 重放
 		// 不能靠"删后重建"绕过高水位（redis 侧高水位键同理）。
-		c.mu.Lock()
 		rev := int64(0)
 		if cur, has := c.cache.get(key); has {
 			rev = cur.Revision
 		}
 		c.cache.set(key, CachedRoute{Value: nil, FetchedAt: now, Revision: rev})
 		c.cache.evict(c.maxEntries())
-		c.mu.Unlock()
-		return nil, false, ErrNotFound
-	}
-	// 回源失败：stale 窗口内允许 last-known-good（仅此路径 servedStale=true）。
-	if ok && e.Value != nil {
-		if now.Sub(e.FetchedAt) < c.StaleWindow {
-			c.mu.Lock()
+		rv, rstale, rerr = nil, false, ErrNotFound
+	default:
+		// 回源失败：stale 窗口内允许 last-known-good（仅此路径 servedStale=true）。
+		switch {
+		case ok && e.Value != nil && now.Sub(e.FetchedAt) < c.StaleWindow:
 			c.cache.touch(key)
-			c.mu.Unlock()
-			return e.Value, true, nil
+			rv, rstale, rerr = e.Value, true, nil
+		case ok && e.Value != nil:
+			rv, rstale, rerr = nil, false, ErrBeyondStale
+		default:
+			rv, rstale, rerr = nil, false, err
 		}
-		return nil, false, ErrBeyondStale
 	}
-	return nil, false, err
+	fl.v, fl.stale, fl.err = rv, rstale, rerr
+	// 只有仍是本 flight 的注册者才删除：Invalidate 可能已清掉并让新
+	// flight 接管，误删会让新 flight 失去合并能力。
+	if c.flights[key] == fl {
+		delete(c.flights, key)
+	}
+	close(fl.done)
+	c.mu.Unlock()
+	return rv, rstale, rerr
 }
 
-// Invalidate 清空单个 host（发布切换后加速收敛；TTL 兜底）。
+// Invalidate 清空单个 host（发布切换后加速收敛；TTL 兜底）。同时丢弃
+// 在途 flight：后续 Get（含失效重试路径）必须重新回源，而不是合并到
+// 失效前已开始的 load。
 func (c *RouteCache) Invalidate(key string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.cache.delete(key)
+	delete(c.flights, key)
 }
 
 // ---- 每 hostname 令牌桶限流 ----

@@ -125,6 +125,12 @@ type Request struct {
 	// RequiredNodeID is a hard locality constraint (LOCAL_RW origin node). It is
 	// evaluated after resource/capability filters and before anti-affinity.
 	RequiredNodeID string
+	// PinnedNodeID（review 2026-09-10）是已派发过的 operation 记录的目标节点。
+	// 与 RequiredNodeID 不同：pinned 不是 locality 需求，而是“重放必须回原
+	// agent”的 fencing 约束（agent operation ledger 是单节点的，换节点重放
+	// 可能造成同一 execution 双 VM）。控制面只在 pinned 节点可达时设置；
+	// 节点不可达时由控制面降级为无 pin 重调度并记事件/指标。
+	PinnedNodeID string
 }
 
 // Event 是调度事件（写 scheduler_events，审计可解释）。
@@ -284,6 +290,12 @@ func (p *Placer) evaluateCandidates(req Request, nodes []Node, opts candidateEva
 	candidates = filter(candidates, func(n Node) string {
 		if req.RequiredNodeID != "" && n.ID != req.RequiredNodeID {
 			return "volume locality mismatch"
+		}
+		return ""
+	})
+	candidates = filter(candidates, func(n Node) string {
+		if req.PinnedNodeID != "" && n.ID != req.PinnedNodeID {
+			return "dispatch pin mismatch"
 		}
 		return ""
 	})

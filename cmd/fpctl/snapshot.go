@@ -50,7 +50,7 @@ func runSnapshot(args []string) error {
 		return doIdem("POST", "/v1/machines/"+url.PathEscape(args[1])+"/snapshots", body, nil, resolveIdemKey(*idem))
 	case "ls":
 		fs := flag.NewFlagSet("snapshot ls", flag.ExitOnError)
-		project := fs.String("project", "", "filter by project id")
+		project := fs.String("project", defaultProject(""), "filter by project id")
 		_ = fs.Parse(args[1:])
 		path := "/v1/snapshots"
 		if *project != "" {

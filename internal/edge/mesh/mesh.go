@@ -185,12 +185,21 @@ type Endpoints struct {
 	rdb   *redis.Client
 	fresh time.Duration
 	stale time.Duration
+	// MaxEntries 是缓存容量上限；<=0 时使用
+	// defaultEndpointsCacheMaxEntries。execution 换代会产生新 key，
+	// 无上限则历史 execution 的条目无限驻留。
+	MaxEntries int
 	// fetchFn 测试注入（nil = Redis 回源）。
 	fetchFn func(ctx context.Context, machineID, executionID string) (*catalog.MeshEndpointRecord, error)
 
 	mu    sync.Mutex
 	cache map[string]endpointEntry
 }
+
+// defaultEndpointsCacheMaxEntries 是 Endpoints 缓存的默认容量上限。
+// 与 edge RouteCache/TokenClient 同一有界口径（此处默认值较小：mesh
+// endpoint key = machine\x00execution，活跃集受节点数×execution 数约束）。
+const defaultEndpointsCacheMaxEntries = 4096
 
 type endpointEntry struct {
 	rec     catalog.MeshEndpointRecord
@@ -203,7 +212,53 @@ type endpointEntry struct {
 // NewEndpoints 构造；fresh = 缓存有效期，stale = 回源失败复用窗口
 // （与 edge route/token 的 serve-stale 预算同源）。
 func NewEndpoints(rdb *redis.Client, fresh, stale time.Duration) *Endpoints {
-	return &Endpoints{rdb: rdb, fresh: fresh, stale: stale, cache: map[string]endpointEntry{}}
+	return &Endpoints{
+		rdb: rdb, fresh: fresh, stale: stale,
+		MaxEntries: defaultEndpointsCacheMaxEntries,
+		cache:      map[string]endpointEntry{},
+	}
+}
+
+func (e *Endpoints) maxEntries() int {
+	if e.MaxEntries > 0 {
+		return e.MaxEntries
+	}
+	return defaultEndpointsCacheMaxEntries
+}
+
+// evictLocked 在插入前收敛缓存容量（调用方持 e.mu）：
+//
+//  1. 删除 fetched 已超出 stale 窗口的条目——它们既过 fresh 又过 stale，
+//     已无任何服务价值；
+//  2. 仍达上限则按 fetched 最旧优先删除，直到低于上限（腾出插入位）。
+func (e *Endpoints) evictLocked(now time.Time) {
+	max := e.maxEntries()
+	if len(e.cache) < max {
+		return
+	}
+	if e.stale > 0 {
+		for key, ent := range e.cache {
+			if now.Sub(ent.fetched) >= e.stale {
+				delete(e.cache, key)
+			}
+		}
+	}
+	// 仍达上限：单次扫描淘汰最旧（通常只删 1 条即可，不用全量排序/额外 map；
+	// 同刻插入时按键稳定定序）。
+	for len(e.cache) >= max {
+		oldestKey := ""
+		var oldest time.Time
+		for key, ent := range e.cache {
+			if oldestKey == "" || ent.fetched.Before(oldest) ||
+				(ent.fetched.Equal(oldest) && key < oldestKey) {
+				oldestKey, oldest = key, ent.fetched
+			}
+		}
+		if oldestKey == "" {
+			return
+		}
+		delete(e.cache, oldestKey)
+	}
 }
 
 // Get 返回 (machine, execution) 的直达入口。ok=false = 无直达入口
@@ -235,13 +290,17 @@ func (e *Endpoints) Get(ctx context.Context, machineID, executionID string) (cat
 	if rec == nil {
 		// 确认无直达入口：短 TTL 负缓存（miss 是正常态：非 mesh_direct
 		// 服务恒 miss，不应逐请求回源 Redis）。
+		now := time.Now()
 		e.mu.Lock()
-		e.cache[key] = endpointEntry{miss: true, fetched: time.Now()}
+		e.evictLocked(now)
+		e.cache[key] = endpointEntry{miss: true, fetched: now}
 		e.mu.Unlock()
 		return catalog.MeshEndpointRecord{}, false
 	}
+	now := time.Now()
 	e.mu.Lock()
-	e.cache[key] = endpointEntry{rec: *rec, fetched: time.Now()}
+	e.evictLocked(now)
+	e.cache[key] = endpointEntry{rec: *rec, fetched: now}
 	e.mu.Unlock()
 	return *rec, true
 }

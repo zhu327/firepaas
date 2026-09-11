@@ -32,7 +32,10 @@ current_alloc() {
 import json, sys
 version = int(sys.argv[1])
 allocs = json.load(sys.stdin)
-current = [a for a in allocs if a.get("DesiredStatus") == "run" and a.get("JobVersion") == version]
+current = [a for a in allocs if a.get("DesiredStatus") == "run" and a.get("JobVersion") == version
+           # 多节点宿主上另一个 Nomad client 的 alloc 可能已 failed（静态端口冲突等）。
+           # 终态 alloc 不是本脚本要等待的对象：只保留未终结的候选。
+           and a.get("ClientStatus") not in ("failed", "complete", "lost")]
 current.sort(key=lambda a: a.get("CreateIndex", 0), reverse=True)
 print(current[0]["ID"] if current else "")
 ' "$JOB_VERSION"

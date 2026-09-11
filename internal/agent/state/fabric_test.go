@@ -123,3 +123,32 @@ func TestOpenFabricCorruptFile(t *testing.T) {
 		t.Fatal("corrupt fabric file must fail open")
 	}
 }
+
+// TestFabricCurrentDeepCopy：Current() 返回的快照不得与内部存储共享
+// EastWest/DNS 底层切片（调用方修改不得污染已应用状态）。
+func TestFabricCurrentDeepCopy(t *testing.T) {
+	f, _ := openTestFabric(t)
+	snap := FabricSnapshot{
+		NodeID: "node-a", Generation: 3, NodePrefix: "fd7a:9a55:1::/64",
+		EastWest: []EastWestRule{{
+			SrcProject: "p1", SrcApp: "a1", DstProject: "p1", DstApp: "a2",
+			DstService: "api", Ports: []uint32{8080},
+		}},
+		DNS: []DnsRecord{{Name: "a2.p1.internal", AAAA: []string{"fd7a:9a55:1::9"}, Generation: 1}},
+	}
+	if _, err := f.Apply(snap); err != nil {
+		t.Fatal(err)
+	}
+	got := f.Current()
+	got.EastWest[0].Ports[0] = 9999
+	got.DNS[0].AAAA[0] = "fd7a:9a55:1::dead"
+	// 调用方传入的切片也不得被内部存储别名（Apply 内部深拷贝）。
+	snap.EastWest[0].Ports[0] = 7777
+	snap.DNS[0].AAAA[0] = "fd7a:9a55:1::beef"
+
+	again := f.Current()
+	if again.EastWest[0].Ports[0] != 8080 || again.DNS[0].AAAA[0] != "fd7a:9a55:1::9" {
+		t.Fatalf("internal snapshot mutated: ports=%v aaaa=%v",
+			again.EastWest[0].Ports, again.DNS[0].AAAA)
+	}
+}

@@ -46,7 +46,7 @@ func runLogs(args []string) error {
 	}
 	machineID := fs.Arg(0)
 	query := "follow=" + strconv.FormatBool(*follow) + "&tail=" + strconv.FormatBool(*tail)
-	return doRawStream("GET", "/v1/machines/"+machineID+"/logs?"+query, nil, os.Stdout, nil)
+	return doRawStream("GET", "/v1/machines/"+url.PathEscape(machineID)+"/logs?"+query, nil, os.Stdout, nil)
 }
 
 type execOutputEvent struct {
@@ -115,7 +115,12 @@ func runExec(args []string) error {
 		return err
 	}
 
-	resp, err := rawRequest("POST", "/v1/machines/"+machineID+"/exec", bytes.NewReader(rawBody), "application/json")
+	resp, err := rawRequest(
+		"POST",
+		"/v1/machines/"+url.PathEscape(machineID)+"/exec",
+		bytes.NewReader(rawBody),
+		"application/json",
+	)
 	if err != nil {
 		return err
 	}
@@ -182,7 +187,13 @@ func runCP(args []string) error {
 		}
 		resp, err := rawRequest(
 			"PUT",
-			"/v1/machines/"+machineID+"/files?path="+urlQuery(remote)+"&operation_id="+urlQuery(operationID),
+			"/v1/machines/"+url.PathEscape(
+				machineID,
+			)+"/files?path="+urlQuery(
+				remote,
+			)+"&operation_id="+urlQuery(
+				operationID,
+			),
 			f,
 			"application/octet-stream",
 		)
@@ -201,7 +212,12 @@ func runCP(args []string) error {
 			return errors.New("usage: fpctl cp <machine_id> down <guest_path> <local_file>")
 		}
 		remote, local := args[2], args[3]
-		resp, err := rawRequest("GET", "/v1/machines/"+machineID+"/files?path="+urlQuery(remote), nil, "")
+		resp, err := rawRequest(
+			"GET",
+			"/v1/machines/"+url.PathEscape(machineID)+"/files?path="+urlQuery(remote),
+			nil,
+			"",
+		)
 		if err != nil {
 			return err
 		}
@@ -220,13 +236,7 @@ func runCP(args []string) error {
 // 原始 HTTP 辅助（流式；不复用 do 的整包 JSON 语义）
 // ---------------------------------------------------------------------------
 
-func apiBase() string {
-	addr := os.Getenv("FP_API_ADDR")
-	if addr == "" {
-		addr = "http://127.0.0.1:8080"
-	}
-	return strings.TrimRight(addr, "/")
-}
+func apiBase() string { return apiAddr() }
 
 func rawRequest(method, path string, body io.Reader, contentType string) (*http.Response, error) {
 	req, err := http.NewRequest(method, apiBase()+path, body)
@@ -236,10 +246,10 @@ func rawRequest(method, path string, body io.Reader, contentType string) (*http.
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
-	if token := os.Getenv("FP_API_TOKEN"); token != "" {
+	if token := apiToken(); token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	return http.DefaultClient.Do(req)
+	return longClient.Do(req)
 }
 
 func doRawStream(method, path string, body io.Reader, w io.Writer, headers map[string]string) error {

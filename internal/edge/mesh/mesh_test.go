@@ -2,6 +2,7 @@ package mesh
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -66,6 +67,81 @@ func TestEndpointsFreshAndStale(t *testing.T) {
 	}
 	if fetches != 1 {
 		t.Fatalf("negative cache must suppress refetch in fresh window: fetches=%d", fetches)
+	}
+}
+
+// W2-6：Endpoints 缓存有界——execution 换代会产生新 key，只增不减会持续
+// 泄漏；插入前先淘汰超 stale 窗口条目，仍满则按最旧 fetched 淘汰。
+func TestEndpointsCacheBounded(t *testing.T) {
+	const maxEntries = 4
+	newEP := func(fetch func(context.Context, string, string) (*catalog.MeshEndpointRecord, error)) *Endpoints {
+		return &Endpoints{
+			fresh: time.Minute, stale: time.Minute,
+			MaxEntries: maxEntries, cache: map[string]endpointEntry{}, fetchFn: fetch,
+		}
+	}
+	okFetch := func(ctx context.Context, machine, exec string) (*catalog.MeshEndpointRecord, error) {
+		return &catalog.MeshEndpointRecord{
+			MachineID: machine, ExecutionID: exec,
+			NodeULA: "fd7a:9a55:0:1::", IngressPort: 5109,
+		}, nil
+	}
+
+	ep := newEP(okFetch)
+	for i := 0; i < maxEntries+1; i++ {
+		m := fmt.Sprintf("m-%d", i)
+		if _, ok := ep.Get(context.Background(), m, "e"); !ok {
+			t.Fatalf("get %s miss", m)
+		}
+	}
+	if len(ep.cache) > maxEntries {
+		t.Fatalf("endpoint cache unbounded: %d entries", len(ep.cache))
+	}
+	latest := fmt.Sprintf("m-%d", maxEntries) + "\x00e"
+	if _, ok := ep.cache[latest]; !ok {
+		t.Fatal("latest endpoint entry evicted")
+	}
+	if _, ok := ep.cache["m-0\x00e"]; ok {
+		t.Fatal("oldest endpoint entry must be evicted first")
+	}
+
+	// 负缓存条目同样受容量约束。
+	ep2 := newEP(func(context.Context, string, string) (*catalog.MeshEndpointRecord, error) {
+		return nil, nil
+	})
+	for i := 0; i < maxEntries+1; i++ {
+		if _, ok := ep2.Get(context.Background(), fmt.Sprintf("miss-%d", i), "e"); ok {
+			t.Fatal("nil endpoint must be a miss")
+		}
+	}
+	if len(ep2.cache) > maxEntries {
+		t.Fatalf("negative endpoint cache unbounded: %d entries", len(ep2.cache))
+	}
+
+	// 超 stale 窗口的条目优先于最旧 fresh 条目被淘汰。
+	ep3 := newEP(okFetch)
+	now := time.Now()
+	ep3.cache["stale\x00e"] = endpointEntry{
+		rec:     catalog.MeshEndpointRecord{NodeULA: "fd7a:9a55:0:1::"},
+		fetched: now.Add(-2 * time.Minute),
+	}
+	for i := 0; i < maxEntries-1; i++ {
+		ep3.cache[fmt.Sprintf("fresh-%d\x00e", i)] = endpointEntry{
+			rec:     catalog.MeshEndpointRecord{NodeULA: "fd7a:9a55:0:1::"},
+			fetched: now,
+		}
+	}
+	if _, ok := ep3.Get(context.Background(), "new", "e"); !ok {
+		t.Fatal("get new miss")
+	}
+	if _, ok := ep3.cache["stale\x00e"]; ok {
+		t.Fatal("beyond-stale entry must be evicted before fresh entries")
+	}
+	if _, ok := ep3.cache["fresh-0\x00e"]; !ok {
+		t.Fatal("fresh entry must survive stale pruning")
+	}
+	if len(ep3.cache) > maxEntries {
+		t.Fatalf("cache unbounded after stale pruning: %d", len(ep3.cache))
 	}
 }
 

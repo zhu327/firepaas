@@ -4,14 +4,19 @@
 
 ## 每节点可售容量
 
+> 权威来源：agent 本机采集并上报的容量（`internal/agent/info/info.go`）与
+> create/volume 硬准入；控制面调度器投影只是软决策，不得覆盖 agent 的真实
+> 资源判定（ADR-0002）。下列公式即当前实现。
+
 ```text
-可售 vcpu = 物理 vcpu × cpu_overcommit(R)
-可售内存 = (总内存 - 系统/hugepage 预留) × mem_overcommit
-预留 = max(4GiB, 16% 内存)  # 参考 e2b start-client.sh 的巨页策略
-可售磁盘 = 总磁盘 - 系统预留 - 快照预算 - 镜像缓存预算
-快照预算(P0 测定单副本 standby 快照体积 S 后更新)
-  = max(节点 mem 可售上限 × 0.5, 64GiB)   # 全节点副本同时 standby 的最坏情形按半内存估
-镜像缓存预算 = min(总磁盘 × 30%, 100GiB) # LRU 驱逐的配额上限
+可售 vcpu = min(host vcpu, cgroup cpu.max)        # agent 上报 CPUTotal
+调度 CPU 上限 = 可售 vcpu × R（R=4，调度器超售比）
+可售内存 = min(host MemTotal, cgroup memory.max) - 预留   # 内存不超售（MemR=1.0）
+预留 = max(512MiB, 总量 × 1/32 ≈ 3%)   # Nomad/agentd/hypeman/页缓存安全余量
+
+磁盘：requested 驱动 + 水位硬准入（ADR-0035，无固定系统/快照/镜像预算公式）
+  scheduler 硬过滤：disk_allocated + disk_pending + disk_requested ≤ disk_total
+  agent 最终防线：disk_used / disk_total ≥ FIREPAAS_ADMISSION_DISK_WATERMARK（默认 0.9）
 ```
 
 单机首轮实测（2026-08-25，见 benchmarks.md）：
@@ -27,15 +32,20 @@
 > 的吞吐与密度上限需重新标定（含 mesh 加密开销与 MTU 1280），标定前上述
 > 数值仅作历史基线，不用于生产容量承诺。
 
-## 磁盘水位与回收(M3 依赖,agent 守护职责)
+## 磁盘水位与回收（ADR-0035）
 
-- **镜像缓存 GC**:节点磁盘使用率 ≥ 70% 触发 LRU 驱逐(从未被任何在用 machine 引用
-  的镜像开始);≥ 85% 拒绝新拉取并上报 `InfoService` 降权标签;缓存占用不超过上表预算。
-- **快照预算守门**:standby 前检查剩余快照预算,不足则拒绝 Pause 并返回明确错误
-  (控制面转为 cold-start 路径);快照体积随 `Machine` observed state 上报,计入对账。
-- 节点本地数据不作跨节点持久承诺(ADR-0003 不变),磁盘预算只服务本节点可用性。
+- **create/volume 硬准入（权威）**：requested 驱动调度（scheduler 硬过滤
+  `disk_allocated + disk_pending + disk_requested ≤ disk_total`），agent 以真实
+  文件系统水位做最终防线：已用比 ≥ `FIREPAAS_ADMISSION_DISK_WATERMARK`（默认 0.9）
+  时拒绝 create/volume（`ResourceExhausted`，控制面换节点重试）。
+- **预取水位**：`PullImage` 是可让步优化，已用比 ≥ `FIREPAAS_PREFETCH_DISK_WATERMARK`
+  （默认 0.9）时拒绝预取，不影响已有负载。
+- **镜像缓存 GC / scrub**：由控制面 `FIREPAAS_LOCAL_GC_MODE`（默认 off）与
+  `FIREPAAS_GC_LOW/HIGH_WATERMARK`（默认 0.70/0.85）配置，不再使用固定
+  系统/快照/镜像预算公式；`FIREPAAS_SCRUB_*` 默认关闭。
+- 节点本地数据不作跨节点持久承诺（ADR-0003 不变）。
 
-- 初始参数:R=4、α=0.5、K=3、mem_overcommit=1.0
+- 初始参数（scheduler.DefaultBestOfKConfig）:R=4、MemR=1.0、DiskR=1.0、α=0.5、K=3、WeightImage=0.5
 - 实测依据:见 benchmarks.md(单机首轮)
 - 硬件选型建议:本机(Ryzen 7 8700G / 60GiB / KVM)仅作单机验证基准,
   生产 compute 节点需多机复测后才能给选型

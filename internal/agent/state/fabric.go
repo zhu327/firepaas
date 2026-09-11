@@ -185,7 +185,7 @@ func (f *Fabric) Apply(snap FabricSnapshot) (bool, error) {
 	if err := f.persistLocked(snap); err != nil {
 		return false, err
 	}
-	f.current = snap
+	f.current = cloneSnapshot(snap)
 	return true, nil
 }
 
@@ -203,9 +203,19 @@ func snapshotEqual(a, b FabricSnapshot) bool {
 	return bytes.Equal(ra, rb)
 }
 
+// cloneSnapshot 深拷贝全部可变字段（含 EastWest.Ports 与 DNS.AAAA）：
+// Current()/Apply 的返回值不得与内部存储共享底层数组。
 func cloneSnapshot(s FabricSnapshot) FabricSnapshot {
 	s.Peers = append([]FabricPeer(nil), s.Peers...)
 	s.Identities = append([]FabricIdentity(nil), s.Identities...)
+	s.EastWest = append([]EastWestRule(nil), s.EastWest...)
+	for i := range s.EastWest {
+		s.EastWest[i].Ports = append([]uint32(nil), s.EastWest[i].Ports...)
+	}
+	s.DNS = append([]DnsRecord(nil), s.DNS...)
+	for i := range s.DNS {
+		s.DNS[i].AAAA = append([]string(nil), s.DNS[i].AAAA...)
+	}
 	return s
 }
 

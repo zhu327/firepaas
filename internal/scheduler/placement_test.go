@@ -531,6 +531,34 @@ func TestLocalRWLocalityWinsOverAntiAffinity(t *testing.T) {
 	}
 }
 
+// review 2026-09-10：PinnedNodeID 是已派发 operation 回到原 agent 的硬约束。
+// 与 RequiredNodeID（locality）分开；同时存在时两者都必须在硬过滤中满足。
+func TestPinnedNodeIDHardFilter(t *testing.T) {
+	p := New(DefaultBestOfKConfig(), Options{})
+	nodes := []Node{
+		healthyNode("origin", "compute", 4, 4096),
+		healthyNode("other", "compute", 4, 4096),
+	}
+	// 只允许 pin 节点：即使 other 分数更优也不能选。
+	pl, err := p.Place(Request{VCPU: 1, MemMib: 512, PinnedNodeID: "origin"}, nodes, rand.New(rand.NewSource(1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pl.NodeID != "origin" {
+		t.Fatalf("placed on %q, want pinned origin", pl.NodeID)
+	}
+	// pin 与 locality 同时存在且一致时正常；不一致时无候选（fail closed）。
+	if _, err := p.Place(Request{
+		VCPU: 1, MemMib: 512, PinnedNodeID: "origin", RequiredNodeID: "other",
+	}, nodes, rand.New(rand.NewSource(1))); err == nil {
+		t.Fatal("conflicting pin/locality must fail closed")
+	}
+	// pin 到不存在的节点：无候选，不得静默换节点（换节点与否由控制面决定）。
+	if _, err := p.Place(Request{VCPU: 1, MemMib: 512, PinnedNodeID: "gone"}, nodes, rand.New(rand.NewSource(1))); err == nil {
+		t.Fatal("pin to unknown node must be a hard rejection")
+	}
+}
+
 // v1.2-E（ADR-0035）：磁盘维度硬过滤——requested 承诺不超售；旧 agent
 // 未上报容量（DiskTotalMib==0）时跳过磁盘过滤。
 func TestDiskHardFilter(t *testing.T) {

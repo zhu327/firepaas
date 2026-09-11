@@ -110,6 +110,22 @@ func TestInflightLifecycle(t *testing.T) {
 	}
 }
 
+// W2-6：legacy upstream Transport 与 mesh 直达同口径（拨号 3s + 首字节
+// 30s），避免节点失联/WG 断链时 OS 默认 SYN 重试吞掉整个请求预算。
+func TestLegacyTransportTimeouts(t *testing.T) {
+	h := testHandler(nil, 8)
+	tr, ok := h.proxy.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("legacy proxy transport = %T", h.proxy.Transport)
+	}
+	if tr.DialContext == nil {
+		t.Fatal("legacy transport must set a bounded DialContext")
+	}
+	if tr.ResponseHeaderTimeout != 30*time.Second {
+		t.Fatalf("ResponseHeaderTimeout = %v, want 30s", tr.ResponseHeaderTimeout)
+	}
+}
+
 func TestRequestRoutePort(t *testing.T) {
 	h := testHandler(nil, 8)
 	cases := map[string]int{"app.test": 0, "app.test:8081": 0, "app.test:8447": 0, "app.test:80": 80}
@@ -184,6 +200,45 @@ func TestHandlerRetriesBodylessMarked502OnceWithoutLeakingHeader(t *testing.T) {
 	}
 	if rr.Header().Get(HeaderMachineID) != "m1" {
 		t.Fatalf("machine=%q", rr.Header().Get(HeaderMachineID))
+	}
+}
+
+// 关联 ID：handler 入口生成（覆盖客户端伪造值），响应回显给客户端，
+// 内部头 + 标准 X-Request-Id 以同一值转发给 agent。
+func TestHandlerGeneratesCorrelationIDAndForwardsIt(t *testing.T) {
+	seen := make(chan http.Header, 1)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.Header.Clone()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer up.Close()
+	tokens := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, `{"token":"trusted-credential","execution_id":"e-m1"}`)
+	}))
+	defer tokens.Close()
+	backend := testBackend("m1", strings.TrimPrefix(up.URL, "http://"))
+	backend.AppPort = 0
+	cat := &fakeCatalog{route: &catalog.Route{Backends: []catalog.Backend{backend}}, declared: true}
+	h := testHandler(cat, 8)
+	h.tokens = NewTokenClient(tokens.URL, "bearer", time.Minute)
+	r := httptest.NewRequest("GET", "http://app.test/", nil)
+	r.Header.Set(HeaderRequestID, "forged-internal")
+	r.Header.Set(HeaderClientRequestID, "forged-client")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, r)
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("code=%d body=%q", rr.Code, rr.Body.String())
+	}
+	respID := rr.Header().Get(HeaderClientRequestID)
+	if respID == "" || respID == "forged-client" {
+		t.Fatalf("response request id = %q, want generated non-forged value", respID)
+	}
+	got := <-seen
+	if got.Get(HeaderRequestID) != respID {
+		t.Fatalf("forwarded internal request id = %q, want %q", got.Get(HeaderRequestID), respID)
+	}
+	if got.Get(HeaderClientRequestID) != respID {
+		t.Fatalf("forwarded client request id = %q, want %q", got.Get(HeaderClientRequestID), respID)
 	}
 }
 
@@ -761,6 +816,85 @@ func TestHandlerMeshDirectServesAndFallsBack(t *testing.T) {
 	}
 	if n := h3.cnt.meshDirect.Load(); n != 1 || h3.cnt.meshFallback.Load() != 1 {
 		t.Fatalf("counters direct=%d fallback=%d", h3.cnt.meshDirect.Load(), h3.cnt.meshFallback.Load())
+	}
+}
+
+// TestHandlerMeshDirectStripsInternalHeadersAndRetryable502（T5）：直达响应
+// 里的内部 retry 信号与凭证头不得出网；有 body 的 retryable 502 不重放
+// （与 legacy 的 body 语义一致），无 body 的同信号回落 legacy。
+func TestHandlerMeshDirectStripsInternalHeadersAndRetryable502(t *testing.T) {
+	ingress := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set(headerProxyRetryable, retryableProxyValue)
+		w.Header().Set(traffic.HeaderCredential, "must-not-leak")
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer ingress.Close()
+	_, portStr, _ := strings.Cut(strings.TrimPrefix(ingress.URL, "http://"), ":")
+	ingressPort, _ := strconv.Atoi(portStr)
+	legacy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("via-legacy"))
+	}))
+	defer legacy.Close()
+	h := testDirectHandler(t, &fakeCatalog{
+		route: &catalog.Route{Backends: []catalog.Backend{{
+			MachineID: "m1", ExecutionID: "e1", NodeProxyEndpoint: strings.TrimPrefix(legacy.URL, "http://"),
+			AppPort: 80, Readiness: "READY", ULA: "fd7a:9a55:0:1::5",
+		}}},
+	}, mesh.NewTransportForTest(meshEndpointFor("127.0.0.1", ingressPort)))
+
+	// 有 body：报错中段不可安全重放 → 终态 502，且内部头被剥离。
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest("POST", "http://app.test/", strings.NewReader("payload")))
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("body request with retryable direct 502: code=%d body=%q", rr.Code, rr.Body.String())
+	}
+	if got := rr.Header().Get(headerProxyRetryable); got != "" {
+		t.Fatalf("internal retry header leaked to client: %q", got)
+	}
+	if got := rr.Header().Get(traffic.HeaderCredential); got != "" {
+		t.Fatalf("credential header leaked to client: %q", got)
+	}
+	// 无 body：同一信号按既有语义回落 legacy。
+	rr2 := httptest.NewRecorder()
+	h.ServeHTTP(rr2, httptest.NewRequest("GET", "http://app.test/", nil))
+	if rr2.Code != http.StatusOK || rr2.Body.String() != "via-legacy" {
+		t.Fatalf("bodyless retryable direct 502 must fall back: code=%d body=%q", rr2.Code, rr2.Body.String())
+	}
+	if n := h.cnt.meshFallback.Load(); n != 1 {
+		t.Fatalf("meshFallback=%d, want 1", n)
+	}
+}
+
+// TestHandlerMeshDirectForbiddenInvalidatesAndRetries（T5）：直达 403 与 legacy
+// 同语义——失效 token/路由并重试一次，第二次直达成功。
+func TestHandlerMeshDirectForbiddenInvalidatesAndRetries(t *testing.T) {
+	var hits atomic.Int64
+	ingress := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if hits.Add(1) == 1 {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		_, _ = w.Write([]byte("via-mesh"))
+	}))
+	defer ingress.Close()
+	_, portStr, _ := strings.Cut(strings.TrimPrefix(ingress.URL, "http://"), ":")
+	ingressPort, _ := strconv.Atoi(portStr)
+	h := testDirectHandler(t, &fakeCatalog{
+		route: &catalog.Route{Backends: []catalog.Backend{{
+			MachineID: "m1", ExecutionID: "e1", NodeProxyEndpoint: "127.0.0.1:1",
+			AppPort: 80, Readiness: "READY", ULA: "fd7a:9a55:0:1::5",
+		}}},
+	}, mesh.NewTransportForTest(meshEndpointFor("127.0.0.1", ingressPort)))
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest("GET", "http://app.test/", nil))
+	if rr.Code != http.StatusOK || rr.Body.String() != "via-mesh" {
+		t.Fatalf("forbidden retry: code=%d body=%q hits=%d", rr.Code, rr.Body.String(), hits.Load())
+	}
+	if hits.Load() != 2 {
+		t.Fatalf("direct ingress hits=%d, want 2 (403 then retry)", hits.Load())
+	}
+	if n := h.cnt.forbiddenRetry.Load(); n != 1 {
+		t.Fatalf("forbiddenRetry=%d, want 1", n)
 	}
 }
 

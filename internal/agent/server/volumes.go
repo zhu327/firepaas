@@ -87,8 +87,16 @@ func (s *Server) admitVolume(sizeBytes uint64) error {
 		return status.Error(codes.Unavailable, "node disk capacity not available yet")
 	}
 	// 调用方必须先用 registerVolumeInflight 登记本请求（先加后查）；inflight
-	// 已含本请求的预算，这里不重复加 sizeBytes（仅用于错误报告）。
-	inflight := uint64(s.inflightVolumeDisk.Load())
+	// 已含本请求的预算，这里不重复加 sizeBytes（仅用于错误报告）。统一计数
+	// （review 2026-09-10）：create overlay 的在途承诺（inflightDisk）与本
+	// 路径共享同一磁盘硬上限，必须互相可见。review L1：负值（double-release）
+	// 必须 fail closed，不得以 uint64 回绕放行。
+	inflSigned := s.inflightVolumeDisk.Load() + s.inflightDisk.Load()
+	if inflSigned < 0 {
+		return status.Error(codes.Unavailable,
+			"disk admission counter underflow; admission fail-closed")
+	}
+	inflight := uint64(inflSigned)
 	if diskAllocated+inflight > diskTotal {
 		return status.Errorf(
 			codes.ResourceExhausted,

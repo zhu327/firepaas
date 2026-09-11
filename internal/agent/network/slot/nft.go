@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net/netip"
 	"os/exec"
 	"strings"
 
@@ -313,6 +314,133 @@ func (b *NftBackend) ensureEgressProxyInputRule(ctx context.Context) error {
 		return fmt.Errorf("slot: insert egress proxy input rule: %w", err)
 	}
 	return nil
+}
+
+// EnsureRootEgressNAT 幂等确保 root ns 存在对 vethCIDR 的出口 masquerade
+// （ADR-0040 §7：南北出口仍节点 SNAT）。eBPF 后端使用：nft 后端的等价
+// 规则在 fp-isolation 表的 post 链内，eBPF 后端不建该表，缺此规则时
+// slot 内一级 NAT 改写后的源（链路地址）无法获得公网回程（全新 eBPF
+// 节点上非代理南北向流量断流；升级节点靠旧 nft 表残留掩盖）。
+//
+// 多 agent 同主机：规则按 CIDR 标记判定存在性，同表各自补自己的 CIDR，
+// 互不覆盖；table 默认 "fp-egress"，测试/多实例可传独立表名。
+func EnsureRootEgressNAT(ctx context.Context, table, vethCIDR string) error {
+	table = strings.TrimSpace(table)
+	vethCIDR = strings.TrimSpace(vethCIDR)
+	if table == "" || vethCIDR == "" {
+		return fmt.Errorf("slot: root egress NAT needs table and veth CIDR (got %q/%q)", table, vethCIDR)
+	}
+	// 规范化（带主机位的输入如 10.12.5.0/16 → 10.12.0.0/16）：nft 列出的是
+	// 规范化文本，存在性判定若用原串会永不命中——每次 EnsureNode（每次
+	// attach/reconcile）追加一条等价规则，无界增长。
+	cidr, err := normalizeVethCIDR(vethCIDR)
+	if err != nil {
+		return err
+	}
+	if err := exec.Command("nft", "list", "table", "ip", table).Run(); err != nil {
+		steps := [][]string{
+			{"nft", "add", "table", "ip", table},
+			{
+				"nft", "add", "chain", "ip", table, "post",
+				"{", "type", "nat", "hook", "postrouting", "priority", "srcnat;", "policy", "accept;", "}",
+			},
+		}
+		for _, step := range steps {
+			if err := execCmd(ctx, step[0], step[1:]...); err != nil {
+				return fmt.Errorf("slot: root egress NAT setup (%s): %w", strings.Join(step, " "), err)
+			}
+		}
+	}
+	out, err := exec.Command("nft", "-a", "list", "chain", "ip", table, "post").Output()
+	if err != nil {
+		return fmt.Errorf("slot: list root egress NAT chain: %w", err)
+	}
+	if strings.Contains(string(out), "ip saddr "+cidr+" masquerade") {
+		return nil // 该 CIDR 的规则已存在（幂等）
+	}
+	if err := execCmd(ctx, "nft", "add", "rule", "ip", table, "post", "ip", "saddr", cidr, "masquerade"); err != nil {
+		return fmt.Errorf("slot: add root egress NAT rule: %w", err)
+	}
+	return nil
+}
+
+// normalizeVethCIDR 规范化 veth 源段（Masked，仅 IPv4）。
+func normalizeVethCIDR(raw string) (string, error) {
+	p, err := netip.ParsePrefix(strings.TrimSpace(raw))
+	if err != nil {
+		return "", fmt.Errorf("slot: root egress NAT veth cidr %q: %w", raw, err)
+	}
+	if !p.Addr().Is4() {
+		return "", fmt.Errorf("slot: root egress NAT veth cidr %q must be IPv4", raw)
+	}
+	return p.Masked().String(), nil
+}
+
+// EnsureNetnsTCPLimit 幂等替换 slot netns 的 per-execution TCP 新连接上限
+// （W2-1）：内核 conntrack 的 `meta l4proto tcp ct state new ct count over N
+// counter drop`，与 nft 后端 egress-fwd 链内的规则同一口径，随 conntrack
+// 超时自愈（BPF 聚合计数在去重表淘汰后会漏减，已在 tc.c 移除）。
+// limit=0 = 清除规则。实现：确保 fp-slot 表与 tcp_limit 链存在，然后单事务
+// flush + add（原子替换；失败保留旧规则）。
+func EnsureNetnsTCPLimit(ctx context.Context, ref SlotRef, limit uint32) error {
+	if ref.Netns == "" {
+		return fmt.Errorf("slot: tcp limit: empty netns")
+	}
+	// 表/基础链不存在时补齐（与 EnsureNetnsNAT 同源，不装 DNAT）。
+	if err := EnsureNetnsNAT(ctx, ref, 0, 0); err != nil {
+		return err
+	}
+	// 回收 nft 后端遗留策略（切换/升级窗口），避免旧链与 tc 裁决叠加。
+	cleanupLegacyNftPolicy(ctx, ref)
+	if _, err := exec.Command("ip", "netns", "exec", ref.Netns,
+		"nft", "list", "chain", "ip", "fp-slot", tcpLimitChain).CombinedOutput(); err != nil {
+		if err := execCmd(ctx, "ip", "netns", "exec", ref.Netns,
+			"nft", "add", "chain", "ip", "fp-slot", tcpLimitChain,
+			"{", "type", "filter", "hook", "forward", "priority", "filter;", "policy", "accept;", "}"); err != nil {
+			return fmt.Errorf("slot: add tcp limit chain: %w", err)
+		}
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "flush chain ip fp-slot %s\n", tcpLimitChain)
+	if limit > 0 {
+		fmt.Fprintf(&b, "add rule ip fp-slot %s %s\n", tcpLimitChain, tcpLimitRule(limit))
+	}
+	if err := runNftBatch(ctx, ref.Netns, b.String()); err != nil {
+		return fmt.Errorf("slot: apply tcp limit: %w", err)
+	}
+	return nil
+}
+
+// tcpLimitChain/tcpLimitComment：限额链名（`limit` 是 nft 关键字，不可用）
+// 与规则注释标记（注释仅便于排障/审计）。
+const (
+	tcpLimitChain   = "tcp_limit"
+	tcpLimitComment = "firepaas-tcp-limit"
+)
+
+// tcpLimitRule 是一条 per-execution 新 TCP 上限规则的规则体（不含链名）。
+// nft 后端（egress-fwd 内）与 eBPF 后端（tcp_limit 链）共用同一文本，
+// 避免两处手写同一条 ct count 规则再次漂移。
+func tcpLimitRule(limit uint32) string {
+	return fmt.Sprintf(
+		"meta l4proto tcp ct state new ct count over %d counter drop comment \"%s\"",
+		limit, tcpLimitComment,
+	)
+}
+
+// cleanupLegacyNftPolicy 尽力删除 nft 后端遗留的 slot 内策略链/集合。
+// 后端切换（ADR-0040 §12）要求重建 execution，但 agent 升级或 Reconcile
+// 复用旧 netns 时，egress-fwd/egress-allow4/egress-deny4 会与 tc 裁决叠加
+// （旧 CIDR/限额继续生效）。eBPF 后端在每次 ApplyEgress 前顺手回收。
+func cleanupLegacyNftPolicy(ctx context.Context, ref SlotRef) {
+	for _, args := range [][]string{
+		{"nft", "delete", "chain", "ip", "fp-slot", "egress-fwd"},
+		{"nft", "delete", "set", "ip", "fp-slot", "egress-allow4"},
+		{"nft", "delete", "set", "ip", "fp-slot", "egress-deny4"},
+	} {
+		full := append([]string{"ip", "netns", "exec", ref.Netns}, args...)
+		_, _ = exec.CommandContext(ctx, full[0], full[1:]...).CombinedOutput()
+	}
 }
 
 // EnsureNetnsNAT 幂等创建 slot 内一级 NAT：出口 masquerade +（port>0 时）

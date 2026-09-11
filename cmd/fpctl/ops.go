@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/url"
 )
 
 func runOps(args []string) error {
@@ -20,16 +21,18 @@ func runOps(args []string) error {
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
-		path := "/v1/operations?limit=200"
+		q := url.Values{}
+		q.Set("limit", "200")
 		if *machine != "" {
-			path += "&machine_id=" + *machine
+			q.Set("machine_id", *machine)
 		}
 		if *kind != "" {
-			path += "&kind=" + *kind
+			q.Set("kind", *kind)
 		}
 		if *status != "" {
-			path += "&status=" + *status
+			q.Set("status", *status)
 		}
+		path := "/v1/operations?" + q.Encode()
 		var out struct {
 			Operations []struct {
 				ID          string  `json:"id"`
@@ -44,6 +47,9 @@ func runOps(args []string) error {
 		}
 		if err := do("GET", path, nil, &out); err != nil {
 			return err
+		}
+		if global.json {
+			return nil
 		}
 		for _, op := range out.Operations {
 			done := "-"
@@ -61,7 +67,7 @@ func runOps(args []string) error {
 		if err != nil {
 			return err
 		}
-		return do("GET", "/v1/operations/"+id, nil, nil)
+		return do("GET", "/v1/operations/"+url.PathEscape(id), nil, nil)
 	default:
 		return fmt.Errorf("unknown ops command %q", args[0])
 	}

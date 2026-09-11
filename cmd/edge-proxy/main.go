@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -24,6 +25,7 @@ import (
 	edgesvc "github.com/zhu327/firepaas/internal/edge"
 	edgemesh "github.com/zhu327/firepaas/internal/edge/mesh"
 	"github.com/zhu327/firepaas/internal/security/mtls"
+	"github.com/zhu327/firepaas/shared/pkg/logging"
 )
 
 const (
@@ -38,7 +40,11 @@ const (
 	idleTimeout       = 90 * time.Second
 )
 
+// version 由 -ldflags "-X main.version=..." 注入发布版本。
+var version = "dev"
+
 func main() {
+	logging.Setup()
 	if err := run(); err != nil {
 		slog.Error("edge-proxy terminated", "error", err)
 		os.Exit(1)
@@ -128,15 +134,25 @@ func run() error {
 			staleWindow)
 		direct = edgemesh.NewTransport(endpoints)
 	}
-	handler := edgesvc.NewHandler(edgesvc.Config{
+	// ADR-0041：per-hostname 并发信号记账 + 5s 上报（autoscale:{host}，
+	// 20s TTL）。只写 TTL 键，旧 controller 不读，独立可回滚；失败只记
+	// 指标，不阻塞转发。
+	autoscaleTracker := edgesvc.NewAutoscaleTracker(envIntOr("FIREPAAS_EDGE_AUTOSCALE_MAX_HOSTS", 0))
+	autoscaleReporter := edgesvc.NewAutoscaleReporter(rdb, resolveAutoscaleEdgeID(),
+		autoscaleTracker, counters, envDurOr("FIREPAAS_EDGE_AUTOSCALE_INTERVAL", 0))
+	go autoscaleReporter.Run(ctx)
+	dataHandler := edgesvc.NewHandler(edgesvc.Config{
 		Catalog: catalog.New(rdb), Routes: routes, Tokens: tokens, Limiter: limiter,
 		Counters: counters, AgentTLS: agentTLS, HardConcurrency: hardConcurrency, EdgePorts: edgePorts,
-		Direct: direct,
+		Direct: direct, Tracker: autoscaleTracker,
 	})
 
-	if err := startMetrics(counters, handler, gauges); err != nil {
+	if err := startMetrics(counters, dataHandler, gauges); err != nil {
 		return err
 	}
+	// W4：/healthz 在进程层返回 {"status":"ok","version":...}；其余路径
+	// 直通 edge 数据面 handler（详见 withVersionedHealthz）。
+	handler := withVersionedHealthz(dataHandler)
 	plainHandler := http.Handler(handler)
 	tlsEnabled := tlsPort != "" && serverCertMgr != nil
 	if tlsEnabled {
@@ -347,11 +363,30 @@ func redirectHandler(tlsPort string) http.Handler {
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/healthz" {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte("ok\n"))
+			writeHealthz(w)
 			return
 		}
 		http.Redirect(w, r, "https://"+stripPort(r.Host)+suffix+r.URL.RequestURI(), http.StatusPermanentRedirect)
+	})
+}
+
+// writeHealthz 输出进程 liveness JSON（含版本）。
+func writeHealthz(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "version": version})
+}
+
+// withVersionedHealthz 在 edge 数据面 handler 前拦截 /healthz，返回带版本的
+// JSON。数据面 handler 自身的 /healthz 是纯文本（internal/edge），进程版本
+// 只在 main 包可见，因此在此覆盖；其余路径与行为不变。
+func withVersionedHealthz(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			writeHealthz(w)
+			return
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 
@@ -417,6 +452,16 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// resolveAutoscaleEdgeID 解析 autoscale reporter 的 edge 身份
+// （ADR-0041 §2：FIREPAAS_EDGE_ID → FIREPAAS_MESH_EDGE_ID → hostname）。
+func resolveAutoscaleEdgeID() string {
+	return edgesvc.ResolveEdgeID(
+		os.Getenv("FIREPAAS_EDGE_ID"),
+		os.Getenv("FIREPAAS_MESH_EDGE_ID"),
+		os.Hostname,
+	)
 }
 
 func envDurOr(key string, def time.Duration) time.Duration {

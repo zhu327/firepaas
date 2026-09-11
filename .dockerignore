@@ -1,0 +1,20 @@
+# Docker build context exclusions. The Dockerfiles do:
+#   COPY go.mod go.sum ./  ->  go mod download  ->  COPY . .  ->  go build ./cmd/<bin>
+# Only cmd/, internal/, shared/ and the module manifests are needed at build time;
+# docs, lab scripts, IaC and repo metadata are not.
+.git
+.github
+.agents
+.pi
+docs
+scripts
+iac
+tools
+*.md
+coverage.out
+bin/
+
+# go build ./... artifacts that may sit at the repository root
+api
+agentd
+edge-proxy

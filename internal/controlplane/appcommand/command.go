@@ -278,7 +278,9 @@ func prepare(active *store.Deployment, in Intent, generation int64) (store.Deplo
 	if err != nil {
 		return store.Deployment{}, err
 	}
-	egressJSON, err := marshalEgress(egress, generation)
+	// strict = 用户在本次 intent 里显式提交了 egress（而非继承存量）：
+	// allowed_domains 非 allowlist 只在提交路径拒绝，存量行保持可调度。
+	egressJSON, err := marshalEgress(egress, generation, in.Egress != nil)
 	if err != nil {
 		return store.Deployment{}, invalid(err)
 	}
@@ -440,7 +442,7 @@ func resolveEgress(policy *EgressPolicy, raw json.RawMessage) (*EgressPolicy, er
 	}, nil
 }
 
-func marshalEgress(policy *EgressPolicy, generation int64) (json.RawMessage, error) {
+func marshalEgress(policy *EgressPolicy, generation int64, strict bool) (json.RawMessage, error) {
 	if policy == nil {
 		return nil, nil
 	}
@@ -475,7 +477,11 @@ func marshalEgress(policy *EgressPolicy, generation int64) (json.RawMessage, err
 		PolicyGeneration:  uint64(generation),
 		AuditAll:          policy.AuditAll,
 	}
-	if err := agentv1.ValidateEgressPolicy(spec); err != nil {
+	if strict {
+		if err := agentv1.ValidateEgressPolicySubmission(spec); err != nil {
+			return nil, err
+		}
+	} else if err := agentv1.ValidateEgressPolicy(spec); err != nil {
 		return nil, err
 	}
 	raw, err := protojson.Marshal(spec)

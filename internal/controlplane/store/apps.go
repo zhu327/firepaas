@@ -115,30 +115,55 @@ func (s *Store) EnsureApp(ctx context.Context, projectID, appID, hostname, image
 	return nil
 }
 
-// App 是 apps 表行。
+// App 是 apps 表行。Autoscale* 是 ADR-0041 策略列（PG 权威；改策略不
+// 产生新 generation）。零值行（旧查询/手工构造）经 Autoscale() 归一
+// 为默认策略，避免裸零值（min=max=0）被误读为 scale-to-zero。
 type App struct {
-	ID              string
-	ProjectID       string
-	Hostname        string
-	ImageRef        string
-	VCPU            int64
-	MemMIB          int64
-	DesiredReplicas int
-	Generation      int64
-	Deleted         bool // deleted_at 非空（P0-1：app 生命周期终态）
-	CreatedAt       string
-	UpdatedAt       string
+	ID                string
+	ProjectID         string
+	Hostname          string
+	ImageRef          string
+	VCPU              int64
+	MemMIB            int64
+	DesiredReplicas   int
+	Generation        int64
+	Deleted           bool // deleted_at 非空（P0-1：app 生命周期终态）
+	AutoscaleEnabled  bool
+	MinReplicas       int
+	MaxReplicas       int
+	TargetConcurrency int
+	ScaleDownDelaySec int
+	PanicThreshold    float64
+	CreatedAt         string
+	UpdatedAt         string
+}
+
+// Autoscale 返回钳制后的策略视图（防脏行；store 写入前另有严格校验）。
+func (a App) Autoscale() AutoscalePolicy {
+	return clampAutoscalePolicy(AutoscalePolicy{
+		Enabled:           a.AutoscaleEnabled,
+		MinReplicas:       a.MinReplicas,
+		MaxReplicas:       a.MaxReplicas,
+		TargetConcurrency: a.TargetConcurrency,
+		ScaleDownDelaySec: a.ScaleDownDelaySec,
+		PanicThreshold:    a.PanicThreshold,
+	})
 }
 
 // getAppColumns 是 apps 的公共列序（Get/List 共用）。
 const appColumns = `id, project_id, hostname, image_ref, vcpu, mem_mib, desired_replicas,
-	generation, (deleted_at IS NOT NULL), created_at::text, updated_at::text`
+	generation, (deleted_at IS NOT NULL), autoscale_enabled, min_replicas, max_replicas,
+	target_concurrency, scale_down_delay_sec, panic_threshold,
+	created_at::text, updated_at::text`
 
 // scanApp 按列序扫描 app 行。
 func scanApp(row scanner) (*App, error) {
 	var a App
 	if err := row.Scan(&a.ID, &a.ProjectID, &a.Hostname, &a.ImageRef, &a.VCPU, &a.MemMIB,
-		&a.DesiredReplicas, &a.Generation, &a.Deleted, &a.CreatedAt, &a.UpdatedAt); err != nil {
+		&a.DesiredReplicas, &a.Generation, &a.Deleted,
+		&a.AutoscaleEnabled, &a.MinReplicas, &a.MaxReplicas, &a.TargetConcurrency,
+		&a.ScaleDownDelaySec, &a.PanicThreshold,
+		&a.CreatedAt, &a.UpdatedAt); err != nil {
 		return nil, err
 	}
 	return &a, nil

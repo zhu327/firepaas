@@ -69,6 +69,21 @@ type Catalog struct {
 // New 构造 Catalog。
 func New(rdb *redis.Client) *Catalog { return &Catalog{rdb: rdb} }
 
+// AutoscaleKey 返回并发信号键（ADR-0041 §2：带 20s TTL 的瞬时信号族，
+// 与 route:{host}:{port} 无 TTL 靠 rebuild/prune 的投影区分开——单点
+// 故障只导致 hold 而不是删光；TTL 靠过期自清，不进 keepRoutes/PruneRoutes）。
+func AutoscaleKey(hostname string) string { return "autoscale:" + hostname }
+
+// GetAutoscaleFields 读单个 hostname 的全 edge 信号 field（HGETALL）。
+// 调用方（controller 聚合）只认 fresh field；key 缺失/读失败由调用方按
+// hold 处理（fail-closed），本方法只透传 Redis 错误。
+func (c *Catalog) GetAutoscaleFields(ctx context.Context, hostname string) (map[string]string, error) {
+	if hostname == "" {
+		return nil, nil
+	}
+	return c.rdb.HGetAll(ctx, AutoscaleKey(hostname)).Result()
+}
+
 // HostRoute 是一个 hostname 的完整 route 投影项。
 type HostRoute struct {
 	Port  int

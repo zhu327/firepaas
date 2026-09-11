@@ -783,3 +783,46 @@ func TestDNSStaleWindowDefaultsMatchEdge(t *testing.T) {
 		t.Fatalf("SetDNSStaleWindow(60s) = %v", p.dnsStaleWindow)
 	}
 }
+
+// TestDeriveExcludesSupersededGenerationAfterRolloutComplete（review 2026-09-10）：
+// rollout COMPLETE 后已无活跃 rollout，但旧代 machine 直到 delete 收敛仍会被
+// ActiveRouteMachines 返回。draining 必须从 deployment 终态派生，否则
+// 被替换的旧代会被重新发布为健康 backend（ADR-0015 切流语义被回退）。
+func TestDeriveExcludesSupersededGenerationAfterRolloutComplete(t *testing.T) {
+	machine := func(id, depID string) store.Machine {
+		return store.Machine{
+			ID: id, AppID: "app", DeploymentID: depID, Hostname: "app.test",
+			CurrentExecutionID: "exec-" + id, NodeID: "node",
+			ObservedState: "RUNNING", ObservedReadiness: "READY", ReplicaOrdinal: 0,
+		}
+	}
+	projection := Derive(Input{
+		Machines: []store.Machine{machine("old", "dep-old"), machine("new", "dep-new")},
+		Deployments: []store.Deployment{
+			{ID: "dep-old", AppID: "app", Generation: 1, Port: 8080, Status: "SUPERSEDED"},
+			{ID: "dep-new", AppID: "app", Generation: 2, Port: 8080, Status: "ACTIVE"},
+		},
+		ProxyByNode: map[string]string{"node": "proxy"}, DefaultAppPort: 8080,
+	})
+	if len(projection.Routes) != 1 {
+		t.Fatalf("routes = %+v, want 1 hostname", projection.Routes)
+	}
+	backends := projection.Routes[0].Backends
+	if len(backends) != 1 || backends[0].MachineID != "new" {
+		t.Fatalf("superseded generation re-published: %+v", backends)
+	}
+
+	// 失败/回滚代（FAILED）同样永不 serving。
+	projection = Derive(Input{
+		Machines: []store.Machine{machine("bad", "dep-bad"), machine("good", "dep-good")},
+		Deployments: []store.Deployment{
+			{ID: "dep-bad", AppID: "app", Generation: 3, Port: 8080, Status: "FAILED"},
+			{ID: "dep-good", AppID: "app", Generation: 2, Port: 8080, Status: "ACTIVE"},
+		},
+		ProxyByNode: map[string]string{"node": "proxy"}, DefaultAppPort: 8080,
+	})
+	if len(projection.Routes) != 1 || len(projection.Routes[0].Backends) != 1 ||
+		projection.Routes[0].Backends[0].MachineID != "good" {
+		t.Fatalf("failed generation must not serve: %+v", projection.Routes)
+	}
+}

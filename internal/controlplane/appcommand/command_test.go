@@ -51,7 +51,11 @@ func (f fakeImages) Validate(image string) (string, error) {
 func TestExecuteInheritsAndInitiatesDeployment(t *testing.T) {
 	hc, _ := protojson.Marshal(&pb.HealthCheckSpec{Type: pb.HealthCheckSpec_HTTP, Target: "/ready"})
 	auto, _ := protojson.Marshal(&pb.AutoStandbyPolicy{Enabled: false, IdleTimeoutSeconds: 60})
-	egress, err := marshalEgress(&EgressPolicy{Mode: "allowlist", AllowedDomains: []string{"API.EXAMPLE.COM."}}, 4)
+	egress, err := marshalEgress(
+		&EgressPolicy{Mode: "allowlist", AllowedDomains: []string{"API.EXAMPLE.COM."}},
+		4,
+		true,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}

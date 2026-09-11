@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -29,6 +30,22 @@ import (
 //  5. v6 源绑定 + ipcache/policy：合法 ULA 对放行、无 policy/未知 src drop。
 //
 //     sudo FIREPAAS_TEST_NETNS=1 go test ./internal/agent/network/ebpf/ -run TestEbpfDatapathNetns -v
+//
+// testProxyPort 读取测试代理端口（默认值兼容历史；同主机 lab 占用默认端口时
+// 可用 FIREPAAS_TEST_PROXY_PORT80/443 切换，避免 bind 冲突）。
+func testProxyPort(t *testing.T, env string, def int) int {
+	t.Helper()
+	raw := strings.TrimSpace(os.Getenv(env))
+	if raw == "" {
+		return def
+	}
+	p, err := strconv.Atoi(raw)
+	if err != nil || p < 1 || p > 65535 {
+		t.Fatalf("%s=%q invalid", env, raw)
+	}
+	return p
+}
+
 func TestEbpfDatapathNetns(t *testing.T) {
 	if os.Getenv("FIREPAAS_TEST_NETNS") != "1" {
 		t.Skip("set FIREPAAS_TEST_NETNS=1 (root) to run kernel networking test")
@@ -145,15 +162,24 @@ func TestEbpfDatapathNetns(t *testing.T) {
 
 	b, err := New(Options{
 		PinDir:         pinDir,
-		EgressProxy80:  18080,
-		EgressProxy443: 18443,
+		EgressProxy80:  testProxyPort(t, "FIREPAAS_TEST_PROXY_PORT80", 18080),
+		EgressProxy443: testProxyPort(t, "FIREPAAS_TEST_PROXY_PORT443", 18443),
+		// 独立 root NAT 表：避免与同主机 lab/agentd 的 fp-egress 表互扰。
+		VethCIDR:     "10.12.9.0/24",
+		RootNATTable: fmt.Sprintf("fp-egress-test-%d", os.Getpid()),
+		// 测试需看到每个 allow 事件（生产默认 1/128 采样）。
+		FlowSampleEvery: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		_ = exec.Command("nft", "delete", "table", "ip", fmt.Sprintf("fp-egress-test-%d", os.Getpid())).Run()
+	})
 	ref := slot.SlotRef{
 		Index: 0, VethHost: vh, VethGuest: vg,
 		HostAddr: "10.12.9.1", NsAddr: "10.12.9.2", Netns: ns, GuestIP: guestIP,
+		GuestIP6: ulaSrc,
 	}
 	if os.Getenv("EBPF_DEBUG_NO_TC") == "" {
 		// 与 slot.Manager.ensureNodeBackend 同序：EnsureNode（节点级设施，
@@ -218,7 +244,7 @@ func TestEbpfDatapathNetns(t *testing.T) {
 	}
 
 	// 2) 代理 redirect + 反向 NAT（回流 src 还原为原始 dst:80）。
-	proxy, err := net.Listen("tcp", "0.0.0.0:18080")
+	proxy, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", testProxyPort(t, "FIREPAAS_TEST_PROXY_PORT80", 18080)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,8 +306,8 @@ func TestEbpfDatapathNetns(t *testing.T) {
 	if runHelper(t, ctx, guestNS, dialSpec{
 		target: "203.0.113.10:80", src: guestIP, timeout: 1200 * time.Millisecond,
 	}) {
-		// 238 偶发诊断：limit 未生效时打印聚合计数与 cap，供定位计数竞态。
-		dumpConnCount(t, b, guestIP)
+		out, _ := exec.Command("ip", "netns", "exec", ns, "nft", "list", "table", "ip", "fp-slot").CombinedOutput()
+		t.Logf("ns fp-slot table:\n%s", out)
 		t.Fatal("third connection must exceed conn limit")
 	}
 
@@ -435,40 +461,6 @@ func TestEbpfDatapathNetns(t *testing.T) {
 	}
 }
 
-// dumpConnCount 打印 conn_count 聚合表与 conn_cap（limit 断言失败诊断用）。
-func dumpConnCount(t *testing.T, b *Backend, guestIP string) {
-	t.Helper()
-	type connKey struct {
-		Saddr uint32
-		Daddr uint32
-		Sport uint16
-		Dport uint16
-	}
-	// 与 BPF 侧 struct conn_val 同布局（lock u32 + 填充 + count u64）。
-	type connVal struct {
-		Lock  uint32
-		_     [4]byte
-		Count uint64
-	}
-	key, _ := ipv4Key(guestIP)
-	var cap uint32
-	if err := b.connCap.Lookup(key, &cap); err != nil {
-		t.Logf("conn_cap lookup: %v", err)
-	} else {
-		t.Logf("conn_cap[%s]=%d", guestIP, cap)
-	}
-	it := b.connCount.Iterate()
-	var k connKey
-	var v connVal
-	for it.Next(&k, &v) {
-		t.Logf("conn_count[saddr=%08x daddr=%08x sport=%d dport=%d]={count=%d}",
-			k.Saddr, k.Daddr, k.Sport, k.Dport, v.Count)
-	}
-	if err := it.Err(); err != nil {
-		t.Logf("conn_count iterate: %v", err)
-	}
-}
-
 // dialSpec 描述一次 helper 连接。
 type dialSpec struct {
 	target     string
@@ -607,10 +599,8 @@ func dumpEbpfDebug(t *testing.T, ctx context.Context, ns, guestNS string, b *Bac
 	t.Helper()
 	key, _ := ipv4Key(guestIP)
 	var host uint32
-	var cap uint32
 	_ = b.host4.Lookup(key, &host)
-	_ = b.connCap.Lookup(key, &cap)
-	t.Logf("host4[%s]=%x conn_cap=%d", guestIP, host, cap)
+	t.Logf("host4[%s]=%x", guestIP, host)
 	out, _ := exec.Command("ip", "netns", "exec", ns, "nft", "list", "table", "ip", "fp-slot").CombinedOutput()
 	t.Logf("ns fp-slot table:\n%s", out)
 	out, _ = exec.Command("ip", "netns", "exec", ns, "tc", "filter", "show", "dev", "v-ebpf-g", "egress").

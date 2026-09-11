@@ -1,0 +1,76 @@
+// operations.go：M5.3 操作追踪端点（mvp-plan §9.3 operation trace）。
+//
+//	GET /v1/operations?machine_id=&kind=&status=&limit=    列表（read scope）
+//	GET /v1/operations/{id}                                详情
+//
+// 安全：request/result 经 redact.RedactJSONBytes 全树脱敏后才出（M4 单向下发
+// 字段绝不回显）；error 也可能带回显信息（当前为错误文案，无明文凭证）。
+package httpapi
+
+import (
+	"errors"
+	"net/http"
+	"strconv"
+
+	"github.com/zhu327/firepaas/internal/controlplane/store"
+	"github.com/zhu327/firepaas/internal/security/redact"
+)
+
+func (a *API) listOperations(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	limit := 100
+	if v := q.Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 500 {
+			limit = n
+		}
+	}
+	project := effectiveProjectID(r, "dev")
+	ops, err := a.store.ListOperations(r.Context(), project, q.Get("machine_id"), q.Get("kind"), q.Get("status"), limit)
+	if err != nil {
+		writeInternalErr(w, r, err)
+		return
+	}
+	out := make([]map[string]any, 0, len(ops))
+	for _, op := range ops {
+		out = append(out, opJSON(op))
+	}
+	writeJSON(w, 200, map[string]any{"operations": out})
+}
+
+func (a *API) getOperation(w http.ResponseWriter, r *http.Request) {
+	op, err := a.store.GetOperation(r.Context(), effectiveProjectID(r, "dev"), r.PathValue("id"))
+	if err != nil {
+		// 仅确证 not-found 才 404（store 将 pgx.ErrNoRows 归为 ErrNotFound 哨兵）；
+		// PG 故障等内部错误 5xx，不再伪装成“操作不存在”。
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, 404, "operation not found")
+			return
+		}
+		writeInternalErr(w, r, err)
+		return
+	}
+	writeJSON(w, 200, opJSON(*op))
+}
+
+// opJSON 输出 trace 字段；request/result/error 全树脱敏。
+func opJSON(op store.OperationTrace) map[string]any {
+	fields := map[string]any{
+		"id":            op.ID,
+		"project_id":    op.ProjectID,
+		"machine_id":    op.MachineID,
+		"execution_id":  op.ExecutionID,
+		"generation":    op.Generation,
+		"kind":          op.Kind,
+		"status":        op.Status,
+		"dispatch_node": op.DispatchNodeID,
+		"attempts":      op.Attempts,
+		"created_at":    op.CreatedAt,
+		"updated_at":    op.UpdatedAt,
+		"claimed_at":    op.ClaimedAt,
+		"completed_at":  op.CompletedAt,
+		"request":       string(redact.RedactJSONBytes(op.Request)),
+		"result":        string(redact.RedactJSONBytes(op.Result)),
+		"error":         redact.RedactText(op.Error),
+	}
+	return fields
+}

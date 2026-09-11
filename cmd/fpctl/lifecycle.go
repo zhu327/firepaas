@@ -27,7 +27,7 @@ func runMachines(args []string) error {
 	switch args[0] {
 	case "ls":
 		fs := flag.NewFlagSet("machines ls", flag.ExitOnError)
-		project := fs.String("project", "", "filter by project id")
+		project := fs.String("project", defaultProject(""), "filter by project id")
 		_ = fs.Parse(args[1:])
 		path := "/v1/machines"
 		if *project != "" {
@@ -82,7 +82,7 @@ func runWait(args []string) error {
 		q := url.Values{}
 		q.Set("execution_id", *exec)
 		q.Set("timeout_ms", strconv.Itoa(*timeout))
-		return do("GET", "/v1/machines/"+url.PathEscape(args[1])+"/wait?"+q.Encode(), nil, nil)
+		return doLong("GET", "/v1/machines/"+url.PathEscape(args[1])+"/wait?"+q.Encode(), nil, nil)
 	case "operation":
 		if len(args) < 2 {
 			return errors.New("usage: fpctl wait operation <operation_id> [--timeout-ms N]")
@@ -92,7 +92,7 @@ func runWait(args []string) error {
 		_ = fs.Parse(args[2:])
 		q := url.Values{}
 		q.Set("timeout_ms", strconv.Itoa(*timeout))
-		return do("GET", "/v1/operations/"+url.PathEscape(args[1])+"/wait?"+q.Encode(), nil, nil)
+		return doLong("GET", "/v1/operations/"+url.PathEscape(args[1])+"/wait?"+q.Encode(), nil, nil)
 	case "rollout":
 		if len(args) < 2 {
 			return errors.New("usage: fpctl wait rollout <rollout_id> --generation G [--timeout-ms N]")
@@ -107,7 +107,7 @@ func runWait(args []string) error {
 		q := url.Values{}
 		q.Set("generation", strconv.FormatInt(*generation, 10))
 		q.Set("timeout_ms", strconv.Itoa(*timeout))
-		return do("GET", "/v1/rollouts/"+url.PathEscape(args[1])+"/wait?"+q.Encode(), nil, nil)
+		return doLong("GET", "/v1/rollouts/"+url.PathEscape(args[1])+"/wait?"+q.Encode(), nil, nil)
 	default:
 		return fmt.Errorf("unknown wait command %q", args[0])
 	}

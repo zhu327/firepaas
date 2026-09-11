@@ -60,7 +60,8 @@ sudo_run() { # lab 脚本大多需要 root 与显式 env（sudo 默认剥环境�
   if [ "$(id -u)" = "0" ]; then "$@"; return; fi
   local -a envs=()
   for v in FIREPAAS_MESH NOMAD_ADDR FABRIC_SPIKE_API_TOKEN FABRIC_SPIKE_NODE_A FABRIC_SPIKE_NODE_B \
-           FABRIC_SPIKE_IMAGE_REF FABRIC_SPIKE_EDGE_METRICS FP_API_TOKEN FP_SOAK_IMAGE FP_API_ADDR; do
+           FABRIC_SPIKE_IMAGE_REF FABRIC_SPIKE_EDGE_METRICS FP_API_TOKEN FP_SOAK_IMAGE FP_API_ADDR \
+           FIREPAAS_GO FIREPAAS_LAB_EDGE_PORT FIREPAAS_LAB_API_PORT; do
     [ -n "${!v:-}" ] && envs+=("$v=${!v}")
   done
   if [ ${#envs[@]} -gt 0 ]; then sudo env "${envs[@]}" "$@"; else sudo "$@"; fi

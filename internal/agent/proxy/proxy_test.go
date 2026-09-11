@@ -147,3 +147,33 @@ func TestProxyDoesNotForwardOrTrustRetryHeaderFromWorkload(t *testing.T) {
 		t.Fatalf("workload-forged retry marker leaked to edge: %q", got)
 	}
 }
+
+// edge→agent 的请求关联 ID 只用于 agent 日志：绝不转发给 guest。
+func TestProxyStripsRequestIDBeforeWorkload(t *testing.T) {
+	guestSaw := make(chan string, 1)
+	guest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		guestSaw <- r.Header.Get(HeaderRequestID)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer guest.Close()
+	_, port, err := net.SplitHostPort(guest.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	inst := &instances.Instance{StoredMetadata: instances.StoredMetadata{
+		IP: "127.0.0.1", Tags: map[string]string{
+			"firepaas/execution_id": "e1", "firepaas/port": port,
+		},
+	}}
+	p := New(machine.New(&testInstances{instance: inst}, &testImages{}, nil, nil))
+	r := proxyRequest()
+	r.Header.Set(HeaderRequestID, "req-1")
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, r)
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", rr.Code)
+	}
+	if got := <-guestSaw; got != "" {
+		t.Fatalf("internal request id forwarded to workload: %q", got)
+	}
+}

@@ -53,7 +53,11 @@ func runEvents(args []string) error {
 	switch args[0] {
 	case "ls":
 		fs := flag.NewFlagSet("events ls", flag.ExitOnError)
-		project := fs.String("project", "", "project id (required for root; scoped keys default to own)")
+		project := fs.String(
+			"project",
+			defaultProject(""),
+			"project id (required for root; scoped keys default to own)",
+		)
 		app := fs.String("app", "", "filter by app id")
 		machine := fs.String("machine", "", "filter by machine id")
 		typ := fs.String("type", "", "filter by event type")
@@ -77,7 +81,7 @@ func runEvents(args []string) error {
 	case "scheduler":
 		fs := flag.NewFlagSet("events scheduler", flag.ExitOnError)
 		limit := fs.Int("limit", 200, "max events")
-		project := fs.String("project", "", "filter by project id")
+		project := fs.String("project", defaultProject(""), "filter by project id")
 		_ = fs.Parse(args[1:])
 		q := url.Values{}
 		q.Set("limit", fmt.Sprint(*limit))

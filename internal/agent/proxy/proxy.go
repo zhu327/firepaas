@@ -29,6 +29,9 @@ const (
 	// HeaderAppPort（v1.1，ADR-0022）：edge→proxy 的目标 service 端口头。
 	// 缺失 = 旧行为（spec 声明的主 service 端口），向后兼容。
 	HeaderAppPort = "X-Firepaas-App-Port"
+	// HeaderRequestID 是 edge→agent 的请求关联 ID（只进日志；转发 guest 前
+	// 剥离）。缺失时日志记空串，不阻塞请求。
+	HeaderRequestID = "X-Firepaas-Request-ID"
 	// HeaderRetryable marks an agent-generated 502 that edge may retry after
 	// refreshing its route. It is strictly an internal agent→edge signal and
 	// must never be forwarded to a workload or client.
@@ -37,6 +40,16 @@ const (
 )
 
 type targetKey struct{}
+
+// logFieldsKey 承载请求日志关联字段（edge 传入的 request_id + 路由归属），
+// 供 Director 之后的 ErrorHandler 使用（Director 已剥离内部头）。
+type logFieldsKey struct{}
+
+type logFields struct {
+	requestID   string
+	machineID   string
+	executionID string
+}
 
 // Proxy 按 machine_id + execution_id 把流量转发到 workload endpoint。
 // ReverseProxy 与 Transport 在构造时创建一次并复用（评审 P3：连接池不得
@@ -107,9 +120,10 @@ func newReverseProxy() *httputil.ReverseProxy {
 			req.URL.Scheme = target.Scheme
 			req.URL.Host = target.Host
 			req.Host = target.Host
-			// 内部转发头不进入 guest。
+			// 内部转发头不进入 guest（request id 同步剥离；关联只到 agent 日志）。
 			req.Header.Del(HeaderMachineID)
 			req.Header.Del(HeaderExecutionID)
+			req.Header.Del(HeaderRequestID)
 			req.Header.Del(traffic.HeaderCredential)
 			req.Header.Del(HeaderAppPort)
 			req.Header.Del(HeaderRetryable)
@@ -123,7 +137,11 @@ func newReverseProxy() *httputil.ReverseProxy {
 			// P0#4：transport 错误正文不得携带 guest IP:port 等内部拓扑——
 			// 对 edge 只回固定文案，拨号细节留在本机日志。retryable 头
 			// 语义不变（edge 仍可按它决定是否换 backend 重试）。
+			fields, _ := r.Context().Value(logFieldsKey{}).(logFields)
 			slog.Warn("workload proxy transport error",
+				"request_id", fields.requestID,
+				"machine_id", fields.machineID,
+				"execution_id", fields.executionID,
 				"method", r.Method, "path", r.URL.Path, "error", err)
 			w.Header().Set(HeaderRetryable, retryableValue)
 			http.Error(w, "workload upstream unreachable", http.StatusBadGateway)
@@ -170,6 +188,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // serveTarget 是两条入口共享的转发路径（legacy :5107 头路由与 G2d
 // fabric ingress 凭证路由）：endpoint 解析 → 反向代理到 guest。
 func (p *Proxy) serveTarget(w http.ResponseWriter, r *http.Request, machineID, executionID string, wantPort int) {
+	// 关联字段进 context：Director 会剥离内部头，ErrorHandler 只能从
+	// context 取 request_id 与路由归属。
+	r = r.WithContext(context.WithValue(r.Context(), logFieldsKey{}, logFields{
+		requestID:   r.Header.Get(HeaderRequestID),
+		machineID:   machineID,
+		executionID: executionID,
+	}))
 	ip, port, err := p.machines.GetEndpointForPort(r.Context(), machineID, executionID, wantPort)
 	if err != nil {
 		// Endpoint lookup failure means this agent cannot serve the catalogued

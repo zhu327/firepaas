@@ -396,3 +396,44 @@ func TestDeleteErrorConverges(t *testing.T) {
 		}
 	}
 }
+
+// 验收修复（2026-09-11）：machine desired=DELETED 时存量 create 直接
+// SUPERSEDED 终态，不发起 placement/agent RPC（零客户端下完整收敛即证明）。
+func TestProcessCreateDeletedMachineSuperseded(t *testing.T) {
+	s, _ := testPGStore(t)
+	ctx := context.Background()
+	sfx := fmt.Sprint(os.Getpid())
+	project := "t-crdel-p" + sfx
+	appID := "t-crdel-app" + sfx
+	machineID := "t-crdel-m" + sfx
+	opID := "t-crdel-op" + sfx
+	seedR2App(t, s, ctx, project, appID)
+	insertR2Machine(t, s, ctx, appID, machineID, "dep-crdel"+sfx, "e1-"+sfx, 1, "node-x")
+	if _, err := s.Pool().Exec(ctx,
+		`UPDATE machines SET desired_state='DELETED' WHERE id=$1`, machineID); err != nil {
+		t.Fatal(err)
+	}
+	req := fmt.Sprintf(`{"machine_id":%q,"operation_id":%q}`, machineID, opID)
+	insertR2OpInFlight(t, s, ctx, project, opID, machineID, "e1-"+sfx, 1, "create", []byte(req))
+
+	nm, err := nodemanager.New(nodemanager.Config{NomadAddr: "http://127.0.0.1:9"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nm.Close()
+	c := &Controller{
+		store: s, nodes: nm, metrics: metrics.New(),
+		cfg: Config{AgentRPCTimeout: 100 * time.Millisecond},
+	}
+	op := store.Operation{
+		ID: opID, ProjectID: project, MachineID: machineID,
+		ExecutionID: "e1-" + sfx, Generation: 1, Kind: "create",
+		Request: []byte(req),
+	}
+	if err := c.processCreate(ctx, op); err != nil {
+		t.Fatalf("deleted machine create must converge as SUPERSEDED without RPC, got error: %v", err)
+	}
+	if status, errText := opStatus(t, s, ctx, opID); status != "SUPERSEDED" {
+		t.Fatalf("op status = %q (err=%q), want SUPERSEDED", status, errText)
+	}
+}

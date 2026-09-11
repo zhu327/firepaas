@@ -212,6 +212,7 @@ func (m *Manager) refFor(s Slot) (SlotRef, error) {
 		NsAddr:    nsAddr,
 		Netns:     m.nsName(s.Index),
 		GuestIP:   s.GuestIP,
+		GuestIP6:  s.GuestIP6,
 	}, nil
 }
 
@@ -326,13 +327,13 @@ func (m *Manager) AttachNetns(ctx context.Context, spec api.NetnsSpec) error {
 		// the persisted rule set so it can be replayed and rebuilt by egress.Manager.
 		s.Tap = tap
 		s.GuestIP = guestIP
-		if s.GuestIP6 != guestIP6 {
+		if eff6 := effectiveGuestIP6(s.GuestIP6, guestIP6); s.GuestIP6 != eff6 {
 			// execution 更替带来新 ULA：旧 /128 路由与 NDP 代理尽力回收，
 			// 避免 stale 条目把旧地址继续引入本 slot。
 			if s.GuestIP6 != "" {
 				m.removeSlotV6Locked(ctx, s)
 			}
-			s.GuestIP6 = guestIP6
+			s.GuestIP6 = eff6
 		}
 		m.slots[machineID] = s
 		return m.persistLocked()
@@ -384,10 +385,7 @@ func (m *Manager) Check(ctx context.Context, spec api.NetnsSpec) error {
 	if !ok {
 		return fmt.Errorf("slot: check: machine %s has no slot", spec.MachineID)
 	}
-	g6 := spec.GuestIP6
-	if g6 == "" {
-		g6 = s.GuestIP6
-	}
+	g6 := effectiveGuestIP6(s.GuestIP6, spec.GuestIP6)
 	return m.ensureKernel(ctx, s, spec.Tap, spec.GuestIP, g6)
 }
 
@@ -435,14 +433,28 @@ func (m *Manager) Reconcile(ctx context.Context, live []api.LiveInstance) error 
 			continue
 		}
 		if !exists {
+			// 内核 netns 已不存在：不能只 delete 内存条目——后端 map
+			//（eBPF host4/egress_slot/slot_ula）与 root 侧 veth/路由
+			// 残留会在 ifindex 复用窗口内作用于新 slot。releaseLocked
+			// 对“netns 已不存在”幂等（deleteNetns 容忍），best-effort
+			// 失败记 Warn 后继续。
+			if err := m.releaseLocked(ctx, s); err != nil {
+				logf(slog.LevelWarn, "slot: reconcile release missing netns %s (degraded): %v", id, err)
+			}
 			delete(m.slots, id)
 			continue
 		}
 		if l, ok := liveByID[id]; ok && l.Tap == s.Tap {
-			g6 := l.GuestIP6
-			if g6 == "" {
-				g6 = s.GuestIP6
+			if l.GuestIP6 != "" && l.GuestIP6 != s.GuestIP6 {
+				// execution 更替带来新 ULA：旧 /128 路由与 NDP 代理若
+				// 留到 ifindex 复用窗口会误导新 slot 的 v6 引导，先
+				// 回收再更新持久状态。落盘收敛到函数尾的 persistLocked
+				// （本分支 continue，不在循环内多次写盘）。
+				m.removeSlotV6Locked(ctx, s)
+				s.GuestIP6 = l.GuestIP6
+				m.slots[id] = s
 			}
+			g6 := effectiveGuestIP6(s.GuestIP6, l.GuestIP6)
 			if err := m.ensureKernel(ctx, s, l.Tap, l.GuestIP, g6); err != nil {
 				logf(slog.LevelWarn, "slot: re-ensure %s (degraded): %v", id, err)
 			}
@@ -778,6 +790,11 @@ func (m *Manager) setupLocked(ctx context.Context, s Slot) error {
 
 // ensureKernel 幂等补齐已有 slot 的内核状态（Reconcile/重复 Attach 用）。
 func (m *Manager) ensureKernel(ctx context.Context, s Slot, tap, guestIP, guestIP6 string) error {
+	// 目标态副本：execution 更替时调用方尚未更新 s.GuestIP6，但后端 ref
+	// （eBPF slot_ula 源绑定）必须用**目标** ULA；空值 = 保持既有（见
+	// effectiveGuestIP6——Resume 复挂不携带 ULA）。
+	g6 := effectiveGuestIP6(s.GuestIP6, guestIP6)
+	s.Tap, s.GuestIP, s.GuestIP6 = tap, guestIP, g6
 	var err error
 	_, nsAddr, err := m.vethAddrs(s.Index)
 	if err != nil {
@@ -812,10 +829,6 @@ func (m *Manager) ensureKernel(ctx context.Context, s Slot, tap, guestIP, guestI
 		}
 	}
 	// v6 接线幂等补齐（TAP 重建后 ULA 经 TAP 路由需重建；replace 语义幂等）。
-	g6 := guestIP6
-	if g6 == "" {
-		g6 = s.GuestIP6
-	}
 	if g6 != "" {
 		if err := m.ensureSlotV6Locked(ctx, Slot{Index: s.Index, MachineID: s.MachineID, Tap: tap, GuestIP6: g6}); err != nil {
 			return err
@@ -832,6 +845,18 @@ func parseSlotULA6(raw string) (string, error) {
 		return "", fmt.Errorf("slot: invalid guest ULA %q", raw)
 	}
 	return a.String(), nil
+}
+
+// effectiveGuestIP6 解析“未提供 ULA”（provided 空串）的语义：保持既有 ULA。
+// reattachSlot（Resume/autoresume/ConvergeResume，adapter.go）不携带
+// GuestIP6；空值若被解读为“清空”，会出现“v6 路由已删但 slot_ula 仍认旧
+// ULA”的不一致（且 Resume 后 v6 永久失联）。显式清空只走 DetachNetns/
+// 新 execution 的完整 attach。
+func effectiveGuestIP6(existing, provided string) string {
+	if strings.TrimSpace(provided) == "" {
+		return existing
+	}
+	return provided
 }
 
 // slotTapMTU6 是 ULA slot 的 TAP MTU（1280 = IPv6 最小 MTU；WG 封装

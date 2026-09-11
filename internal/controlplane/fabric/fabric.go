@@ -4,7 +4,10 @@
 //
 // 语义（与 agent 侧节点级 fencing 配套）：
 //   - 每节点推送水位 = fabric_versions.generation，只升不降；
-//   - 快照内容哈希不变 = 不推送；内容变化 → generation+1 推送；
+//   - 快照内容哈希不变 = 不推送（距上次成功推送超过 ForceSyncEvery 时仍强制
+//     重推一代，自愈 agent 状态丢失）；内容变化 → generation+1 推送；
+//   - 发送前用契约包校验请求；非法快照不出网、不推进水位，只记录可观测状态
+//     （否则 agent 以 InvalidArgument 拒收，控制面把每次失败当可重试）；
 //   - 推送失败（含响应丢失）→ 同 operation_id 重试（agent ledger 幂等）；
 //   - agent 返回 FailedPrecondition（其水位高于本侧，外部干预/丢更新）→
 //     本侧强制推进水位并置空内容哈希，下一轮以更高代重推，自动收敛；
@@ -31,6 +34,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/zhu327/firepaas/internal/contracts/agentv1"
 	"github.com/zhu327/firepaas/internal/controlplane/agentclient"
 	"github.com/zhu327/firepaas/internal/controlplane/catalog"
 	"github.com/zhu327/firepaas/internal/controlplane/nodemanager"
@@ -56,12 +60,15 @@ type InternalDNSLister interface {
 }
 
 type Config struct {
-	Store       *store.Store
-	NodeSource  NodeSource
-	CellPrefix  string // 本 cell /40 ULA（RFC 4193 fd00::/8；节点 /64 从内分配）
-	WgPort      uint16 // peer endpoint 端口（与 agent FIREPAAS_MESH_WG_PORT 同值）
-	SyncEvery   time.Duration
-	PushTimeout time.Duration
+	Store      *store.Store
+	NodeSource NodeSource
+	CellPrefix string // 本 cell /40 ULA（RFC 4193 fd00::/8；节点 /64 从内分配）
+	WgPort     uint16 // peer endpoint 端口（与 agent FIREPAAS_MESH_WG_PORT 同值）
+	SyncEvery  time.Duration
+	// ForceSyncEvery：内容哈希未变也强制重推的最大间隔（agent 无水位查询，
+	// 全量快照是有界状态，周期重推可自愈 agent 状态丢失）。默认 10 分钟。
+	ForceSyncEvery time.Duration
+	PushTimeout    time.Duration
 	// DNS（G2c）：.internal 记录源（Redis dns:internal:* 投影，publisher
 	// 唯一写者）。nil = 快照不携带 DNS（节点本地 DNS 服空表）。
 	DNS InternalDNSLister
@@ -109,6 +116,13 @@ type Reconciler struct {
 
 	statusMu sync.Mutex
 	statuses map[string]*NodeFabricStatus
+	// lastPushAt：per-node 上次成功推进水位的时刻（周期强制重推的计时基准）。
+	// 与 statuses 同锁保护：Sync 目前单 goroutine，但 Status/Statuses 允许并发读。
+	lastPushAt map[string]time.Time
+	// lastPushedGen：per-node 本进程最近一次成功推进的水位。DB 水位低于它
+	// 说明 fabric_versions 被回退（备份恢复/丢更新）——内容哈希未变也必须
+	// 立即重推，否则要等 ForceSyncEvery 才会发现，期间 agent 已拒收新内容。
+	lastPushedGen map[string]int64
 }
 
 // NodeFabricStatus 是单节点的 fabric 发布状态（纯观测，不参与 fencing）。
@@ -180,6 +194,45 @@ func (r *Reconciler) lastSectionHashes(nodeID string) map[string]string {
 	return nil
 }
 
+// forceSyncDue 报告是否已到周期强制重推窗口：本进程尚无该节点的成功推送
+// 记录（首次观察，可能是进程重启后 agent 已丢状态）视为到期；否则距上次
+// 成功推送超过 ForceSyncEvery 才到期。到期时内容哈希未变也强制推一代，
+// 使 agent 状态丢失后在有限窗口内收敛，而不是永不重推。
+func (r *Reconciler) forceSyncDue(nodeID string) bool {
+	r.statusMu.Lock()
+	defer r.statusMu.Unlock()
+	last, ok := r.lastPushAt[nodeID]
+	if !ok {
+		return true
+	}
+	return time.Since(last) >= r.cfg.ForceSyncEvery
+}
+
+// markPushed 记录一次成功推送（仅在水位推进成功后调用，见 syncNode）。
+// gen 参与水位回退检测：DB 水位低于本进程已推代时必须立即重推。
+func (r *Reconciler) markPushed(nodeID string, gen int64, at time.Time) {
+	r.statusMu.Lock()
+	defer r.statusMu.Unlock()
+	if r.lastPushAt == nil {
+		r.lastPushAt = map[string]time.Time{}
+	}
+	if r.lastPushedGen == nil {
+		r.lastPushedGen = map[string]int64{}
+	}
+	r.lastPushAt[nodeID] = at
+	r.lastPushedGen[nodeID] = gen
+}
+
+// watermarkRegressed 报告 DB 水位是否低于本进程最近一次成功推进的世代。
+// 备份恢复/外部直写会把 fabric_versions.generation 拉低；此时内容哈希虽然
+// 未变，但 agent 的水位仍在高位，必须立即推一代（agent 拒绝时携带水位
+// detail，控制面一步跳到 applied+1），而不是等 ForceSyncEvery 窗口。
+func (r *Reconciler) watermarkRegressed(nodeID string, version int64) bool {
+	r.statusMu.Lock()
+	defer r.statusMu.Unlock()
+	return r.lastPushedGen[nodeID] > version
+}
+
 // New 校验配置并构造（cell 必须为规范化 /40 ULA）。
 func New(cfg Config) (*Reconciler, error) {
 	if cfg.Store == nil {
@@ -192,12 +245,21 @@ func New(cfg Config) (*Reconciler, error) {
 	if err != nil {
 		return nil, fmt.Errorf("fabric: cell_prefix: %w", err)
 	}
-	r := &Reconciler{cfg: cfg, cell: cell, dnsCache: map[string][]*pb.DnsRecord{}, statuses: map[string]*NodeFabricStatus{}}
+	r := &Reconciler{
+		cfg: cfg, cell: cell,
+		dnsCache:      map[string][]*pb.DnsRecord{},
+		statuses:      map[string]*NodeFabricStatus{},
+		lastPushAt:    map[string]time.Time{},
+		lastPushedGen: map[string]int64{},
+	}
 	if r.cfg.WgPort == 0 {
 		r.cfg.WgPort = 51820
 	}
 	if r.cfg.SyncEvery == 0 {
 		r.cfg.SyncEvery = 10 * time.Second
+	}
+	if r.cfg.ForceSyncEvery <= 0 {
+		r.cfg.ForceSyncEvery = 10 * time.Minute
 	}
 	if r.cfg.PushTimeout == 0 {
 		r.cfg.PushTimeout = 5 * time.Second
@@ -450,12 +512,13 @@ func (r *Reconciler) syncNode(ctx context.Context, it nodeItem, round roundSnaps
 		})
 		return err
 	}
-	if version > 0 && lastHash == hash {
+	if version > 0 && lastHash == hash && !r.forceSyncDue(nodeID) &&
+		!r.watermarkRegressed(nodeID, version) {
 		r.recordStatus(NodeFabricStatus{
 			NodeID: nodeID, DesiredGeneration: version, AppliedGeneration: version,
 			LastHash: lastHash, SectionHashes: sections, LastAttempt: time.Now().UTC(),
 		})
-		return nil // 内容未变：不推送
+		return nil // 内容未变且在强制重推窗口内：不推送
 	}
 	gen := version + 1
 	req := &pb.ApplyFabricRequest{
@@ -490,6 +553,19 @@ func (r *Reconciler) syncNode(ctx context.Context, it nodeItem, round roundSnaps
 	req.Eastwest = eastwest
 	req.Dns = dnsRecords
 
+	// 发送前用冻结契约预校验（与 agent 同一实现）：非法快照在本侧 fail closed，
+	// 不出网、不推进水位，只留下可观测错误——否则 agent 以 InvalidArgument
+	// 拒收，控制面把每次失败当作可重试，形成全网无限重试。
+	if err := agentv1.ValidateApplyFabricRequest(req); err != nil {
+		r.recordStatus(NodeFabricStatus{
+			NodeID: nodeID, DesiredGeneration: gen,
+			SectionHashes: sections, ChangedSections: changed,
+			LastError:   fmt.Sprintf("validate snapshot: %v", err),
+			LastAttempt: time.Now().UTC(),
+		})
+		return fmt.Errorf("validate fabric snapshot for %s: %w", nodeID, err)
+	}
+
 	pushCtx, cancel := context.WithTimeout(ctx, r.cfg.PushTimeout)
 	resp, err := it.client.ApplyFabric(pushCtx, req)
 	cancel()
@@ -497,10 +573,25 @@ func (r *Reconciler) syncNode(ctx context.Context, it nodeItem, round roundSnaps
 	if err != nil {
 		if status.Code(err) == codes.FailedPrecondition {
 			// agent 水位高于本侧（丢更新/外部干预）：强制推进水位并清空
-			// 内容哈希，下一轮以更高代重推，自动收敛。
-			if aerr := r.cfg.Store.AdvanceFabricVersion(ctx, nodeID, gen+1, ""); aerr != nil {
+			// 内容哈希，下一轮以更高代重推，自动收敛。新版 agent 随
+			// FailedPrecondition 返回 FabricWatermarkDetail（自身已应用水位），
+			// 直接跳到 applied+1，避免逐代爬升的长窗口；旧 agent 无 detail
+			// 时回退为逐代 +1。
+			next := gen + 1
+			if st := status.Convert(err); st != nil {
+				for _, detail := range st.Details() {
+					wm, ok := detail.(*pb.FabricWatermarkDetail)
+					if !ok {
+						continue
+					}
+					if applied := int64(wm.GetAppliedGeneration()); applied >= next {
+						next = applied + 1
+					}
+				}
+			}
+			if aerr := r.cfg.Store.AdvanceFabricVersion(ctx, nodeID, next, ""); aerr != nil {
 				r.recordStatus(NodeFabricStatus{
-					NodeID: nodeID, DesiredGeneration: gen + 1,
+					NodeID: nodeID, DesiredGeneration: next,
 					SectionHashes: sections, ChangedSections: changed,
 					LastError:   fmt.Sprintf("stale push, bump version: %v", aerr),
 					LastAttempt: attemptAt,
@@ -508,13 +599,13 @@ func (r *Reconciler) syncNode(ctx context.Context, it nodeItem, round roundSnaps
 				return fmt.Errorf("stale push, bump version: %w", aerr)
 			}
 			r.recordStatus(NodeFabricStatus{
-				NodeID: nodeID, DesiredGeneration: gen + 1,
+				NodeID: nodeID, DesiredGeneration: next,
 				SectionHashes: sections, ChangedSections: changed,
 				LastError:   fmt.Sprintf("agent watermark ahead: %v", err),
 				LastAttempt: attemptAt,
 			})
 			slog.Warn("fabric push rejected as stale; version bumped",
-				"node", nodeID, "next_generation", gen+1)
+				"node", nodeID, "next_generation", next)
 			return fmt.Errorf("agent fabric watermark ahead of control plane: %v", err)
 		}
 		r.recordStatus(NodeFabricStatus{
@@ -543,6 +634,7 @@ func (r *Reconciler) syncNode(ctx context.Context, it nodeItem, round roundSnaps
 		})
 		return fmt.Errorf("advance fabric version: %w", err)
 	}
+	r.markPushed(nodeID, gen, attemptAt)
 	r.recordStatus(NodeFabricStatus{
 		NodeID: nodeID, DesiredGeneration: gen, AppliedGeneration: gen,
 		LastHash: hash, SectionHashes: sections, ChangedSections: changed,

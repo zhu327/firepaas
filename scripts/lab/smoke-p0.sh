@@ -135,8 +135,9 @@ if command -v ip >/dev/null; then
     echo "$TAP_LEAK"
     fail "TAP 接口残留（hype- 前缀）"
   fi
-  # k8s/CNI 的 cni-* netns 不属于 hypeman；只关注 hypeman 命名（当前 bridge 模式不建 netns）
-  HYPEMAN_NS="$(ip netns list 2>/dev/null | awk '{print $1}' | grep -viE '^cni-' || true)"
+  # cni-*（k8s/CNI）与 fp-*（agentd slot netns fp-slot-N / fabric 网元，属常驻基础设施）
+  # 都不属于 hypeman 实例残留；只关注 hypeman 命名（当前 bridge 模式不建 netns）。
+  HYPEMAN_NS="$(ip netns list 2>/dev/null | awk '{print $1}' | grep -viE '^(cni|fp)-' || true)"
   if [[ -n "$HYPEMAN_NS" ]]; then
     echo "$HYPEMAN_NS"
     fail "netns 残留（非 CNI）"

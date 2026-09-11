@@ -9,6 +9,7 @@ These records distinguish implemented code from release evidence. Accepted ADRs 
 | v1.2 | [v1.2-plan.md](../v1.2-plan.md) | [v1.2 implementation notes](../v1.2-implementation-notes.md) | Major paths implemented; notes explicitly mark the release gate unmet. |
 | v1.3 | [v1.3-plan.md](../v1.3-plan.md) | [v1.3 implementation notes](../v1.3-implementation-notes.md) | Egress, snapshot and LOCAL_RW paths implemented; CoW remains disabled and version-level gates are not established. |
 | v1.4 | [v1.4-plan.md](../v1.4-plan.md) | [v1.4 implementation notes](../v1.4-implementation-notes.md) | Partial implementation; version-level acceptance is not complete. |
+| v1.5 | [ADR-0039](../adr/0039-tenant-self-service.md) (tenant self-service); no v1.5-plan.md exists | Implementation commit `2a7cf09`: project CRUD, scoped API keys/roles, prewarm self-service, fpctl gap closure | No version-level acceptance record and no v1.5-plan.md; not established. |
 | Fabric (ADR-0040, G1–G3) | [ADR-0040](../adr/0040-network-fabric-g1-g2-g3.md) + [G1–G3 plan](../plans/2026-09-08-network-fabric-g1-g2-g3.md) + [review fixes](../plans/2026-09-09-fabric-review-fixes.md) | 同上两份 plan 的落地后记与验证轮记录 | 同主机双节点实验室 spike stage1–3 / chaos 五场景 / 有界 soak 已跑通；真双主机断连断言、正式证据归档与版本级门禁未建立。 |
 
 Current GA evidence status: [GA observation scorecard](../ga-observation-scorecard.md).

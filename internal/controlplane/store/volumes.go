@@ -366,6 +366,31 @@ func (s *Store) TransitionVolume(ctx context.Context, id, from, to string) error
 	return nil
 }
 
+// MarkVolumeReady 把 volume 推进到 READY，幂等：已是 READY 视为成功。
+//
+// review 2026-09-10：processVolumeCreate 在 agent RPC 成功后崩溃/重试时，
+// CREATING→READY 可能已生效但 CompleteOperation 未落库；旧实现的两个
+// TransitionVolume 都会因状态已为目标而返回 ErrVolumeStateConflict，
+// 导致 operation 无限 requeue（agent 侧幂等重放永远成功，控制面永不变终态）。
+func (s *Store) MarkVolumeReady(ctx context.Context, id string) error {
+	tag, err := s.pool.Exec(ctx, `UPDATE volumes SET state='READY', updated_at=now()
+		WHERE id=$1 AND state IN ('CREATING','UNAVAILABLE')`, id)
+	if err != nil {
+		return fmt.Errorf("mark volume ready: %w", err)
+	}
+	if tag.RowsAffected() > 0 {
+		return nil
+	}
+	v, err := s.GetVolume(ctx, id)
+	if err != nil {
+		return err
+	}
+	if v != nil && v.State == "READY" {
+		return nil
+	}
+	return ErrVolumeStateConflict
+}
+
 // MarkVolumesUnavailable / MarkVolumesAvailable：节点失联/恢复。
 func (s *Store) MarkVolumesUnavailable(ctx context.Context, nodeID string) (int, error) {
 	tag, err := s.pool.Exec(ctx, `UPDATE volumes SET state='UNAVAILABLE', updated_at=now()
@@ -483,16 +508,35 @@ func (s *Store) FailDatasetImport(ctx context.Context, id string) error {
 	return nil
 }
 
+// SealDataset 把 DATASET_RO 导入收敛到 READY/sealed。
+//
+// review 2026-09-10：与 volume create 同一崩溃窗口——首次 SealDataset 已
+// 生效但 CompleteOperation 失败时，重试必须幂等收敛；旧实现只接受
+// state='CREATING'，重试返回 ErrDatasetDigest → operation 无限 requeue。
 func (s *Store) SealDataset(ctx context.Context, id, digest string, size int64) error {
 	tag, err := s.pool.Exec(ctx, `UPDATE volumes SET state='READY',import_status='sealed',size_bytes=$3,updated_at=now()
 		WHERE id=$1 AND mode='DATASET_RO' AND state='CREATING' AND content_digest=$2`, id, digest, size)
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() != 1 {
-		return ErrDatasetDigest
+	if tag.RowsAffected() == 1 {
+		return nil
 	}
-	return nil
+	var mode, state, importStatus, contentDigest string
+	var sizeBytes int64
+	if err := s.pool.QueryRow(ctx, `
+		SELECT mode, state, import_status, coalesce(content_digest,''), size_bytes
+		FROM volumes WHERE id=$1`, id).Scan(&mode, &state, &importStatus, &contentDigest, &sizeBytes); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrDatasetDigest
+		}
+		return fmt.Errorf("seal dataset %s: %w", id, err)
+	}
+	if mode == "DATASET_RO" && state == "READY" && importStatus == "sealed" &&
+		contentDigest == digest && sizeBytes == size {
+		return nil
+	}
+	return ErrDatasetDigest
 }
 
 // ClaimDatasetAttachmentAndEnqueue allows same-project readonly multi-attach.

@@ -492,3 +492,54 @@ func TestMeshProjectionLifecycle(t *testing.T) {
 		t.Fatalf("expired endpoint must disappear: (%+v, %v)", ep, err)
 	}
 }
+
+// TestAutoscaleFieldsRoundTrip（ADR-0041 §2）：信号键读写 + 缺失 key 行为。
+func TestAutoscaleFieldsRoundTrip(t *testing.T) {
+	rdb := testRedis(t)
+	c := New(rdb)
+	ctx := context.Background()
+	host := fmt.Sprintf("as-test-%d.local", time.Now().UnixNano())
+	t.Cleanup(func() { _ = rdb.Del(context.Background(), AutoscaleKey(host)).Err() })
+	if got, err := c.GetAutoscaleFields(ctx, host); err != nil || len(got) != 0 {
+		t.Fatalf("missing key = %v, %v; want empty", got, err)
+	}
+	if got, err := c.GetAutoscaleFields(ctx, ""); err != nil || len(got) != 0 {
+		t.Fatalf("empty host = %v, %v; want empty", got, err)
+	}
+	payload := `{"ewma":3.5,"rps":7,"hard_rejected":0,"unserved":21,"ts_ms":1700000000000,"win_ms":10000}`
+	if err := rdb.HSet(ctx, AutoscaleKey(host), "edge-1", payload).Err(); err != nil {
+		t.Fatal(err)
+	}
+	// TTL 由 reporter 的 Lua 原子附带（HSET+EXPIRE）；此处模拟同一形态。
+	if err := rdb.Expire(ctx, AutoscaleKey(host), 20*time.Second).Err(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.GetAutoscaleFields(ctx, host)
+	if err != nil || got["edge-1"] != payload {
+		t.Fatalf("fields = %v, %v", got, err)
+	}
+	if ttl := rdb.TTL(ctx, AutoscaleKey(host)).Val(); ttl < 0 {
+		t.Fatalf("signal key has no TTL: %v", ttl)
+	}
+}
+
+// TestAutoscaleSignalFieldNames（P2-5）：信号线格式字段名契约——edge 写、
+// controller 读同键，改名必须双端同步（本测试在改名时变红）。
+func TestAutoscaleSignalFieldNames(t *testing.T) {
+	raw, err := json.Marshal(SignalSample{EWMA: 1.5, RPS: 2, HardRejected: 3, Unserved: 4, TsMs: 5, WinMs: 6})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"ewma", "rps", "hard_rejected", "unserved", "ts_ms", "win_ms"} {
+		if _, ok := m[k]; !ok {
+			t.Errorf("signal field %q missing in %s", k, raw)
+		}
+	}
+	if len(m) != 6 {
+		t.Errorf("unexpected signal fields: %s", raw)
+	}
+}

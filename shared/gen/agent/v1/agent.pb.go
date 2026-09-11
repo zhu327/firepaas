@@ -579,7 +579,7 @@ func (x SnapshotCompressionSpec_Algorithm) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use SnapshotCompressionSpec_Algorithm.Descriptor instead.
 func (SnapshotCompressionSpec_Algorithm) EnumDescriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{57, 0}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{58, 0}
 }
 
 type NodeCapacity struct {
@@ -3868,9 +3868,10 @@ type IdentityMapping struct {
 	MachineId   string                 `protobuf:"bytes,7,opt,name=machine_id,json=machineId,proto3" json:"machine_id,omitempty"`
 	ExecutionId string                 `protobuf:"bytes,8,opt,name=execution_id,json=executionId,proto3" json:"execution_id,omitempty"`
 	Generation  uint64                 `protobuf:"varint,9,opt,name=generation,proto3" json:"generation,omitempty"` // machine generation（绑定水位）
-	// ADR-0040 §15（G2a）：本 execution 主服务的 mesh 直连声明。agent 建
-	// policy 条目要求 EastWest 规则与 dst mesh_direct 缺一不可；false = 本
-	// execution 只可被南北链路到达（东西向默认 deny）。
+	// ADR-0040 §15（G2a）：本 execution 主服务的 mesh 直连声明。门控在控制面
+	// 组装侧完成（未声明的 dst_service 规则不进快照，W3 分工）；agent 不做
+	// 二次门控——identity 跨 execution 共享，逐行声明无法在 identity 粒度
+	// 收紧。false = 本 execution 只可被南北链路到达（东西向默认 deny）。
 	MeshDirect    bool `protobuf:"varint,10,opt,name=mesh_direct,json=meshDirect,proto3" json:"mesh_direct,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -4197,6 +4198,54 @@ func (x *ApplyFabricResponse) GetReplayed() bool {
 	return false
 }
 
+// FabricWatermarkDetail 作为 FailedPrecondition 的 gRPC status detail 返回：
+// agent 当前已应用的 fabric 水位。控制面在水位回退（DB 恢复/丢更新）时据此
+// 直接跳到 applied+1 重推，避免逐代爬升导致的长窗口冻结。旧控制面忽略
+// details；旧 agent 不携带 details 时控制面回退为逐代 +1 爬升。
+type FabricWatermarkDetail struct {
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	AppliedGeneration uint64                 `protobuf:"varint,1,opt,name=applied_generation,json=appliedGeneration,proto3" json:"applied_generation,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *FabricWatermarkDetail) Reset() {
+	*x = FabricWatermarkDetail{}
+	mi := &file_agent_v1_agent_proto_msgTypes[47]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FabricWatermarkDetail) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FabricWatermarkDetail) ProtoMessage() {}
+
+func (x *FabricWatermarkDetail) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_v1_agent_proto_msgTypes[47]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FabricWatermarkDetail.ProtoReflect.Descriptor instead.
+func (*FabricWatermarkDetail) Descriptor() ([]byte, []int) {
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{47}
+}
+
+func (x *FabricWatermarkDetail) GetAppliedGeneration() uint64 {
+	if x != nil {
+		return x.AppliedGeneration
+	}
+	return 0
+}
+
 type PullImageRequest struct {
 	state    protoimpl.MessageState `protogen:"open.v1"`
 	ImageRef string                 `protobuf:"bytes,1,opt,name=image_ref,json=imageRef,proto3" json:"image_ref,omitempty"`
@@ -4208,7 +4257,7 @@ type PullImageRequest struct {
 
 func (x *PullImageRequest) Reset() {
 	*x = PullImageRequest{}
-	mi := &file_agent_v1_agent_proto_msgTypes[47]
+	mi := &file_agent_v1_agent_proto_msgTypes[48]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4220,7 +4269,7 @@ func (x *PullImageRequest) String() string {
 func (*PullImageRequest) ProtoMessage() {}
 
 func (x *PullImageRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[47]
+	mi := &file_agent_v1_agent_proto_msgTypes[48]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4233,7 +4282,7 @@ func (x *PullImageRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PullImageRequest.ProtoReflect.Descriptor instead.
 func (*PullImageRequest) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{47}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{48}
 }
 
 func (x *PullImageRequest) GetImageRef() string {
@@ -4261,7 +4310,7 @@ type PullImageResponse struct {
 
 func (x *PullImageResponse) Reset() {
 	*x = PullImageResponse{}
-	mi := &file_agent_v1_agent_proto_msgTypes[48]
+	mi := &file_agent_v1_agent_proto_msgTypes[49]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4273,7 +4322,7 @@ func (x *PullImageResponse) String() string {
 func (*PullImageResponse) ProtoMessage() {}
 
 func (x *PullImageResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[48]
+	mi := &file_agent_v1_agent_proto_msgTypes[49]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4286,7 +4335,7 @@ func (x *PullImageResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PullImageResponse.ProtoReflect.Descriptor instead.
 func (*PullImageResponse) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{48}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{49}
 }
 
 func (x *PullImageResponse) GetImageRef() string {
@@ -4318,7 +4367,7 @@ type ListImagesRequest struct {
 
 func (x *ListImagesRequest) Reset() {
 	*x = ListImagesRequest{}
-	mi := &file_agent_v1_agent_proto_msgTypes[49]
+	mi := &file_agent_v1_agent_proto_msgTypes[50]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4330,7 +4379,7 @@ func (x *ListImagesRequest) String() string {
 func (*ListImagesRequest) ProtoMessage() {}
 
 func (x *ListImagesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[49]
+	mi := &file_agent_v1_agent_proto_msgTypes[50]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4343,7 +4392,7 @@ func (x *ListImagesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListImagesRequest.ProtoReflect.Descriptor instead.
 func (*ListImagesRequest) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{49}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{50}
 }
 
 type ListImagesResponse struct {
@@ -4355,7 +4404,7 @@ type ListImagesResponse struct {
 
 func (x *ListImagesResponse) Reset() {
 	*x = ListImagesResponse{}
-	mi := &file_agent_v1_agent_proto_msgTypes[50]
+	mi := &file_agent_v1_agent_proto_msgTypes[51]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4367,7 +4416,7 @@ func (x *ListImagesResponse) String() string {
 func (*ListImagesResponse) ProtoMessage() {}
 
 func (x *ListImagesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[50]
+	mi := &file_agent_v1_agent_proto_msgTypes[51]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4380,7 +4429,7 @@ func (x *ListImagesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListImagesResponse.ProtoReflect.Descriptor instead.
 func (*ListImagesResponse) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{50}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{51}
 }
 
 func (x *ListImagesResponse) GetImages() []*PullImageResponse {
@@ -4399,7 +4448,7 @@ type DeleteImageRequest struct {
 
 func (x *DeleteImageRequest) Reset() {
 	*x = DeleteImageRequest{}
-	mi := &file_agent_v1_agent_proto_msgTypes[51]
+	mi := &file_agent_v1_agent_proto_msgTypes[52]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4411,7 +4460,7 @@ func (x *DeleteImageRequest) String() string {
 func (*DeleteImageRequest) ProtoMessage() {}
 
 func (x *DeleteImageRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[51]
+	mi := &file_agent_v1_agent_proto_msgTypes[52]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4424,7 +4473,7 @@ func (x *DeleteImageRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteImageRequest.ProtoReflect.Descriptor instead.
 func (*DeleteImageRequest) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{51}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{52}
 }
 
 func (x *DeleteImageRequest) GetImageRef() string {
@@ -4446,7 +4495,7 @@ type QuarantineImageRequest struct {
 
 func (x *QuarantineImageRequest) Reset() {
 	*x = QuarantineImageRequest{}
-	mi := &file_agent_v1_agent_proto_msgTypes[52]
+	mi := &file_agent_v1_agent_proto_msgTypes[53]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4458,7 +4507,7 @@ func (x *QuarantineImageRequest) String() string {
 func (*QuarantineImageRequest) ProtoMessage() {}
 
 func (x *QuarantineImageRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[52]
+	mi := &file_agent_v1_agent_proto_msgTypes[53]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4471,7 +4520,7 @@ func (x *QuarantineImageRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use QuarantineImageRequest.ProtoReflect.Descriptor instead.
 func (*QuarantineImageRequest) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{52}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{53}
 }
 
 func (x *QuarantineImageRequest) GetImageRef() string {
@@ -4513,7 +4562,7 @@ type ImageQuarantineActionRequest struct {
 
 func (x *ImageQuarantineActionRequest) Reset() {
 	*x = ImageQuarantineActionRequest{}
-	mi := &file_agent_v1_agent_proto_msgTypes[53]
+	mi := &file_agent_v1_agent_proto_msgTypes[54]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4525,7 +4574,7 @@ func (x *ImageQuarantineActionRequest) String() string {
 func (*ImageQuarantineActionRequest) ProtoMessage() {}
 
 func (x *ImageQuarantineActionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[53]
+	mi := &file_agent_v1_agent_proto_msgTypes[54]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4538,7 +4587,7 @@ func (x *ImageQuarantineActionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImageQuarantineActionRequest.ProtoReflect.Descriptor instead.
 func (*ImageQuarantineActionRequest) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{53}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{54}
 }
 
 func (x *ImageQuarantineActionRequest) GetClaimId() string {
@@ -4576,7 +4625,7 @@ type ImageQuarantine struct {
 
 func (x *ImageQuarantine) Reset() {
 	*x = ImageQuarantine{}
-	mi := &file_agent_v1_agent_proto_msgTypes[54]
+	mi := &file_agent_v1_agent_proto_msgTypes[55]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4588,7 +4637,7 @@ func (x *ImageQuarantine) String() string {
 func (*ImageQuarantine) ProtoMessage() {}
 
 func (x *ImageQuarantine) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[54]
+	mi := &file_agent_v1_agent_proto_msgTypes[55]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4601,7 +4650,7 @@ func (x *ImageQuarantine) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImageQuarantine.ProtoReflect.Descriptor instead.
 func (*ImageQuarantine) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{54}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{55}
 }
 
 func (x *ImageQuarantine) GetClaimId() string {
@@ -4654,7 +4703,7 @@ type ListImageQuarantinesRequest struct {
 
 func (x *ListImageQuarantinesRequest) Reset() {
 	*x = ListImageQuarantinesRequest{}
-	mi := &file_agent_v1_agent_proto_msgTypes[55]
+	mi := &file_agent_v1_agent_proto_msgTypes[56]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4666,7 +4715,7 @@ func (x *ListImageQuarantinesRequest) String() string {
 func (*ListImageQuarantinesRequest) ProtoMessage() {}
 
 func (x *ListImageQuarantinesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[55]
+	mi := &file_agent_v1_agent_proto_msgTypes[56]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4679,7 +4728,7 @@ func (x *ListImageQuarantinesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListImageQuarantinesRequest.ProtoReflect.Descriptor instead.
 func (*ListImageQuarantinesRequest) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{55}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{56}
 }
 
 type ListImageQuarantinesResponse struct {
@@ -4691,7 +4740,7 @@ type ListImageQuarantinesResponse struct {
 
 func (x *ListImageQuarantinesResponse) Reset() {
 	*x = ListImageQuarantinesResponse{}
-	mi := &file_agent_v1_agent_proto_msgTypes[56]
+	mi := &file_agent_v1_agent_proto_msgTypes[57]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4703,7 +4752,7 @@ func (x *ListImageQuarantinesResponse) String() string {
 func (*ListImageQuarantinesResponse) ProtoMessage() {}
 
 func (x *ListImageQuarantinesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[56]
+	mi := &file_agent_v1_agent_proto_msgTypes[57]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4716,7 +4765,7 @@ func (x *ListImageQuarantinesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListImageQuarantinesResponse.ProtoReflect.Descriptor instead.
 func (*ListImageQuarantinesResponse) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{56}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{57}
 }
 
 func (x *ListImageQuarantinesResponse) GetQuarantines() []*ImageQuarantine {
@@ -4736,7 +4785,7 @@ type SnapshotCompressionSpec struct {
 
 func (x *SnapshotCompressionSpec) Reset() {
 	*x = SnapshotCompressionSpec{}
-	mi := &file_agent_v1_agent_proto_msgTypes[57]
+	mi := &file_agent_v1_agent_proto_msgTypes[58]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4748,7 +4797,7 @@ func (x *SnapshotCompressionSpec) String() string {
 func (*SnapshotCompressionSpec) ProtoMessage() {}
 
 func (x *SnapshotCompressionSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[57]
+	mi := &file_agent_v1_agent_proto_msgTypes[58]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4761,7 +4810,7 @@ func (x *SnapshotCompressionSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotCompressionSpec.ProtoReflect.Descriptor instead.
 func (*SnapshotCompressionSpec) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{57}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{58}
 }
 
 func (x *SnapshotCompressionSpec) GetAlgorithm() SnapshotCompressionSpec_Algorithm {
@@ -4794,7 +4843,7 @@ type CreateSnapshotRequest struct {
 
 func (x *CreateSnapshotRequest) Reset() {
 	*x = CreateSnapshotRequest{}
-	mi := &file_agent_v1_agent_proto_msgTypes[58]
+	mi := &file_agent_v1_agent_proto_msgTypes[59]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4806,7 +4855,7 @@ func (x *CreateSnapshotRequest) String() string {
 func (*CreateSnapshotRequest) ProtoMessage() {}
 
 func (x *CreateSnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[58]
+	mi := &file_agent_v1_agent_proto_msgTypes[59]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4819,7 +4868,7 @@ func (x *CreateSnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateSnapshotRequest.ProtoReflect.Descriptor instead.
 func (*CreateSnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{58}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{59}
 }
 
 func (x *CreateSnapshotRequest) GetMachineId() string {
@@ -4899,7 +4948,7 @@ type SnapshotInfo struct {
 
 func (x *SnapshotInfo) Reset() {
 	*x = SnapshotInfo{}
-	mi := &file_agent_v1_agent_proto_msgTypes[59]
+	mi := &file_agent_v1_agent_proto_msgTypes[60]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4911,7 +4960,7 @@ func (x *SnapshotInfo) String() string {
 func (*SnapshotInfo) ProtoMessage() {}
 
 func (x *SnapshotInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[59]
+	mi := &file_agent_v1_agent_proto_msgTypes[60]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4924,7 +4973,7 @@ func (x *SnapshotInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotInfo.ProtoReflect.Descriptor instead.
 func (*SnapshotInfo) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{59}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{60}
 }
 
 func (x *SnapshotInfo) GetId() string {
@@ -5020,7 +5069,7 @@ type CreateSnapshotResponse struct {
 
 func (x *CreateSnapshotResponse) Reset() {
 	*x = CreateSnapshotResponse{}
-	mi := &file_agent_v1_agent_proto_msgTypes[60]
+	mi := &file_agent_v1_agent_proto_msgTypes[61]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5032,7 +5081,7 @@ func (x *CreateSnapshotResponse) String() string {
 func (*CreateSnapshotResponse) ProtoMessage() {}
 
 func (x *CreateSnapshotResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[60]
+	mi := &file_agent_v1_agent_proto_msgTypes[61]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5045,7 +5094,7 @@ func (x *CreateSnapshotResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateSnapshotResponse.ProtoReflect.Descriptor instead.
 func (*CreateSnapshotResponse) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{60}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{61}
 }
 
 func (x *CreateSnapshotResponse) GetSnapshot() *SnapshotInfo {
@@ -5065,7 +5114,7 @@ type ScrubSnapshotRequest struct {
 
 func (x *ScrubSnapshotRequest) Reset() {
 	*x = ScrubSnapshotRequest{}
-	mi := &file_agent_v1_agent_proto_msgTypes[61]
+	mi := &file_agent_v1_agent_proto_msgTypes[62]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5077,7 +5126,7 @@ func (x *ScrubSnapshotRequest) String() string {
 func (*ScrubSnapshotRequest) ProtoMessage() {}
 
 func (x *ScrubSnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[61]
+	mi := &file_agent_v1_agent_proto_msgTypes[62]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5090,7 +5139,7 @@ func (x *ScrubSnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ScrubSnapshotRequest.ProtoReflect.Descriptor instead.
 func (*ScrubSnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{61}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{62}
 }
 
 func (x *ScrubSnapshotRequest) GetSnapshotId() string {
@@ -5118,7 +5167,7 @@ type ScrubSnapshotResponse struct {
 
 func (x *ScrubSnapshotResponse) Reset() {
 	*x = ScrubSnapshotResponse{}
-	mi := &file_agent_v1_agent_proto_msgTypes[62]
+	mi := &file_agent_v1_agent_proto_msgTypes[63]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5130,7 +5179,7 @@ func (x *ScrubSnapshotResponse) String() string {
 func (*ScrubSnapshotResponse) ProtoMessage() {}
 
 func (x *ScrubSnapshotResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[62]
+	mi := &file_agent_v1_agent_proto_msgTypes[63]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5143,7 +5192,7 @@ func (x *ScrubSnapshotResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ScrubSnapshotResponse.ProtoReflect.Descriptor instead.
 func (*ScrubSnapshotResponse) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{62}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{63}
 }
 
 func (x *ScrubSnapshotResponse) GetSnapshotId() string {
@@ -5177,7 +5226,7 @@ type ListSnapshotsRequest struct {
 
 func (x *ListSnapshotsRequest) Reset() {
 	*x = ListSnapshotsRequest{}
-	mi := &file_agent_v1_agent_proto_msgTypes[63]
+	mi := &file_agent_v1_agent_proto_msgTypes[64]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5189,7 +5238,7 @@ func (x *ListSnapshotsRequest) String() string {
 func (*ListSnapshotsRequest) ProtoMessage() {}
 
 func (x *ListSnapshotsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[63]
+	mi := &file_agent_v1_agent_proto_msgTypes[64]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5202,7 +5251,7 @@ func (x *ListSnapshotsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSnapshotsRequest.ProtoReflect.Descriptor instead.
 func (*ListSnapshotsRequest) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{63}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{64}
 }
 
 func (x *ListSnapshotsRequest) GetMachineId() string {
@@ -5233,7 +5282,7 @@ type InventoryObservation struct {
 
 func (x *InventoryObservation) Reset() {
 	*x = InventoryObservation{}
-	mi := &file_agent_v1_agent_proto_msgTypes[64]
+	mi := &file_agent_v1_agent_proto_msgTypes[65]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5245,7 +5294,7 @@ func (x *InventoryObservation) String() string {
 func (*InventoryObservation) ProtoMessage() {}
 
 func (x *InventoryObservation) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[64]
+	mi := &file_agent_v1_agent_proto_msgTypes[65]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5258,7 +5307,7 @@ func (x *InventoryObservation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InventoryObservation.ProtoReflect.Descriptor instead.
 func (*InventoryObservation) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{64}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{65}
 }
 
 func (x *InventoryObservation) GetComplete() bool {
@@ -5307,7 +5356,7 @@ type ListSnapshotsResponse struct {
 
 func (x *ListSnapshotsResponse) Reset() {
 	*x = ListSnapshotsResponse{}
-	mi := &file_agent_v1_agent_proto_msgTypes[65]
+	mi := &file_agent_v1_agent_proto_msgTypes[66]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5319,7 +5368,7 @@ func (x *ListSnapshotsResponse) String() string {
 func (*ListSnapshotsResponse) ProtoMessage() {}
 
 func (x *ListSnapshotsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[65]
+	mi := &file_agent_v1_agent_proto_msgTypes[66]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5332,7 +5381,7 @@ func (x *ListSnapshotsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSnapshotsResponse.ProtoReflect.Descriptor instead.
 func (*ListSnapshotsResponse) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{65}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{66}
 }
 
 func (x *ListSnapshotsResponse) GetSnapshots() []*SnapshotInfo {
@@ -5383,7 +5432,7 @@ type DeleteSnapshotRequest struct {
 
 func (x *DeleteSnapshotRequest) Reset() {
 	*x = DeleteSnapshotRequest{}
-	mi := &file_agent_v1_agent_proto_msgTypes[66]
+	mi := &file_agent_v1_agent_proto_msgTypes[67]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5395,7 +5444,7 @@ func (x *DeleteSnapshotRequest) String() string {
 func (*DeleteSnapshotRequest) ProtoMessage() {}
 
 func (x *DeleteSnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[66]
+	mi := &file_agent_v1_agent_proto_msgTypes[67]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5408,7 +5457,7 @@ func (x *DeleteSnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteSnapshotRequest.ProtoReflect.Descriptor instead.
 func (*DeleteSnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{66}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{67}
 }
 
 func (x *DeleteSnapshotRequest) GetSnapshotId() string {
@@ -5467,7 +5516,7 @@ type ForkSnapshotRequest struct {
 
 func (x *ForkSnapshotRequest) Reset() {
 	*x = ForkSnapshotRequest{}
-	mi := &file_agent_v1_agent_proto_msgTypes[67]
+	mi := &file_agent_v1_agent_proto_msgTypes[68]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5479,7 +5528,7 @@ func (x *ForkSnapshotRequest) String() string {
 func (*ForkSnapshotRequest) ProtoMessage() {}
 
 func (x *ForkSnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[67]
+	mi := &file_agent_v1_agent_proto_msgTypes[68]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5492,7 +5541,7 @@ func (x *ForkSnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ForkSnapshotRequest.ProtoReflect.Descriptor instead.
 func (*ForkSnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{67}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{68}
 }
 
 func (x *ForkSnapshotRequest) GetSnapshotId() string {
@@ -5560,7 +5609,7 @@ type ForkSnapshotResponse struct {
 
 func (x *ForkSnapshotResponse) Reset() {
 	*x = ForkSnapshotResponse{}
-	mi := &file_agent_v1_agent_proto_msgTypes[68]
+	mi := &file_agent_v1_agent_proto_msgTypes[69]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5572,7 +5621,7 @@ func (x *ForkSnapshotResponse) String() string {
 func (*ForkSnapshotResponse) ProtoMessage() {}
 
 func (x *ForkSnapshotResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[68]
+	mi := &file_agent_v1_agent_proto_msgTypes[69]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5585,7 +5634,7 @@ func (x *ForkSnapshotResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ForkSnapshotResponse.ProtoReflect.Descriptor instead.
 func (*ForkSnapshotResponse) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{68}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{69}
 }
 
 func (x *ForkSnapshotResponse) GetMachine() *Machine {
@@ -5616,7 +5665,7 @@ type RestoreSnapshotRequest struct {
 
 func (x *RestoreSnapshotRequest) Reset() {
 	*x = RestoreSnapshotRequest{}
-	mi := &file_agent_v1_agent_proto_msgTypes[69]
+	mi := &file_agent_v1_agent_proto_msgTypes[70]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5628,7 +5677,7 @@ func (x *RestoreSnapshotRequest) String() string {
 func (*RestoreSnapshotRequest) ProtoMessage() {}
 
 func (x *RestoreSnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[69]
+	mi := &file_agent_v1_agent_proto_msgTypes[70]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5641,7 +5690,7 @@ func (x *RestoreSnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestoreSnapshotRequest.ProtoReflect.Descriptor instead.
 func (*RestoreSnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{69}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{70}
 }
 
 func (x *RestoreSnapshotRequest) GetSnapshotId() string {
@@ -5711,7 +5760,7 @@ type RestoreSnapshotResponse struct {
 
 func (x *RestoreSnapshotResponse) Reset() {
 	*x = RestoreSnapshotResponse{}
-	mi := &file_agent_v1_agent_proto_msgTypes[70]
+	mi := &file_agent_v1_agent_proto_msgTypes[71]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5723,7 +5772,7 @@ func (x *RestoreSnapshotResponse) String() string {
 func (*RestoreSnapshotResponse) ProtoMessage() {}
 
 func (x *RestoreSnapshotResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[70]
+	mi := &file_agent_v1_agent_proto_msgTypes[71]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5736,7 +5785,7 @@ func (x *RestoreSnapshotResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestoreSnapshotResponse.ProtoReflect.Descriptor instead.
 func (*RestoreSnapshotResponse) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{70}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{71}
 }
 
 func (x *RestoreSnapshotResponse) GetMachine() *Machine {
@@ -5771,7 +5820,7 @@ type CreateVolumeRequest struct {
 
 func (x *CreateVolumeRequest) Reset() {
 	*x = CreateVolumeRequest{}
-	mi := &file_agent_v1_agent_proto_msgTypes[71]
+	mi := &file_agent_v1_agent_proto_msgTypes[72]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5783,7 +5832,7 @@ func (x *CreateVolumeRequest) String() string {
 func (*CreateVolumeRequest) ProtoMessage() {}
 
 func (x *CreateVolumeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[71]
+	mi := &file_agent_v1_agent_proto_msgTypes[72]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5796,7 +5845,7 @@ func (x *CreateVolumeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateVolumeRequest.ProtoReflect.Descriptor instead.
 func (*CreateVolumeRequest) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{71}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{72}
 }
 
 func (x *CreateVolumeRequest) GetVolumeId() string {
@@ -5832,7 +5881,7 @@ type CreateVolumeResponse struct {
 
 func (x *CreateVolumeResponse) Reset() {
 	*x = CreateVolumeResponse{}
-	mi := &file_agent_v1_agent_proto_msgTypes[72]
+	mi := &file_agent_v1_agent_proto_msgTypes[73]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5844,7 +5893,7 @@ func (x *CreateVolumeResponse) String() string {
 func (*CreateVolumeResponse) ProtoMessage() {}
 
 func (x *CreateVolumeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[72]
+	mi := &file_agent_v1_agent_proto_msgTypes[73]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5857,7 +5906,7 @@ func (x *CreateVolumeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateVolumeResponse.ProtoReflect.Descriptor instead.
 func (*CreateVolumeResponse) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{72}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{73}
 }
 
 func (x *CreateVolumeResponse) GetVolumeId() string {
@@ -5907,7 +5956,7 @@ type ImportDatasetRequest struct {
 
 func (x *ImportDatasetRequest) Reset() {
 	*x = ImportDatasetRequest{}
-	mi := &file_agent_v1_agent_proto_msgTypes[73]
+	mi := &file_agent_v1_agent_proto_msgTypes[74]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5919,7 +5968,7 @@ func (x *ImportDatasetRequest) String() string {
 func (*ImportDatasetRequest) ProtoMessage() {}
 
 func (x *ImportDatasetRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[73]
+	mi := &file_agent_v1_agent_proto_msgTypes[74]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5932,7 +5981,7 @@ func (x *ImportDatasetRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImportDatasetRequest.ProtoReflect.Descriptor instead.
 func (*ImportDatasetRequest) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{73}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{74}
 }
 
 func (x *ImportDatasetRequest) GetVolumeId() string {
@@ -6015,7 +6064,7 @@ type AttachVolumeRequest struct {
 
 func (x *AttachVolumeRequest) Reset() {
 	*x = AttachVolumeRequest{}
-	mi := &file_agent_v1_agent_proto_msgTypes[74]
+	mi := &file_agent_v1_agent_proto_msgTypes[75]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6027,7 +6076,7 @@ func (x *AttachVolumeRequest) String() string {
 func (*AttachVolumeRequest) ProtoMessage() {}
 
 func (x *AttachVolumeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[74]
+	mi := &file_agent_v1_agent_proto_msgTypes[75]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6040,7 +6089,7 @@ func (x *AttachVolumeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AttachVolumeRequest.ProtoReflect.Descriptor instead.
 func (*AttachVolumeRequest) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{74}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{75}
 }
 
 func (x *AttachVolumeRequest) GetVolumeId() string {
@@ -6119,7 +6168,7 @@ type DetachVolumeRequest struct {
 
 func (x *DetachVolumeRequest) Reset() {
 	*x = DetachVolumeRequest{}
-	mi := &file_agent_v1_agent_proto_msgTypes[75]
+	mi := &file_agent_v1_agent_proto_msgTypes[76]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6131,7 +6180,7 @@ func (x *DetachVolumeRequest) String() string {
 func (*DetachVolumeRequest) ProtoMessage() {}
 
 func (x *DetachVolumeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[75]
+	mi := &file_agent_v1_agent_proto_msgTypes[76]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6144,7 +6193,7 @@ func (x *DetachVolumeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DetachVolumeRequest.ProtoReflect.Descriptor instead.
 func (*DetachVolumeRequest) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{75}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{76}
 }
 
 func (x *DetachVolumeRequest) GetVolumeId() string {
@@ -6192,7 +6241,7 @@ type DeleteVolumeRequest struct {
 
 func (x *DeleteVolumeRequest) Reset() {
 	*x = DeleteVolumeRequest{}
-	mi := &file_agent_v1_agent_proto_msgTypes[76]
+	mi := &file_agent_v1_agent_proto_msgTypes[77]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6204,7 +6253,7 @@ func (x *DeleteVolumeRequest) String() string {
 func (*DeleteVolumeRequest) ProtoMessage() {}
 
 func (x *DeleteVolumeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[76]
+	mi := &file_agent_v1_agent_proto_msgTypes[77]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6217,7 +6266,7 @@ func (x *DeleteVolumeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteVolumeRequest.ProtoReflect.Descriptor instead.
 func (*DeleteVolumeRequest) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{76}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{77}
 }
 
 func (x *DeleteVolumeRequest) GetVolumeId() string {
@@ -6242,7 +6291,7 @@ type ListVolumesRequest struct {
 
 func (x *ListVolumesRequest) Reset() {
 	*x = ListVolumesRequest{}
-	mi := &file_agent_v1_agent_proto_msgTypes[77]
+	mi := &file_agent_v1_agent_proto_msgTypes[78]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6254,7 +6303,7 @@ func (x *ListVolumesRequest) String() string {
 func (*ListVolumesRequest) ProtoMessage() {}
 
 func (x *ListVolumesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[77]
+	mi := &file_agent_v1_agent_proto_msgTypes[78]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6267,7 +6316,7 @@ func (x *ListVolumesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListVolumesRequest.ProtoReflect.Descriptor instead.
 func (*ListVolumesRequest) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{77}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{78}
 }
 
 type QuarantineVolumeRequest struct {
@@ -6284,7 +6333,7 @@ type QuarantineVolumeRequest struct {
 
 func (x *QuarantineVolumeRequest) Reset() {
 	*x = QuarantineVolumeRequest{}
-	mi := &file_agent_v1_agent_proto_msgTypes[78]
+	mi := &file_agent_v1_agent_proto_msgTypes[79]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6296,7 +6345,7 @@ func (x *QuarantineVolumeRequest) String() string {
 func (*QuarantineVolumeRequest) ProtoMessage() {}
 
 func (x *QuarantineVolumeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[78]
+	mi := &file_agent_v1_agent_proto_msgTypes[79]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6309,7 +6358,7 @@ func (x *QuarantineVolumeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use QuarantineVolumeRequest.ProtoReflect.Descriptor instead.
 func (*QuarantineVolumeRequest) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{78}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{79}
 }
 
 func (x *QuarantineVolumeRequest) GetVolumeId() string {
@@ -6365,7 +6414,7 @@ type VolumeQuarantineActionRequest struct {
 
 func (x *VolumeQuarantineActionRequest) Reset() {
 	*x = VolumeQuarantineActionRequest{}
-	mi := &file_agent_v1_agent_proto_msgTypes[79]
+	mi := &file_agent_v1_agent_proto_msgTypes[80]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6377,7 +6426,7 @@ func (x *VolumeQuarantineActionRequest) String() string {
 func (*VolumeQuarantineActionRequest) ProtoMessage() {}
 
 func (x *VolumeQuarantineActionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[79]
+	mi := &file_agent_v1_agent_proto_msgTypes[80]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6390,7 +6439,7 @@ func (x *VolumeQuarantineActionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VolumeQuarantineActionRequest.ProtoReflect.Descriptor instead.
 func (*VolumeQuarantineActionRequest) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{79}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{80}
 }
 
 func (x *VolumeQuarantineActionRequest) GetClaimId() string {
@@ -6427,7 +6476,7 @@ type VolumeQuarantine struct {
 
 func (x *VolumeQuarantine) Reset() {
 	*x = VolumeQuarantine{}
-	mi := &file_agent_v1_agent_proto_msgTypes[80]
+	mi := &file_agent_v1_agent_proto_msgTypes[81]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6439,7 +6488,7 @@ func (x *VolumeQuarantine) String() string {
 func (*VolumeQuarantine) ProtoMessage() {}
 
 func (x *VolumeQuarantine) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[80]
+	mi := &file_agent_v1_agent_proto_msgTypes[81]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6452,7 +6501,7 @@ func (x *VolumeQuarantine) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VolumeQuarantine.ProtoReflect.Descriptor instead.
 func (*VolumeQuarantine) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{80}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{81}
 }
 
 func (x *VolumeQuarantine) GetClaimId() string {
@@ -6498,7 +6547,7 @@ type ListVolumeQuarantinesRequest struct {
 
 func (x *ListVolumeQuarantinesRequest) Reset() {
 	*x = ListVolumeQuarantinesRequest{}
-	mi := &file_agent_v1_agent_proto_msgTypes[81]
+	mi := &file_agent_v1_agent_proto_msgTypes[82]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6510,7 +6559,7 @@ func (x *ListVolumeQuarantinesRequest) String() string {
 func (*ListVolumeQuarantinesRequest) ProtoMessage() {}
 
 func (x *ListVolumeQuarantinesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[81]
+	mi := &file_agent_v1_agent_proto_msgTypes[82]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6523,7 +6572,7 @@ func (x *ListVolumeQuarantinesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListVolumeQuarantinesRequest.ProtoReflect.Descriptor instead.
 func (*ListVolumeQuarantinesRequest) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{81}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{82}
 }
 
 type ListVolumeQuarantinesResponse struct {
@@ -6535,7 +6584,7 @@ type ListVolumeQuarantinesResponse struct {
 
 func (x *ListVolumeQuarantinesResponse) Reset() {
 	*x = ListVolumeQuarantinesResponse{}
-	mi := &file_agent_v1_agent_proto_msgTypes[82]
+	mi := &file_agent_v1_agent_proto_msgTypes[83]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6547,7 +6596,7 @@ func (x *ListVolumeQuarantinesResponse) String() string {
 func (*ListVolumeQuarantinesResponse) ProtoMessage() {}
 
 func (x *ListVolumeQuarantinesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[82]
+	mi := &file_agent_v1_agent_proto_msgTypes[83]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6560,7 +6609,7 @@ func (x *ListVolumeQuarantinesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListVolumeQuarantinesResponse.ProtoReflect.Descriptor instead.
 func (*ListVolumeQuarantinesResponse) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{82}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{83}
 }
 
 func (x *ListVolumeQuarantinesResponse) GetQuarantines() []*VolumeQuarantine {
@@ -6583,7 +6632,7 @@ type VolumeAttachmentInfo struct {
 
 func (x *VolumeAttachmentInfo) Reset() {
 	*x = VolumeAttachmentInfo{}
-	mi := &file_agent_v1_agent_proto_msgTypes[83]
+	mi := &file_agent_v1_agent_proto_msgTypes[84]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6595,7 +6644,7 @@ func (x *VolumeAttachmentInfo) String() string {
 func (*VolumeAttachmentInfo) ProtoMessage() {}
 
 func (x *VolumeAttachmentInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[83]
+	mi := &file_agent_v1_agent_proto_msgTypes[84]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6608,7 +6657,7 @@ func (x *VolumeAttachmentInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VolumeAttachmentInfo.ProtoReflect.Descriptor instead.
 func (*VolumeAttachmentInfo) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{83}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{84}
 }
 
 func (x *VolumeAttachmentInfo) GetMachineId() string {
@@ -6662,7 +6711,7 @@ type VolumeInfo struct {
 
 func (x *VolumeInfo) Reset() {
 	*x = VolumeInfo{}
-	mi := &file_agent_v1_agent_proto_msgTypes[84]
+	mi := &file_agent_v1_agent_proto_msgTypes[85]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6674,7 +6723,7 @@ func (x *VolumeInfo) String() string {
 func (*VolumeInfo) ProtoMessage() {}
 
 func (x *VolumeInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[84]
+	mi := &file_agent_v1_agent_proto_msgTypes[85]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6687,7 +6736,7 @@ func (x *VolumeInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VolumeInfo.ProtoReflect.Descriptor instead.
 func (*VolumeInfo) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{84}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{85}
 }
 
 func (x *VolumeInfo) GetId() string {
@@ -6761,7 +6810,7 @@ type ListVolumesResponse struct {
 
 func (x *ListVolumesResponse) Reset() {
 	*x = ListVolumesResponse{}
-	mi := &file_agent_v1_agent_proto_msgTypes[85]
+	mi := &file_agent_v1_agent_proto_msgTypes[86]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6773,7 +6822,7 @@ func (x *ListVolumesResponse) String() string {
 func (*ListVolumesResponse) ProtoMessage() {}
 
 func (x *ListVolumesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_agent_proto_msgTypes[85]
+	mi := &file_agent_v1_agent_proto_msgTypes[86]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6786,7 +6835,7 @@ func (x *ListVolumesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListVolumesResponse.ProtoReflect.Descriptor instead.
 func (*ListVolumesResponse) Descriptor() ([]byte, []int) {
-	return file_agent_v1_agent_proto_rawDescGZIP(), []int{85}
+	return file_agent_v1_agent_proto_rawDescGZIP(), []int{86}
 }
 
 func (x *ListVolumesResponse) GetVolumes() []*VolumeInfo {
@@ -7199,7 +7248,9 @@ const file_agent_v1_agent_proto_rawDesc = "" +
 	"generation\"`\n" +
 	"\x13ApplyFabricResponse\x12-\n" +
 	"\x12applied_generation\x18\x01 \x01(\x04R\x11appliedGeneration\x12\x1a\n" +
-	"\breplayed\x18\x02 \x01(\bR\breplayed\"b\n" +
+	"\breplayed\x18\x02 \x01(\bR\breplayed\"F\n" +
+	"\x15FabricWatermarkDetail\x12-\n" +
+	"\x12applied_generation\x18\x01 \x01(\x04R\x11appliedGeneration\"b\n" +
 	"\x10PullImageRequest\x12\x1b\n" +
 	"\timage_ref\x18\x01 \x01(\tR\bimageRef\x121\n" +
 	"\x14credential_reference\x18\x02 \x01(\tR\x13credentialReference\"c\n" +
@@ -7525,7 +7576,7 @@ func file_agent_v1_agent_proto_rawDescGZIP() []byte {
 }
 
 var file_agent_v1_agent_proto_enumTypes = make([]protoimpl.EnumInfo, 10)
-var file_agent_v1_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 91)
+var file_agent_v1_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 92)
 var file_agent_v1_agent_proto_goTypes = []any{
 	(MachineState)(0),                      // 0: firepaas.agent.v1.MachineState
 	(MachineReadiness)(0),                  // 1: firepaas.agent.v1.MachineReadiness
@@ -7584,60 +7635,61 @@ var file_agent_v1_agent_proto_goTypes = []any{
 	(*ApplyFabricRequest)(nil),             // 54: firepaas.agent.v1.ApplyFabricRequest
 	(*DnsRecord)(nil),                      // 55: firepaas.agent.v1.DnsRecord
 	(*ApplyFabricResponse)(nil),            // 56: firepaas.agent.v1.ApplyFabricResponse
-	(*PullImageRequest)(nil),               // 57: firepaas.agent.v1.PullImageRequest
-	(*PullImageResponse)(nil),              // 58: firepaas.agent.v1.PullImageResponse
-	(*ListImagesRequest)(nil),              // 59: firepaas.agent.v1.ListImagesRequest
-	(*ListImagesResponse)(nil),             // 60: firepaas.agent.v1.ListImagesResponse
-	(*DeleteImageRequest)(nil),             // 61: firepaas.agent.v1.DeleteImageRequest
-	(*QuarantineImageRequest)(nil),         // 62: firepaas.agent.v1.QuarantineImageRequest
-	(*ImageQuarantineActionRequest)(nil),   // 63: firepaas.agent.v1.ImageQuarantineActionRequest
-	(*ImageQuarantine)(nil),                // 64: firepaas.agent.v1.ImageQuarantine
-	(*ListImageQuarantinesRequest)(nil),    // 65: firepaas.agent.v1.ListImageQuarantinesRequest
-	(*ListImageQuarantinesResponse)(nil),   // 66: firepaas.agent.v1.ListImageQuarantinesResponse
-	(*SnapshotCompressionSpec)(nil),        // 67: firepaas.agent.v1.SnapshotCompressionSpec
-	(*CreateSnapshotRequest)(nil),          // 68: firepaas.agent.v1.CreateSnapshotRequest
-	(*SnapshotInfo)(nil),                   // 69: firepaas.agent.v1.SnapshotInfo
-	(*CreateSnapshotResponse)(nil),         // 70: firepaas.agent.v1.CreateSnapshotResponse
-	(*ScrubSnapshotRequest)(nil),           // 71: firepaas.agent.v1.ScrubSnapshotRequest
-	(*ScrubSnapshotResponse)(nil),          // 72: firepaas.agent.v1.ScrubSnapshotResponse
-	(*ListSnapshotsRequest)(nil),           // 73: firepaas.agent.v1.ListSnapshotsRequest
-	(*InventoryObservation)(nil),           // 74: firepaas.agent.v1.InventoryObservation
-	(*ListSnapshotsResponse)(nil),          // 75: firepaas.agent.v1.ListSnapshotsResponse
-	(*DeleteSnapshotRequest)(nil),          // 76: firepaas.agent.v1.DeleteSnapshotRequest
-	(*ForkSnapshotRequest)(nil),            // 77: firepaas.agent.v1.ForkSnapshotRequest
-	(*ForkSnapshotResponse)(nil),           // 78: firepaas.agent.v1.ForkSnapshotResponse
-	(*RestoreSnapshotRequest)(nil),         // 79: firepaas.agent.v1.RestoreSnapshotRequest
-	(*RestoreSnapshotResponse)(nil),        // 80: firepaas.agent.v1.RestoreSnapshotResponse
-	(*CreateVolumeRequest)(nil),            // 81: firepaas.agent.v1.CreateVolumeRequest
-	(*CreateVolumeResponse)(nil),           // 82: firepaas.agent.v1.CreateVolumeResponse
-	(*ImportDatasetRequest)(nil),           // 83: firepaas.agent.v1.ImportDatasetRequest
-	(*AttachVolumeRequest)(nil),            // 84: firepaas.agent.v1.AttachVolumeRequest
-	(*DetachVolumeRequest)(nil),            // 85: firepaas.agent.v1.DetachVolumeRequest
-	(*DeleteVolumeRequest)(nil),            // 86: firepaas.agent.v1.DeleteVolumeRequest
-	(*ListVolumesRequest)(nil),             // 87: firepaas.agent.v1.ListVolumesRequest
-	(*QuarantineVolumeRequest)(nil),        // 88: firepaas.agent.v1.QuarantineVolumeRequest
-	(*VolumeQuarantineActionRequest)(nil),  // 89: firepaas.agent.v1.VolumeQuarantineActionRequest
-	(*VolumeQuarantine)(nil),               // 90: firepaas.agent.v1.VolumeQuarantine
-	(*ListVolumeQuarantinesRequest)(nil),   // 91: firepaas.agent.v1.ListVolumeQuarantinesRequest
-	(*ListVolumeQuarantinesResponse)(nil),  // 92: firepaas.agent.v1.ListVolumeQuarantinesResponse
-	(*VolumeAttachmentInfo)(nil),           // 93: firepaas.agent.v1.VolumeAttachmentInfo
-	(*VolumeInfo)(nil),                     // 94: firepaas.agent.v1.VolumeInfo
-	(*ListVolumesResponse)(nil),            // 95: firepaas.agent.v1.ListVolumesResponse
-	nil,                                    // 96: firepaas.agent.v1.ServiceInfoResponse.LabelsEntry
-	nil,                                    // 97: firepaas.agent.v1.MachineSpec.EnvEntry
-	nil,                                    // 98: firepaas.agent.v1.PlacementConstraints.LabelsEntry
-	nil,                                    // 99: firepaas.agent.v1.CreateMachineRequest.SecretEnvEntry
-	nil,                                    // 100: firepaas.agent.v1.ExecOpen.EnvEntry
-	(*timestamppb.Timestamp)(nil),          // 101: google.protobuf.Timestamp
-	(*emptypb.Empty)(nil),                  // 102: google.protobuf.Empty
+	(*FabricWatermarkDetail)(nil),          // 57: firepaas.agent.v1.FabricWatermarkDetail
+	(*PullImageRequest)(nil),               // 58: firepaas.agent.v1.PullImageRequest
+	(*PullImageResponse)(nil),              // 59: firepaas.agent.v1.PullImageResponse
+	(*ListImagesRequest)(nil),              // 60: firepaas.agent.v1.ListImagesRequest
+	(*ListImagesResponse)(nil),             // 61: firepaas.agent.v1.ListImagesResponse
+	(*DeleteImageRequest)(nil),             // 62: firepaas.agent.v1.DeleteImageRequest
+	(*QuarantineImageRequest)(nil),         // 63: firepaas.agent.v1.QuarantineImageRequest
+	(*ImageQuarantineActionRequest)(nil),   // 64: firepaas.agent.v1.ImageQuarantineActionRequest
+	(*ImageQuarantine)(nil),                // 65: firepaas.agent.v1.ImageQuarantine
+	(*ListImageQuarantinesRequest)(nil),    // 66: firepaas.agent.v1.ListImageQuarantinesRequest
+	(*ListImageQuarantinesResponse)(nil),   // 67: firepaas.agent.v1.ListImageQuarantinesResponse
+	(*SnapshotCompressionSpec)(nil),        // 68: firepaas.agent.v1.SnapshotCompressionSpec
+	(*CreateSnapshotRequest)(nil),          // 69: firepaas.agent.v1.CreateSnapshotRequest
+	(*SnapshotInfo)(nil),                   // 70: firepaas.agent.v1.SnapshotInfo
+	(*CreateSnapshotResponse)(nil),         // 71: firepaas.agent.v1.CreateSnapshotResponse
+	(*ScrubSnapshotRequest)(nil),           // 72: firepaas.agent.v1.ScrubSnapshotRequest
+	(*ScrubSnapshotResponse)(nil),          // 73: firepaas.agent.v1.ScrubSnapshotResponse
+	(*ListSnapshotsRequest)(nil),           // 74: firepaas.agent.v1.ListSnapshotsRequest
+	(*InventoryObservation)(nil),           // 75: firepaas.agent.v1.InventoryObservation
+	(*ListSnapshotsResponse)(nil),          // 76: firepaas.agent.v1.ListSnapshotsResponse
+	(*DeleteSnapshotRequest)(nil),          // 77: firepaas.agent.v1.DeleteSnapshotRequest
+	(*ForkSnapshotRequest)(nil),            // 78: firepaas.agent.v1.ForkSnapshotRequest
+	(*ForkSnapshotResponse)(nil),           // 79: firepaas.agent.v1.ForkSnapshotResponse
+	(*RestoreSnapshotRequest)(nil),         // 80: firepaas.agent.v1.RestoreSnapshotRequest
+	(*RestoreSnapshotResponse)(nil),        // 81: firepaas.agent.v1.RestoreSnapshotResponse
+	(*CreateVolumeRequest)(nil),            // 82: firepaas.agent.v1.CreateVolumeRequest
+	(*CreateVolumeResponse)(nil),           // 83: firepaas.agent.v1.CreateVolumeResponse
+	(*ImportDatasetRequest)(nil),           // 84: firepaas.agent.v1.ImportDatasetRequest
+	(*AttachVolumeRequest)(nil),            // 85: firepaas.agent.v1.AttachVolumeRequest
+	(*DetachVolumeRequest)(nil),            // 86: firepaas.agent.v1.DetachVolumeRequest
+	(*DeleteVolumeRequest)(nil),            // 87: firepaas.agent.v1.DeleteVolumeRequest
+	(*ListVolumesRequest)(nil),             // 88: firepaas.agent.v1.ListVolumesRequest
+	(*QuarantineVolumeRequest)(nil),        // 89: firepaas.agent.v1.QuarantineVolumeRequest
+	(*VolumeQuarantineActionRequest)(nil),  // 90: firepaas.agent.v1.VolumeQuarantineActionRequest
+	(*VolumeQuarantine)(nil),               // 91: firepaas.agent.v1.VolumeQuarantine
+	(*ListVolumeQuarantinesRequest)(nil),   // 92: firepaas.agent.v1.ListVolumeQuarantinesRequest
+	(*ListVolumeQuarantinesResponse)(nil),  // 93: firepaas.agent.v1.ListVolumeQuarantinesResponse
+	(*VolumeAttachmentInfo)(nil),           // 94: firepaas.agent.v1.VolumeAttachmentInfo
+	(*VolumeInfo)(nil),                     // 95: firepaas.agent.v1.VolumeInfo
+	(*ListVolumesResponse)(nil),            // 96: firepaas.agent.v1.ListVolumesResponse
+	nil,                                    // 97: firepaas.agent.v1.ServiceInfoResponse.LabelsEntry
+	nil,                                    // 98: firepaas.agent.v1.MachineSpec.EnvEntry
+	nil,                                    // 99: firepaas.agent.v1.PlacementConstraints.LabelsEntry
+	nil,                                    // 100: firepaas.agent.v1.CreateMachineRequest.SecretEnvEntry
+	nil,                                    // 101: firepaas.agent.v1.ExecOpen.EnvEntry
+	(*timestamppb.Timestamp)(nil),          // 102: google.protobuf.Timestamp
+	(*emptypb.Empty)(nil),                  // 103: google.protobuf.Empty
 }
 var file_agent_v1_agent_proto_depIdxs = []int32{
 	4,   // 0: firepaas.agent.v1.ServiceInfoResponse.status:type_name -> firepaas.agent.v1.ServiceInfoResponse.Status
-	101, // 1: firepaas.agent.v1.ServiceInfoResponse.status_changed_at:type_name -> google.protobuf.Timestamp
+	102, // 1: firepaas.agent.v1.ServiceInfoResponse.status_changed_at:type_name -> google.protobuf.Timestamp
 	10,  // 2: firepaas.agent.v1.ServiceInfoResponse.capacity:type_name -> firepaas.agent.v1.NodeCapacity
 	11,  // 3: firepaas.agent.v1.ServiceInfoResponse.usage:type_name -> firepaas.agent.v1.NodeUsage
-	96,  // 4: firepaas.agent.v1.ServiceInfoResponse.labels:type_name -> firepaas.agent.v1.ServiceInfoResponse.LabelsEntry
-	97,  // 5: firepaas.agent.v1.MachineSpec.env:type_name -> firepaas.agent.v1.MachineSpec.EnvEntry
+	97,  // 4: firepaas.agent.v1.ServiceInfoResponse.labels:type_name -> firepaas.agent.v1.ServiceInfoResponse.LabelsEntry
+	98,  // 5: firepaas.agent.v1.MachineSpec.env:type_name -> firepaas.agent.v1.MachineSpec.EnvEntry
 	22,  // 6: firepaas.agent.v1.MachineSpec.volumes:type_name -> firepaas.agent.v1.VolumeMount
 	18,  // 7: firepaas.agent.v1.MachineSpec.network:type_name -> firepaas.agent.v1.NetworkSpec
 	23,  // 8: firepaas.agent.v1.MachineSpec.restart_policy:type_name -> firepaas.agent.v1.RestartPolicy
@@ -7646,7 +7698,7 @@ var file_agent_v1_agent_proto_depIdxs = []int32{
 	17,  // 11: firepaas.agent.v1.MachineSpec.placement:type_name -> firepaas.agent.v1.PlacementConstraints
 	14,  // 12: firepaas.agent.v1.MachineSpec.auto_standby:type_name -> firepaas.agent.v1.AutoStandbyPolicy
 	15,  // 13: firepaas.agent.v1.MachineSpec.services:type_name -> firepaas.agent.v1.ServiceSpec
-	98,  // 14: firepaas.agent.v1.PlacementConstraints.labels:type_name -> firepaas.agent.v1.PlacementConstraints.LabelsEntry
+	99,  // 14: firepaas.agent.v1.PlacementConstraints.labels:type_name -> firepaas.agent.v1.PlacementConstraints.LabelsEntry
 	5,   // 15: firepaas.agent.v1.PlacementConstraints.anti_affinity:type_name -> firepaas.agent.v1.PlacementConstraints.AntiAffinity
 	21,  // 16: firepaas.agent.v1.NetworkSpec.egress:type_name -> firepaas.agent.v1.EgressPolicySpec
 	19,  // 17: firepaas.agent.v1.NetworkSpec.eastwest:type_name -> firepaas.agent.v1.EastWestPolicySpec
@@ -7655,16 +7707,16 @@ var file_agent_v1_agent_proto_depIdxs = []int32{
 	7,   // 20: firepaas.agent.v1.RestartPolicy.mode:type_name -> firepaas.agent.v1.RestartPolicy.Mode
 	8,   // 21: firepaas.agent.v1.HealthCheckSpec.type:type_name -> firepaas.agent.v1.HealthCheckSpec.Type
 	13,  // 22: firepaas.agent.v1.CreateMachineRequest.spec:type_name -> firepaas.agent.v1.MachineSpec
-	99,  // 23: firepaas.agent.v1.CreateMachineRequest.secret_env:type_name -> firepaas.agent.v1.CreateMachineRequest.SecretEnvEntry
+	100, // 23: firepaas.agent.v1.CreateMachineRequest.secret_env:type_name -> firepaas.agent.v1.CreateMachineRequest.SecretEnvEntry
 	30,  // 24: firepaas.agent.v1.CreateMachineResponse.machine:type_name -> firepaas.agent.v1.Machine
 	18,  // 25: firepaas.agent.v1.UpdateMachineRequest.network:type_name -> firepaas.agent.v1.NetworkSpec
 	30,  // 26: firepaas.agent.v1.ListMachinesResponse.machines:type_name -> firepaas.agent.v1.Machine
 	0,   // 27: firepaas.agent.v1.Machine.state:type_name -> firepaas.agent.v1.MachineState
 	13,  // 28: firepaas.agent.v1.Machine.spec:type_name -> firepaas.agent.v1.MachineSpec
-	101, // 29: firepaas.agent.v1.Machine.created_at:type_name -> google.protobuf.Timestamp
-	101, // 30: firepaas.agent.v1.Machine.updated_at:type_name -> google.protobuf.Timestamp
+	102, // 29: firepaas.agent.v1.Machine.created_at:type_name -> google.protobuf.Timestamp
+	102, // 30: firepaas.agent.v1.Machine.updated_at:type_name -> google.protobuf.Timestamp
 	1,   // 31: firepaas.agent.v1.Machine.readiness:type_name -> firepaas.agent.v1.MachineReadiness
-	101, // 32: firepaas.agent.v1.Machine.last_readiness_change:type_name -> google.protobuf.Timestamp
+	102, // 32: firepaas.agent.v1.Machine.last_readiness_change:type_name -> google.protobuf.Timestamp
 	2,   // 33: firepaas.agent.v1.Machine.secret_delivery_state:type_name -> firepaas.agent.v1.SecretDeliveryState
 	31,  // 34: firepaas.agent.v1.Machine.egress_audit:type_name -> firepaas.agent.v1.EgressAuditStats
 	32,  // 35: firepaas.agent.v1.EgressAuditStats.deny_buckets:type_name -> firepaas.agent.v1.EgressDenyBucket
@@ -7676,29 +7728,29 @@ var file_agent_v1_agent_proto_depIdxs = []int32{
 	34,  // 41: firepaas.agent.v1.CheckpointMachineRequest.operation:type_name -> firepaas.agent.v1.MachineOperationRequest
 	42,  // 42: firepaas.agent.v1.CopyToInput.open:type_name -> firepaas.agent.v1.CopyToOpen
 	46,  // 43: firepaas.agent.v1.CopyFromResponse.header:type_name -> firepaas.agent.v1.CopyFromHeader
-	100, // 44: firepaas.agent.v1.ExecOpen.env:type_name -> firepaas.agent.v1.ExecOpen.EnvEntry
+	101, // 44: firepaas.agent.v1.ExecOpen.env:type_name -> firepaas.agent.v1.ExecOpen.EnvEntry
 	48,  // 45: firepaas.agent.v1.ExecInput.open:type_name -> firepaas.agent.v1.ExecOpen
 	50,  // 46: firepaas.agent.v1.ExecInput.resize:type_name -> firepaas.agent.v1.ExecResize
 	52,  // 47: firepaas.agent.v1.ApplyFabricRequest.peers:type_name -> firepaas.agent.v1.FabricPeer
 	53,  // 48: firepaas.agent.v1.ApplyFabricRequest.identities:type_name -> firepaas.agent.v1.IdentityMapping
 	19,  // 49: firepaas.agent.v1.ApplyFabricRequest.eastwest:type_name -> firepaas.agent.v1.EastWestPolicySpec
 	55,  // 50: firepaas.agent.v1.ApplyFabricRequest.dns:type_name -> firepaas.agent.v1.DnsRecord
-	58,  // 51: firepaas.agent.v1.ListImagesResponse.images:type_name -> firepaas.agent.v1.PullImageResponse
-	64,  // 52: firepaas.agent.v1.ListImageQuarantinesResponse.quarantines:type_name -> firepaas.agent.v1.ImageQuarantine
+	59,  // 51: firepaas.agent.v1.ListImagesResponse.images:type_name -> firepaas.agent.v1.PullImageResponse
+	65,  // 52: firepaas.agent.v1.ListImageQuarantinesResponse.quarantines:type_name -> firepaas.agent.v1.ImageQuarantine
 	9,   // 53: firepaas.agent.v1.SnapshotCompressionSpec.algorithm:type_name -> firepaas.agent.v1.SnapshotCompressionSpec.Algorithm
 	3,   // 54: firepaas.agent.v1.CreateSnapshotRequest.kind:type_name -> firepaas.agent.v1.SnapshotKind
-	67,  // 55: firepaas.agent.v1.CreateSnapshotRequest.compression:type_name -> firepaas.agent.v1.SnapshotCompressionSpec
+	68,  // 55: firepaas.agent.v1.CreateSnapshotRequest.compression:type_name -> firepaas.agent.v1.SnapshotCompressionSpec
 	3,   // 56: firepaas.agent.v1.SnapshotInfo.kind:type_name -> firepaas.agent.v1.SnapshotKind
-	69,  // 57: firepaas.agent.v1.CreateSnapshotResponse.snapshot:type_name -> firepaas.agent.v1.SnapshotInfo
-	69,  // 58: firepaas.agent.v1.ListSnapshotsResponse.snapshots:type_name -> firepaas.agent.v1.SnapshotInfo
-	74,  // 59: firepaas.agent.v1.ListSnapshotsResponse.observation:type_name -> firepaas.agent.v1.InventoryObservation
+	70,  // 57: firepaas.agent.v1.CreateSnapshotResponse.snapshot:type_name -> firepaas.agent.v1.SnapshotInfo
+	70,  // 58: firepaas.agent.v1.ListSnapshotsResponse.snapshots:type_name -> firepaas.agent.v1.SnapshotInfo
+	75,  // 59: firepaas.agent.v1.ListSnapshotsResponse.observation:type_name -> firepaas.agent.v1.InventoryObservation
 	30,  // 60: firepaas.agent.v1.ForkSnapshotResponse.machine:type_name -> firepaas.agent.v1.Machine
 	30,  // 61: firepaas.agent.v1.RestoreSnapshotResponse.machine:type_name -> firepaas.agent.v1.Machine
-	90,  // 62: firepaas.agent.v1.ListVolumeQuarantinesResponse.quarantines:type_name -> firepaas.agent.v1.VolumeQuarantine
-	93,  // 63: firepaas.agent.v1.VolumeInfo.attachments:type_name -> firepaas.agent.v1.VolumeAttachmentInfo
-	94,  // 64: firepaas.agent.v1.ListVolumesResponse.volumes:type_name -> firepaas.agent.v1.VolumeInfo
-	74,  // 65: firepaas.agent.v1.ListVolumesResponse.observation:type_name -> firepaas.agent.v1.InventoryObservation
-	102, // 66: firepaas.agent.v1.InfoService.ServiceInfo:input_type -> google.protobuf.Empty
+	91,  // 62: firepaas.agent.v1.ListVolumeQuarantinesResponse.quarantines:type_name -> firepaas.agent.v1.VolumeQuarantine
+	94,  // 63: firepaas.agent.v1.VolumeInfo.attachments:type_name -> firepaas.agent.v1.VolumeAttachmentInfo
+	95,  // 64: firepaas.agent.v1.ListVolumesResponse.volumes:type_name -> firepaas.agent.v1.VolumeInfo
+	75,  // 65: firepaas.agent.v1.ListVolumesResponse.observation:type_name -> firepaas.agent.v1.InventoryObservation
+	103, // 66: firepaas.agent.v1.InfoService.ServiceInfo:input_type -> google.protobuf.Empty
 	25,  // 67: firepaas.agent.v1.MachineService.CreateMachine:input_type -> firepaas.agent.v1.CreateMachineRequest
 	27,  // 68: firepaas.agent.v1.MachineService.UpdateMachine:input_type -> firepaas.agent.v1.UpdateMachineRequest
 	28,  // 69: firepaas.agent.v1.MachineService.ListMachines:input_type -> firepaas.agent.v1.ListMachinesRequest
@@ -7713,34 +7765,34 @@ var file_agent_v1_agent_proto_depIdxs = []int32{
 	43,  // 78: firepaas.agent.v1.MachineService.CopyTo:input_type -> firepaas.agent.v1.CopyToInput
 	45,  // 79: firepaas.agent.v1.MachineService.CopyFrom:input_type -> firepaas.agent.v1.CopyFromRequest
 	54,  // 80: firepaas.agent.v1.FabricService.ApplyFabric:input_type -> firepaas.agent.v1.ApplyFabricRequest
-	57,  // 81: firepaas.agent.v1.ImageService.PullImage:input_type -> firepaas.agent.v1.PullImageRequest
-	59,  // 82: firepaas.agent.v1.ImageService.ListImages:input_type -> firepaas.agent.v1.ListImagesRequest
-	61,  // 83: firepaas.agent.v1.ImageService.DeleteImage:input_type -> firepaas.agent.v1.DeleteImageRequest
-	62,  // 84: firepaas.agent.v1.ImageService.QuarantineImage:input_type -> firepaas.agent.v1.QuarantineImageRequest
-	65,  // 85: firepaas.agent.v1.ImageService.ListImageQuarantines:input_type -> firepaas.agent.v1.ListImageQuarantinesRequest
-	63,  // 86: firepaas.agent.v1.ImageService.RollbackImageQuarantine:input_type -> firepaas.agent.v1.ImageQuarantineActionRequest
-	63,  // 87: firepaas.agent.v1.ImageService.FinalizeImageQuarantine:input_type -> firepaas.agent.v1.ImageQuarantineActionRequest
-	68,  // 88: firepaas.agent.v1.SnapshotService.CreateSnapshot:input_type -> firepaas.agent.v1.CreateSnapshotRequest
-	73,  // 89: firepaas.agent.v1.SnapshotService.ListSnapshots:input_type -> firepaas.agent.v1.ListSnapshotsRequest
-	76,  // 90: firepaas.agent.v1.SnapshotService.DeleteSnapshot:input_type -> firepaas.agent.v1.DeleteSnapshotRequest
-	77,  // 91: firepaas.agent.v1.SnapshotService.ForkSnapshot:input_type -> firepaas.agent.v1.ForkSnapshotRequest
-	79,  // 92: firepaas.agent.v1.SnapshotService.RestoreSnapshot:input_type -> firepaas.agent.v1.RestoreSnapshotRequest
-	71,  // 93: firepaas.agent.v1.SnapshotService.ScrubSnapshot:input_type -> firepaas.agent.v1.ScrubSnapshotRequest
-	81,  // 94: firepaas.agent.v1.VolumeService.CreateVolume:input_type -> firepaas.agent.v1.CreateVolumeRequest
-	83,  // 95: firepaas.agent.v1.VolumeService.ImportDataset:input_type -> firepaas.agent.v1.ImportDatasetRequest
-	84,  // 96: firepaas.agent.v1.VolumeService.AttachVolume:input_type -> firepaas.agent.v1.AttachVolumeRequest
-	85,  // 97: firepaas.agent.v1.VolumeService.DetachVolume:input_type -> firepaas.agent.v1.DetachVolumeRequest
-	86,  // 98: firepaas.agent.v1.VolumeService.DeleteVolume:input_type -> firepaas.agent.v1.DeleteVolumeRequest
-	87,  // 99: firepaas.agent.v1.VolumeService.ListVolumes:input_type -> firepaas.agent.v1.ListVolumesRequest
-	88,  // 100: firepaas.agent.v1.VolumeService.QuarantineVolume:input_type -> firepaas.agent.v1.QuarantineVolumeRequest
-	91,  // 101: firepaas.agent.v1.VolumeService.ListVolumeQuarantines:input_type -> firepaas.agent.v1.ListVolumeQuarantinesRequest
-	89,  // 102: firepaas.agent.v1.VolumeService.RollbackVolumeQuarantine:input_type -> firepaas.agent.v1.VolumeQuarantineActionRequest
-	89,  // 103: firepaas.agent.v1.VolumeService.FinalizeVolumeQuarantine:input_type -> firepaas.agent.v1.VolumeQuarantineActionRequest
+	58,  // 81: firepaas.agent.v1.ImageService.PullImage:input_type -> firepaas.agent.v1.PullImageRequest
+	60,  // 82: firepaas.agent.v1.ImageService.ListImages:input_type -> firepaas.agent.v1.ListImagesRequest
+	62,  // 83: firepaas.agent.v1.ImageService.DeleteImage:input_type -> firepaas.agent.v1.DeleteImageRequest
+	63,  // 84: firepaas.agent.v1.ImageService.QuarantineImage:input_type -> firepaas.agent.v1.QuarantineImageRequest
+	66,  // 85: firepaas.agent.v1.ImageService.ListImageQuarantines:input_type -> firepaas.agent.v1.ListImageQuarantinesRequest
+	64,  // 86: firepaas.agent.v1.ImageService.RollbackImageQuarantine:input_type -> firepaas.agent.v1.ImageQuarantineActionRequest
+	64,  // 87: firepaas.agent.v1.ImageService.FinalizeImageQuarantine:input_type -> firepaas.agent.v1.ImageQuarantineActionRequest
+	69,  // 88: firepaas.agent.v1.SnapshotService.CreateSnapshot:input_type -> firepaas.agent.v1.CreateSnapshotRequest
+	74,  // 89: firepaas.agent.v1.SnapshotService.ListSnapshots:input_type -> firepaas.agent.v1.ListSnapshotsRequest
+	77,  // 90: firepaas.agent.v1.SnapshotService.DeleteSnapshot:input_type -> firepaas.agent.v1.DeleteSnapshotRequest
+	78,  // 91: firepaas.agent.v1.SnapshotService.ForkSnapshot:input_type -> firepaas.agent.v1.ForkSnapshotRequest
+	80,  // 92: firepaas.agent.v1.SnapshotService.RestoreSnapshot:input_type -> firepaas.agent.v1.RestoreSnapshotRequest
+	72,  // 93: firepaas.agent.v1.SnapshotService.ScrubSnapshot:input_type -> firepaas.agent.v1.ScrubSnapshotRequest
+	82,  // 94: firepaas.agent.v1.VolumeService.CreateVolume:input_type -> firepaas.agent.v1.CreateVolumeRequest
+	84,  // 95: firepaas.agent.v1.VolumeService.ImportDataset:input_type -> firepaas.agent.v1.ImportDatasetRequest
+	85,  // 96: firepaas.agent.v1.VolumeService.AttachVolume:input_type -> firepaas.agent.v1.AttachVolumeRequest
+	86,  // 97: firepaas.agent.v1.VolumeService.DetachVolume:input_type -> firepaas.agent.v1.DetachVolumeRequest
+	87,  // 98: firepaas.agent.v1.VolumeService.DeleteVolume:input_type -> firepaas.agent.v1.DeleteVolumeRequest
+	88,  // 99: firepaas.agent.v1.VolumeService.ListVolumes:input_type -> firepaas.agent.v1.ListVolumesRequest
+	89,  // 100: firepaas.agent.v1.VolumeService.QuarantineVolume:input_type -> firepaas.agent.v1.QuarantineVolumeRequest
+	92,  // 101: firepaas.agent.v1.VolumeService.ListVolumeQuarantines:input_type -> firepaas.agent.v1.ListVolumeQuarantinesRequest
+	90,  // 102: firepaas.agent.v1.VolumeService.RollbackVolumeQuarantine:input_type -> firepaas.agent.v1.VolumeQuarantineActionRequest
+	90,  // 103: firepaas.agent.v1.VolumeService.FinalizeVolumeQuarantine:input_type -> firepaas.agent.v1.VolumeQuarantineActionRequest
 	12,  // 104: firepaas.agent.v1.InfoService.ServiceInfo:output_type -> firepaas.agent.v1.ServiceInfoResponse
 	26,  // 105: firepaas.agent.v1.MachineService.CreateMachine:output_type -> firepaas.agent.v1.CreateMachineResponse
 	30,  // 106: firepaas.agent.v1.MachineService.UpdateMachine:output_type -> firepaas.agent.v1.Machine
 	29,  // 107: firepaas.agent.v1.MachineService.ListMachines:output_type -> firepaas.agent.v1.ListMachinesResponse
-	102, // 108: firepaas.agent.v1.MachineService.DeleteMachine:output_type -> google.protobuf.Empty
+	103, // 108: firepaas.agent.v1.MachineService.DeleteMachine:output_type -> google.protobuf.Empty
 	30,  // 109: firepaas.agent.v1.MachineService.StartMachine:output_type -> firepaas.agent.v1.Machine
 	30,  // 110: firepaas.agent.v1.MachineService.StopMachine:output_type -> firepaas.agent.v1.Machine
 	30,  // 111: firepaas.agent.v1.MachineService.PauseMachine:output_type -> firepaas.agent.v1.Machine
@@ -7751,29 +7803,29 @@ var file_agent_v1_agent_proto_depIdxs = []int32{
 	44,  // 116: firepaas.agent.v1.MachineService.CopyTo:output_type -> firepaas.agent.v1.CopyToResponse
 	47,  // 117: firepaas.agent.v1.MachineService.CopyFrom:output_type -> firepaas.agent.v1.CopyFromResponse
 	56,  // 118: firepaas.agent.v1.FabricService.ApplyFabric:output_type -> firepaas.agent.v1.ApplyFabricResponse
-	58,  // 119: firepaas.agent.v1.ImageService.PullImage:output_type -> firepaas.agent.v1.PullImageResponse
-	60,  // 120: firepaas.agent.v1.ImageService.ListImages:output_type -> firepaas.agent.v1.ListImagesResponse
-	102, // 121: firepaas.agent.v1.ImageService.DeleteImage:output_type -> google.protobuf.Empty
-	64,  // 122: firepaas.agent.v1.ImageService.QuarantineImage:output_type -> firepaas.agent.v1.ImageQuarantine
-	66,  // 123: firepaas.agent.v1.ImageService.ListImageQuarantines:output_type -> firepaas.agent.v1.ListImageQuarantinesResponse
-	102, // 124: firepaas.agent.v1.ImageService.RollbackImageQuarantine:output_type -> google.protobuf.Empty
-	102, // 125: firepaas.agent.v1.ImageService.FinalizeImageQuarantine:output_type -> google.protobuf.Empty
-	70,  // 126: firepaas.agent.v1.SnapshotService.CreateSnapshot:output_type -> firepaas.agent.v1.CreateSnapshotResponse
-	75,  // 127: firepaas.agent.v1.SnapshotService.ListSnapshots:output_type -> firepaas.agent.v1.ListSnapshotsResponse
-	102, // 128: firepaas.agent.v1.SnapshotService.DeleteSnapshot:output_type -> google.protobuf.Empty
-	78,  // 129: firepaas.agent.v1.SnapshotService.ForkSnapshot:output_type -> firepaas.agent.v1.ForkSnapshotResponse
-	80,  // 130: firepaas.agent.v1.SnapshotService.RestoreSnapshot:output_type -> firepaas.agent.v1.RestoreSnapshotResponse
-	72,  // 131: firepaas.agent.v1.SnapshotService.ScrubSnapshot:output_type -> firepaas.agent.v1.ScrubSnapshotResponse
-	82,  // 132: firepaas.agent.v1.VolumeService.CreateVolume:output_type -> firepaas.agent.v1.CreateVolumeResponse
-	82,  // 133: firepaas.agent.v1.VolumeService.ImportDataset:output_type -> firepaas.agent.v1.CreateVolumeResponse
+	59,  // 119: firepaas.agent.v1.ImageService.PullImage:output_type -> firepaas.agent.v1.PullImageResponse
+	61,  // 120: firepaas.agent.v1.ImageService.ListImages:output_type -> firepaas.agent.v1.ListImagesResponse
+	103, // 121: firepaas.agent.v1.ImageService.DeleteImage:output_type -> google.protobuf.Empty
+	65,  // 122: firepaas.agent.v1.ImageService.QuarantineImage:output_type -> firepaas.agent.v1.ImageQuarantine
+	67,  // 123: firepaas.agent.v1.ImageService.ListImageQuarantines:output_type -> firepaas.agent.v1.ListImageQuarantinesResponse
+	103, // 124: firepaas.agent.v1.ImageService.RollbackImageQuarantine:output_type -> google.protobuf.Empty
+	103, // 125: firepaas.agent.v1.ImageService.FinalizeImageQuarantine:output_type -> google.protobuf.Empty
+	71,  // 126: firepaas.agent.v1.SnapshotService.CreateSnapshot:output_type -> firepaas.agent.v1.CreateSnapshotResponse
+	76,  // 127: firepaas.agent.v1.SnapshotService.ListSnapshots:output_type -> firepaas.agent.v1.ListSnapshotsResponse
+	103, // 128: firepaas.agent.v1.SnapshotService.DeleteSnapshot:output_type -> google.protobuf.Empty
+	79,  // 129: firepaas.agent.v1.SnapshotService.ForkSnapshot:output_type -> firepaas.agent.v1.ForkSnapshotResponse
+	81,  // 130: firepaas.agent.v1.SnapshotService.RestoreSnapshot:output_type -> firepaas.agent.v1.RestoreSnapshotResponse
+	73,  // 131: firepaas.agent.v1.SnapshotService.ScrubSnapshot:output_type -> firepaas.agent.v1.ScrubSnapshotResponse
+	83,  // 132: firepaas.agent.v1.VolumeService.CreateVolume:output_type -> firepaas.agent.v1.CreateVolumeResponse
+	83,  // 133: firepaas.agent.v1.VolumeService.ImportDataset:output_type -> firepaas.agent.v1.CreateVolumeResponse
 	30,  // 134: firepaas.agent.v1.VolumeService.AttachVolume:output_type -> firepaas.agent.v1.Machine
 	30,  // 135: firepaas.agent.v1.VolumeService.DetachVolume:output_type -> firepaas.agent.v1.Machine
-	102, // 136: firepaas.agent.v1.VolumeService.DeleteVolume:output_type -> google.protobuf.Empty
-	95,  // 137: firepaas.agent.v1.VolumeService.ListVolumes:output_type -> firepaas.agent.v1.ListVolumesResponse
-	90,  // 138: firepaas.agent.v1.VolumeService.QuarantineVolume:output_type -> firepaas.agent.v1.VolumeQuarantine
-	92,  // 139: firepaas.agent.v1.VolumeService.ListVolumeQuarantines:output_type -> firepaas.agent.v1.ListVolumeQuarantinesResponse
-	102, // 140: firepaas.agent.v1.VolumeService.RollbackVolumeQuarantine:output_type -> google.protobuf.Empty
-	102, // 141: firepaas.agent.v1.VolumeService.FinalizeVolumeQuarantine:output_type -> google.protobuf.Empty
+	103, // 136: firepaas.agent.v1.VolumeService.DeleteVolume:output_type -> google.protobuf.Empty
+	96,  // 137: firepaas.agent.v1.VolumeService.ListVolumes:output_type -> firepaas.agent.v1.ListVolumesResponse
+	91,  // 138: firepaas.agent.v1.VolumeService.QuarantineVolume:output_type -> firepaas.agent.v1.VolumeQuarantine
+	93,  // 139: firepaas.agent.v1.VolumeService.ListVolumeQuarantines:output_type -> firepaas.agent.v1.ListVolumeQuarantinesResponse
+	103, // 140: firepaas.agent.v1.VolumeService.RollbackVolumeQuarantine:output_type -> google.protobuf.Empty
+	103, // 141: firepaas.agent.v1.VolumeService.FinalizeVolumeQuarantine:output_type -> google.protobuf.Empty
 	104, // [104:142] is the sub-list for method output_type
 	66,  // [66:104] is the sub-list for method input_type
 	66,  // [66:66] is the sub-list for extension type_name
@@ -7814,7 +7866,7 @@ func file_agent_v1_agent_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_agent_v1_agent_proto_rawDesc), len(file_agent_v1_agent_proto_rawDesc)),
 			NumEnums:      10,
-			NumMessages:   91,
+			NumMessages:   92,
 			NumExtensions: 0,
 			NumServices:   6,
 		},

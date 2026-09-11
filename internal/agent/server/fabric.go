@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
 
@@ -85,7 +86,7 @@ func (s *Server) ApplyFabric(ctx context.Context, req *pb.ApplyFabricRequest) (*
 		Codec: protoCodec(func() *pb.ApplyFabricResponse { return &pb.ApplyFabricResponse{} }),
 	})
 	if err != nil {
-		return nil, mutationError(err)
+		return nil, fabricApplyError(err, s.fabric)
 	}
 	// 已完成重放直接按存储结果返回时，补上 replay 信号。
 	if existed {
@@ -94,7 +95,138 @@ func (s *Server) ApplyFabric(ctx context.Context, req *pb.ApplyFabricRequest) (*
 	return out, nil
 }
 
-// fabricPolicyFromSnapshot 把契约请求解析为 eBPF policy 快照（G2a §15）。
+// fabricApplyError 映射 ApplyFabric 失败：stale 水位拒绝时随 FailedPrecondition
+// 附带 agent 当前已应用水位（gRPC status detail）。控制面据此一步跳到该水位 +1
+// 重推，避免 DB 水位回退（备份恢复/丢更新）后逐代爬升造成的长窗口冻结；
+// 其余错误仍走 mutationError 的统一映射。
+func fabricApplyError(err error, fabric *state.Fabric) error {
+	if errors.Is(err, state.ErrStaleFabricGeneration) && fabric != nil {
+		applied := fabric.Current().Generation
+		st, derr := status.New(codes.FailedPrecondition, err.Error()).
+			WithDetails(&pb.FabricWatermarkDetail{AppliedGeneration: applied})
+		if derr == nil {
+			return st.Err()
+		}
+	}
+	return mutationError(err)
+}
+
+// FabricIdentityView / FabricRuleView 是 policy 组装的中立输入：接收路径
+// （pb 请求）与 agentd 重启重放（持久化快照）共用同一组装实现，避免两处
+// 各自维护导致语义漂移。
+type FabricIdentityView struct {
+	IdentityID uint32
+	ProjectID  string
+	AppID      string
+	Service    string
+	ULA        string
+}
+
+type FabricRuleView struct {
+	SrcProject string
+	SrcApp     string
+	DstProject string
+	DstApp     string
+	DstService string
+	Ports      []uint32
+}
+
+// BuildFabricPolicy 由 identity/规则集合组装 eBPF policy 快照：
+// ipcache = identities 全集（ULA→identity，v6 源绑定）；dst 按
+// (project,app,service) 精确解析；src 按 app 展开到全部 service identity
+// （规则只声明 src_app 的语义）；回程条目携带同一端口集并按源端口匹配。
+// mesh_direct 与在役门控在控制面组装侧完成（未声明的 dst_service 规则不
+// 会进快照），此处不重查（W3 分工：identity 跨 execution 共享，逐行声明
+// 无法在 identity 粒度收紧）。
+func BuildFabricPolicy(
+	generation uint64,
+	nodePrefix string,
+	ids []FabricIdentityView,
+	rules []FabricRuleView,
+) api.FabricPolicySnapshot {
+	snap := api.FabricPolicySnapshot{
+		Generation: generation,
+		Identities: make([]api.IdentityMapEntry, 0, len(ids)),
+	}
+	// 本节点自身 ULA = NodePrefix /64 基址（wg 设备地址）：平台流量放行。
+	if p, err := netip.ParsePrefix(nodePrefix); err == nil {
+		snap.NodeULA = p.Addr().String()
+	}
+	type identityKey struct {
+		project, app, service string
+	}
+	type appKey struct {
+		project, app string
+	}
+	// identity 按 (project, app, service) 解析：service 是策略粒度的真实
+	// 一维，按 (project, app) 折叠会让同 app 的多个 service 互相覆盖
+	// （规则落到最后遍历到的 identity，过多/过少授权）。src 侧规则只声明
+	// src_app，语义是“该 app 任一声明 service 都可发起”，故按 app 聚合同
+	// project/app 下的全部 identity。
+	byService := make(map[identityKey]uint32, len(ids))
+	byApp := make(map[appKey][]uint32, len(ids))
+	for _, m := range ids {
+		snap.Identities = append(snap.Identities, api.IdentityMapEntry{
+			IdentityID: m.IdentityID,
+			ULA:        m.ULA,
+		})
+		byService[identityKey{m.ProjectID, m.AppID, m.Service}] = m.IdentityID
+		ak := appKey{m.ProjectID, m.AppID}
+		byApp[ak] = append(byApp[ak], m.IdentityID)
+	}
+	for _, r := range rules {
+		dstID, ok := byService[identityKey{r.DstProject, r.DstApp, r.DstService}]
+		if !ok {
+			// dst 身份不在本节点/未部署：条目无从命中，跳过（规则仍随快照
+			// 持久化，dst 上线后下一代快照再生效）。
+			continue
+		}
+		for _, srcID := range byApp[appKey{r.SrcProject, r.SrcApp}] {
+			snap.Entries = append(snap.Entries, api.FabricPolicyEntry{
+				SrcIdentity: srcID,
+				DstIdentity: dstID,
+				Generation:  generation,
+				Ports:       append([]uint32(nil), r.Ports...),
+			})
+			// 对称回程条目：跨节点时请求在 src 节点、回包在 dst 节点分别过
+			// eBPF，回程授权无法靠运行时流表（节点间不共享 map），所以回程
+			// 必须是静态条目。条目携带同一端口集但按**源端口**校验
+			// （SrcPorts），把回程从“任意端口”收窄到声明服务端口；反向
+			// 新建 TCP 仍被纯 SYN 的 dport 检查拒绝。
+			snap.Entries = append(snap.Entries, api.FabricPolicyEntry{
+				SrcIdentity: dstID,
+				DstIdentity: srcID,
+				Generation:  generation,
+				Ports:       append([]uint32(nil), r.Ports...),
+				SrcPorts:    true,
+			})
+		}
+	}
+	return snap
+}
+
+// FabricPolicyFromState 把持久化 fabric 快照转换为重放输入（agentd 重启
+// 后重播 ipcache/policy；与接收路径共用 BuildFabricPolicy）。
+func FabricPolicyFromState(snap state.FabricSnapshot) api.FabricPolicySnapshot {
+	ids := make([]FabricIdentityView, 0, len(snap.Identities))
+	for _, m := range snap.Identities {
+		ids = append(ids, FabricIdentityView{
+			IdentityID: m.IdentityID, ProjectID: m.ProjectID, AppID: m.AppID,
+			Service: m.Service, ULA: m.ULA,
+		})
+	}
+	rules := make([]FabricRuleView, 0, len(snap.EastWest))
+	for _, r := range snap.EastWest {
+		rules = append(rules, FabricRuleView{
+			SrcProject: r.SrcProject, SrcApp: r.SrcApp,
+			DstProject: r.DstProject, DstApp: r.DstApp, DstService: r.DstService,
+			Ports: append([]uint32(nil), r.Ports...),
+		})
+	}
+	return BuildFabricPolicy(snap.Generation, snap.NodePrefix, ids, rules)
+}
+
+// fabricPolicyFromSnapshot 把契约请求解析为 policy 组装输入并构建快照。
 // ipcache = identities 全集（ULA→identity，v6 源绑定）；policy 条目 =
 // EastWest 规则 ∧ dst 身份存在（dst 上线前跳过，上线后下一代快照生效）。
 // “本服务可被直连”半边由控制面组装侧裁决（buildEastWestSnapshot 按在役
@@ -102,56 +234,25 @@ func (s *Server) ApplyFabric(ctx context.Context, req *pb.ApplyFabricRequest) (*
 // 端口取规则集（逐端口白名单本身即 per-service 隔离）。
 // 同 app 自连（src/dst 同身份）放行全部声明端口：EastWest 委托语义。
 func fabricPolicyFromSnapshot(req *pb.ApplyFabricRequest) api.FabricPolicySnapshot {
-	snap := api.FabricPolicySnapshot{
-		Generation: req.GetFabricGeneration(),
-		Identities: make([]api.IdentityMapEntry, 0, len(req.GetIdentities())),
-	}
-	// 本节点自身 ULA = NodePrefix /64 基址（wg 设备地址）：平台流量放行。
-	if p, err := netip.ParsePrefix(req.GetNodePrefix()); err == nil {
-		snap.NodeULA = p.Addr().String()
-	}
-	type identityKey struct {
-		project, app string
-	}
-	byCoord := make(map[identityKey]uint32, len(req.GetIdentities()))
+	ids := make([]FabricIdentityView, 0, len(req.GetIdentities()))
 	for _, m := range req.GetIdentities() {
-		snap.Identities = append(snap.Identities, api.IdentityMapEntry{
-			IdentityID: m.GetIdentityId(),
-			ULA:        m.GetUla(),
+		ids = append(ids, FabricIdentityView{
+			IdentityID: m.GetIdentityId(), ProjectID: m.GetProjectId(), AppID: m.GetAppId(),
+			Service: m.GetService(), ULA: m.GetUla(),
 		})
-		key := identityKey{m.GetProjectId(), m.GetAppId()}
-		byCoord[key] = m.GetIdentityId()
 	}
-	ew := req.GetEastwest()
-	if ew == nil {
-		return snap
-	}
-	for _, r := range ew.GetRules() {
-		dstID, ok := byCoord[identityKey{r.GetDstProject(), r.GetDstApp()}]
-		if !ok {
-			// dst 身份不在本节点/未部署：条目无从命中，跳过（规则仍随快照
-			// 持久化，dst 上线后下一代快照再生效）。
-			continue
-		}
-		if srcID, ok := byCoord[identityKey{r.GetSrcProject(), r.GetSrcApp()}]; ok {
-			snap.Entries = append(snap.Entries, api.FabricPolicyEntry{
-				SrcIdentity: srcID,
-				DstIdentity: dstID,
-				Generation:  ew.GetGeneration(),
-				Ports:       append([]uint32(nil), r.GetPorts()...),
-			})
-			// 对称回程条目（无 ports）：跨节点时请求在 src 节点、回包在 dst
-			// 节点分别过 eBPF，回程授权无法靠运行时流表（节点间不共享 map）。
-			// 纯 SYN 端口白名单只挂在正向条目上，对称条目只放行非发起包
-			// （SYN-ACK/ACK/数据/ICMP）——反向新建 TCP 仍被端口检查拒。
-			snap.Entries = append(snap.Entries, api.FabricPolicyEntry{
-				SrcIdentity: dstID,
-				DstIdentity: srcID,
-				Generation:  ew.GetGeneration(),
+	var rules []FabricRuleView
+	if ew := req.GetEastwest(); ew != nil {
+		rules = make([]FabricRuleView, 0, len(ew.GetRules()))
+		for _, r := range ew.GetRules() {
+			rules = append(rules, FabricRuleView{
+				SrcProject: r.GetSrcProject(), SrcApp: r.GetSrcApp(),
+				DstProject: r.GetDstProject(), DstApp: r.GetDstApp(), DstService: r.GetDstService(),
+				Ports: append([]uint32(nil), r.GetPorts()...),
 			})
 		}
 	}
-	return snap
+	return BuildFabricPolicy(req.GetFabricGeneration(), req.GetNodePrefix(), ids, rules)
 }
 
 // apiPeersFromRequest 把契约 peer 集转换为 api.Peer（underlay 消费）。

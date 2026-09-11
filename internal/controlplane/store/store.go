@@ -3,6 +3,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,7 +13,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -506,21 +506,6 @@ func (s *Store) ensureAppAndEnqueueCreate(
 			VALUES($1,$2,$3,$4,$5,'create',$1,'PENDING',$6::jsonb)
 			ON CONFLICT (project_id, idempotency_key) DO NOTHING`,
 			operationID, projectID, machineID, executionID, generation, string(requestJSON)); err != nil {
-			// 并发同幂等键：唯一索引冲突说明另一事务已插入，重读比较。
-			var pgErr *pgconn.PgError
-			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-				traced, err := selectOperationByKey(ctx, tx, projectID, operationID)
-				if err != nil {
-					return err
-				}
-				if traced != nil {
-					if !jsonEqual(traced.Request, requestJSON) {
-						return ErrRequestConflict
-					}
-					op = *traced
-					return nil
-				}
-			}
 			return fmt.Errorf("enqueue create: %w", err)
 		}
 
@@ -530,6 +515,12 @@ func (s *Store) ensureAppAndEnqueueCreate(
 		}
 		if created == nil {
 			return fmt.Errorf("operation %s disappeared after insert", operationID)
+		}
+		// review 2026-09-10：预检与 INSERT 之间另一事务可能已入同键不同 body
+		// 的 operation；DO NOTHING 不会报错也不会覆盖。重读后必须再比一次，
+		// 否则不同请求会静默拿到赢家的结果（违反“同幂等键不同请求必须拒绝”）。
+		if !jsonEqual(created.Request, requestJSON) {
+			return ErrRequestConflict
 		}
 		op = *created
 		return nil
@@ -589,20 +580,6 @@ func (s *Store) EnqueueLifecycle(ctx context.Context, projectID, machineID, exec
 			VALUES($1,$2,$3,$4,$5,$6,$1,'PENDING',$7::jsonb)
 			ON CONFLICT (project_id, idempotency_key) DO NOTHING`,
 			operationID, projectID, machineID, executionID, generation, kind, string(requestJSON)); err != nil {
-			var pgErr *pgconn.PgError
-			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-				traced, terr := selectOperationByKey(ctx, tx, projectID, operationID)
-				if terr != nil {
-					return terr
-				}
-				if traced != nil && !jsonEqual(traced.Request, requestJSON) {
-					return ErrRequestConflict
-				}
-				if traced != nil {
-					op = *traced
-					return nil
-				}
-			}
 			return fmt.Errorf("enqueue %s: %w", kind, err)
 		}
 		fresh, ferr := selectOperationByKey(ctx, tx, projectID, operationID)
@@ -611,6 +588,11 @@ func (s *Store) EnqueueLifecycle(ctx context.Context, projectID, machineID, exec
 		}
 		if fresh == nil {
 			return fmt.Errorf("enqueue %s: operation vanished", kind)
+		}
+		// review 2026-09-10：DO NOTHING 的并发窗口靠重读比对关闭（见
+		// ensureAppAndEnqueueCreate 同名注释）。
+		if !jsonEqual(fresh.Request, requestJSON) {
+			return ErrRequestConflict
 		}
 		op = *fresh
 		return nil
@@ -679,6 +661,10 @@ func enqueueOperationIdempotentTx(
 	}
 	if created == nil {
 		return Operation{}, fmt.Errorf("operation %s disappeared after insert", operationID)
+	}
+	// review 2026-09-10：并发不同 body 的同幂等键必须拒绝，不能静默返回赢家。
+	if !jsonEqual(created.Request, requestJSON) {
+		return Operation{}, ErrRequestConflict
 	}
 	return *created, nil
 }
@@ -818,6 +804,11 @@ func (s *Store) EnqueueOperation(ctx context.Context, p EnqueueOperationParams) 
 		}
 		if created == nil {
 			return fmt.Errorf("operation %s disappeared after insert", p.OperationID)
+		}
+		// review 2026-09-10：并发不同 body 的同幂等键必须拒绝（见
+		// ensureAppAndEnqueueCreate 同名注释）。
+		if !jsonEqual(created.Request, p.Request) {
+			return ErrRequestConflict
 		}
 		op = *created
 		return nil
@@ -1373,6 +1364,17 @@ func (s *Store) ListSchedulerEvents(ctx context.Context, projectID string, limit
 	return out, rows.Err()
 }
 
+// DeleteSchedulerEventsOlderThan 清理过期调度/对账事件（review 2026-09-10：
+// scheduler_events 此前无任何保留期，无限增长）。索引 scheduler_events_at
+// （0004）支撑该删除。
+func (s *Store) DeleteSchedulerEventsOlderThan(ctx context.Context, cutoff time.Time) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM scheduler_events WHERE at < $1`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("delete old scheduler events: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 // UpdateOperationDispatchNode 记录操作实际派发的节点（optimistic accounting 依据）。
 func (s *Store) UpdateOperationDispatchNode(ctx context.Context, opID, nodeID string) error {
 	_, err := s.pool.Exec(ctx, `
@@ -1477,6 +1479,26 @@ func (s *Store) GetLatestOperationForMachine(ctx context.Context, machineID stri
 		return nil, fmt.Errorf("latest op for %s: %w", machineID, err)
 	}
 	return op, nil
+}
+
+// LatestCreateDispatchNode 返回该 machine 最近一条匹配 execution 的 create
+// operation 记录的 dispatch_node_id（无则空）。
+// review 2026-09-10：同一 execution 出现多节点副本时，保留哪个副本必须以
+// operation ledger 的归属节点为首选，而不是 agent ID 排序（排序会把 ledger
+// 归属的原始副本删掉，留下重派的副本）。
+func (s *Store) LatestCreateDispatchNode(ctx context.Context, machineID, executionID string) (string, error) {
+	var node string
+	err := s.pool.QueryRow(ctx, `
+		SELECT coalesce(dispatch_node_id,'') FROM operations
+		WHERE machine_id=$1 AND execution_id=$2 AND kind='create'
+		ORDER BY created_at DESC, id DESC LIMIT 1`, machineID, executionID).Scan(&node)
+	if err == pgx.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("latest create dispatch node %s: %w", machineID, err)
+	}
+	return node, nil
 }
 
 // FailedCreateAttempts 返回该 machine 自最近一次 SUCCEEDED create 以来
@@ -1728,7 +1750,10 @@ func (s *Store) ActiveRouteMachines(ctx context.Context) ([]Machine, error) {
 		FROM machines m
 		WHERE m.desired_state IN ('CREATED','RUNNING')
 		  AND m.lifecycle_delete_phase = 'ACTIVE'
-		  AND m.observed_state IN ('RUNNING','PAUSED')`)
+		  AND m.observed_state IN ('RUNNING','PAUSED')
+		  -- review 2026-09-10：debug fork 机器 hostname=''（无公开 route 语义）；
+		  -- 不过滤会产出空 hostname 的 route/Redis 键。
+		  AND m.hostname <> ''`)
 	if err != nil {
 		return nil, fmt.Errorf("active route machines: %w", err)
 	}
@@ -1909,12 +1934,27 @@ func selectOperationByKey(ctx context.Context, tx pgx.Tx, projectID, operationID
 
 // jsonEqual 语义化比较两段 JSON（键序无关；protojson 的 64 位整数序列化为
 // 字符串，两侧同为 protojson 文本，类型一致可比较）。
+//
+// review L2：用 UseNumber 解码，避免默认 float64 把 >2^53 的整数折叠成相等
+// （1e18 ± 1 会被判等，幂等键“同 key 不同 body 必须拒绝”的语义被精度削弱）。
+// 代价是 `1` 与 `1.0` 视为不同——两侧都来自同一 protojson 生成路径，不构成
+// 正常重放差异。
 func jsonEqual(a, b []byte) bool {
-	var av, bv any
-	if err := json.Unmarshal(a, &av); err != nil {
+	decode := func(raw []byte) (any, bool) {
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.UseNumber()
+		var v any
+		if err := dec.Decode(&v); err != nil {
+			return nil, false
+		}
+		return v, true
+	}
+	av, ok := decode(a)
+	if !ok {
 		return false
 	}
-	if err := json.Unmarshal(b, &bv); err != nil {
+	bv, ok := decode(b)
+	if !ok {
 		return false
 	}
 	return reflect.DeepEqual(av, bv)

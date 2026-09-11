@@ -281,6 +281,13 @@ const secretFileMode = 0o400
 var ErrSecretSnapshotForbidden = errors.New(
 	"execution received one-shot secrets; memory snapshot/standby forbidden (ADR-0024)")
 
+// ErrUnsupportedHealthCheck（review 2026-09-10）：声明的探针无法编码
+// （EXEC 未实现 / HTTP|TCP target 非法）时必须 fail closed，不得静默降级为
+// “未声明探针”（UNCONFIGURED = RUNNING 即 READY），否则 readiness 会在未
+// 执行任何探针的情况下把 backend 发布进路由（ADR-0008 的唯一就绪来源失效）。
+var ErrUnsupportedHealthCheck = errors.New(
+	"health_check is declared but not supported; refusing fail-open readiness")
+
 // Adapter 包装 hypeman 的 instance/image manager。network 非空时启用 slot
 // 网络后端（ADR-0004）：create 后把 hypeman TAP 移入 slot netns，delete 后回收。
 // network 是 internal/agent/network/api.Datapath 插件缝（ADR-0040 §11）：
@@ -587,11 +594,16 @@ func (a *Adapter) Create(ctx context.Context, req *pb.CreateMachineRequest) (*pb
 		}
 		sort.Strings(secretKeys)
 	}
-	// 完整探针策略 JSON 入 tag（ADR-0008）；EXEC 或非法 target 降级为
-	// 未声明（UNCONFIGURED = RUNNING 即 READY）。
+	// 完整探针策略 JSON 入 tag（ADR-0008）。声明的探针无法编码时 fail
+	// closed（review 2026-09-10）；只有 TYPE_UNSPECIFIED（空消息）等同于
+	// 未声明。未声明探针才允许 UNCONFIGURED = RUNNING 即 READY。
 	healthTag := "0"
-	if spec.HealthCheck != nil {
-		if encoded, err := health.EncodePolicy(spec.HealthCheck); err == nil && encoded != "" {
+	if hc := spec.HealthCheck; hc != nil {
+		encoded, err := health.EncodePolicy(hc)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrUnsupportedHealthCheck, err)
+		}
+		if encoded != "" {
 			healthTag = encoded
 		}
 	}

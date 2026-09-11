@@ -518,7 +518,16 @@ func (p *Proxy) dialFor(policy *Policy, host string, port uint32, _ []byte) (net
 	if !decision.Allow {
 		return nil, decision
 	}
-	conn, err := dialFirst(public, port)
+	dialSet := dialSetFor(decision, public, policy.AllowedCIDRs)
+	if len(dialSet) == 0 {
+		// CIDR 授权来自解析集里的某个地址，但过滤后为空（实现不应发生；
+		// 防御性 fail closed，避免“授权了却无可拨地址”变成拨全集）。
+		return nil, Decision{
+			Allow: false, MatchType: "cidr_allowed", CIDRAuthorized: true,
+			Reason: "no resolved address inside allowed_cidrs",
+		}
+	}
+	conn, err := dialFirst(dialSet, port)
 	if err != nil {
 		return nil, Decision{
 			Allow: false, MatchType: "dial_failed",

@@ -443,6 +443,27 @@ func ValidateEgressPolicy(p *pb.EgressPolicySpec) error {
 	return nil
 }
 
+// ValidateEgressPolicySubmission 是**新提交**（部署创建/更新）的校验：在
+// 结构校验之上拒绝 allowed_domains 非 allowlist 的组合。域名只由 allowlist
+// 模式的透明代理执行（unrestricted/deny_all 不装代理，域名被静默忽略——
+// 对 unrestricted 是 fail-open 的误配置）。
+//
+// 存量 deployment 不走本函数（controller/placement/reconciler 继续用
+// ValidateEgressPolicy）：否则升级后既有 unrestricted+domains 行会被
+// placement 判为 egress.invalid-policy 而硬过滤成不可调度。
+func ValidateEgressPolicySubmission(p *pb.EgressPolicySpec) error {
+	if err := ValidateEgressPolicy(p); err != nil {
+		return err
+	}
+	if p == nil {
+		return nil
+	}
+	if len(p.GetAllowedDomains()) > 0 && p.GetMode() != pb.EgressPolicySpec_ALLOWLIST {
+		return fmt.Errorf("egress allowed_domains requires mode ALLOWLIST, got mode %d", p.GetMode())
+	}
+	return nil
+}
+
 // ValidateEastWestPolicy 校验 EastWestPolicySpec（ADR-0040 §15；nil = 未
 // 声明，合法 = default deny）。全量替换快照：generation > 0、规则字段非空、
 // 端口 [1,65535] 且规则内不重复、同 (dst 三元组) 规则不重复。

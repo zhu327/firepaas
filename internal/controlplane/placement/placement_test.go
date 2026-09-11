@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math/rand"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -260,4 +261,59 @@ func TestDeploymentPlacementLockSerializesPerDeployment(t *testing.T) {
 		t.Fatal("different deployment blocked behind held placement lock")
 	}
 	releaseA()
+}
+
+// review 2026-09-10：重试/leader 切换后的未完成 create 必须优先回原 agent
+// 重放（agent ledger 单节点幂等）；原节点不可用时降级为普通调度并记 rehome。
+func TestDispatchPin(t *testing.T) {
+	live := []liveNode{
+		{NodeID: "node-a", Status: scheduler.StatusHealthy},
+		{NodeID: "node-b", Status: scheduler.StatusUnhealthy},
+		{NodeID: "node-d", Status: scheduler.StatusDraining},
+	}
+	cases := []struct {
+		name       string
+		dispatch   string
+		excluded   map[string]bool
+		wantPin    string
+		wantReason string
+	}{
+		{name: "no prior dispatch", wantPin: "", wantReason: ""},
+		{name: "healthy node pinned", dispatch: "node-a", wantPin: "node-a"},
+		{
+			name: "explicit retry exclusion rehomes", dispatch: "node-a",
+			excluded: map[string]bool{"node-a": true}, wantReason: "excluded",
+		},
+		{name: "unhealthy node rehomes", dispatch: "node-b", wantReason: "status=UNHEALTHY"},
+		{name: "draining node rehomes", dispatch: "node-d", wantReason: "status=DRAINING"},
+		{name: "undiscovered node rehomes", dispatch: "node-x", wantReason: "not_discovered"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pin, reason := dispatchPin(tc.dispatch, live, tc.excluded)
+			if pin != tc.wantPin || reason != tc.wantReason {
+				t.Fatalf("dispatchPin(%q) = (%q,%q), want (%q,%q)",
+					tc.dispatch, pin, reason, tc.wantPin, tc.wantReason)
+			}
+		})
+	}
+}
+
+// review M2：pinned 节点因资源不足被拒是暂态，必须与永久性原因区分，
+// 前者不得清除 fencing 换节点（原 RPC 可能已落地 → 双 VM）。
+func TestPinnedRejectionReasonClassification(t *testing.T) {
+	events := []scheduler.Event{
+		{Kind: "filter_rejection", NodeID: "node-a", Reason: "resources: need vcpu=1"},
+		{Kind: "filter_rejection", NodeID: "node-b", Reason: "capability missing: x"},
+		{Kind: "placement", NodeID: "", Reason: "anti_affinity degraded"},
+	}
+	if got := pinnedRejectionReason(events, "node-a"); !strings.HasPrefix(got, "resources:") {
+		t.Fatalf("resources reason = %q, want resources: prefix (must hold pin)", got)
+	}
+	if got := pinnedRejectionReason(events, "node-b"); strings.HasPrefix(got, "resources:") {
+		t.Fatalf("capability reason = %q, must be treated as permanent rehome", got)
+	}
+	if got := pinnedRejectionReason(events, "node-c"); got != "" {
+		t.Fatalf("unfiltered node reason = %q, want empty", got)
+	}
 }

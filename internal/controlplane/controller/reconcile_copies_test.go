@@ -249,3 +249,116 @@ func TestOrphanReapReArmedAfterIneffectiveTerminal(t *testing.T) {
 		t.Fatalf("re-arm must derive a new op id, got same %s", secondOp)
 	}
 }
+
+// TestProcessPGMachineReapsDuplicateLiveExecution（review 2026-09-10）：
+// 同一 execution 在 home 与另一节点同时存活（leader 切换后换节点重派发的
+// 双 VM 场景）。存活副本选择顺序：operation.dispatch_node_id > m.NodeID >
+// agent ID 排序；同优先级内优先存活副本（RUNNING/PAUSED）。
+func TestProcessPGMachineReapsDuplicateLiveExecution(t *testing.T) {
+	cases := []struct {
+		name string
+		// nodeA 是 m.NodeID（PG home），nodeB 是另一节点。
+		nodeA, nodeB string
+		homeState    pb.MachineState // nodeA 的观测状态
+		otherState   pb.MachineState // nodeB 的观测状态
+		dispatchNode string          // 为空则不插 create op
+		wantReapNode string
+	}{
+		{
+			name: "home sorts first", nodeA: "node-1", nodeB: "node-2",
+			homeState: pb.MachineState_RUNNING, otherState: pb.MachineState_RUNNING,
+			wantReapNode: "node-2",
+		},
+		{
+			name: "home sorts last", nodeA: "node-2", nodeB: "node-1",
+			homeState: pb.MachineState_RUNNING, otherState: pb.MachineState_RUNNING,
+			wantReapNode: "node-1",
+		},
+		{
+			name: "stopped duplicate still occupies the name", nodeA: "node-1", nodeB: "node-2",
+			homeState: pb.MachineState_RUNNING, otherState: pb.MachineState_STOPPED,
+			wantReapNode: "node-2",
+		},
+		{
+			// H1：ledger 归属（dispatch_node_id）优先于 PG home；否则会删掉
+			// 原始派发的副本、留下重派副本。
+			name: "dispatch node wins over pg home", nodeA: "node-1", nodeB: "node-2",
+			homeState: pb.MachineState_RUNNING, otherState: pb.MachineState_RUNNING,
+			dispatchNode: "node-2", wantReapNode: "node-1",
+		},
+		{
+			// M1：home 是 STOPPED、另一节点 RUNNING 时，必须保留 RUNNING 副本，
+			// 否则会先停服再由 STOPPED 分支触发重建。
+			name: "usable duplicate wins over stopped home", nodeA: "node-1", nodeB: "node-2",
+			homeState: pb.MachineState_STOPPED, otherState: pb.MachineState_RUNNING,
+			wantReapNode: "node-1",
+		},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := testPGStore(t)
+			ctx := context.Background()
+			sfx := fmt.Sprintf("%d-%d", os.Getpid(), i)
+			project, appID := "t-copies-p"+sfx, "t-copies-app"+sfx
+			machineID, depID := "t-copies-m"+sfx, "dep-copies"+sfx
+			execID := "exec-dup-" + sfx
+			cleanupCopiesProject(t, s, project)
+			t.Cleanup(func() { cleanupCopiesProject(t, s, project) })
+			seedR2App(t, s, ctx, project, appID)
+			insertR2Machine(t, s, ctx, appID, machineID, depID, execID, 2, tc.nodeA)
+			if tc.dispatchNode != "" {
+				if _, err := s.Pool().Exec(ctx, `
+					INSERT INTO operations(id, project_id, machine_id, execution_id, generation,
+						kind, idempotency_key, status, request, dispatch_node_id)
+					VALUES($1,$2,$3,$4,2,'create',$1,'SUCCEEDED','{}'::jsonb,$5)`,
+					"op-dup-seed-"+sfx, project, machineID, execID, tc.dispatchNode); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			nm, err := nodemanager.New(nodemanager.Config{NomadAddr: "http://127.0.0.1:9"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer nm.Close()
+			c := newR2Controller(t, nm, s)
+
+			live := func(node string) *pb.Machine {
+				return &pb.Machine{
+					MachineId: machineID, ExecutionId: execID, Generation: 2,
+					State: pb.MachineState_RUNNING,
+				}
+			}
+			copies := map[string]*pb.Machine{
+				tc.nodeA: live(tc.nodeA),
+				tc.nodeB: live(tc.nodeB),
+			}
+			copies[tc.nodeA].State = tc.homeState
+			copies[tc.nodeB].State = tc.otherState
+			c.processPGMachine(ctx, mustGetMachine(t, s, ctx, machineID), copies)
+
+			var exec, dispatch string
+			err = s.Pool().QueryRow(ctx, `
+				SELECT execution_id, coalesce(dispatch_node_id,'') FROM operations
+				WHERE machine_id=$1 AND kind='reap' ORDER BY created_at DESC LIMIT 1`, machineID).
+				Scan(&exec, &dispatch)
+			if err != nil {
+				t.Fatalf("duplicate live copy must be reaped: %v", err)
+			}
+			if exec != execID || dispatch != tc.wantReapNode {
+				t.Fatalf("reap = (exec=%q, node=%q), want (%q, %q)", exec, dispatch, execID, tc.wantReapNode)
+			}
+
+			// pending 守卫：同一副本不得在收敛前重复下单。
+			c.processPGMachine(ctx, mustGetMachine(t, s, ctx, machineID), copies)
+			var n int
+			if err := s.Pool().QueryRow(ctx,
+				`SELECT count(*) FROM operations WHERE machine_id=$1 AND kind='reap'`, machineID).Scan(&n); err != nil {
+				t.Fatal(err)
+			}
+			if n != 1 {
+				t.Fatalf("duplicate reap must be one op per round, got %d", n)
+			}
+		})
+	}
+}

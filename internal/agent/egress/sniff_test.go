@@ -131,3 +131,26 @@ func TestParseClientHelloSNIGarbage(t *testing.T) {
 	}
 	_ = binary.BigEndian // keep import honest for future record parsing
 }
+
+// TestPeekHTTPHostBoundedReads：请求行/头行无换行的恶意超长输入必须被上界
+// 拒绝，不能无限增长内存（单次 ReadString 无法中途设界）。
+func TestPeekHTTPHostBoundedReads(t *testing.T) {
+	longLine := strings.Repeat("A", maxHTTPHeaderBytes+1024)
+	if _, err := PeekHTTPHost(bufio.NewReader(strings.NewReader(longLine))); !errors.Is(err, errSniffTooLarge) {
+		t.Fatalf("oversized request line: err=%v, want errSniffTooLarge", err)
+	}
+	// 头行超限：合法请求行 + 超长无换行 header。
+	raw := "GET / HTTP/1.1\r\nX-Big: " + longLine
+	if _, err := PeekHTTPHost(bufio.NewReader(strings.NewReader(raw))); !errors.Is(err, errSniffTooLarge) {
+		t.Fatalf("oversized header line: err=%v, want errSniffTooLarge", err)
+	}
+	// 恰好在上界内的正常请求仍可解析（前缀完整回放）。
+	ok := "GET / HTTP/1.1\r\nHost: a.example\r\nX-Pad: " + strings.Repeat("b", maxHTTPHeaderBytes-128) + "\r\n\r\n"
+	peek, err := PeekHTTPHost(bufio.NewReader(strings.NewReader(ok)))
+	if err != nil || peek.Host != "a.example" {
+		t.Fatalf("in-budget header: host=%q err=%v", peek.Host, err)
+	}
+	if string(peek.Prefix) != ok {
+		t.Fatalf("prefix must replay exactly")
+	}
+}

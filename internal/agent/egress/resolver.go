@@ -18,6 +18,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/zhu327/firepaas/internal/agent/netpolicy"
+
 	"github.com/miekg/dns"
 )
 
@@ -224,34 +226,22 @@ func NewReservedChecker(platformCIDRs ...string) (*ReservedChecker, error) {
 	return rc, nil
 }
 
-// IsReserved 判断地址是否在保留段（连接前检查）。
+// IsReserved 判断地址是否在保留段（连接前检查）。canonical 集合来自
+// internal/agent/netpolicy（单一事实源：含 NAT64 64:ff9b::/96、6to4
+// anycast、240.0.0.0/4 等；本函数此前自维护的清单已与它漂移，NAT64/DNS64
+// 主机上 64:ff9b::a00:1 可映射到私网 10.0.0.1 绕过保留段拒绝）。
 func (rc *ReservedChecker) IsReserved(addr netip.Addr) bool {
 	a := addr.Unmap()
 	if !a.IsValid() {
 		return true
 	}
+	if netpolicy.Contains(a) {
+		return true
+	}
+	// 族级语义补充（canonical 集未覆盖的回环/链路本地/组播/未指定）。
 	if a.IsLoopback() || a.IsLinkLocalUnicast() || a.IsLinkLocalMulticast() ||
 		a.IsPrivate() || a.IsMulticast() || a.IsUnspecified() {
 		return true
-	}
-	// 显式补充：CGNAT、IETF 保留、benchmark、broadcast、文档段（IPv4）。
-	if a.Is4() {
-		ip := a.As4()
-		switch {
-		case ip[0] == 0, ip[0] == 100 && ip[1]&0xC0 == 64, // 0/8, 100.64/10
-			ip[0] == 192 && ip[1] == 0 && ip[2] == 0,     // 192.0.0.0/24
-			ip[0] == 198 && (ip[1] == 18 || ip[1] == 19), // 198.18/15
-			ip[0] == 255,                                // broadcast
-			ip[0] == 192 && ip[1] == 0 && ip[2] == 2,    // TEST-NET-1
-			ip[0] == 198 && ip[1] == 51 && ip[2] == 100, // TEST-NET-2
-			ip[0] == 203 && ip[1] == 0 && ip[2] == 113:  // TEST-NET-3
-			return true
-		}
-	} else {
-		// IPv6 文档段 2001:db8::/32。
-		if a.Is6() && a.As16()[0] == 0x20 && a.As16()[1] == 0x01 && a.As16()[2] == 0x0d && a.As16()[3] == 0xb8 {
-			return true
-		}
 	}
 	for _, prefix := range rc.extra {
 		if prefix.Contains(a) {

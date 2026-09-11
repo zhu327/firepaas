@@ -62,3 +62,60 @@ func TestCreateAdmissionFailClosedOnInvalidInventory(t *testing.T) {
 		t.Fatalf("list machines must not depend on admission snapshot: %v", err)
 	}
 }
+
+// TestDiskAdmissionCrossPathVisibility（review 2026-09-10）：create overlay 与
+// volume/import/overlay attach 的在途磁盘承诺必须共享同一硬上限。修复前两侧
+// 各查各的 counter，并发的 create 与 volume create 可同时越过 diskTotal。
+func TestDiskAdmissionCrossPathVisibility(t *testing.T) {
+	provider := info.New("node", "test", "test", "compute", "v1", "", t.TempDir(), nil, nil)
+	total, _ := provider.DiskAdmissionSnapshot()
+	if total < 4 {
+		t.Skip("test filesystem too small")
+	}
+	s := &Server{info: provider}
+
+	// 场景 A：volume 在途 T-1，create 请求 2（inflightDisk 已含本请求）→ 拒。
+	s.inflightVolumeDisk.Store(int64(total - 1))
+	s.inflightDisk.Store(2)
+	req := &pb.CreateMachineRequest{Spec: &pb.MachineSpec{Vcpu: 1, MemMib: 1, DiskMib: 2}}
+	if code := status.Code(s.admit(req)); code != codes.ResourceExhausted {
+		t.Fatalf("create must see in-flight volume disk: code = %s, want %s", code, codes.ResourceExhausted)
+	}
+
+	// 场景 B：create 在途 T-1，volume 请求 2（已 register）→ 拒。
+	s.inflightDisk.Store(int64(total - 1))
+	s.inflightVolumeDisk.Store(2)
+	if code := status.Code(s.admitVolume(2 << 20)); code != codes.ResourceExhausted {
+		t.Fatalf("volume must see in-flight create disk: code = %s, want %s", code, codes.ResourceExhausted)
+	}
+
+	// 清零后两条路径都恢复可准入。
+	s.inflightDisk.Store(0)
+	s.inflightVolumeDisk.Store(0)
+	if err := s.admit(req); err != nil {
+		t.Fatalf("create after inflight release must pass: %v", err)
+	}
+	s.inflightVolumeDisk.Store(1)
+	if err := s.admitVolume(1 << 20); err != nil {
+		t.Fatalf("volume after inflight release must pass: %v", err)
+	}
+}
+
+// review L1：在途计数 double-release 变负时，uint64 回绕会放大而不是缩小
+// 已承诺量，硬准入必须 fail closed（Unavailable），不得放行。
+func TestDiskAdmissionCounterUnderflowFailsClosed(t *testing.T) {
+	provider := info.New("node", "test", "test", "compute", "v1", "", t.TempDir(), nil, nil)
+	s := &Server{info: provider}
+	req := &pb.CreateMachineRequest{Spec: &pb.MachineSpec{Vcpu: 1, MemMib: 1, DiskMib: 1}}
+
+	s.inflightDisk.Store(-1)
+	if code := status.Code(s.admit(req)); code != codes.Unavailable {
+		t.Fatalf("negative create inflight: code = %s, want %s", code, codes.Unavailable)
+	}
+	s.inflightDisk.Store(0)
+
+	s.inflightVolumeDisk.Store(-1)
+	if code := status.Code(s.admitVolume(1 << 20)); code != codes.Unavailable {
+		t.Fatalf("negative volume inflight: code = %s, want %s", code, codes.Unavailable)
+	}
+}

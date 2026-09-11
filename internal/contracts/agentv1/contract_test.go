@@ -510,3 +510,39 @@ func TestValidateMachineSpecWithEastWestAndMeshDirect(t *testing.T) {
 		t.Fatal("eastwest generation 0 must fail")
 	}
 }
+
+// TestValidateEgressPolicyDomainMode：allowed_domains 只在 ALLOWLIST 模式由
+// 代理执行；unrestricted/deny_all 下域名会被静默忽略（unrestricted 时等于
+// 无限制），必须在部署期拒绝。
+func TestValidateEgressPolicyDomainMode(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		mode    pb.EgressPolicySpec_Mode
+		domains []string
+		wantErr bool
+	}{
+		{"unrestricted with domains", pb.EgressPolicySpec_UNRESTRICTED, []string{"example.com"}, true},
+		{"deny_all with domains", pb.EgressPolicySpec_DENY_ALL, []string{"example.com"}, true},
+		{"unspecified with domains", pb.EgressPolicySpec_MODE_UNSPECIFIED, []string{"example.com"}, true},
+		{"allowlist with domains", pb.EgressPolicySpec_ALLOWLIST, []string{"example.com"}, false},
+		{"allowlist without domains", pb.EgressPolicySpec_ALLOWLIST, nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := &pb.EgressPolicySpec{
+				Mode: tc.mode, AllowedDomains: tc.domains, PolicyGeneration: 1,
+			}
+			err := ValidateEgressPolicySubmission(spec)
+			if tc.wantErr && err == nil {
+				t.Fatalf("want error for mode=%v domains=%v", tc.mode, tc.domains)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			// 结构校验对存量行保持宽容（placement/controller 消费路径），
+			// 否则升级后既有 unrestricted+domains 会被硬过滤成不可调度。
+			if err := ValidateEgressPolicy(spec); err != nil {
+				t.Fatalf("structural validator must stay tolerant for stored rows: %v", err)
+			}
+		})
+	}
+}

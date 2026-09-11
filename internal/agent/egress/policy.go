@@ -228,11 +228,40 @@ func containsCIDR(list []netip.Prefix, addr netip.Addr) bool {
 	return false
 }
 
+// filterPrefixes 返回落在任一 prefix 内的地址子集（保持原顺序）。
+func filterPrefixes(addrs []netip.Addr, prefixes []netip.Prefix) []netip.Addr {
+	out := make([]netip.Addr, 0, len(addrs))
+	for _, a := range addrs {
+		if containsCIDR(prefixes, a) {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// dialSetFor 从保留段过滤后的解析集合选出实际拨号集合。只有 CIDR 命中
+// 授权时取交集：DecideForProxied 对 CIDR allowlist 的语义是“任一解析地址
+// 命中即放行”，若直接对全量解析集拨号，攻击者控制的 DNS 用一条授权段记录
+// 加一条未授权记录就能把连接引到未授权地址（检查集 ≠ 使用集）。域名规则
+// （domain）授权的是域名本身，全部公网解析结果可拨；unrestricted 默认放行
+// 语义不变。
+func dialSetFor(decision Decision, resolved []netip.Addr, allowed []netip.Prefix) []netip.Addr {
+	if !decision.CIDRAuthorized {
+		return resolved
+	}
+	return filterPrefixes(resolved, allowed)
+}
+
 // Decision 是一次连接判定结果（审计用）。
 type Decision struct {
 	Allow     bool
 	MatchType string // cidr_allowed | cidr_denied | domain | mode_default | no_host | reserved
 	Reason    string
+	// CIDRAuthorized 标记本次 allow 来自 allowed_cidrs 命中：调用方拨号时
+	// 必须把拨号集与该授权集取交集（“任一解析地址命中即授权”不等于
+	// “解析集全部可拨”）。结构化字段避免 dialSetFor 依赖 MatchType 字符串
+	// 比较——新增授权路径漏改字面量会静默 fail-open。
+	CIDRAuthorized bool
 }
 
 // DecideForProxied 判定经透明代理的 80/443 连接。host 空 = 无 Host/SNI
@@ -267,7 +296,12 @@ func (p *Policy) DecideForProxied(host string, resolved []netip.Addr) Decision {
 			return Decision{Allow: false, MatchType: "cidr_denied", Reason: "resolved address in denied_cidrs"}
 		}
 		if allowedByCIDR {
-			return Decision{Allow: true, MatchType: "cidr_allowed", Reason: "resolved address in allowed_cidrs"}
+			return Decision{
+				Allow:          true,
+				MatchType:      "cidr_allowed",
+				Reason:         "resolved address in allowed_cidrs",
+				CIDRAuthorized: true,
+			}
 		}
 		return Decision{Allow: false, MatchType: "mode_default", Reason: "deny_all mode"}
 	case ModeAllowlist:
@@ -275,7 +309,12 @@ func (p *Policy) DecideForProxied(host string, resolved []netip.Addr) Decision {
 			return Decision{Allow: false, MatchType: "cidr_denied", Reason: "resolved address in denied_cidrs"}
 		}
 		if allowedByCIDR {
-			return Decision{Allow: true, MatchType: "cidr_allowed", Reason: "resolved address in allowed_cidrs"}
+			return Decision{
+				Allow:          true,
+				MatchType:      "cidr_allowed",
+				Reason:         "resolved address in allowed_cidrs",
+				CIDRAuthorized: true,
+			}
 		}
 		if host == "" {
 			// 无 Host/SNI/ECH：域名规则无法保护，allowlist-only 默认拒绝。

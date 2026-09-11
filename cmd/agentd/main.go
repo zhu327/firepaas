@@ -62,18 +62,22 @@ import (
 	"github.com/zhu327/firepaas/internal/capabilities"
 	"github.com/zhu327/firepaas/internal/security/mtls"
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
+	"github.com/zhu327/firepaas/shared/pkg/logging"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
 
+// serviceVersion 由 -ldflags "-X main.serviceVersion=..." 注入发布版本。
+var serviceVersion = "dev"
+
 const (
-	serviceVersion = "0.1.0-m1"
-	serviceCommit  = "dev"
+	serviceCommit = "dev"
 	// agentProtocolVersion 是 v1.2-A（ADR-0023）的契约版本标识。
 	agentProtocolVersion = "firepaas.agent.v1"
 )
 
 func main() {
+	logging.Setup()
 	if err := run(); err != nil {
 		slog.Error("agentd terminated", "error", err)
 		os.Exit(1)
@@ -225,6 +229,10 @@ func run() error {
 				EgressProxy443: egressPort443,
 				// 同主机多节点：bpffs 固定目录可配（默认 /sys/fs/bpf/firepaas）。
 				PinDir: envOr("FIREPAAS_EBPF_PIN_DIR", ""),
+				// root 出口 NAT（T3）：eBPF 后端不建 nft fp-isolation 表，
+				// 必须自管 slot veth 源段 masquerade（ADR-0040 §7）。
+				VethCIDR:     slotVethCIDR,
+				RootNATTable: envOr("FIREPAAS_EBPF_ROOT_NAT_TABLE", ""),
 				// G3（§21）：低基数指标（attach 失败/回落事件/策略代）。
 				Observer: newEbpfObserver(meter),
 			})
@@ -597,7 +605,7 @@ func run() error {
 			// agent 重启后 v6 东西向静默断流直到下一次快照内容变更（真机实
 			// 测教训）。重放幂等全量，与 WG peers 重放同型。
 			if snap := fabric.Current(); snap.Generation > 0 {
-				if err := ebpfBackend.ApplyFabricPolicy(ctx, fabricPolicyReplay(snap)); err != nil {
+				if err := ebpfBackend.ApplyFabricPolicy(ctx, server.FabricPolicyFromState(snap)); err != nil {
 					slog.Warn("fabric policy replay failed; waiting next snapshot push", "error", err)
 				} else {
 					slog.Info("fabric policy replayed from durable snapshot", "generation", snap.Generation)
@@ -789,48 +797,6 @@ func envInt(key string, def int) int {
 }
 
 // liveSlotInstances 从 hypeman 实例清单构建 slot 对账的存活实例视图。
-// fabricPolicyReplay 把持久化快照转换为 eBPF policy 重放输入（与
-// server.fabricPolicyFromSnapshot 同构：规则按 (project,app) 映射到
-// identity，附对称回程条目；无 ports 的正向规则无意义，不重放）。
-func fabricPolicyReplay(snap state.FabricSnapshot) api.FabricPolicySnapshot {
-	out := api.FabricPolicySnapshot{
-		Generation: snap.Generation,
-		Identities: make([]api.IdentityMapEntry, 0, len(snap.Identities)),
-	}
-	if p, err := netip.ParsePrefix(snap.NodePrefix); err == nil {
-		out.NodeULA = p.Addr().String()
-	}
-	type identityKey struct{ project, app string }
-	byCoord := make(map[identityKey]uint32, len(snap.Identities))
-	for _, m := range snap.Identities {
-		out.Identities = append(out.Identities, api.IdentityMapEntry{
-			IdentityID: m.IdentityID,
-			ULA:        m.ULA,
-		})
-		byCoord[identityKey{m.ProjectID, m.AppID}] = m.IdentityID
-	}
-	for _, r := range snap.EastWest {
-		dstID, ok := byCoord[identityKey{r.DstProject, r.DstApp}]
-		if !ok {
-			continue
-		}
-		srcID, ok := byCoord[identityKey{r.SrcProject, r.SrcApp}]
-		if !ok {
-			continue
-		}
-		out.Entries = append(out.Entries, api.FabricPolicyEntry{
-			SrcIdentity: srcID, DstIdentity: dstID,
-			Generation: snap.EastWestGeneration,
-			Ports:      append([]uint32(nil), r.Ports...),
-		})
-		out.Entries = append(out.Entries, api.FabricPolicyEntry{
-			SrcIdentity: dstID, DstIdentity: srcID,
-			Generation: snap.EastWestGeneration,
-		})
-	}
-	return out
-}
-
 func liveSlotInstances(ctx context.Context, mgr instances.Manager) ([]api.LiveInstance, error) {
 	listed, err := mgr.ListInstances(ctx, nil)
 	if err != nil {
@@ -1220,19 +1186,67 @@ func (r fabricIdentityResolver) Resolve(id uint32) (ebpf.FlowIdentity, bool) {
 	return ebpf.FlowIdentity{}, false
 }
 
-// flowLogSink（G3，§21）：flow 事件消费——deny 全量日志（审计面）+ allow
-// 采样日志（1/128，噪声预算）；域名/IP/机器不进 label。
+// flowLogSink（G3，§21）：flow 事件消费——deny 限速日志（审计面，
+// 每秒窗口上限防拒绝风暴打爆日志）+ allow 采样日志（1/128，噪声预算）；
+// 域名/IP/机器不进 label。
 type flowLogSink struct {
-	allowSeen uint64 // 采样计数（原子；无锁快路径）
+	allowSeen uint64 // 采样计数（ringbuf 读取单 goroutine；无锁快路径）
+
+	mu      sync.Mutex
+	limiter flowLogLimiter
+}
+
+// flowDenyLogsPerSecond 是 deny flow 日志的每秒上限（单节点）。超限事件
+// 只计数，窗口滚动时汇总一条 Warn——高 pps 拒绝流量不再产生逐包日志。
+const flowDenyLogsPerSecond = 20
+
+// flowLogLimiter 是每秒窗口限速器（纯逻辑，可单测）。
+type flowLogLimiter struct {
+	window     int64
+	logged     int
+	suppressed uint64
+}
+
+// admit 返回本事件是否应记录，以及本次窗口滚动时需要汇报的抑制条数。
+func (l *flowLogLimiter) admit(now time.Time) (bool, uint64) {
+	sec := now.Unix()
+	var report uint64
+	if sec != l.window {
+		report = l.suppressed
+		l.window = sec
+		l.logged = 0
+		l.suppressed = 0
+	}
+	if l.logged >= flowDenyLogsPerSecond {
+		l.suppressed++
+		return false, report
+	}
+	l.logged++
+	return true, report
 }
 
 func (s *flowLogSink) Observe(rec ebpf.FlowRecord) {
 	if rec.Verdict == ebpf.FlowAllow {
+		// allow 采样已在 BPF 侧按 flow_sample 完成（ringbuf 前的开销收口），
+		// 这里收到的每条都记录；再按 1/128 二次采样会让 allow 日志实际
+		// 1/16384，等于没有。
 		s.allowSeen++
-		if s.allowSeen%128 != 0 {
-			return
-		}
+		logFabricFlow(rec)
+		return
 	}
+	s.mu.Lock()
+	admit, report := s.limiter.admit(time.Now())
+	s.mu.Unlock()
+	if report > 0 {
+		slog.Warn("fabric flow deny logs suppressed", "count", report,
+			"limit_per_second", flowDenyLogsPerSecond)
+	}
+	if admit {
+		logFabricFlow(rec)
+	}
+}
+
+func logFabricFlow(rec ebpf.FlowRecord) {
 	slog.Info("fabric flow",
 		"verdict", rec.Verdict.String(),
 		"proto", int(rec.Proto), "dport", int(rec.DPort),

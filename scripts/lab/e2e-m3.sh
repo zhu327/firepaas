@@ -18,6 +18,9 @@ RUN_DIR="/var/lib/firepaas-p0/e2e-m3"
 RUN_ID="e2e-m3-$(date +%s)"
 API_TOKEN="e2e-m3-token-$RUN_ID"
 TRAFFIC_KEY="$(openssl rand -base64 32)"   # M4：proxy credential 密钥（与 agent 强制校验配套）
+# edge 明文入口端口。默认 8081；宿主已有进程占用时用 FIREPAAS_LAB_EDGE_PORT 覆盖
+# （M4 API 默认也用 8081，两者时序不重叠，但本机常驻进程可能先占）。
+EDGE_HTTP_PORT="${FIREPAAS_LAB_EDGE_PORT:-8081}"
 PG="docker exec dev-postgres-1 psql -U firepaas -d firepaas -tAc"
 
 export PATH="$LAB_BIN:$HOME/.local/firepaas-lab/go/bin:$PATH"
@@ -73,7 +76,7 @@ nohup env FIREPAAS_POSTGRES_URL='postgres://firepaas:firepaas@127.0.0.1:5432/fir
   FIREPAAS_AGENT_TLS_CERT="$CERT_DIR/control-plane.crt" FIREPAAS_AGENT_TLS_KEY="$CERT_DIR/control-plane.key" \
   FIREPAAS_AGENT_TLS_CA="$CERT_DIR/ca.crt" \
   "$LAB_BIN/firepaas-api" > "$RUN_DIR/api.log" 2>&1 &
-nohup env FIREPAAS_EDGE_PORT=8081 FIREPAAS_API_ADDR=http://127.0.0.1:8080 FIREPAAS_API_TOKEN="$API_TOKEN" \
+nohup env FIREPAAS_EDGE_PORT=$EDGE_HTTP_PORT FIREPAAS_API_ADDR=http://127.0.0.1:8080 FIREPAAS_API_TOKEN="$API_TOKEN" \
   FIREPAAS_EDGE_TLS_CERT="$CERT_DIR/edge.crt" FIREPAAS_EDGE_TLS_KEY="$CERT_DIR/edge.key" \
   FIREPAAS_REDIS_ADDR=127.0.0.1:6379 FIREPAAS_EDGE_TLS_CA="$CERT_DIR/ca.crt" \
   "$LAB_BIN/edge-proxy" > "$RUN_DIR/edge.log" 2>&1 &
@@ -103,6 +106,17 @@ for _ in $(seq 1 40); do
   [[ "$fc" == "0" ]] && break
   sleep 5
 done
+# 无 firecracker = 无 live VM：残留的 fp-slot-*/fp-vp* 是上次失败退出的孤儿
+# （带 stale TAP 的 netns 会让后面的 slot 泄漏测试无法建同名 netns）。
+# 有 firecracker 时绝不清理（属于 live VM）。
+if [[ "$fc" == "0" ]]; then
+  for ns in $(ip netns list 2>/dev/null | awk '{print $1}' | grep -E '^fp-slot-' || true); do
+    ip netns del "$ns" 2>/dev/null || true
+  done
+  for lk in $(ip -o link show 2>/dev/null | awk -F'[:@ ]+' '{print $2}' | grep -E '^fp-(vp|vg)[0-9]+$' || true); do
+    ip link del "$lk" 2>/dev/null || true
+  done
+fi
 log "    预清理完成（机器 0 / VM 0）"
 
 log "2) 等待节点 HEALTHY"
@@ -116,8 +130,14 @@ done
 [[ "$n" -ge 1 ]] || fail "节点未 HEALTHY"
 
 log "2.5) slot 泄漏：1000 次 attach/release（内核对象级，须在业务机创建前跑）"
+# 前置：无 live VM（有则退出，避免误删运行中 VM 的 slot 内核对象）。
+ps -eo args | grep -q "[b]inaries/firecracker" && fail "存在运行中的 VM，不能跑 slot 泄漏测试"
+
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
-(cd "$REPO_ROOT" && FIREPAAS_TEST_NETNS=1 $HOME/.local/firepaas-lab/go/bin/go test ./internal/agent/network/slot/ -run 'TestSlotLifecycle|TestSlotCycleLeak' -count=1 -v > "$RUN_DIR/slot-test.log" 2>&1) \
+GO_BIN="${FIREPAAS_GO:-$HOME/.local/firepaas-lab/go/bin/go}"
+[[ -x "$GO_BIN" ]] || GO_BIN="$(command -v go || true)"
+[[ -x "$GO_BIN" ]] || fail "go 未找到：设 FIREPAAS_GO 或把 go 放到 ~/.local/firepaas-lab/go/bin/go"
+(cd "$REPO_ROOT" && FIREPAAS_TEST_NETNS=1 "$GO_BIN" test ./internal/agent/network/slot/ -run 'TestSlotLifecycle|TestSlotCycleLeak' -count=1 -v > "$RUN_DIR/slot-test.log" 2>&1) \
   || { tail -20 "$RUN_DIR/slot-test.log" >&2; fail "slot 生命周期/泄漏测试失败"; }
 log "    attach/release 无 netns/veth/路由泄漏 OK"
 
@@ -136,7 +156,7 @@ wait_app "$APP" "len([m for m in ms if m['ObservedState']=='RUNNING'])==1" 240 |
 # edge 轮询至 200（VM 冷启动）
 ok=0
 for _ in $(seq 1 30); do
-  code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' -H "Host: $HN" http://127.0.0.1:8081/ || true)
+  code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' -H "Host: $HN" http://127.0.0.1:$EDGE_HTTP_PORT/ || true)
   [[ "$code" == "200" ]] && ok=1 && break
   sleep 3
 done
@@ -170,14 +190,14 @@ curl -fsS -m 10 -X POST -H "Authorization: Bearer $API_TOKEN" -H 'Content-Type: 
 }' >/dev/null || fail "deploy 失败"
 # 切流前旧代继续服务（PREPARING 期间不切流）
 sleep 5
-code=$(curl -s -m 8 -o /dev/null -w '%{http_code}' -H "Host: $HN" http://127.0.0.1:8081/ || true)
+code=$(curl -s -m 8 -o /dev/null -w '%{http_code}' -H "Host: $HN" http://127.0.0.1:$EDGE_HTTP_PORT/ || true)
 [[ "$code" == "200" ]] || fail "PREPARING 期间旧代应继续服务（got $code）"
 wait_app "$APP" "rl is None and len([m for m in ms if m['ObservedState']=='RUNNING'])==3" 480 \
   || fail "rollout 未完成"
 sleep 15  # 旧代回收
 old_left=$(pg "SELECT count(*) FROM machines WHERE app_id='$APP' AND deployment_id LIKE '%-g1' AND desired_state!='DELETED'")
 [[ "$old_left" -eq 0 ]] || fail "旧代机器未回收（剩余 $old_left）"
-code=$(curl -s -m 8 -o /dev/null -w '%{http_code}' -H "Host: $HN" http://127.0.0.1:8081/ || true)
+code=$(curl -s -m 8 -o /dev/null -w '%{http_code}' -H "Host: $HN" http://127.0.0.1:$EDGE_HTTP_PORT/ || true)
 [[ "$code" == "200" ]] || fail "发布完成后 edge != 200"
 log "    新代全部 READY 切流、旧代 drain 回收、edge 200 OK"
 
@@ -193,7 +213,7 @@ status=$(curl -s -m 10 -o /dev/null -w '%{http_code}' -X POST \
 wait_app "$APP" "rl is None" 600 || fail "失败发布未回滚收敛"
 dep_status=$(pg "SELECT status FROM deployments WHERE app_id='$APP' ORDER BY generation DESC LIMIT 1")
 [[ "$dep_status" == "FAILED" ]] || fail "坏镜像 deployment 应为 FAILED（got $dep_status）"
-code=$(curl -s -m 8 -o /dev/null -w '%{http_code}' -H "Host: $HN" http://127.0.0.1:8081/ || true)
+code=$(curl -s -m 8 -o /dev/null -w '%{http_code}' -H "Host: $HN" http://127.0.0.1:$EDGE_HTTP_PORT/ || true)
 [[ "$code" == "200" ]] || fail "回滚后 edge != 200"
 log "    409 互斥 + 自动回滚 + 旧代持续服务 OK"
 
@@ -219,7 +239,7 @@ $REDIS_CLI DEL "hostidx:$HN" >/dev/null
 # 不 serve-stale），重建后 → 200。断言覆盖两个阶段。
 saw404=0
 for _ in $(seq 1 8); do
-  code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' -H "Host: $HN" http://127.0.0.1:8081/ || true)
+  code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' -H "Host: $HN" http://127.0.0.1:$EDGE_HTTP_PORT/ || true)
   [[ "$code" == "404" || "$code" == "503" ]] && saw404=1
   [[ "$saw404" == "1" ]] && break
   sleep 2
@@ -228,14 +248,14 @@ done
 # 也是合法收敛——两种部接受，但至少不能一直非 200 或直接 5xx 之外的状态。
 if [[ "$saw404" != "1" ]]; then
   # 验证当前确实已重建（200）；否则是断言窗口内既无 miss 又未恢复的异常。
-  code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' -H "Host: $HN" http://127.0.0.1:8081/ || true)
+  code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' -H "Host: $HN" http://127.0.0.1:$EDGE_HTTP_PORT/ || true)
   [[ "$code" == "200" ]] || fail "catalog 删除后既无 404 也未恢复（got $code）"
   log "    （快速重建路径：删除后 fresh 窗口内投影已重建，无 miss 窗口）"
 fi
 # 等投影重建（controller 下一轮 buildRoutes，≤ sync 周期 + 余量）
 ok=0
 for _ in $(seq 1 24); do
-  code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' -H "Host: $HN" http://127.0.0.1:8081/ || true)
+  code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' -H "Host: $HN" http://127.0.0.1:$EDGE_HTTP_PORT/ || true)
   [[ "$code" == "200" ]] && ok=1 && break
   sleep 5
 done
@@ -286,7 +306,7 @@ for _ in $(seq 1 60); do "$LAB_BIN/agentctl" info >/dev/null 2>&1 && break; slee
 for _ in $(seq 1 60); do
   vm_count=$(pg "SELECT count(*) FROM machines WHERE app_id='$APP' AND observed_state='RUNNING' AND desired_state!='DELETED'")
   ns_count=$(ip netns list | grep -c '^fp-slot-' || true)
-  code=$(curl -s -m 8 -o /dev/null -w '%{http_code}' -H "Host: $HN" http://127.0.0.1:8081/ || true)
+  code=$(curl -s -m 8 -o /dev/null -w '%{http_code}' -H "Host: $HN" http://127.0.0.1:$EDGE_HTTP_PORT/ || true)
   [[ "$vm_count" == "3" && "$ns_count" == "3" && "$code" == "200" ]] && break
   sleep 5
 done

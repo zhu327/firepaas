@@ -109,6 +109,88 @@ func TestRouteCacheNilNilIsMiss(t *testing.T) {
 	}
 }
 
+// W2-6：RouteCache 回源 singleflight——fresh 过期瞬间 N 个并发 Get 只触发
+// 一次 load，且都拿到同一结果（通道同步，无 sleep 碰运气）。
+func TestRouteCacheSingleFlight(t *testing.T) {
+	const n = 8
+	rc := NewRouteCache(time.Minute, time.Minute)
+	var loads atomic.Int64
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	loader := func(ctx context.Context, key string) (any, error) {
+		loads.Add(1)
+		once.Do(func() { close(started) })
+		<-release
+		return "route-v1", nil
+	}
+
+	var arrival sync.WaitGroup
+	arrival.Add(n)
+	results := make(chan any, n)
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			arrival.Done()
+			v, _, err := rc.Get(context.Background(), "h", loader)
+			results <- v
+			errs <- err
+		}()
+	}
+	<-started      // leader 已进入 load
+	arrival.Wait() // 所有调用者都已启动；其余在 leader 释放前合并或命中缓存
+	close(release)
+	for i := 0; i < n; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent get: %v", err)
+		}
+		if v := <-results; v != "route-v1" {
+			t.Fatalf("value = %v, want route-v1", v)
+		}
+	}
+	if got := loads.Load(); got != 1 {
+		t.Fatalf("loads = %d, want 1 (single-flight coalescing)", got)
+	}
+}
+
+// W2-6：ErrNotFound 同样经 singleflight 合并（不因并发各自回源）。
+func TestRouteCacheSingleFlightNotFound(t *testing.T) {
+	const n = 6
+	rc := NewRouteCache(time.Minute, time.Minute)
+	var loads atomic.Int64
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	loader := func(ctx context.Context, key string) (any, error) {
+		loads.Add(1)
+		once.Do(func() { close(started) })
+		<-release
+		return nil, ErrNotFound
+	}
+
+	var arrival sync.WaitGroup
+	arrival.Add(n)
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			arrival.Done()
+			_, _, err := rc.Get(context.Background(), "gone", loader)
+			errs <- err
+		}()
+	}
+	<-started
+	arrival.Wait()
+	close(release)
+	for i := 0; i < n; i++ {
+		if err := <-errs; !errors.Is(err, ErrNotFound) {
+			t.Fatalf("err = %v, want ErrNotFound", err)
+		}
+	}
+	if got := loads.Load(); got != 1 {
+		t.Fatalf("loads = %d, want 1", got)
+	}
+}
+
 func TestRateLimiterBurst(t *testing.T) {
 	l := NewRateLimiter(10, 3) // burst 3：连打第 4 个立刻拒绝
 	for i := 0; i < 3; i++ {

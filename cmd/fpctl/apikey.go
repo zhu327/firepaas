@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/url"
 	"strings"
 )
 
@@ -23,7 +24,7 @@ func runAPIKey(args []string) error {
 		scopes := secretFlags{}
 		fs.Var(&scopes, "scope", "scope（可重复：read/deploy/exec/write/debug/admin），缺省 read")
 		role := fs.String("role", "", "RBAC 角色（与 --scope 二选一：viewer|operator|deployer|maintainer|owner）")
-		project := fs.String("project", "", "限制项目（空=全部项目，仅全局身份）")
+		project := fs.String("project", defaultProject(""), "限制项目（空=全部项目，仅全局身份）")
 		ttlHours := fs.Int("ttl-hours", 0, "过期小时数（0=不过期）")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
@@ -48,15 +49,18 @@ func runAPIKey(args []string) error {
 		}, &out); err != nil {
 			return err
 		}
+		if global.json {
+			return nil
+		}
 		fmt.Printf("created %s scopes=%s project=%q\nKEY: %s\n（密钥只显示这一次，泄露即 revoke 重建）\n",
 			out.ID, strings.Join(out.Scopes, ","), orDash(out.Project), out.Key)
 	case "ls":
 		lsfs := flag.NewFlagSet("apikey ls", flag.ExitOnError)
-		lsProject := lsfs.String("project", "", "按项目过滤")
+		lsProject := lsfs.String("project", defaultProject(""), "按项目过滤")
 		_ = lsfs.Parse(args[1:])
 		path := "/v1/apikeys"
 		if *lsProject != "" {
-			path += "?project_id=" + *lsProject
+			path += "?project_id=" + url.QueryEscape(*lsProject)
 		}
 		var out struct {
 			Keys []struct {
@@ -71,6 +75,9 @@ func runAPIKey(args []string) error {
 		}
 		if err := do("GET", path, nil, &out); err != nil {
 			return err
+		}
+		if global.json {
+			return nil
 		}
 		for _, k := range out.Keys {
 			state := "active"
@@ -89,7 +96,7 @@ func runAPIKey(args []string) error {
 		if err != nil {
 			return err
 		}
-		return do("DELETE", "/v1/apikeys/"+id, nil, nil)
+		return do("DELETE", "/v1/apikeys/"+url.PathEscape(id), nil, nil)
 	case "rotate":
 		if len(args) < 2 {
 			return errors.New("usage: fpctl apikey rotate <id> [--ttl-hours N]")
@@ -107,8 +114,11 @@ func runAPIKey(args []string) error {
 			Scopes  []string `json:"scopes"`
 			Project string   `json:"project_id"`
 		}
-		if err := do("POST", "/v1/apikeys/"+args[1]+"/rotate", body, &out); err != nil {
+		if err := do("POST", "/v1/apikeys/"+url.PathEscape(args[1])+"/rotate", body, &out); err != nil {
 			return err
+		}
+		if global.json {
+			return nil
 		}
 		fmt.Printf("rotated %s -> %s scopes=%s project=%q\nKEY: %s\n（旧 key 已撤销；密钥只显示这一次）\n",
 			args[1], out.ID, strings.Join(out.Scopes, ","), orDash(out.Project), out.Key)

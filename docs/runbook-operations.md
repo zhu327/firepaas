@@ -46,6 +46,25 @@ curl -sk -H "X-Firepaas-Pin-Machine: <machine_id>" https://<app>.internal/
 edge→agent proxy 是**请求头**（路由寻址）。钉扎是调试契约——平台不承诺钉扎
 请求的路由稳定性；钉错 id 返回 404（与 503"平台侧不可用"显式区分）。
 
+### 日志与请求关联（edge → agent → guest）
+
+三个进程共用 `shared/pkg/logging`：`FIREPAAS_LOG_LEVEL=debug|info|warn|error`、
+`FIREPAAS_LOG_FORMAT=text|json`（接入 Loki/Vector 等汇聚端时用 json，字段稳定）。
+每次请求的关联 ID 在 edge 入口生成（不信任客户端入站值），并贯穿各跳：
+
+| 跳 | 字段 / 头 | 说明 |
+|---|---|---|
+| 客户端 | 响应头 `X-Request-Id` | edge 回显；复现/客服工单用它定位 |
+| edge 日志 | `request_id`、`backend`(machine_id)、`execution_id`、`route_generation` | `edge request` 行，另有 host/port/status/duration |
+| edge→agent | 请求头 `X-Firepaas-Request-ID`（内部）与 `X-Request-Id`（guest 可见） | 均为 edge 覆盖后的值；客户端同名头被丢弃 |
+| agent 日志 | `request_id`、`machine_id`、`execution_id` | `workload proxy transport error` 行 |
+| guest | 请求头 `X-Request-Id` | 供应用日志关联；内部 `X-Firepaas-Request-ID` 已剥离 |
+| 控制面 API | 响应头 `X-Request-Id`；审计/错误日志 `request_id` | 入站 ID 经字符集/长度校验，非法则重新生成 |
+
+排查链路：按 `request_id` grep 三个进程日志即可还原 edge 选路（machine/execution/
+route generation）与 agent 转发结果。当前仓库没有日志汇聚组件，多机仍需逐台
+grep / `fpctl logs`；汇聚栈（Loki/Vector）是独立立项，不阻塞关联 ID 的使用。
+
 edge 并发控制（per-edge 本地视角，多 edge 各自计数——集群容量上限 ≈
 N×edge 数）：
 
@@ -61,6 +80,31 @@ auto-standby（ADR-0017）相关：app 声明
 autoresume 唤醒（<5s）。`/metrics` 关注
 `firepaas_machine_standby_total`（控制面）与
 `firepaas_agent_autostandby_wakes_total`/`..._wake_seconds`（agent）。
+
+自动弹性（ADR-0041）不扩/不缩归因决策树（按序排查，先用户事件，再指标，最后信号键）：
+
+```bash
+APP=<app_id>; HOST=<hostname>
+# 1) 用户事件：最近的 policy/takeover/decision（from/to/reason/sig 全量）
+curl -s -H "Authorization: Bearer $TOKEN" "$API/v1/events?app_id=$APP" | grep autoscale
+# 2) 控制器指标：hold 原因分布（signal/rollout/quota/conflict）
+curl -s $API_METRICS | grep firepaas_autoscale_decisions_total
+# 3) edge 指标：上报成功/失败、零容量请求
+curl -s $EDGE_METRICS | grep -E "autoscale|unserved"
+# 4) 信号键新鲜度（ts_ms 与 now 差值；过期非零 field 会冻结缩容）
+redis-cli HGETALL "autoscale:$HOST"
+```
+
+| 现象 | 归因 | 动作 |
+|---|---|---|
+| `hold_signal` 涨、`desired` 不动 | 无 fresh field（edge 未上线/Redis 分区）或过期非零 field | 查信号键 `ts_ms`；分区 edge 恢复前不缩容是 fail-closed 设计；排障看 edge `/metrics` + 必要时关 autoscale |
+| `hold_signal` 涨但 detail=stable window | 缩容稳定窗等待中（非信号丢失，是正常 pacing） | 等 `scale_down_delay_sec` 走完；controller debug 日志带 app/hostname 可区分 |
+| edge 重启后缩容/缩零长期停滞 | reporter 只上报内存表 hostname，重启后空闲 app 无 fresh field（P2-1 已知约束） | 首个真实请求即恢复上报；`min` 收敛同样等信号；急需缩容可手动 scale 接管 |
+| `hold_rollout` 涨 | 发布中（PREPARING/CUTOVER/ROLLING_BACK）或 rollout 查询失败 | 等发布完成；查 rollout 状态 |
+| `hold_quota` 涨 | 配额拒绝或连续 resources 拒绝后冻结（默认 100s） | 查 `quota.rejected` 事件与配额；缩容仍开放；超时自动解冻重探 |
+| `conflict` 涨 | CAS 落空（策略变更/手动接管并发） | 正常现象：下一拍收敛；频繁出现查是否有人在手动 scale |
+| `desired=0` 后流量 404/503 | 冷起中（无 activator，请求不缓冲） | 确认 `unserved>0` 且 30s 内 `desired>=1`；慢可接受、卡死不可接受 |
+| `min=0` 长期不上零 | 秒级心跳应用 `rps` 永不为零 | P0 接受：它确实在服务流量；东西向服务不得用 `min=0`（mesh 流量无信号） |
 
 ## v1.4 本地完整性、GC 与镜像治理
 

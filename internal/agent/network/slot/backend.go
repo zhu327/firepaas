@@ -20,7 +20,10 @@ type SlotRef struct {
 	HostAddr  string // 10.12.A.B+1（veth host 侧地址 = 网关/代理目标）
 	NsAddr    string // 10.12.A.B+2（veth netns 侧地址）
 	Netns     string // fp-slot-N
-	GuestIP   string // guest IPv4（eBPF host4/conn_cap key）
+	GuestIP   string // guest IPv4（eBPF host4/egress_slot key）
+	// GuestIP6 是 execution 域 ULA（裸地址；空 = 纯 IPv4）。eBPF 后端
+	// 用它维护 per-veth 源绑定 map（slot_ula），ADR-0040 §6。
+	GuestIP6 string
 }
 
 // Backend 是 slot 数据面后端（nft 现役 / eBPF 新后端）。

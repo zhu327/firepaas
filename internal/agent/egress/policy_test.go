@@ -216,3 +216,41 @@ func TestSnapshotRoundTrip(t *testing.T) {
 		t.Fatalf("empty rule set must yield nil policy")
 	}
 }
+
+// TestDialSetMatchesAuthorizedSet：CIDR allowlist 的授权语义是“任一解析地址
+// 命中 allowed_cidrs”，但实际拨号必须限制在授权地址内——否则攻击者控制的
+// DNS 用 {授权段内 IP, 未授权 IP} 的混合应答可把连接引到未授权地址。
+func TestDialSetMatchesAuthorizedSet(t *testing.T) {
+	p := policyFor(pb.EgressPolicySpec_ALLOWLIST, []string{"203.0.113.0/24"}, nil, nil)
+	mixed := []netip.Addr{
+		netip.MustParseAddr("198.51.100.7"),
+		netip.MustParseAddr("203.0.113.5"),
+	}
+	decision := p.DecideForProxied("", mixed)
+	if !decision.Allow || decision.MatchType != "cidr_allowed" || !decision.CIDRAuthorized {
+		t.Fatalf("decision = %+v", decision)
+	}
+	got := dialSetFor(decision, mixed, p.AllowedCIDRs)
+	if len(got) != 1 || got[0].String() != "203.0.113.5" {
+		t.Fatalf("dial set = %v, want only the authorized address", got)
+	}
+
+	// 域名授权覆盖全部公网解析结果（域名本身是授权对象）。
+	dom := policyFor(pb.EgressPolicySpec_ALLOWLIST, nil, nil, []string{"example.com"})
+	d2 := dom.DecideForProxied("example.com", mixed)
+	if !d2.Allow || dialSetFor(d2, mixed, dom.AllowedCIDRs)[0] != mixed[0] {
+		t.Fatalf("domain decision must keep full dial set: %+v", d2)
+	}
+
+	// deny_all/unrestricted 的 mode_default 放行不做交集。
+	un := policyFor(pb.EgressPolicySpec_UNRESTRICTED, nil, nil, nil)
+	d3 := un.DecideForProxied("", mixed)
+	if !d3.Allow || len(dialSetFor(d3, mixed, nil)) != len(mixed) {
+		t.Fatalf("unrestricted dial set changed: %+v", d3)
+	}
+	if got := dialSetFor(Decision{CIDRAuthorized: true}, mixed, []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}); len(
+		got,
+	) != 0 {
+		t.Fatalf("no authorized address must yield empty dial set, got %v", got)
+	}
+}

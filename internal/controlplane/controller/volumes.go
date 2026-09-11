@@ -229,10 +229,10 @@ func (c *Controller) processVolumeCreate(ctx context.Context, op store.Operation
 	}
 	// Redis projection is rebuildable; PG completion remains authoritative.
 	_ = c.resv.Commit(ctx, op.ID)
-	if err := c.store.TransitionVolume(ctx, req.GetVolumeId(), "CREATING", "READY"); err != nil {
-		if err := c.store.TransitionVolume(ctx, req.GetVolumeId(), "UNAVAILABLE", "READY"); err != nil {
-			return err
-		}
+	// review 2026-09-10：agent RPC 成功后崩溃/重试时 mark-ready 必须幂等
+	// 收敛（见 store.MarkVolumeReady），否则 operation 无限 requeue。
+	if err := c.store.MarkVolumeReady(ctx, req.GetVolumeId()); err != nil {
+		return err
 	}
 	return c.store.CompleteOperation(ctx, op.ID, "SUCCEEDED", []byte(`{}`), "")
 }

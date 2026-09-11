@@ -452,3 +452,204 @@ func TestStateFileLockMutualExclusion(t *testing.T) {
 		t.Fatal("second holder acquired the lock before first holder released it")
 	}
 }
+
+// TestEffectiveGuestIP6KeepSemantics：空 spec.GuestIP6 表示“保持既有 ULA”
+// （Resume/复挂路径不携带 ULA），不是清空；显式清空只走 DetachNetns。
+func TestEffectiveGuestIP6KeepSemantics(t *testing.T) {
+	cases := []struct {
+		existing, provided, want string
+	}{
+		{"fd7a:9a55:1::5", "", "fd7a:9a55:1::5"},
+		{"fd7a:9a55:1::5", "  ", "fd7a:9a55:1::5"},
+		{"fd7a:9a55:1::5", "fd7a:9a55:1::9", "fd7a:9a55:1::9"},
+		{"", "fd7a:9a55:1::9", "fd7a:9a55:1::9"},
+		{"", "", ""},
+	}
+	for _, c := range cases {
+		if got := effectiveGuestIP6(c.existing, c.provided); got != c.want {
+			t.Fatalf("effectiveGuestIP6(%q,%q)=%q, want %q", c.existing, c.provided, got, c.want)
+		}
+	}
+}
+
+// TestNormalizeVethCIDR：带主机位的输入必须规范化为 Masked 形式，否则
+// EnsureRootEgressNAT 的存在性判定永远不命中（规则无界追加）。
+func TestNormalizeVethCIDR(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    string
+		wantErr bool
+	}{
+		{"10.12.5.0/16", "10.12.0.0/16", false},
+		{"10.12.0.0/16", "10.12.0.0/16", false},
+		{" 10.13.0.0/16 ", "10.13.0.0/16", false},
+		{"fd7a::/64", "", true},
+		{"not-a-cidr", "", true},
+		{"", "", true},
+	}
+	for _, c := range cases {
+		got, err := normalizeVethCIDR(c.in)
+		if c.wantErr {
+			if err == nil {
+				t.Fatalf("normalizeVethCIDR(%q) must error, got %q", c.in, got)
+			}
+			continue
+		}
+		if err != nil || got != c.want {
+			t.Fatalf("normalizeVethCIDR(%q)=%q,%v want %q", c.in, got, err, c.want)
+		}
+	}
+}
+
+// ---- W2-6：Reconcile 状态同步与清理（非 root 单测） ----
+
+// fakeBackend 记录 slot 后端调用，替代 nft/eBPF 真实内核操作。
+type fakeBackend struct {
+	mu       sync.Mutex
+	node     int
+	attach   []SlotRef
+	detached []SlotRef
+}
+
+func (f *fakeBackend) EnsureNode(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.node++
+	return nil
+}
+
+func (f *fakeBackend) AttachSlot(_ context.Context, ref SlotRef) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.attach = append(f.attach, ref)
+	return nil
+}
+
+func (f *fakeBackend) DetachSlot(_ context.Context, ref SlotRef) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.detached = append(f.detached, ref)
+	return nil
+}
+
+func (f *fakeBackend) EnsureSlotNAT(context.Context, SlotRef) error { return nil }
+
+func (f *fakeBackend) ApplyEgress(context.Context, SlotRef, *api.PolicySnapshot) error { return nil }
+
+// fakeIP 把 ip/sysctl 影子到临时目录（非 root 单测不触主机网络/内核）：
+// `netns list` 输出由 netnsList 决定，其余命令一律成功并记录到返回的 log
+// 文件；sysctl 恒成功以避免 root 环境改写主机 sysctl。
+func fakeIP(t *testing.T, netnsList string) string {
+	t.Helper()
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "ip.log")
+	listPath := filepath.Join(dir, "netns-list")
+	if err := os.WriteFile(listPath, []byte(netnsList), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\n" +
+		"echo \"$@\" >> \"" + logPath + "\"\n" +
+		"if [ \"$1 $2\" = \"netns list\" ]; then cat \"" + listPath + "\"; fi\n" +
+		"exit 0\n"
+	if err := os.WriteFile(filepath.Join(dir, "ip"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sysctl"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return logPath
+}
+
+// W2-6：Reconcile 对 live instance 的 ULA 更替——回收旧 /128 与 NDP，更新
+// 持久状态，后端重挂用新 ULA（落盘收敛到函数尾 persistLocked）。
+func TestReconcileSyncsChangedGuestULA(t *testing.T) {
+	const idx = 3
+	oldULA := "fd7a:9a55:1::5"
+	newULA := "fd7a:9a55:1::9"
+	ipLog := fakeIP(t, fmt.Sprintf("fp-slot-%d\n", idx))
+	state := filepath.Join(t.TempDir(), "slots.json")
+	fb := &fakeBackend{}
+	m, err := New(Config{SubnetCIDR: "10.100.0.0/24", StatePath: state, Backend: fb})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.slots["m1"] = Slot{
+		Index: idx, MachineID: "m1", Tap: "", GuestIP: "10.100.0.7", GuestIP6: oldULA,
+	}
+	if err := m.Reconcile(context.Background(), []api.LiveInstance{{
+		MachineID: "m1", Tap: "", GuestIP: "10.100.0.7", GuestIP6: newULA,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	s, ok := m.SlotFor("m1")
+	if !ok || s.GuestIP6 != newULA {
+		t.Fatalf("in-memory ULA = %+v, want %s", s, newULA)
+	}
+	raw, err := os.ReadFile(ipLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), oldULA+"/128") {
+		t.Fatalf("old ULA route/NDP not reclaimed:\n%s", raw)
+	}
+	// 落盘同步：重启 Load 后新 ULA 仍在。
+	m2, err := New(Config{SubnetCIDR: "10.100.0.0/24", StatePath: state, Backend: fb})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m2.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if s2, ok := m2.SlotFor("m1"); !ok || s2.GuestIP6 != newULA {
+		t.Fatalf("persisted ULA = %+v, want %s", s2, newULA)
+	}
+	// 后端重挂 ref 携带目标 ULA（eBPF slot_ula 源绑定）。
+	if len(fb.attach) == 0 || fb.attach[len(fb.attach)-1].GuestIP6 != newULA {
+		t.Fatalf("backend attach refs = %+v, want last GuestIP6=%s", fb.attach, newULA)
+	}
+}
+
+// W2-6：Reconcile 在内核 netns 已不存在时也走 releaseLocked（清后端 map 与
+// root 侧残留），不只删内存条目。
+func TestReconcileReleasesBackendWhenNetnsGone(t *testing.T) {
+	const idx = 5
+	ipLog := fakeIP(t, "") // netns list 为空 → netnsExists=false
+	state := filepath.Join(t.TempDir(), "slots.json")
+	fb := &fakeBackend{}
+	m, err := New(Config{SubnetCIDR: "10.100.0.0/24", StatePath: state, Backend: fb})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.slots["m1"] = Slot{
+		Index: idx, MachineID: "m1", Tap: "hype-tap5", GuestIP: "10.100.0.9",
+		GuestIP6: "fd7a:9a55:1::5",
+	}
+	if err := m.Reconcile(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.SlotFor("m1"); ok {
+		t.Fatal("slot entry must be removed when netns is gone")
+	}
+	if len(fb.detached) != 1 || fb.detached[0].Index != idx {
+		t.Fatalf("backend detach = %+v, want one for index %d", fb.detached, idx)
+	}
+	raw, err := os.ReadFile(ipLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "fd7a:9a55:1::5/128") {
+		t.Fatalf("root v6 residual not reclaimed:\n%s", raw)
+	}
+	// 状态已落盘（无条目）。
+	reloaded, err := New(Config{SubnetCIDR: "10.100.0.0/24", StatePath: state, Backend: fb})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reloaded.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Count() != 0 {
+		t.Fatalf("persisted state still has %d slots", reloaded.Count())
+	}
+}

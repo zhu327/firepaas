@@ -48,8 +48,14 @@ const (
 	// fail-closed 拒绝（未创建 VM），与 quota 拒绝区分开以便针对性告警。
 	UserEventSecretCreateRejected = "secret.create_rejected"
 	UserEventQuotaRejected        = "quota.rejected"
-	UserEventRateLimitRejected    = "ratelimit.rejected"
-	UserEventSessionRejected      = "session.rejected"
+	// Autoscale 事件（ADR-0041 §5，稳定契约）：policy=策略变更
+	// （enable/disable/参数），takeover=手动接管，decision=扩/缩/
+	// 冻结/解冻的状态变化（hold 只进指标与 debug 日志，不落库）。
+	UserEventAutoscalePolicy   = "autoscale.policy"
+	UserEventAutoscaleTakeover = "autoscale.takeover"
+	UserEventAutoscaleDecision = "autoscale.decision"
+	UserEventRateLimitRejected = "ratelimit.rejected"
+	UserEventSessionRejected   = "session.rejected"
 )
 
 // RecordUserEvent 追加一条租户事件（fire-and-forget：错误只返回给调用方

@@ -18,6 +18,8 @@ API_ADDR="${FP_API_ADDR:-http://127.0.0.1:8081}"
 API_TOKEN="${FP_API_TOKEN:?FP_API_TOKEN required}"
 LAB_BIN="${LAB_BIN:-$HOME/.local/firepaas-lab/bin}"
 GO="${FIREPAAS_GO:-$HOME/.local/firepaas-lab/go/bin/go}"
+[[ -x "$GO" ]] || GO="$(command -v go || true)"
+[[ -x "$GO" ]] || { echo "ERROR: go 未找到（设 FIREPAAS_GO 或安装到 ~/.local/firepaas-lab/go/bin/go）" >&2; exit 1; }
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="${REPO:-$(cd "$HERE/../.." && pwd)}"
 NOMAD_JOB="${FIREPAAS_AGENT_NOMAD_JOB:-firepaas-agentd}"
@@ -105,7 +107,20 @@ restore_ready() {
   api -X POST "$API_ADDR/v1/nodes/$NODE_ID/ready" >/dev/null 2>&1 || true
 }
 trap restore_ready EXIT
-timeout 60 nomad job restart -address="$NOMAD_ADDR" -on-error fail "$NOMAD_JOB"
+# 只重启 running alloc：`nomad job restart` 会连 dead/down 节点上的历史
+# failed alloc 一起重启，报 "No path to node" 整体失败（双 client 单机
+# 实验室关掉 node-b 后实测）。终态 alloc 本就不需要重启。
+mapfile -t RUN_ALLOCS < <(timeout 20 nomad job allocs -json -address="$NOMAD_ADDR" "$NOMAD_JOB" 2>/dev/null | python3 -c '
+import json,sys
+allocs=json.load(sys.stdin) or []
+for a in allocs:
+    if a.get("DesiredStatus")=="run" and a.get("ClientStatus")=="running":
+        print(a["ID"])')
+[[ ${#RUN_ALLOCS[@]} -gt 0 ]] || die "no running allocation to restart for $NOMAD_JOB"
+for alloc in "${RUN_ALLOCS[@]}"; do
+  timeout 60 nomad alloc restart -address="$NOMAD_ADDR" "$alloc" \
+    || die "restart allocation $alloc failed"
+done
 for _ in $(seq 1 40); do
   timeout 10 nomad job status -address="$NOMAD_ADDR" "$NOMAD_JOB" >/dev/null && break
   sleep 3

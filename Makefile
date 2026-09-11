@@ -2,6 +2,9 @@
 
 SHELL := /bin/bash
 
+# 发布二进制版本号；CI release job 通过 -X 注入对应 tag（本地可用 VERSION=x.y.z 覆盖）。
+VERSION ?= dev
+
 .PHONY: help build test lint proto ebpf dev-up check tidy-check clean
 
 help: ## 列出可用目标
@@ -50,7 +53,9 @@ proto: ## 生成 protobuf 代码（需要 scripts/lab/install-protoc.sh 先执�
 		protos/agent/v1/agent.proto
 
 ebpf: ## 重新生成 eBPF 对象（bpfel.o 提交仓库；需要 clang + libbpf-dev）
-	cd internal/agent/network/ebpf && GOPACKAGE=ebpf go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -Wall -Werror -D__TARGET_ARCH_x86" -target amd64 tc bpf/tc.c -- -I bpf
+	# bpf2go 版本必须与仓库生成物一致：v0.18.0 输出 <stem>_<target>_bpfel.go；
+	# 未 pin 的旧版会把文件改名成 <stem>_bpfel_<target>.go 并造成双份符号。
+	cd internal/agent/network/ebpf && GOPACKAGE=ebpf go run github.com/cilium/ebpf/cmd/bpf2go@v0.18.0 -cc clang -cflags "-O2 -Wall -Werror -D__TARGET_ARCH_x86" -target amd64 tc bpf/tc.c -- -I bpf
 	@echo "generated: shared/gen/agent/v1/*.pb.go"
 
 sim: ## M2.6 调度仿真：10 万次放置断言（过滤先于打分/硬准入/反亲和/失联排除）
@@ -69,3 +74,18 @@ clean: ## 仅清理未跟踪产物（bin/）；shared/gen/ 是已跟踪的 proto
 images: ## 构建 api/edge 生产镜像（本地 tag firepaas-api:local / firepaas-edge-proxy:local）
 	docker build -f Dockerfile.api -t firepaas-api:local .
 	docker build -f Dockerfile.edge-proxy -t firepaas-edge-proxy:local .
+
+# --- 发布二进制：linux/amd64，版本符号由 VERSION 注入（见 ci.yml release job）。
+# -X 只作用于已存在的 string 变量；目标进程未定义该符号时链接器忽略，二进制保留默认值。
+# cni-firepaas 无构建版本符号，只做 strip/trimpath。 ---
+
+.PHONY: release
+release: ## 构建 linux/amd64 发布二进制到 bin/（VERSION 默认 dev）
+	@mkdir -p bin
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.serviceVersion=$(VERSION)" -o bin/agentd ./cmd/agentd
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o bin/fpctl ./cmd/fpctl
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o bin/agentctl ./cmd/agentctl
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.buildVersion=$(VERSION)" -o bin/api ./cmd/api
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o bin/edge-proxy ./cmd/edge-proxy
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/cni-firepaas ./cmd/cni-firepaas
+	@echo "built release binaries into bin/ (VERSION=$(VERSION))"

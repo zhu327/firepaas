@@ -3,7 +3,9 @@ package edge
 import (
 	"bufio"
 	"context"
+	cryptorand "crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -29,6 +31,12 @@ const (
 	HeaderAppPort        = "X-Firepaas-App-Port"
 	headerProxyRetryable = "X-Firepaas-Proxy-Retryable"
 	retryableProxyValue  = "true"
+	// HeaderRequestID 是 edge→agent 的内部关联 ID（每请求生成，供 edge/agent
+	// 日志关联；agent 在转发 guest 前剥离）。
+	HeaderRequestID = "X-Firepaas-Request-ID"
+	// HeaderClientRequestID 是客户端可见的关联 ID：响应回显 + 转发给
+	// workload 供应用日志关联。入站同名头一律被覆盖，不信任客户端值。
+	HeaderClientRequestID = "X-Request-Id"
 )
 
 // RouteCatalog is the read side of the Redis route projection used by edge.
@@ -44,6 +52,9 @@ type Counters struct {
 	staleServes, beyondStale, redisErrors, tokenErrors atomic.Uint64
 	tokenStaleServes, rateLimited, proxiedReqs         atomic.Uint64
 	forbiddenRetry, hardRejected, pinHits, pinMisses   atomic.Uint64
+	// autoscale（ADR-0041 §5）：reporter 上报成功/失败次数（不带 hostname
+	// label，守 ADR-0027 基数约束）与零容量请求总数（冷起链路排障）。
+	autoscaleReports, autoscaleReportErrors, unservedRequests atomic.Uint64
 	// G2d（ADR-0040 §14）：mesh 直达与回落观测——direct 请求、回落
 	// legacy 次数、直达终态失败。回落计数与 direct 计数分母一致：
 	// direct_requests = direct 成功 + fallback + errors（直达尝试总数）。
@@ -180,6 +191,21 @@ func (c *Counters) WritePrometheus(w http.ResponseWriter) {
 		"firepaas_edge_hard_rejected_total",
 		"requests rejected 503 at per-machine hard concurrency limit",
 		c.hardRejected.Load(),
+	)
+	write(
+		"firepaas_edge_autoscale_reports_total",
+		"autoscale signal samples successfully reported to redis",
+		c.autoscaleReports.Load(),
+	)
+	write(
+		"firepaas_edge_autoscale_report_errors_total",
+		"autoscale signal report failures (forwarding unaffected)",
+		c.autoscaleReportErrors.Load(),
+	)
+	write(
+		"firepaas_edge_unserved_requests_total",
+		"requests hitting zero capacity for their hostname (cold-start signal)",
+		c.unservedRequests.Load(),
 	)
 	write(
 		"firepaas_edge_pin_hits_total",
@@ -334,6 +360,9 @@ type Config struct {
 	AgentTLS        *tls.Config
 	HardConcurrency int64
 	EdgePorts       map[int]bool
+	// Tracker（ADR-0041）：per-hostname 并发信号记账。nil = 不记账
+	// （reporter 未装配时的零开销形态；上报由 AutoscaleReporter 驱动）。
+	Tracker *AutoscaleTracker
 	// Direct（G2d，ADR-0040 §14）：mesh 直达 Transport（FIREPAAS_EDGE_MESH_DIRECT
 	// 开启时注入）。nil = 功能关闭（全部流量走 legacy :5107，回滚即关）。
 	Direct *mesh.Transport
@@ -351,6 +380,7 @@ type Handler struct {
 	inflight        *inflightTracker
 	hardConcurrency int64
 	edgePorts       map[int]bool
+	tracker         *AutoscaleTracker
 }
 
 type (
@@ -359,7 +389,9 @@ type (
 	transportRetryKey struct{}
 	listenPortKey     struct{}
 	attemptStateKey   struct{}
-	retryReason       uint8
+	// edgeRequestIDKey 承载 handler 入口生成的请求关联 ID。
+	edgeRequestIDKey struct{}
+	retryReason      uint8
 )
 
 const (
@@ -398,9 +430,12 @@ func NewHandler(cfg Config) *Handler {
 		inflight:        newInflightTracker(),
 		hardConcurrency: cfg.HardConcurrency,
 		edgePorts:       cfg.EdgePorts,
+		tracker:         cfg.Tracker,
 	}
 	// G2d（§14）：mesh 直达代理。URL 占位由 Transport 按凭证/endpoint 改写；
-	// 错误处理同 legacy（P0#4：固定文案，不泄内部拓扑）。
+	// 响应纪律与 legacy 对齐（P0#4 固定文案 + ModifyResponse 剥内部头/
+	// retry 信号），否则 agent 产生的 X-Firepaas-Proxy-Retryable 会直达
+	// 外部客户端，且 retryable 502/403 不会触发回落/失效重试。
 	if cfg.Direct != nil {
 		h.direct = &httputil.ReverseProxy{
 			Director: func(req *http.Request) {
@@ -408,6 +443,29 @@ func NewHandler(cfg Config) *Handler {
 				req.URL.Scheme = "http"
 				req.URL.Host = "mesh-direct.invalid"
 				req.Host = "mesh-direct.invalid"
+				// 关联 ID 与 legacy 同口径：覆盖客户端入站值后下行。
+				req.Header.Del(HeaderRequestID)
+				req.Header.Del(HeaderClientRequestID)
+				if id := requestIDFrom(req.Context()); id != "" {
+					req.Header.Set(HeaderRequestID, id)
+					req.Header.Set(HeaderClientRequestID, id)
+				}
+			},
+			ModifyResponse: func(resp *http.Response) error {
+				retryable := resp.StatusCode == http.StatusBadGateway &&
+					resp.Header.Get(headerProxyRetryable) == retryableProxyValue
+				resp.Header.Del(headerProxyRetryable)
+				// 凭证与内部头即便被上游误回显也不能出网。
+				resp.Header.Del(traffic.HeaderCredential)
+				if retryable {
+					_ = resp.Body.Close()
+					return errRetryProxyRoute
+				}
+				if resp.StatusCode == http.StatusForbidden {
+					_ = resp.Body.Close()
+					return errRetryForbidden
+				}
+				return nil
 			},
 			ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 				if d, ok := r.Context().Value(directAttemptKey{}).(*directAttempt); ok {
@@ -417,9 +475,17 @@ func NewHandler(cfg Config) *Handler {
 					// 号期失败同等 retriable；否则投影抖动窗口的 POST
 					// 会被误判终态 502。
 					d.retriable = isDialError(err) || errors.Is(err, mesh.ErrNoDirect)
+					if errors.Is(err, errRetryForbidden) {
+						d.reason = retryForbidden
+					}
 				}
-				if errors.Is(err, mesh.ErrNoDirect) {
+				switch {
+				case errors.Is(err, mesh.ErrNoDirect):
 					// 无入口：tryServe 探测后回落，不写响应。
+					return
+				case errors.Is(err, errRetryForbidden), errors.Is(err, errRetryProxyRoute):
+					// ModifyResponse 产生的应用层重试信号：交 tryServe/
+					// ServeHTTP 的重试与回落逻辑处理。
 					return
 				}
 				slog.Warn("edge mesh direct transport error",
@@ -443,6 +509,8 @@ func NewHandler(cfg Config) *Handler {
 				HeaderPinMachine,
 				headerProxyRetryable,
 				traffic.HeaderCredential,
+				HeaderRequestID,
+				HeaderClientRequestID,
 			} {
 				req.Header.Del(name)
 			}
@@ -454,6 +522,10 @@ func NewHandler(cfg Config) *Handler {
 			req.URL.Host = b.NodeProxyEndpoint
 			req.Header.Set(HeaderMachineID, b.MachineID)
 			req.Header.Set(HeaderExecutionID, b.ExecutionID)
+			if id := requestIDFrom(req.Context()); id != "" {
+				req.Header.Set(HeaderRequestID, id)
+				req.Header.Set(HeaderClientRequestID, id)
+			}
 			if b.AppPort > 0 {
 				req.Header.Set(HeaderAppPort, strconv.Itoa(b.AppPort))
 			}
@@ -487,6 +559,11 @@ func NewHandler(cfg Config) *Handler {
 			MaxIdleConns:        64,
 			MaxIdleConnsPerHost: 64,
 			IdleConnTimeout:     30 * time.Second,
+			// W2-6：与 mesh.Transport 同口径——拨号 3s（节点失联/WG 断链时
+			// SYN 无 RST，OS 默认重试会吞掉请求预算）+ 首字节 30s（半开连接
+			// 兜底）。不改 retry/header 语义；ForceAttemptHTTP2 保持默认。
+			DialContext:           (&net.Dialer{Timeout: 3 * time.Second}).DialContext,
+			ResponseHeaderTimeout: 30 * time.Second,
 		},
 	}
 	return h
@@ -583,6 +660,22 @@ func writePlain(w http.ResponseWriter, code int, s string) {
 	_, _ = w.Write([]byte(s))
 }
 
+// requestIDFrom 返回本请求的关联 ID（handler 入口生成，永远非空）。
+func requestIDFrom(ctx context.Context) string {
+	id, _ := ctx.Value(edgeRequestIDKey{}).(string)
+	return id
+}
+
+// newRequestID 生成 16 hex 字符的请求关联 ID。失败时回退时间戳（仍保证
+// 非空、可关联，不阻塞请求）。
+func newRequestID() string {
+	var b [8]byte
+	if _, err := cryptorand.Read(b[:]); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 16)
+	}
+	return hex.EncodeToString(b[:])
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/healthz" {
 		writePlain(w, http.StatusOK, "ok\n")
@@ -591,17 +684,29 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	host := stripPort(r.Host)
 	port := h.requestRoutePort(r)
-	// 结构化访问日志：host/port/backend/outcome/duration。凭证、token、
-	// Authorization 等敏感材料绝不进日志（AGENTS.md 数据边界）。
+	// 关联 ID：handler 入口生成（不采信客户端入站值），响应回显给客户端并
+	// 注入 context；转发时作为内部头/标准 X-Request-Id 下行，供 edge 日志、
+	// agent 日志与 workload 应用日志关联。
+	reqID := newRequestID()
+	r = r.WithContext(context.WithValue(r.Context(), edgeRequestIDKey{}, reqID))
+	w.Header().Set(HeaderClientRequestID, reqID)
+	// 结构化访问日志：request_id/host/port/backend/execution/generation/
+	// outcome/duration。凭证、token、Authorization 等敏感材料绝不进日志
+	// （AGENTS.md 数据边界）。
 	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 	w = rec
 	backendID := ""
+	executionID := ""
+	var routeGeneration int64
 	defer func() {
 		h.cnt.observeRequest(rec.status)
 		slog.Info("edge request",
+			"request_id", reqID,
 			"host", host,
 			"port", port,
 			"backend", backendID,
+			"execution_id", executionID,
+			"route_generation", routeGeneration,
 			"status", rec.status,
 			"duration_ms", time.Since(start).Milliseconds(),
 		)
@@ -621,6 +726,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	)
 	h.cnt.observeRouteLookup(time.Since(lookupStart).Seconds())
 	if errors.Is(err, ErrNotFound) {
+		h.noteUnserved(host)
 		http.Error(w, "no route for hostname", http.StatusNotFound)
 		return
 	}
@@ -637,15 +743,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	route, ok := v.(*catalog.Route)
 	if !ok || route == nil || len(route.Backends) == 0 {
+		h.noteUnserved(host)
 		http.Error(w, "no route for hostname", http.StatusNotFound)
 		return
 	}
+	routeGeneration = route.RouteGeneration
 	backend, err := h.selectBackend(route, r.Header.Get(HeaderPinMachine))
 	if err != nil {
-		h.writeSelectionError(w, err)
+		h.writeSelectionError(w, err, host)
 		return
 	}
 	backendID = backend.MachineID
+	executionID = backend.ExecutionID
 	if r.Header.Get(HeaderPinMachine) != "" {
 		h.cnt.pinHits.Add(1) // 每个请求只计一次；重试路径不重复计数
 	}
@@ -668,6 +777,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// proxiedReqs 统计到达转发决策的客户端请求（每请求只计一次，重试
 	// 不重复——评审 R2 P3：否则与 requests_total 分母在重试时语义无分叉）。
 	h.cnt.proxiedReqs.Add(1)
+	// ADR-0041 served 记账：与 proxiedReqs 同一判定点 +1，handler 出口
+	// defer -1；内部 forbidden/transport 重试不重复 +1（retry 时机器级
+	// inflight 先释放再获取，host 计数保持到请求结束）。
+	if h.tracker != nil {
+		h.tracker.Acquire(host)
+		defer h.tracker.Release(host)
+	}
 	retry := h.tryServe(w, r, backend, cred, stale, true)
 	if retry == retryNone {
 		return
@@ -695,10 +811,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.cnt.observeRouteLookup(time.Since(lookupStart).Seconds())
 	retryBackend, err := h.selectBackend(retryRoute, r.Header.Get(HeaderPinMachine))
 	if err != nil {
-		h.writeSelectionError(w, err)
+		h.writeSelectionError(w, err, host)
 		return
 	}
 	backendID = retryBackend.MachineID
+	executionID = retryBackend.ExecutionID
+	routeGeneration = retryRoute.RouteGeneration
 	retryCred, retryTokenStale, err := h.getToken(r.Context(), retryBackend)
 	if err != nil {
 		h.inflight.release(retryBackend.MachineID)
@@ -759,7 +877,7 @@ func (h *Handler) selectBackend(route *catalog.Route, pin string) (catalog.Backe
 	}
 }
 
-func (h *Handler) writeSelectionError(w http.ResponseWriter, err error) {
+func (h *Handler) writeSelectionError(w http.ResponseWriter, err error, host string) {
 	switch {
 	case errors.Is(err, errPinMiss):
 		h.cnt.pinMisses.Add(1)
@@ -767,11 +885,25 @@ func (h *Handler) writeSelectionError(w http.ResponseWriter, err error) {
 		http.Error(w, "pinned machine is not an eligible backend", http.StatusNotFound)
 	case errors.Is(err, errHardLimit):
 		h.cnt.hardRejected.Add(1)
+		if h.tracker != nil {
+			h.tracker.AddHardRejected(host)
+		}
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, "backend at hard concurrency limit", http.StatusServiceUnavailable)
 	default:
+		// errNoEligible：零容量（unserved 冷起信号）。pin-miss/hard 已在
+		// 上分支排除；429/超窗/catalog 错误不经过本函数。
+		h.noteUnserved(host)
 		http.Error(w, "no ready backend for hostname", http.StatusServiceUnavailable)
 	}
+}
+
+// noteUnserved 记录一次零容量请求（per-host 短窗 + edge 全局计数）。
+func (h *Handler) noteUnserved(host string) {
+	if h.tracker != nil {
+		h.tracker.AddUnserved(host)
+	}
+	h.cnt.unservedRequests.Add(1)
 }
 
 func (h *Handler) tryServe(
@@ -808,8 +940,19 @@ func (h *Handler) tryServe(
 			Credential: cred, AppPort: b.AppPort,
 		})
 		tracker := &firstWriteTracker{ResponseWriter: w}
+		// RTT 口径：per forwarding attempt（与 legacy 重试路径一致：一次
+		// 请求的每次尝试各记一条，含 pre-dial miss 与回落前的失败尝试）。
+		directStart := time.Now()
 		h.direct.ServeHTTP(tracker, r.WithContext(dctx))
-		if dstate.failed && !tracker.started() && (requestHasNoBody(r) || dstate.retriable) {
+		h.cnt.observeUpstreamRTT(time.Since(directStart).Seconds())
+		// 直达 403（凭证/执行失效）与 legacy 同语义：交外层失效重试。
+		if dstate.reason == retryForbidden {
+			return retryForbidden
+		}
+		// 客户端已取消时不回落（legacy handleProxyError 同守卫：无意义的上游
+		// 重试只会多打一枪）。
+		if dstate.failed && !tracker.started() && r.Context().Err() == nil &&
+			(requestHasNoBody(r) || dstate.retriable) {
 			h.cnt.meshFallback.Add(1)
 			// 回落 legacy：tracker 未写任何字节，legacy 代理接管。
 		} else {
@@ -887,6 +1030,7 @@ func isDialError(err error) bool {
 type directAttempt struct {
 	failed    bool
 	retriable bool
+	reason    retryReason
 }
 
 type directAttemptKey struct{}

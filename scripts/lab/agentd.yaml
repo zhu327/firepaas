@@ -12,6 +12,11 @@ hypervisor:
 
 network:
   subnet_cidr: 10.100.0.0/16
+  # 显式 bridge：hypeman 的 default network 以“已存在的 bridge 状态”为准；
+  # 不指定时会采纳宿主的 vmbr0（10.101.0.1/16，Proxmox），导致 guest IP
+  # 与 slot bridge 子网不一致（readiness 探测回包无网关 → 永远 NOT_READY）。
+  # firepaas0 已存在且为 10.100.0.1/16，与本文件子网一致。
+  bridge_name: firepaas0
   dns_server: 223.5.5.5
 
 logging:

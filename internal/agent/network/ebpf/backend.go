@@ -9,7 +9,7 @@
 // network.nftfallback.v1；ebpf 可用则上报 network.ebpf.v1（二选一）。
 package ebpf
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -Wall -Werror -D__TARGET_ARCH_x86" -target amd64 tc bpf/tc.c -- -I bpf
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go@v0.18.0 -cc clang -cflags "-O2 -Wall -Werror -D__TARGET_ARCH_x86" -target amd64 tc bpf/tc.c -- -I bpf
 
 import (
 	"context"
@@ -36,10 +36,23 @@ import (
 const PinRoot = "/sys/fs/bpf/firepaas"
 
 // Options 装配 eBPF 后端。
+//
+// VethCIDR/RootNATTable（T3）：eBPF 后端不建 nft fp-isolation 表，因此
+// 必须自己保证 root 对 slot veth 源段的出口 masquerade（ADR-0040 §7
+// “南北出口仍节点 SNAT”）；VethCIDR 缺省 = slot.VethRange，
+// RootNATTable 缺省 = "fp-egress"。
 type Options struct {
 	PinDir         string // 默认 PinRoot
 	EgressProxy80  int    // 透明代理 HTTP 端口（0 = 不代理）
 	EgressProxy443 int
+	// VethCIDR 是 root↔netns veth 源段（slot.Config.VethCIDR 同值）。
+	VethCIDR string
+	// RootNATTable 是 root 出口 NAT 表名（多 agent 同主机可独立，避免
+	// 表名冲突；规则按 CIDR 追加，互不覆盖）。
+	RootNATTable string
+	// FlowSampleEvery 是 allow flow 事件的采样模数：0 = 默认 128，1 = 全量。
+	// deny 事件始终全量。
+	FlowSampleEvery uint32
 	// Observer（G3，§21）：低基数观测缝；nil = no-op。
 	Observer Observer
 }
@@ -52,15 +65,15 @@ type Options struct {
 // s.Egress 经 Reconcile/RestoreSnapshot 重放（外层 pin 复用到的旧条目指向
 // 已死内层 → 查空 → 放行，与重启前“空表=放行”等价，重放后收敛）。
 type Backend struct {
-	pinDir   string
-	port80   int
-	port443  int
-	observer Observer
+	pinDir       string
+	port80       int
+	port443      int
+	vethCIDR     string
+	rootNATTable string
+	observer     Observer
 
 	objs         *tcObjects
 	host4        *ebpf.Map
-	connCap      *ebpf.Map
-	connCount    *ebpf.Map
 	egressAllow  *ebpf.Map     // HASH_OF_MAPS<slotKey, LPM>（per-slot allow）
 	egressDeny   *ebpf.Map     // HASH_OF_MAPS<slotKey, LPM>（per-slot deny）
 	egressMode   *ebpf.Map     // HASH<slotKey, egressModeVal>（per-slot 默认动作）
@@ -70,15 +83,22 @@ type Backend struct {
 	// 替换/删除时关闭旧句柄避免 FD 泄漏）。key = 规范 slot key。
 	egressInnerAllow map[uint32]*ebpf.Map
 	egressInnerDeny  map[uint32]*ebpf.Map
-	ipcache          *ebpf.Map
-	policy           *ebpf.Map
-	policyPorts      *ebpf.Map
-	nodeULA          *ebpf.Map
-	hostAddrs4       *ebpf.Map
-	flows            *ebpf.Map
-	priv4            *ebpf.Map
-	// snapshots 记录已应用的 egress 快照（重启/Reconcile 重放）。
-	snapshots map[int]api.PolicySnapshot
+	slotULA          *ebpf.Map // HASH<ifindex, 16B ULA>（per-veth v6 源绑定）
+	// fabric 策略双缓冲（W2-2）：datapath 每次查表前读 fabric_active，
+	// Go 写非活动集后一次翻转；写失败保持旧集（datapath 不受影响）。
+	fabricActive  *ebpf.Map
+	ipcacheV0     *ebpf.Map
+	ipcacheV1     *ebpf.Map
+	policyV0      *ebpf.Map
+	policyV1      *ebpf.Map
+	policyPortsV0 *ebpf.Map
+	policyPortsV1 *ebpf.Map
+	nodeULAV0     *ebpf.Map
+	nodeULAV1     *ebpf.Map
+	flowSample    *ebpf.Map
+	hostAddrs4    *ebpf.Map
+	flows         *ebpf.Map
+	priv4         *ebpf.Map
 	// fabricStats 是最近一次成功应用的 fabric 策略统计（状态面；
 	// 双 map 原子切换落地前，用于回答“当前生效的是哪一代、规模多大”）。
 	// fabricApplyFailures 是 ApplyFabricPolicy 校验/落表失败累计（gauge
@@ -160,10 +180,17 @@ func New(opts Options) (*Backend, error) {
 		pinDir:           opts.PinDir,
 		port80:           opts.EgressProxy80,
 		port443:          opts.EgressProxy443,
+		vethCIDR:         strings.TrimSpace(opts.VethCIDR),
+		rootNATTable:     strings.TrimSpace(opts.RootNATTable),
 		observer:         opts.Observer,
 		egressInnerAllow: map[uint32]*ebpf.Map{},
 		egressInnerDeny:  map[uint32]*ebpf.Map{},
-		snapshots:        map[int]api.PolicySnapshot{},
+	}
+	if b.vethCIDR == "" {
+		b.vethCIDR = slot.VethRange
+	}
+	if b.rootNATTable == "" {
+		b.rootNATTable = "fp-egress"
 	}
 	if b.observer == nil {
 		b.observer = noopObserver{}
@@ -185,16 +212,21 @@ func New(opts Options) (*Backend, error) {
 	}
 	b.objs = objs
 	b.host4 = objs.Host4
-	b.connCap = objs.ConnCap
-	b.connCount = objs.ConnCount
 	b.egressAllow = objs.EgressAllow
 	b.egressDeny = objs.EgressDeny
 	b.egressMode = objs.EgressMode
 	b.egressSlot = objs.EgressSlot
-	b.ipcache = objs.Ipcache
-	b.policy = objs.Policy
-	b.policyPorts = objs.PolicyPorts
-	b.nodeULA = objs.NodeUla
+	b.slotULA = objs.SlotUla
+	b.fabricActive = objs.FabricActive
+	b.ipcacheV0 = objs.IpcacheV0
+	b.ipcacheV1 = objs.IpcacheV1
+	b.policyV0 = objs.PolicyV0
+	b.policyV1 = objs.PolicyV1
+	b.policyPortsV0 = objs.PolicyPortsV0
+	b.policyPortsV1 = objs.PolicyPortsV1
+	b.nodeULAV0 = objs.NodeUlaV0
+	b.nodeULAV1 = objs.NodeUlaV1
+	b.flowSample = objs.FlowSample
 	b.hostAddrs4 = objs.HostAddrs4
 	b.flows = objs.FlowEvents
 	b.priv4 = objs.Private4
@@ -211,10 +243,25 @@ func New(opts Options) (*Backend, error) {
 		return nil, fmt.Errorf("egress_allow has no inner map template")
 	}
 	b.innerLpmSpec = inner
-	// 旧版全局表（W1 前 cidr_allow4/cidr_deny4/mode_drop）的 pin 残留回收：
-	// 同名复用已不可能（spec 更名），留着只是 bpffs 垃圾。
-	for _, stale := range []string{"cidr_allow4", "cidr_deny4", "mode_drop"} {
+	// 旧版表/单缓冲表的 pin 残留回收：spec 已更名，留着只是 bpffs 垃圾
+	//（运行中的旧程序持有 fd，删除 pin 不影响其工作）。
+	for _, stale := range []string{
+		"cidr_allow4", "cidr_deny4", "mode_drop",
+		"conn_cap", "conn_count", "syn_seen",
+		"ipcache", "policy", "policy_ports", "node_ula",
+	} {
 		_ = os.Remove(filepath.Join(b.pinDir, stale))
+	}
+	// allow 事件采样模数（<=1 = 全量；默认 128）。
+	sampleEvery := opts.FlowSampleEvery
+	if sampleEvery == 0 {
+		sampleEvery = 128
+	}
+	if sampleEvery < 1 {
+		sampleEvery = 1
+	}
+	if err := b.flowSample.Put(uint32(0), sampleEvery); err != nil {
+		return nil, fmt.Errorf("set flow sample: %w", err)
 	}
 	// 代理端口配置（一次性写死，全节点同值）。
 	if err := objs.ProxyPorts.Put(uint32(0), uint16(b.port80)); err != nil {
@@ -260,6 +307,12 @@ func (b *Backend) Close() error {
 
 // EnsureNode 幂等：bpffs + 对象已装载（New 完成），无需每 slot 建表。
 func (b *Backend) EnsureNode(ctx context.Context) error {
+	// root 出口 SNAT：eBPF 后端不建 nft fp-isolation 表，slot 内一级 NAT
+	// 改写后的源（链路地址）必须在本机做 masquerade 才能获得公网回程
+	// （ADR-0040 §7）。幂等、按 CIDR 追加，多 agent 同表互不覆盖。
+	if err := slot.EnsureRootEgressNAT(ctx, b.rootNATTable, b.vethCIDR); err != nil {
+		return err
+	}
 	// 遗留 ip6 隔离表回收：nft fp-isolation（ip6）的 in/fwd 链对 slot-veths
 	// 集合无条件 drop——v6 无 NAT/established 例外，是为纯 v4 时代设计的。
 	// ADR-0040 后 v6 策略点在 tc_ingress（identity fail-closed），该表只会在
@@ -386,7 +439,46 @@ func (b *Backend) attachSlot(ctx context.Context, ref slot.SlotRef) error {
 	if err := b.egressSlot.Put(slotKey, slotKey); err != nil {
 		return fmt.Errorf("ebpf: egress_slot: %w", err)
 	}
+	// per-veth v6 源绑定：veth ifindex → 本 slot 期望 ULA（空 = 清除）。
+	if err := b.putSlotULA(ref); err != nil {
+		return err
+	}
 	return nil
+}
+
+// putSlotULA 维护 slot_ula（ADR-0040 §6：v6 源绑定必须绑定到本 veth，
+// ipcache 命中不证明报文来自拥有该 ULA 的 slot）。空 GuestIP6 = 删除条目，
+// 该 veth 的 v6 全拒（fail closed；纯 v4 slot 零回归）。
+func (b *Backend) putSlotULA(ref slot.SlotRef) error {
+	idx, err := ifaceIndex(ref.VethHost)
+	if err != nil {
+		return fmt.Errorf("ebpf: slot_ula resolve %s: %w", ref.VethHost, err)
+	}
+	raw := strings.TrimSpace(ref.GuestIP6)
+	if raw == "" {
+		if err := b.slotULA.Delete(idx); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return fmt.Errorf("ebpf: slot_ula clear: %w", err)
+		}
+		return nil
+	}
+	addr, err := netip.ParseAddr(raw)
+	if err != nil || !addr.Is6() || addr.Is4In6() {
+		return fmt.Errorf("ebpf: slot_ula invalid ULA %q for %s", raw, ref.VethHost)
+	}
+	ula := addr.As16()
+	if err := b.slotULA.Put(idx, ula); err != nil {
+		return fmt.Errorf("ebpf: slot_ula put %s: %w", addr, err)
+	}
+	return nil
+}
+
+// ifaceIndex 解析 host veth 的 ifindex（tc_ingress 以 skb->ifindex 查询）。
+func ifaceIndex(name string) (uint32, error) {
+	ifc, err := net.InterfaceByName(name)
+	if err != nil {
+		return 0, err
+	}
+	return uint32(ifc.Index), nil
 }
 
 // slotEgressKey 本 slot 在数据面的规范 key：POST-masquerade 源地址（slot 链路
@@ -400,10 +492,13 @@ func slotEgressKey(ref slot.SlotRef) (uint32, error) {
 	return ipv4Key(ref.NsAddr)
 }
 
-// DetachSlot 摘除 slot 的 per-slot 配置：host4/conn_cap/conn_count 聚合、
-// egress 外层条目 + mode + 内层表句柄（netns 删除连带 tc 程序回收）。
+// DetachSlot 摘除 slot 的 per-slot 配置：host4、egress 外层条目 + mode +
+// 内层表句柄（netns 删除连带 tc 程序回收）。
 // 内层内核对象由外层条目引用续命，删除外层条目后引用释放；Go 句柄关闭防 FD 泄漏。
 func (b *Backend) DetachSlot(ctx context.Context, ref slot.SlotRef) error {
+	if idx, err := ifaceIndex(ref.VethHost); err == nil {
+		_ = b.slotULA.Delete(idx)
+	}
 	if guestKey, err := ipv4Key(ref.GuestIP); err == nil {
 		_ = b.host4.Delete(guestKey)
 		_ = b.egressSlot.Delete(guestKey)
@@ -411,8 +506,6 @@ func (b *Backend) DetachSlot(ctx context.Context, ref slot.SlotRef) error {
 	if slotKey, err := slotEgressKey(ref); err == nil {
 		_ = b.host4.Delete(slotKey)
 		_ = b.egressSlot.Delete(slotKey)
-		_ = b.connCap.Delete(slotKey)
-		_ = b.connCount.Delete(connAggKey(slotKey))
 		_ = b.egressAllow.Delete(slotKey)
 		_ = b.egressDeny.Delete(slotKey)
 		_ = b.egressMode.Delete(slotKey)
@@ -425,7 +518,6 @@ func (b *Backend) DetachSlot(ctx context.Context, ref slot.SlotRef) error {
 			delete(b.egressInnerDeny, slotKey)
 		}
 	}
-	delete(b.snapshots, ref.Index)
 	return nil
 }
 
@@ -445,30 +537,25 @@ type egressModeVal struct {
 	_        uint8
 }
 
-// connAggKey 构造 conn_count 聚合 key（{saddr,0,0,0}，与 BPF 侧 agg 同布局）。
-type connAggKeyT struct {
-	Saddr uint32
-	Daddr uint32
-	Sport uint16
-	Dport uint16
-}
-
-func connAggKey(saddr uint32) connAggKeyT { return connAggKeyT{Saddr: saddr} }
+// connAggKey 已随 BPF 连接计数移除（W2-1）：限额改由 slot netns 的
+// nft `ct count` 执行（见 slot.EnsureNetnsTCPLimit）。
 
 // ApplyEgress 全量替换 slot egress 快照（与 nft 同语义：deny → allow →
 // mode 默认；redirect 先于 deny/allow，等价 nft prerouting DNAT 顺序）。
 // per-slot 分片（W1）：只动本 slot（规范 slot key）的外层条目 + mode，多 slot
 // 互不覆盖。snap nil = 清除（删条目回到“未下发=unrestricted”，等价 nft 清表）。
 func (b *Backend) ApplyEgress(ctx context.Context, ref slot.SlotRef, snap *api.PolicySnapshot) error {
-	idx := ref.Index
 	slotKey, err := slotEgressKey(ref)
 	if err != nil {
 		return err
 	}
 	if snap == nil {
+		// 先落限额（标量、幂等、不碰 egress map）：失败即中止，数据面保持旧
+		// CIDR 策略，不产生“策略已切但限额还是旧值”的半应用状态。
+		if err := slot.EnsureNetnsTCPLimit(ctx, ref, 0); err != nil {
+			return err
+		}
 		b.clearEgressSlot(slotKey)
-		_ = b.connCount.Delete(connAggKey(slotKey))
-		delete(b.snapshots, idx)
 		return nil
 	}
 	allow, err := b.egressInner(slotKey, true)
@@ -504,6 +591,11 @@ func (b *Backend) ApplyEgress(ctx context.Context, ref slot.SlotRef, snap *api.P
 	if snap.ProxyPort443 > 0 {
 		mode.Proxy443 = 1
 	}
+	// 先落限额（标量、幂等、不碰 egress map）：失败即中止，数据面保持旧
+	// CIDR 策略，不产生“策略已切但限额还是旧值”的半应用状态。
+	if err := slot.EnsureNetnsTCPLimit(ctx, ref, snap.MaxTCPConns); err != nil {
+		return fmt.Errorf("ebpf: tcp limit: %w", err)
+	}
 	// 落表：内层先清后写，再挂外层，最后写 mode（读端任一中间态仍是旧
 	// 快照或空条目；空外层条目 = unrestricted，崩溃窗口 fail-open 等价
 	// 重启前空表语义，重放后收敛——见 Backend 注释）。
@@ -532,16 +624,6 @@ func (b *Backend) ApplyEgress(ctx context.Context, ref slot.SlotRef, snap *api.P
 	if err := b.egressMode.Put(slotKey, mode); err != nil {
 		return fmt.Errorf("ebpf: set egress mode: %w", err)
 	}
-	if snap.MaxTCPConns > 0 {
-		if err := b.connCap.Put(slotKey, snap.MaxTCPConns); err != nil {
-			return err
-		}
-	} else if err := b.connCap.Delete(slotKey); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
-		// 快照未声明上限时清除旧上限：残留 cap 会让已结束限额的
-		// 陈旧计数继续约束新流量（stale cap bug）。
-		return fmt.Errorf("ebpf: clear stale conn_cap: %w", err)
-	}
-	b.snapshots[idx] = *snap
 	return nil
 }
 
@@ -575,7 +657,6 @@ func (b *Backend) clearEgressSlot(slotKey uint32) {
 		_ = inner.Close()
 		delete(b.egressInnerDeny, slotKey)
 	}
-	_ = b.connCap.Delete(slotKey)
 }
 
 func parsePrefixes(cidrs []string, what string) ([]netip.Prefix, error) {
@@ -603,17 +684,57 @@ type policyKey struct {
 
 type policyVal struct {
 	Generation uint64
-	// HasPorts：正向端口规则标记（1 = 该方向有 ports 白名单，0 = 纯对称回程
-	// 条目）。UDP 凭此区分发起与回包（TCP 回包凭 SYN 标志，不读本字段）。
-	// 对应 BPF 侧 policy_val.has_ports（曾为保留字段 ports_bm）。
-	HasPorts uint64
+	// Flags 是端口白名单方向（与 BPF 侧 policy_val.flags 同布局）：
+	//   policyFlagDport = ports 为目的端口（正向规则）
+	//   policyFlagSport = ports 为源端口（对称回程规则）
+	// flags=0 的条目只放行 ICMPv6；UDP 遇 flags=0 保守 deny。
+	Flags uint64
 }
 
+const (
+	policyFlagDport uint64 = 1 << 0
+	policyFlagSport uint64 = 1 << 1
+)
+
 type policyPortKey struct {
-	Src   uint32
-	Dst   uint32
-	Dport uint16
-	Pad   uint16
+	Src  uint32
+	Dst  uint32
+	Port uint16
+	Dir  uint16 // 0 = dport 白名单；1 = sport 白名单
+}
+
+// mergePolicyEntries 把快照条目折叠为数据面写入形态（纯函数，便于单测）：
+// 同一 (src,dst) 可能同时有正向（DPORT）与回程（SPORT）条目（双向 EastWest
+// 声明）——flags 必须按位合并，不能让后写覆盖前写（否则丢端口约束或把回程
+// 放宽成任意端口）；端口按 dir 分开存储，两个方向互不覆盖。
+func mergePolicyEntries(entries []api.FabricPolicyEntry) (map[policyKey]policyVal, []policyPortKey) {
+	policies := make(map[policyKey]policyVal, len(entries))
+	var ports []policyPortKey
+	for _, e := range entries {
+		k := policyKey{Src: e.SrcIdentity, Dst: e.DstIdentity}
+		v := policies[k]
+		if e.Generation > v.Generation {
+			v.Generation = e.Generation
+		}
+		if len(e.Ports) > 0 {
+			if e.SrcPorts {
+				v.Flags |= policyFlagSport
+			} else {
+				v.Flags |= policyFlagDport
+			}
+		}
+		policies[k] = v
+		dir := uint16(0)
+		if e.SrcPorts {
+			dir = 1
+		}
+		for _, p := range e.Ports {
+			ports = append(ports, policyPortKey{
+				Src: e.SrcIdentity, Dst: e.DstIdentity, Port: uint16(p), Dir: dir,
+			})
+		}
+	}
+	return policies, ports
 }
 
 // clearHashMap 全量清空一个 HASH map（快照全量替换用；先收集后删除，
@@ -641,6 +762,8 @@ func clearHashMap[K any, V any](m *ebpf.Map) error {
 // policy_ports 三表先清后写（快照是全集；下线 execution 的映射/条目必须
 // 消失，否则已撤销身份仍被信任）。输入先整体校验再落 map：非法端口直接
 // 拒绝整快照（fail closed，调用方 ledger claim 保持 in-progress 重试）。
+// 双缓冲（W2-2）：先写非活动集，最后翻转 fabric_active——datapath 只会
+// 看到完整旧集或完整新集；中途失败不翻转，旧集继续生效且返回错误重试。
 func (b *Backend) ApplyFabricPolicy(ctx context.Context, snap api.FabricPolicySnapshot) (err error) {
 	defer func() {
 		b.statsMu.Lock()
@@ -660,64 +783,82 @@ func (b *Backend) ApplyFabricPolicy(ctx context.Context, snap api.FabricPolicySn
 		if e.SrcIdentity == 0 || e.DstIdentity == 0 {
 			return fmt.Errorf("ebpf: policy entry %d has zero identity", i)
 		}
-		// 空 Ports = 对称回程条目（只放行非发起包；端口白名单仅挂在正向）。
+		// 空 Ports = 仅 ICMPv6 放行的条目；带 Ports 的条目按 SrcPorts 决定
+		// 白名单方向（正向 dport / 回程 sport）。
 		for _, p := range e.Ports {
 			if p == 0 || p > 65535 {
 				return fmt.Errorf("ebpf: policy entry %d port %d out of range", i, p)
 			}
 		}
 	}
-	if err := clearHashMap[[16]byte, uint32](b.ipcache); err != nil {
+	target := 1 - b.activeFabricSet()
+	ipcache, policies, ports, nodeULA := b.fabricSet(target)
+	if err := clearHashMap[[16]byte, uint32](ipcache); err != nil {
 		return err
 	}
-	if err := clearHashMap[policyKey, policyVal](b.policy); err != nil {
+	if err := clearHashMap[policyKey, policyVal](policies); err != nil {
 		return err
 	}
-	if err := clearHashMap[policyPortKey, uint8](b.policyPorts); err != nil {
+	if err := clearHashMap[policyPortKey, uint8](ports); err != nil {
+		return err
+	}
+	if err := clearHashMap[[16]byte, uint8](nodeULA); err != nil {
 		return err
 	}
 	for _, id := range snap.Identities {
 		addr, _ := netip.ParseAddr(id.ULA)
-		if err := b.ipcache.Put(ulaKey(addr), id.IdentityID); err != nil {
+		if err := ipcache.Put(ulaKey(addr), id.IdentityID); err != nil {
 			return fmt.Errorf("ebpf: ipcache: %w", err)
 		}
 	}
-	for _, e := range snap.Entries {
-		var hasPorts uint64
-		if len(e.Ports) > 0 {
-			hasPorts = 1
-		}
-		if err := b.policy.Put(
-			policyKey{Src: e.SrcIdentity, Dst: e.DstIdentity},
-			policyVal{Generation: e.Generation, HasPorts: hasPorts},
-		); err != nil {
+	policiesByKey, portKeys := mergePolicyEntries(snap.Entries)
+	for k, v := range policiesByKey {
+		if err := policies.Put(k, v); err != nil {
 			return fmt.Errorf("ebpf: policy: %w", err)
 		}
-		for _, p := range e.Ports {
-			if err := b.policyPorts.Put(
-				policyPortKey{Src: e.SrcIdentity, Dst: e.DstIdentity, Dport: uint16(p)},
-				uint8(1),
-			); err != nil {
-				return fmt.Errorf("ebpf: policy_ports: %w", err)
-			}
+	}
+	for _, pk := range portKeys {
+		if err := ports.Put(pk, uint8(1)); err != nil {
+			return fmt.Errorf("ebpf: policy_ports: %w", err)
 		}
 	}
-	// 平台流量放行：本节点自身 ULA（/64 基址）。全量替换语义（先清后写）。
-	if err := clearHashMap[[16]byte, uint8](b.nodeULA); err != nil {
-		return err
-	}
+	// 平台流量放行：本节点自身 ULA（/64 基址）。
 	if snap.NodeULA != "" {
 		addr, err := netip.ParseAddr(snap.NodeULA)
 		if err != nil || !addr.Is6() || addr.Is4In6() {
 			return fmt.Errorf("ebpf: node ula %q: invalid", snap.NodeULA)
 		}
-		if err := b.nodeULA.Put(ulaKey(addr), uint8(1)); err != nil {
+		if err := nodeULA.Put(ulaKey(addr), uint8(1)); err != nil {
 			return fmt.Errorf("ebpf: node_ula: %w", err)
 		}
+	}
+	// 一次翻转：datapath 从此读到完整新集。
+	if err := b.fabricActive.Put(uint32(0), target); err != nil {
+		return fmt.Errorf("ebpf: fabric_active flip: %w", err)
 	}
 	// G3（§21）：当前已应用 fabric 策略代（gauge；快照 generation）。
 	b.observer.PolicyGen(snap.Generation)
 	return nil
+}
+
+// activeFabricSet 读当前活动集（0/1；读取失败按 0，与 map 初值一致）。
+func (b *Backend) activeFabricSet() uint32 {
+	var idx uint32
+	if err := b.fabricActive.Lookup(uint32(0), &idx); err != nil {
+		return 0
+	}
+	if idx == 1 {
+		return 1
+	}
+	return 0
+}
+
+// fabricSet 返回指定缓冲集的四个 fabric 表句柄。
+func (b *Backend) fabricSet(idx uint32) (ipcache, policies, ports, nodeULA *ebpf.Map) {
+	if idx == 1 {
+		return b.ipcacheV1, b.policyV1, b.policyPortsV1, b.nodeULAV1
+	}
+	return b.ipcacheV0, b.policyV0, b.policyPortsV0, b.nodeULAV0
 }
 
 // ulaKey 把 ULA 地址转成 ipcache 的 16 字节 key（big-endian 字节序）。

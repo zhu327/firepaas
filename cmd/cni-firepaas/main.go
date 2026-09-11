@@ -139,6 +139,7 @@ type slotBundle struct {
 	VethCIDR     string `json:"veth_cidr,omitempty"`
 	Backend      string `json:"backend,omitempty"` // "nft"（默认）| "ebpf"
 	EbpfPinDir   string `json:"ebpf_pin_dir,omitempty"`
+	EbpfNatTable string `json:"ebpf_root_nat_table,omitempty"`
 	ProxyPort80  int    `json:"proxy_port80,omitempty"`
 	ProxyPort443 int    `json:"proxy_port443,omitempty"`
 }
@@ -259,6 +260,8 @@ func bundleBackend(bundle slotBundle) (slot.Backend, error) {
 			PinDir:         pinDir,
 			EgressProxy80:  bundle.ProxyPort80,
 			EgressProxy443: bundle.ProxyPort443,
+			VethCIDR:       bundle.VethCIDR,
+			RootNATTable:   bundle.EbpfNatTable,
 		})
 	default:
 		return nil, fmt.Errorf("unknown bundle backend %q (want nft|ebpf)", bundle.Backend)

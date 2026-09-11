@@ -57,7 +57,7 @@ func stringSliceFlag(target *[]string) *stringSliceValue {
 
 func runImagesPrewarm(args []string) error {
 	fs := flag.NewFlagSet("images prewarm", flag.ExitOnError)
-	project := fs.String("project", "dev", "project id")
+	project := fs.String("project", defaultProject("dev"), "project id")
 	image := fs.String("image", "", "digest-pinned image ref (registry/app@sha256:...)")
 	var nodePool string
 	var nodeIDs []string
@@ -103,7 +103,7 @@ func runImagesCoverage(args []string) error {
 
 func runImagesPins(args []string) error {
 	fs := flag.NewFlagSet("images pins", flag.ExitOnError)
-	project := fs.String("project", "", "filter by project id (default: own/Global sees all)")
+	project := fs.String("project", defaultProject(""), "filter by project id (default: own/Global sees all)")
 	_ = fs.Parse(args)
 	path := "/v1/images/pins"
 	if *project != "" {
@@ -124,7 +124,7 @@ func runImagesUnpin(args []string) error {
 
 func runImagesPin(args []string) error {
 	fs := flag.NewFlagSet("images pin", flag.ExitOnError)
-	project := fs.String("project", "dev", "project id")
+	project := fs.String("project", defaultProject("dev"), "project id")
 	image := fs.String("image", "", "digest-pinned image ref")
 	ttl := fs.Int64("ttl", 3600, "pin TTL seconds")
 	reason := fs.String("reason", "", "pin reason (audited)")

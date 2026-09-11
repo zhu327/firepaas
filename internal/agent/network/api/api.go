@@ -35,6 +35,8 @@ type NetnsSpec struct {
 	// GuestIP6 / GuestPrefix6 / GuestGW6 承载 ULA（ADR-0040 §7）。
 	// firepaas 在 mesh 启用且控制面已分配 ULA 时下发；后端的 v6 数据面
 	// （eBPF ipcache/policy）在 G2 前默认拒绝未知 ULA（fail closed）。
+	// GuestIP6 空串语义 = 保持既有 ULA（Resume/复挂不携带），不是清空；
+	// 显式清空走 DetachNetns 或新 execution 的完整 attach。
 	GuestIP6     string
 	GuestPrefix6 int
 	GuestGW6     string
@@ -137,11 +139,15 @@ type Underlay interface {
 // FabricPolicyEntry 是一条东西向放行条目（G2a §15）：src/dst 稳定身份 +
 // 端口集。dst 身份的 mesh_direct 前置由快照组装方保证（缺一不可），
 // 此处不再校验。
+//
+// SrcPorts 区分端口集方向：false = Ports 是目的端口（正向规则）；true =
+// Ports 是源端口（对称回程规则，把回程从“任意端口”收窄到服务端口）。
 type FabricPolicyEntry struct {
 	SrcIdentity uint32
 	DstIdentity uint32
 	Generation  uint64
 	Ports       []uint32
+	SrcPorts    bool
 }
 
 // FabricPolicySnapshot 是一套 fabric 策略快照（G2a）：ipcache 填充输入 +

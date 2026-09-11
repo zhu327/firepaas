@@ -1,6 +1,9 @@
 package main
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -66,5 +69,35 @@ func TestListenerPorts(t *testing.T) {
 		if !got[port] {
 			t.Fatalf("port %d missing: %v", port, got)
 		}
+	}
+}
+
+// W4：/healthz 返回带版本的 JSON，且不得落到数据面 handler。
+func TestVersionedHealthz(t *testing.T) {
+	called := false
+	h := withVersionedHealthz(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		called = true
+	}))
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("healthz status=%d", rec.Code)
+	}
+	var body map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("healthz body not JSON: %v (%q)", err, rec.Body.String())
+	}
+	if body["status"] != "ok" || body["version"] != version {
+		t.Fatalf("healthz body=%v", body)
+	}
+	if called {
+		t.Fatal("healthz must not reach the data-plane handler")
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if !called {
+		t.Fatal("non-healthz path must delegate to the data-plane handler")
 	}
 }

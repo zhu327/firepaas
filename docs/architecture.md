@@ -131,6 +131,8 @@ readiness 的唯一来源是 agent 在 host 侧经内部 workload endpoint 执�
 
 MVP 最初以 round-robin 为基线；当前 edge 已按 ADR-0020 使用 least-inflight，并在并列时轮转。会话粘性、灰度权重和 WebSocket 长连接迁移仍是后续能力。发布与 scale/节点故障/再次发布的**组合场景决策表在 M3 冻结**（mvp-plan §7）：MVP 至少实现同一 app 同时只允许一个 rollout 的互斥。
 
+副本数的自动写者（ADR-0041）：`PUT /v1/apps/{id}/autoscale` 为 app 配置并发弹性策略后，leader 内决策循环按 edge 上报的并发信号（`autoscale:{hostname}`）只写 `desired_replicas`（快扩慢缩、发布互斥、信号丢失 fail-closed）；路由仍由 route generation 派生，不直写 Redis。
+
 ## 6. agent 契约与内部信任边界
 
 `protos/agent/v1/agent.proto` 是唯一控制面数据面契约。

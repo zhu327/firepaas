@@ -524,9 +524,10 @@ message IdentityMapping {
   string machine_id = 7;
   string execution_id = 8;
   uint64 generation = 9;        // machine generation（绑定水位）
-  // ADR-0040 §15（G2a）：本 execution 主服务的 mesh 直连声明。agent 建
-  // policy 条目要求 EastWest 规则与 dst mesh_direct 缺一不可；false = 本
-  // execution 只可被南北链路到达（东西向默认 deny）。
+  // ADR-0040 §15（G2a）：本 execution 主服务的 mesh 直连声明。门控在控制面
+  // 组装侧完成（未声明的 dst_service 规则不进快照，W3 分工）；agent 不做
+  // 二次门控——identity 跨 execution 共享，逐行声明无法在 identity 粒度
+  // 收紧。false = 本 execution 只可被南北链路到达（东西向默认 deny）。
   bool mesh_direct = 10;
 }
 
@@ -559,6 +560,14 @@ message DnsRecord {
 message ApplyFabricResponse {
   uint64 applied_generation = 1;
   bool replayed = 2;            // 幂等命中（operation_id 已在 ledger）
+}
+
+// FabricWatermarkDetail 作为 FailedPrecondition 的 gRPC status detail 返回：
+// agent 当前已应用的 fabric 水位。控制面在水位回退（DB 恢复/丢更新）时据此
+// 直接跳到 applied+1 重推，避免逐代爬升导致的长窗口冻结。旧控制面忽略
+// details；旧 agent 不携带 details 时控制面回退为逐代 +1 爬升。
+message FabricWatermarkDetail {
+  uint64 applied_generation = 1;
 }
 
 // ---------------------------------------------------------------------------

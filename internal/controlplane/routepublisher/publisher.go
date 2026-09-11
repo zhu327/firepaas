@@ -174,12 +174,14 @@ func Derive(in Input) Projection {
 	depGen := make(map[string]int64, len(in.Deployments))
 	depServices := make(map[string][]store.ServiceSpec, len(in.Deployments))
 	depStrategy := make(map[string]string, len(in.Deployments))
+	depStatus := make(map[string]string, len(in.Deployments))
 	toDepByApp := make(map[string]string)
 	for i := range in.Deployments {
 		dep := &in.Deployments[i]
 		depGen[dep.ID] = dep.Generation
 		depServices[dep.ID] = dep.EffectiveServices()
 		depStrategy[dep.ID] = dep.EffectiveStrategy()
+		depStatus[dep.ID] = dep.Status
 		if rollout := rolloutByApp[dep.AppID]; rollout != nil && dep.Generation == rollout.ToGeneration {
 			toDepByApp[dep.AppID] = dep.ID
 		}
@@ -219,7 +221,15 @@ func Derive(in Input) Projection {
 			proxy = in.LegacyProxyAddr
 		}
 		generation := depGen[m.DeploymentID]
+		// review 2026-09-10：rollout 完成（或回滚失败）后旧代 deployment 已
+		// SUPERSEDED/FAILED，但它的 machine 在 delete 操作收敛前仍是
+		// desired_state=CREATED/RUNNING。旧实现只在“有活跃 rollout”时计算
+		// draining，COMPLETE 后旧代 backend 会被重新发布上线。终态的
+		// 非活跃代永远不能 serving，与是否有活跃 rollout 无关。
 		draining := false
+		if s := depStatus[m.DeploymentID]; s == "SUPERSEDED" || s == "FAILED" {
+			draining = true
+		}
 		if rollout := rolloutByApp[m.AppID]; rollout != nil {
 			rolling := depStrategy[toDepByApp[m.AppID]] == "rolling" && rollout.Status == "PREPARING"
 			switch rollout.Status {

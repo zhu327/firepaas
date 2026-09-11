@@ -23,12 +23,20 @@ import (
 // stringSlice 支持重复标志（标准 flag 无 StringArray）。
 type stringSlice []string
 
+// version 由 release 构建经 -ldflags -X main.version=... 注入。
+var version = "dev"
+
 func (s *stringSlice) String() string     { return strings.Join(*s, ",") }
 func (s *stringSlice) Set(v string) error { *s = append(*s, v); return nil }
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:5108", "agent gRPC address")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println("agentctl", version)
+		return
+	}
 	args := flag.Args()
 	if len(args) == 0 {
 		usage()

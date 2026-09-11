@@ -45,6 +45,15 @@ func TestEbpfEgressPerSlotIsolation(t *testing.T) {
 		guestB     = "10.101.92.5"
 		target     = "11.11.12.9:8080"
 		targetIP   = "11.11.12.9/32"
+		// v6 身份面：guestA 拥有 ulaA，guestB 拥有 ulaB；ulaC 是远端
+		// identity 3（仅存在于 ipcache/policy，用于冒用源测试）。
+		ulaA      = "fd7a:9a55:91::5"
+		ulaB      = "fd7a:9a55:92::5"
+		ulaC      = "fd7a:9a55:93::5"
+		udpOK     = 39998
+		udpNo     = 39997
+		tcpOK     = 39996
+		proxyPort = 38080
 	)
 	for _, c := range [][]string{
 		{"ip", "netns", "del", nsA},
@@ -123,18 +132,32 @@ func TestEbpfEgressPerSlotIsolation(t *testing.T) {
 		_ = exec.Command("umount", pinDir).Run()
 		_ = os.Remove(pinDir)
 	})
-	// 代理端口 0：不装 DNAT，8080 走纯 deny/allow/mode 裁决。
-	b, err := New(Options{PinDir: pinDir})
+	// 代理端口显式配置（默认 18080 可能被同主机 lab 占用）：用于验证
+	// ingress 对代理端口的放行只限本机目的，跨 slot 目标仍走 private drop。
+	b, err := New(Options{
+		PinDir:         pinDir,
+		EgressProxy80:  proxyPort,
+		EgressProxy443: proxyPort + 2,
+		VethCIDR:       "10.13.91.0/24",
+		RootNATTable:   fmt.Sprintf("fp-egress-test-%d", os.Getpid()),
+		// 测试需看到每个 allow 事件（生产默认 1/128 采样）。
+		FlowSampleEvery: 1,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		_ = exec.Command("nft", "delete", "table", "ip", fmt.Sprintf("fp-egress-test-%d", os.Getpid())).Run()
+	})
 	refA := slot.SlotRef{
 		Index: 0, VethHost: vhA, VethGuest: vgA,
 		HostAddr: "10.13.91.1", NsAddr: "10.13.91.2", Netns: nsA, GuestIP: guestA,
+		GuestIP6: ulaA,
 	}
 	refB := slot.SlotRef{
 		Index: 1, VethHost: vhB, VethGuest: vgB,
 		HostAddr: "10.13.92.1", NsAddr: "10.13.92.2", Netns: nsB, GuestIP: guestB,
+		GuestIP6: ulaB,
 	}
 	if err := b.EnsureNode(ctx); err != nil {
 		t.Fatal(err)
@@ -217,15 +240,19 @@ func TestEbpfEgressPerSlotIsolation(t *testing.T) {
 		t.Fatalf("slot B (deny_all) dial err = %s, want timeout (must stay denied after A applied)", out)
 	}
 
+	// T1（P0）：代理端口放行只限本机目的。A→B 的代理端口（跨 slot、dst 为
+	// 私网）必须被 private4 drop（timeout）；fresh eBPF 节点没有遗留 nft
+	// FORWARD 兜底，旧实现里该包会直达 B（无监听 → refused）。
+	if out := helperOutput(t, ctx, gA, dialSpec{
+		target: guestB + fmt.Sprintf(":%d", proxyPort), timeout: 1200 * time.Millisecond,
+	}); !strings.Contains(out, "timeout") {
+		t.Fatalf("cross-slot proxy port must be dropped by private4, got %s", out)
+	}
+
 	// 6) v6 UDP 逐端口白名单（W1）：forward 规则有 ports → 逐包检查；回包凭
 	// 对向纯回程条目（has_ports=0）放行；未放行端口 deny。topology：guestA
 	// ulaA → guestB ulaB，经 vhA/vhB ingress 策决（与主测试同构，独立 /64）。
-	const (
-		ulaA  = "fd7a:9a55:91::5"
-		ulaB  = "fd7a:9a55:92::5"
-		udpOK = 39998
-		udpNo = 39997
-	)
+	// （ulaA/ulaB/udpOK/udpNo 已在上方 const 块声明。）
 	for _, c := range [][]string{
 		{"ip", "netns", "exec", nsA, "ip", "-6", "addr", "add", "fd7a:9a55:fd91::2/64", "dev", vgA, "nodad"},
 		{"ip", "netns", "exec", nsA, "ip", "-6", "addr", "add", "fd7a:9a55:fd91::3/64", "dev", brA, "nodad"},
@@ -265,10 +292,20 @@ func TestEbpfEgressPerSlotIsolation(t *testing.T) {
 		Identities: []api.IdentityMapEntry{
 			{IdentityID: 1, ULA: ulaA},
 			{IdentityID: 2, ULA: ulaB},
+			{IdentityID: 3, ULA: ulaC},
 		},
 		Entries: []api.FabricPolicyEntry{
-			{SrcIdentity: 1, DstIdentity: 2, Generation: 1, Ports: []uint32{udpOK}},
-			{SrcIdentity: 2, DstIdentity: 1, Generation: 1}, // 纯回程条目
+			{SrcIdentity: 1, DstIdentity: 2, Generation: 1, Ports: []uint32{udpOK, tcpOK}},
+			// 对称回程条目：端口集按源端口匹配（SrcPorts）。
+			{SrcIdentity: 2, DstIdentity: 1, Generation: 1, Ports: []uint32{udpOK, tcpOK}, SrcPorts: true},
+			// B→A 也声明（双向 EastWest）：其正向 + 对称回程与 entry1 的
+			// 正/回程叠加后，(1,2)/(2,1) 都合并出 DPORT|SPORT；回归“A 发起
+			// 的 TCP 已建立流（ACK/数据）不得因 sport 不匹配被丢”。
+			{SrcIdentity: 2, DstIdentity: 1, Generation: 1, Ports: []uint32{tcpOK}},
+			{SrcIdentity: 1, DstIdentity: 2, Generation: 1, Ports: []uint32{tcpOK}, SrcPorts: true},
+			// 冒用源测试用：identity 2 到 identity 3 的放行。没有 per-veth
+			// 源绑定时，slot A 伪造 ulaB 源可借 identity 2 通过该条目。
+			{SrcIdentity: 2, DstIdentity: 3, Generation: 1, Ports: []uint32{udpOK}},
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -314,7 +351,8 @@ func TestEbpfEgressPerSlotIsolation(t *testing.T) {
 	}
 	// ipcache 内容自检（deny_src 时区分“没写入”与“内核查不到”）。
 	{
-		it := b.ipcache.Iterate()
+		ipcache, _, _, _ := b.fabricSet(b.activeFabricSet())
+		it := ipcache.Iterate()
 		var k [16]byte
 		var v uint32
 		for it.Next(&k, &v) {
@@ -366,6 +404,103 @@ func TestEbpfEgressPerSlotIsolation(t *testing.T) {
 	if out := udpClient(udpNo); strings.Contains(out, "udp-ok") {
 		t.Fatalf("udp denied port unexpectedly passed: %q", out)
 	}
+
+	// 双向声明下的 TCP 已建立流（W2 回归）：A→B 的 ACK/数据 sport 是 A 的
+	// 临时端口，只查 SPORT 会把连接打在 SYN 之后丢掉（表现为握手超时）。
+	tcpSrv := exec.CommandContext(ctx, "ip", "netns", "exec", gB, "python3", "-c",
+		fmt.Sprintf("import socket\n"+
+			"s=socket.socket(socket.AF_INET6,socket.SOCK_STREAM)\n"+
+			"s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n"+
+			"s.bind(('%s',%d))\ns.listen(4)\n"+
+			"import sys\nprint('READY',flush=True)\n"+
+			"while True:\n"+
+			" c,_=s.accept()\n"+
+			" d=c.recv(64)\n"+
+			" c.sendall(b'pong')\n"+
+			" c.close()\n", ulaB, tcpOK))
+	tcpOut, _ := tcpSrv.StdoutPipe()
+	if err := tcpSrv.Start(); err != nil {
+		t.Fatalf("tcp echo server: %v", err)
+	}
+	defer func() { _ = tcpSrv.Process.Kill() }()
+	tcpReady := make(chan struct{})
+	go func() {
+		buf := make([]byte, 16)
+		for {
+			n, err := tcpOut.Read(buf)
+			if err != nil {
+				return
+			}
+			if strings.Contains(string(buf[:n]), "READY") {
+				close(tcpReady)
+				return
+			}
+		}
+	}()
+	select {
+	case <-tcpReady:
+	case <-time.After(5 * time.Second):
+		t.Fatal("tcp echo server never ready")
+	}
+	if !runHelper(t, ctx, gA, dialSpec{
+		target: "[" + ulaB + "]:" + fmt.Sprint(tcpOK), src: ulaA,
+		timeout: 5 * time.Second, echo: "ping", want: "pong",
+	}) {
+		t.Fatalf("bidirectional TCP flow must stay established (flow: %s)", flows.summary())
+	}
+
+	// T2（P0）：per-veth v6 源绑定。模拟恶意 workload：slot A 把 slot B 的
+	// ULA 绑到自己接口上（guest 本身即 root，可直接伪造源），向 ulaC 发
+	// UDP——无绑定时该包以 identity 2 通过 {2→3} 放行条目（verdict=allow
+	// 且 src=2/dst=3）；有绑定时必须在 tc_ingress 判为 deny_src（ipcache
+	// 命中不再是源绑定的充分条件）。断言只看新产生的 proto=17 事件，
+	// 不依赖环境 ICMPv6/ND 噪声的计数。
+	start := flows.count()
+	if out, err := exec.CommandContext(ctx, "ip", "netns", "exec", gA, "ip", "-6", "addr", "add",
+		ulaB+"/128", "dev", vhGA, "nodad").CombinedOutput(); err != nil {
+		t.Fatalf("spoof source addr: %v: %s", err, out)
+	}
+	t.Cleanup(func() {
+		_ = exec.Command("ip", "netns", "exec", gA, "ip", "-6", "addr", "del",
+			ulaB+"/128", "dev", vhGA).Run()
+	})
+	// 让 spoof 包真正到达 vhA：nsA 无 ulaC 路由时会在 netns 内直接 no-route
+	// 丢弃，测不到 tc_ingress。root 用 blackhole 收尾避免回 ICMPv6 干扰。
+	for _, c := range [][]string{
+		{"ip", "netns", "exec", nsA, "ip", "-6", "route", "replace", ulaC + "/128", "via", "fd7a:9a55:fd91::1", "dev", vgA},
+		{"ip", "-6", "route", "replace", "blackhole", ulaC + "/128"},
+	} {
+		if out, err := exec.CommandContext(ctx, c[0], c[1:]...).CombinedOutput(); err != nil {
+			t.Fatalf("%v: %v: %s", c, err, out)
+		}
+	}
+	t.Cleanup(func() {
+		_ = exec.Command("ip", "-6", "route", "del", "blackhole", ulaC+"/128").Run()
+	})
+	spoofOut, _ := exec.CommandContext(ctx, "ip", "netns", "exec", gA, "python3", "-c",
+		fmt.Sprintf("import socket\ns=socket.socket(socket.AF_INET6,socket.SOCK_DGRAM)\n"+
+			"s.bind(('%s',0))\ns.settimeout(0.5)\n"+
+			"try:\n s.sendto(b'x',('%s',%d))\nexcept Exception as e:\n print('ERR',e)\n"+
+			"print('sent')\n", ulaB, ulaC, udpOK)).CombinedOutput()
+	if !strings.Contains(string(spoofOut), "sent") {
+		t.Fatalf("spoof client did not send: %s", spoofOut)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	verdict, seen := FlowVerdict(0), false
+	for time.Now().Before(deadline) {
+		if v, ok := flows.spoofVerdict(start, 3); ok {
+			verdict, seen = v, true
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	if !seen {
+		t.Fatalf("spoof UDP never reached tc_ingress (flow: %s)", flows.summary())
+	}
+	if verdict != FlowDenySrc {
+		t.Fatalf("spoofed ULA source not rejected by per-veth binding: verdict=%s (flow: %s)",
+			verdict, flows.summary())
+	}
 }
 
 // flowCollector 测试用 flow 汇点（verdict 诊断）。
@@ -388,6 +523,29 @@ func (c *flowCollector) summary() string {
 		counts[r.Verdict.String()]++
 	}
 	return fmt.Sprintf("%d events %v", len(c.recs), counts)
+}
+
+func (c *flowCollector) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.recs)
+}
+
+// spoofVerdict 在 start 之后的事件里找冒用测试的 UDP 决策：
+// proto=17 且（deny_src 或 allow 且 dstID=期望的 dst identity）。
+func (c *flowCollector) spoofVerdict(start int, dstID uint32) (FlowVerdict, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i := start; i < len(c.recs); i++ {
+		r := c.recs[i]
+		if r.Proto != 17 {
+			continue
+		}
+		if r.Verdict == FlowDenySrc || (r.Verdict == FlowAllow && r.DstID == dstID) {
+			return r.Verdict, true
+		}
+	}
+	return 0, false
 }
 
 func dumpEgressState(t *testing.T, b *Backend, refs ...slot.SlotRef) {
