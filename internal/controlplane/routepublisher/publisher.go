@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/zhu327/firepaas/internal/capabilities"
 	"github.com/zhu327/firepaas/internal/controlplane/catalog"
 	"github.com/zhu327/firepaas/internal/controlplane/store"
 )
@@ -391,7 +392,7 @@ func machineServing(m store.Machine) bool {
 	if m.ObservedState != "RUNNING" && m.ObservedState != "PAUSED" {
 		return false
 	}
-	return m.ObservedReadiness == "READY" || m.ObservedReadiness == "UNCONFIGURED"
+	return capabilities.IsServingReadiness(m.ObservedReadiness)
 }
 
 // fabricHint 取 mesh_direct 服务的 backend 提示（G2b，ADR-0040 §16）。

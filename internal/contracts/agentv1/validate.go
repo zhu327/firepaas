@@ -16,6 +16,25 @@ import (
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 )
 
+// dupSet 是去重集合（收敛 map[string]bool / map[uint32]bool /
+// map[netip.Addr]bool 三套手写；错误文案由调用方保留）。
+type dupSet[T comparable] map[T]bool
+
+func newDupSet[T comparable]() dupSet[T] { return make(dupSet[T]) }
+
+// add 插入 k：已存在返回 true（重复），否则插入并返回 false。
+func (s dupSet[T]) add(k T) bool {
+	if s[k] {
+		return true
+	}
+	s[k] = true
+	return false
+}
+
+// checkPortRange 判定端口是否在 [1,65535]（services 与 eastwest 共用范围，
+// 错误文案由调用方保留，避免范围常量两处漂移）。
+func checkPortRange(port uint32) bool { return port != 0 && port <= 65535 }
+
 // ValidateFencing 校验所有状态变更请求必须携带的 fencing/幂等键。
 // 同一 operation_id 重试必须返回已记录结果；同 ID 不同 request hash 由
 // agent operation ledger 拒绝。
@@ -71,23 +90,21 @@ func ValidateMachineSpecForCreate(spec *pb.MachineSpec) error {
 		if svcs[0].GetInternalPort() != uint32(spec.GetNetwork().GetIngressPort()) {
 			return errors.New("spec.services[0].internal_port must equal spec.network.ingress_port")
 		}
-		seenPort := map[uint32]bool{}
-		seenName := map[string]bool{}
+		seenPort := newDupSet[uint32]()
+		seenName := newDupSet[string]()
 		for i, s := range svcs {
 			if s.GetName() == "" {
 				return fmt.Errorf("spec.services[%d].name is required", i)
 			}
-			if seenName[s.GetName()] {
+			if seenName.add(s.GetName()) {
 				return fmt.Errorf("spec.services[%d].name %q duplicated", i, s.GetName())
 			}
-			if s.GetInternalPort() == 0 || s.GetInternalPort() > 65535 {
+			if !checkPortRange(s.GetInternalPort()) {
 				return errors.New("spec.services[].internal_port must be in [1,65535]")
 			}
-			if seenPort[s.GetInternalPort()] {
+			if seenPort.add(s.GetInternalPort()) {
 				return fmt.Errorf("spec.services[%d].internal_port %d duplicated", i, s.GetInternalPort())
 			}
-			seenPort[s.GetInternalPort()] = true
-			seenName[s.GetName()] = true
 		}
 	}
 	// v1.3-A（ADR-0027）：egress policy 契约校验（agent 侧 fail closed）。
@@ -426,16 +443,15 @@ func ValidateEgressPolicy(p *pb.EgressPolicySpec) error {
 			return fmt.Errorf("egress denied_cidrs[%d] %q: IPv6 egress is not supported", i, cidr)
 		}
 	}
-	seen := map[string]bool{}
+	seen := newDupSet[string]()
 	for i, d := range p.GetAllowedDomains() {
 		normalized, err := NormalizeEgressDomain(d)
 		if err != nil {
 			return fmt.Errorf("egress allowed_domains[%d]: %v", i, err)
 		}
-		if seen[normalized] {
+		if seen.add(normalized) {
 			return fmt.Errorf("egress allowed_domains[%d] %q duplicated", i, normalized)
 		}
-		seen[normalized] = true
 	}
 	if p.GetPolicyGeneration() == 0 {
 		return errors.New("egress policy_generation must be > 0")
@@ -474,16 +490,15 @@ func ValidateEastWestPolicy(p *pb.EastWestPolicySpec) error {
 	if p.GetGeneration() == 0 {
 		return errors.New("eastwest generation must be > 0")
 	}
-	seen := map[string]bool{}
+	seen := newDupSet[string]()
 	for i, r := range p.GetRules() {
 		if err := checkEastWestRuleFields(r, i); err != nil {
 			return err
 		}
 		key := r.GetDstProject() + "/" + r.GetDstApp() + "/" + r.GetDstService()
-		if seen[key] {
+		if seen.add(key) {
 			return fmt.Errorf("eastwest rules[%d] dst %s duplicated", i, key)
 		}
-		seen[key] = true
 	}
 	return nil
 }
@@ -499,17 +514,16 @@ func ValidateEastWestPolicyTable(p *pb.EastWestPolicySpec) error {
 	if p.GetGeneration() == 0 {
 		return errors.New("eastwest table generation must be > 0")
 	}
-	seen := map[string]bool{}
+	seen := newDupSet[string]()
 	for i, r := range p.GetRules() {
 		if err := checkEastWestRuleFields(r, i); err != nil {
 			return err
 		}
 		key := r.GetSrcProject() + "/" + r.GetSrcApp() + "→" +
 			r.GetDstProject() + "/" + r.GetDstApp() + "/" + r.GetDstService()
-		if seen[key] {
+		if seen.add(key) {
 			return fmt.Errorf("eastwest table rules[%d] %s duplicated", i, key)
 		}
-		seen[key] = true
 	}
 	return nil
 }
@@ -530,15 +544,14 @@ func checkEastWestRuleFields(r *pb.EastWestPolicyRule, i int) error {
 	case len(r.GetPorts()) == 0:
 		return fmt.Errorf("eastwest rules[%d].ports is required", i)
 	}
-	portSeen := map[uint32]bool{}
+	portSeen := newDupSet[uint32]()
 	for _, port := range r.GetPorts() {
-		if port == 0 || port > 65535 {
+		if !checkPortRange(port) {
 			return fmt.Errorf("eastwest rules[%d].ports contains %d, want [1,65535]", i, port)
 		}
-		if portSeen[port] {
+		if portSeen.add(port) {
 			return fmt.Errorf("eastwest rules[%d].ports %d duplicated", i, port)
 		}
-		portSeen[port] = true
 	}
 	return nil
 }
@@ -562,7 +575,7 @@ func ValidateApplyFabricRequest(req *pb.ApplyFabricRequest) error {
 	if err != nil {
 		return fmt.Errorf("node_prefix: %w", err)
 	}
-	seenPeer := map[string]bool{}
+	seenPeer := newDupSet[string]()
 	for i, p := range req.GetPeers() {
 		switch {
 		case p.GetNodeId() == "":
@@ -586,8 +599,8 @@ func ValidateApplyFabricRequest(req *pb.ApplyFabricRequest) error {
 			return fmt.Errorf("peers[%d].node_prefix: %w", i, err)
 		}
 	}
-	seenBinding := map[string]bool{}
-	seenULA := map[netip.Addr]bool{}
+	seenBinding := newDupSet[string]()
+	seenULA := newDupSet[netip.Addr]()
 	for i, m := range req.GetIdentities() {
 		switch {
 		case m.GetIdentityId() == 0:
@@ -608,18 +621,16 @@ func ValidateApplyFabricRequest(req *pb.ApplyFabricRequest) error {
 			return fmt.Errorf("identities[%d].generation must be > 0", i)
 		}
 		key := m.GetMachineId() + "/" + m.GetExecutionId()
-		if seenBinding[key] {
+		if seenBinding.add(key) {
 			return fmt.Errorf("identities[%d] binding %s duplicated", i, key)
 		}
-		seenBinding[key] = true
 		ula, err := netip.ParseAddr(m.GetUla())
 		if err != nil || !ulanet.IsULAAddr(ula) {
 			return fmt.Errorf("identities[%d].ula %q is not a ULA IPv6 address", i, m.GetUla())
 		}
-		if seenULA[ula] {
+		if seenULA.add(ula) {
 			return fmt.Errorf("identities[%d].ula %s duplicated across bindings", i, ula)
 		}
-		seenULA[ula] = true
 		// G2a 起身份集合为集群全域（跨节点源绑定/策略解析）：ULA 只需是
 		// 合法 ULA，不再要求落在接收节点自身 /64 内（远端 workload 的
 		// ULA 必然在其它节点前缀）。节点内路由仍由本机 ipcache/路由表约束。
@@ -633,15 +644,14 @@ func ValidateApplyFabricRequest(req *pb.ApplyFabricRequest) error {
 	}
 	// G2c（§16）：.internal 记录全表（空 = 无记录）。名字唯一且必须是
 	// 小写 .internal 域名；每条 ≥1 个合法 ULA AAAA；generation > 0。
-	seenName := map[string]bool{}
+	seenName := newDupSet[string]()
 	for i, r := range req.GetDns() {
 		if err := validateDnsRecord(r); err != nil {
 			return fmt.Errorf("dns[%d]: %w", i, err)
 		}
-		if seenName[r.GetName()] {
+		if seenName.add(r.GetName()) {
 			return fmt.Errorf("dns[%d].name %s duplicated", i, r.GetName())
 		}
-		seenName[r.GetName()] = true
 	}
 	return nil
 }

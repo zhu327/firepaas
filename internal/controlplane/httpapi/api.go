@@ -224,7 +224,7 @@ type healthCheckBody struct {
 
 func (a *API) createMachine(w http.ResponseWriter, r *http.Request) {
 	var body createMachineBody
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
+	if err := decodeJSONBody(w, r, &body, 1<<20, false); err != nil {
 		writeErr(w, 400, "bad request: "+err.Error())
 		return
 	}
@@ -618,6 +618,26 @@ func writeErr(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]string{"error": msg})
 }
 
+// decodeJSONBody 收敛 JSON 请求体样板：MaxBytesReader 限流 + Decode。
+// maxBytes 按调用方传入（默认 1<<20；governance 1<<16；runtime exec/cp 用
+// runtimeMaxBody）；allowEmpty=true 时忽略全部解码错误（空 body/可选 body
+// 合法，调用方直接用零值继续，与历史 `_ = Decode` 语义一致）。
+// 非空分支返回 error，调用方保留各自的 writeErr 文案（governance 的
+// "invalid quota/rate limit body" 等不变）。
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any, maxBytes int64, allowEmpty bool) error {
+	if r == nil || r.Body == nil {
+		if allowEmpty {
+			return nil
+		}
+		return errors.New("EOF")
+	}
+	err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBytes)).Decode(dst)
+	if allowEmpty {
+		return nil
+	}
+	return err
+}
+
 // Config 是 HTTP 层的完整依赖装配。字段只在构造时读取；handler 不自行读
 // 进程环境（可变的准入参数在 cmd/api 装配期解析后传入）。
 type Config struct {
@@ -787,7 +807,7 @@ func (a *API) health(w http.ResponseWriter, _ *http.Request) {
 
 func (a *API) metricsHandler(w http.ResponseWriter, r *http.Request) {
 	if a.metricsToken != "" {
-		got := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+		got := bearerToken(r)
 		if subtle.ConstantTimeCompare([]byte(got), []byte(a.metricsToken)) != 1 {
 			writeErr(w, 401, "unauthorized")
 			return

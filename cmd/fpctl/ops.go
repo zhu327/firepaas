@@ -5,7 +5,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"net/url"
 )
 
 func runOps(args []string) error {
@@ -21,18 +20,12 @@ func runOps(args []string) error {
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
-		q := url.Values{}
-		q.Set("limit", "200")
-		if *machine != "" {
-			q.Set("machine_id", *machine)
-		}
-		if *kind != "" {
-			q.Set("kind", *kind)
-		}
-		if *status != "" {
-			q.Set("status", *status)
-		}
-		path := "/v1/operations?" + q.Encode()
+		path := withQuery("/v1/operations", map[string]string{
+			"limit":      "200",
+			"machine_id": *machine,
+			"kind":       *kind,
+			"status":     *status,
+		})
 		var out struct {
 			Operations []struct {
 				ID          string  `json:"id"`
@@ -59,24 +52,13 @@ func runOps(args []string) error {
 			fmt.Printf("%-44s %-10s %-9s attempts=%d %s..%s  %s\n",
 				op.ID, op.Kind, op.Status, op.Attempts, op.CreatedAt[11:19], done, op.MachineID)
 			if op.Error != "" && op.Status == "FAILED" {
-				fmt.Printf("    error: %s\n", truncate(op.Error, 160))
+				fmt.Printf("    error: %s\n", boundedSnippet(op.Error, 160))
 			}
 		}
 	case "show":
-		id, err := oneArg(args[1:], "usage: fpctl ops show <operation-id>")
-		if err != nil {
-			return err
-		}
-		return do("GET", "/v1/operations/"+url.PathEscape(id), nil, nil)
+		return getByID(args[1:], "usage: fpctl ops show <operation-id>", "/v1/operations")
 	default:
 		return fmt.Errorf("unknown ops command %q", args[0])
 	}
 	return nil
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "…"
 }

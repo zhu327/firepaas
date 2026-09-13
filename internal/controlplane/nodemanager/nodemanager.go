@@ -526,27 +526,32 @@ func capabilitySignature(info *pb.ServiceInfoResponse) string {
 	return fmt.Sprintf("%s|%s|%v", info.ProtocolVersion, info.SnapshotCompatibilityKey, info.FeatureIds)
 }
 
-// nomadStatus 根据 Nomad 节点状态计算状态机初值。
-func nomadStatus(n *Node) string {
+// nomadBaseStatus 收敛三函数公共前缀：Nomad 侧 unhealthy/drain 优先。
+// 返回 (status, done)：done=true 时调用方直接返回 status；否则继续各自
+// 的 agent/地址叠加判定。
+func nomadBaseStatus(n *Node) (string, bool) {
 	if !n.Ready || !n.Eligible {
-		return "UNHEALTHY"
+		return "UNHEALTHY", true
 	}
 	if n.Drain {
-		return "DRAINING"
+		return "DRAINING", true
 	}
-	if n.GRPCAddr == "" {
-		return "UNKNOWN"
+	return "", false
+}
+
+// nomadStatus 根据 Nomad 节点状态计算状态机初值。
+func nomadStatus(n *Node) string {
+	if s, done := nomadBaseStatus(n); done {
+		return s
 	}
-	return "UNKNOWN" // 未拉到 ServiceInfo 前调度器不采信
+	// 未拉到 ServiceInfo 前调度器不采信（有无 GRPCAddr 均 UNKNOWN）。
+	return "UNKNOWN"
 }
 
 // combinedStatus 叠加 agent 报告状态；Nomad 侧 unhealthy/drain 优先。
 func combinedStatus(n *Node, info *pb.ServiceInfoResponse) string {
-	if !n.Ready || !n.Eligible {
-		return "UNHEALTHY"
-	}
-	if n.Drain {
-		return "DRAINING"
+	if s, done := nomadBaseStatus(n); done {
+		return s
 	}
 	if n.GRPCAddr == "" {
 		return "UNKNOWN"
@@ -559,11 +564,8 @@ func combinedStatus(n *Node, info *pb.ServiceInfoResponse) string {
 
 // unknownStatus 保留 Nomad 侧 unhealthy/drain 判定，其余退 UNKNOWN。
 func unknownStatus(n *Node) string {
-	if !n.Ready || !n.Eligible {
-		return "UNHEALTHY"
-	}
-	if n.Drain {
-		return "DRAINING"
+	if s, done := nomadBaseStatus(n); done {
+		return s
 	}
 	return "UNKNOWN"
 }

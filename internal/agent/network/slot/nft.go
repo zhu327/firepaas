@@ -165,24 +165,10 @@ func egressTableScript(ref SlotRef, snap *api.PolicySnapshot) (string, error) {
 	b.WriteString("add chain ip fp-slot egress-pre { type nat hook prerouting priority dstnat; policy accept; }\n")
 	b.WriteString("add chain ip fp-slot egress-fwd { type filter hook forward priority filter; policy accept; }\n")
 	if snap.ProxyPort80 > 0 {
-		fmt.Fprintf(
-			&b,
-			"add rule ip fp-slot egress-pre iifname != %q tcp dport 80 ip daddr != %s dnat to %s:%d\n",
-			vethGuest,
-			hostAddr,
-			hostAddr,
-			snap.ProxyPort80,
-		)
+		fmt.Fprintf(&b, "add rule ip fp-slot egress-pre %s\n", proxyDNATRule(vethGuest, hostAddr, 80, snap.ProxyPort80))
 	}
 	if snap.ProxyPort443 > 0 {
-		fmt.Fprintf(
-			&b,
-			"add rule ip fp-slot egress-pre iifname != %q tcp dport 443 ip daddr != %s dnat to %s:%d\n",
-			vethGuest,
-			hostAddr,
-			hostAddr,
-			snap.ProxyPort443,
-		)
+		fmt.Fprintf(&b, "add rule ip fp-slot egress-pre %s\n", proxyDNATRule(vethGuest, hostAddr, 443, snap.ProxyPort443))
 	}
 	b.WriteString("add rule ip fp-slot egress-fwd ct state established,related accept\n")
 	// The limit precedes every new-connection accept, including allowed CIDRs and
@@ -443,6 +429,14 @@ func cleanupLegacyNftPolicy(ctx context.Context, ref SlotRef) {
 	}
 }
 
+// proxyDNATRule 是一条透明代理 DNAT 规则的规则体（不含链名前缀）。
+// slot 全量替换脚本（egress-pre 链）与 EnsureNetnsNAT（pre 链）共用同一
+// 文本，避免两处手写同一条 dnat 规则再次漂移（仿 tcpLimitRule）。
+func proxyDNATRule(vethGuest, hostAddr string, dport, proxyPort int) string {
+	return fmt.Sprintf("iifname != %q tcp dport %d ip daddr != %s dnat to %s:%d",
+		vethGuest, dport, hostAddr, hostAddr, proxyPort)
+}
+
 // EnsureNetnsNAT 幂等创建 slot 内一级 NAT：出口 masquerade +（port>0 时）
 // prerouting DNAT（tcp 80/443 → hostAddr:port，conntrack 反向 NAT——代理回流
 // 不改写）。proxyPort 传 0 = 只建 masquerade（nft 后端在 ApplyEgress 的
@@ -502,18 +496,14 @@ func EnsureNetnsNAT(ctx context.Context, ref SlotRef, proxyPort80, proxyPort443 
 			// 经 veth 进入）不得被重定向回代理——否则探针/回程死循环
 			//（真机 G2c 验收抓到：健康探针回包 DNAT 回代理 → 恒 NOT_READY）。
 			if proxyPort80 > 0 {
-				steps = append(steps, []string{
+				steps = append(steps, append([]string{
 					"ip", "netns", "exec", ns, "nft", "add", "rule", "ip", "fp-slot", "pre",
-					"iifname", "!=", ref.VethGuest, "tcp", "dport", "80", "ip", "daddr", "!=", ref.HostAddr,
-					"dnat", "to", fmt.Sprintf("%s:%d", ref.HostAddr, proxyPort80),
-				})
+				}, strings.Fields(proxyDNATRule(ref.VethGuest, ref.HostAddr, 80, proxyPort80))...))
 			}
 			if proxyPort443 > 0 {
-				steps = append(steps, []string{
+				steps = append(steps, append([]string{
 					"ip", "netns", "exec", ns, "nft", "add", "rule", "ip", "fp-slot", "pre",
-					"iifname", "!=", ref.VethGuest, "tcp", "dport", "443", "ip", "daddr", "!=", ref.HostAddr,
-					"dnat", "to", fmt.Sprintf("%s:%d", ref.HostAddr, proxyPort443),
-				})
+				}, strings.Fields(proxyDNATRule(ref.VethGuest, ref.HostAddr, 443, proxyPort443))...))
 			}
 		}
 		for _, step := range steps {

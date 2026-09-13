@@ -187,10 +187,7 @@ func (a *Adapter) ImportDataset(ctx context.Context, req *pb.ImportDatasetReques
 		_ = f.Close()
 		return nil, err
 	}
-	sizeGB := int((req.GetMaxExpandedBytes() + 1024*1024*1024 - 1) / (1024 * 1024 * 1024))
-	if sizeGB < 1 {
-		sizeGB = 1
-	}
+	sizeGB := ceilGiB(req.GetMaxExpandedBytes())
 	v, err := vp.CreateVolumeFromArchive(
 		ctx,
 		volumes.CreateVolumeFromArchiveRequest{
@@ -210,6 +207,16 @@ func (a *Adapter) ImportDataset(ctx context.Context, req *pb.ImportDatasetReques
 		ContentDigest: got,
 		Sealed:        true,
 	}, nil
+}
+
+// ceilGiB 把字节数向上取整为 GiB（至少 1；向下取整会让创建的卷小于
+// 已准入的预算，磁盘承诺与实际用量出现负差）。
+func ceilGiB(sizeBytes uint64) int {
+	sizeGB := int((sizeBytes + 1024*1024*1024 - 1) / (1024 * 1024 * 1024))
+	if sizeGB < 1 {
+		sizeGB = 1
+	}
+	return sizeGB
 }
 
 func ptr(s string) *string { return &s }
@@ -375,10 +382,7 @@ func (a *Adapter) CreateVolume(
 	}
 	// GiB 向上取整（R2：向下取整会让 hypeman 创建的卷小于已准入的预算，
 	// 磁盘承诺与实际用量出现负差——与 ImportDataset 的 sizeGB 计算同构）。
-	sizeGb := int((sizeBytes + 1024*1024*1024 - 1) / (1024 * 1024 * 1024))
-	if sizeGb < 1 {
-		sizeGb = 1
-	}
+	sizeGb := ceilGiB(sizeBytes)
 	_, err = vp.CreateVolume(ctx, volumes.CreateVolumeRequest{
 		Id:     &volumeID,
 		SizeGb: sizeGb,
@@ -508,14 +512,8 @@ func (a *Adapter) checkedVolumeInstance(
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrMachineNotFound, machineID)
 	}
-	if inst.Tags[tagExecution] != executionID {
-		return nil, fmt.Errorf(
-			"%w: machine %s want %s got %s",
-			ErrStaleExecution,
-			machineID,
-			executionID,
-			inst.Tags[tagExecution],
-		)
+	if err := checkExecution(inst.Tags, executionID, machineID); err != nil {
+		return nil, err
 	}
 	return inst, nil
 }

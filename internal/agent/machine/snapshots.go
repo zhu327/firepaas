@@ -59,9 +59,8 @@ func (a *Adapter) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotRequ
 		}
 		return nil, fmt.Errorf("get instance %s: %w", req.GetMachineId(), err)
 	}
-	if inst.Tags[tagExecution] != req.GetExecutionId() {
-		return nil, fmt.Errorf("%w: machine %s want %s got %s",
-			ErrStaleExecution, req.GetMachineId(), req.GetExecutionId(), inst.Tags[tagExecution])
+	if err := checkExecution(inst.Tags, req.GetExecutionId(), req.GetMachineId()); err != nil {
+		return nil, err
 	}
 	// ADR-0024 §9：接收过 secret 的 execution 禁止 memory snapshot。
 	kind := req.GetKind()
@@ -164,6 +163,24 @@ func (a *Adapter) RecoverMachine(
 	return mapMachine(inst), true, nil
 }
 
+// resolveRestoreMode 解析 restore_mode（memory|filesystem|auto）：auto 按
+// compatibility key 是否匹配收敛为 memory/filesystem。返回解析后 mode 与
+// key 兼容性；memory + 不兼容的拒绝由调用方判定（RestoreSnapshot 返回
+// ErrSnapshotIncompatible，RecoverRestore 只观测不拒绝）。
+func resolveRestoreMode(reqMode, snapKey, reqKey string) (mode string, compatible bool) {
+	if reqMode == "" {
+		reqMode = "auto"
+	}
+	compatible = snapKey != "" && reqKey != "" && snapKey == reqKey
+	if reqMode == "auto" {
+		if compatible {
+			return "memory", true
+		}
+		return "filesystem", false
+	}
+	return reqMode, compatible
+}
+
 // RecoverRestore reconstructs the observable restore response from the target
 // execution identity and immutable snapshot metadata.
 func (a *Adapter) RecoverRestore(
@@ -199,18 +216,7 @@ func (a *Adapter) RecoverRestore(
 	if err != nil || len(snaps) != 1 {
 		return nil, "", "", false, ErrSnapshotNotFound
 	}
-	mode := req.GetRestoreMode()
-	if mode == "" {
-		mode = "auto"
-	}
-	if mode == "auto" {
-		if snaps[0].CompatibilityKey != "" && req.GetCompatibilityKey() != "" &&
-			snaps[0].CompatibilityKey == req.GetCompatibilityKey() {
-			mode = "memory"
-		} else {
-			mode = "filesystem"
-		}
-	}
+	mode, _ := resolveRestoreMode(req.GetRestoreMode(), snaps[0].CompatibilityKey, req.GetCompatibilityKey())
 	consistency := ""
 	if mode == "filesystem" {
 		consistency = "clean"
@@ -314,21 +320,12 @@ func (a *Adapter) RestoreSnapshot(
 	if err != nil {
 		return nil, "", "", err
 	}
-	mode := req.GetRestoreMode()
-	if mode == "" {
-		mode = "auto"
-	}
+	mode, compatible := resolveRestoreMode(
+		req.GetRestoreMode(),
+		snaps[0].CompatibilityKey,
+		req.GetCompatibilityKey(),
+	)
 	filesystemOnly := mode == "filesystem"
-	compatible := snaps[0].CompatibilityKey != "" && req.GetCompatibilityKey() != "" &&
-		snaps[0].CompatibilityKey == req.GetCompatibilityKey()
-	if mode == "auto" {
-		if compatible {
-			mode = "memory"
-		} else {
-			filesystemOnly = true
-			mode = "filesystem"
-		}
-	}
 	if mode == "memory" && !compatible {
 		return nil, "", "", ErrSnapshotIncompatible
 	}

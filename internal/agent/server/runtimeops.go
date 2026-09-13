@@ -75,14 +75,13 @@ func (s *Server) acquire(context.Context) (release func(), err error) {
 	}
 }
 
-// runtimeBoundary applies the common total-duration and idle limits. Every
-// successful data transfer must call touch; cancel stops both timers.
-func (s *Server) runtimeBoundary(parent context.Context) (context.Context, context.CancelFunc, func()) {
-	durationCtx, durationCancel := context.WithTimeout(parent, s.runtimeLimits.maxDuration)
-	ctx, cancel := context.WithCancel(durationCtx)
+// startIdleWatchdog 启动空闲看门狗：timeout 内无 touch 即调用 onExpire。
+// 返回的 touch 非阻塞（缓冲 1，重复触达可合并）。Stop-排空-Reset 语义：
+// Reset 前先 Stop，Stop 失败则排空已触发的 timer 事件再 Reset。
+func startIdleWatchdog(ctx context.Context, timeout time.Duration, onExpire func()) (touch func()) {
 	reset := make(chan struct{}, 1)
 	go func() {
-		timer := time.NewTimer(s.runtimeLimits.idleTimeout)
+		timer := time.NewTimer(timeout)
 		defer timer.Stop()
 		for {
 			select {
@@ -95,22 +94,30 @@ func (s *Server) runtimeBoundary(parent context.Context) (context.Context, conte
 					default:
 					}
 				}
-				timer.Reset(s.runtimeLimits.idleTimeout)
+				timer.Reset(timeout)
 			case <-timer.C:
-				cancel()
+				onExpire()
 				return
 			}
 		}
 	}()
-	stop := func() {
-		cancel()
-		durationCancel()
-	}
-	touch := func() {
+	return func() {
 		select {
 		case reset <- struct{}{}:
 		default:
 		}
+	}
+}
+
+// runtimeBoundary applies the common total-duration and idle limits. Every
+// successful data transfer must call touch; cancel stops both timers.
+func (s *Server) runtimeBoundary(parent context.Context) (context.Context, context.CancelFunc, func()) {
+	durationCtx, durationCancel := context.WithTimeout(parent, s.runtimeLimits.maxDuration)
+	ctx, cancel := context.WithCancel(durationCtx)
+	touch := startIdleWatchdog(ctx, s.runtimeLimits.idleTimeout, cancel)
+	stop := func() {
+		cancel()
+		durationCancel()
 	}
 	return ctx, stop, touch
 }
@@ -330,40 +337,15 @@ func (s *Server) Exec(stream pb.MachineService_ExecServer) error {
 	resizeCh := make(chan *guestpb.WindowSize, 8)
 
 	// 空闲看门狗（ADR-0025 §6）：任何方向的活动都会重置；超时取消会话。
-	idleReset := make(chan struct{}, 1)
-	touchIdle := func() {
-		select {
-		case idleReset <- struct{}{}:
-		default:
-		}
-	}
 	execCtx, cancel := context.WithCancel(durationCtx)
 	defer cancel()
 	s.watchExecution(execCtx, cancel, open.MachineId, open.ExecutionId)
-	go func() {
-		timer := time.NewTimer(s.runtimeLimits.idleTimeout)
-		defer timer.Stop()
-		for {
-			select {
-			case <-execCtx.Done():
-				return
-			case <-idleReset:
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
-				timer.Reset(s.runtimeLimits.idleTimeout)
-			case <-timer.C:
-				_ = sender.send(&pb.ExecOutput{Frame: &pb.ExecOutput_Error{
-					Error: fmt.Sprintf("exec session idle timeout (%s)", s.runtimeLimits.idleTimeout),
-				}})
-				cancel()
-				return
-			}
-		}
-	}()
+	touchIdle := startIdleWatchdog(execCtx, s.runtimeLimits.idleTimeout, func() {
+		_ = sender.send(&pb.ExecOutput{Frame: &pb.ExecOutput_Error{
+			Error: fmt.Sprintf("exec session idle timeout (%s)", s.runtimeLimits.idleTimeout),
+		}})
+		cancel()
+	})
 
 	// 输入转发 goroutine：stdin/resize/signal 帧 → guest 流桥接。
 	go func() {

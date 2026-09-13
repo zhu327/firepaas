@@ -10,7 +10,6 @@
 package httpapi
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
 	"regexp"
@@ -31,7 +30,7 @@ func (a *API) createProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var b createProjectBody
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&b); err != nil {
+	if err := decodeJSONBody(w, r, &b, 1<<20, false); err != nil {
 		writeErr(w, 400, "bad request: "+err.Error())
 		return
 	}

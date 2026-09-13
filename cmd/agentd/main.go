@@ -62,6 +62,7 @@ import (
 	"github.com/zhu327/firepaas/internal/capabilities"
 	"github.com/zhu327/firepaas/internal/security/mtls"
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
+	"github.com/zhu327/firepaas/shared/pkg/env"
 	"github.com/zhu327/firepaas/shared/pkg/logging"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -85,11 +86,11 @@ func main() {
 }
 
 func run() error {
-	port := envOr("FIREPAAS_AGENT_GRPC_PORT", "5108")
-	proxyPort := envOr("FIREPAAS_AGENT_PROXY_PORT", "5107")
-	bind := envOr("FIREPAAS_AGENT_BIND", "127.0.0.1")
-	nodePool := envOr("FIREPAAS_AGENT_NODE_POOL", "compute")
-	nodeID := envOr("FIREPAAS_AGENT_NODE_ID", hostnameOr("firepaas-node"))
+	port := env.Get("FIREPAAS_AGENT_GRPC_PORT", "5108")
+	proxyPort := env.Get("FIREPAAS_AGENT_PROXY_PORT", "5107")
+	bind := env.Get("FIREPAAS_AGENT_BIND", "127.0.0.1")
+	nodePool := env.Get("FIREPAAS_AGENT_NODE_POOL", "compute")
+	nodeID := env.Get("FIREPAAS_AGENT_NODE_ID", hostnameOr("firepaas-node"))
 	fcVersion := os.Getenv("FIREPAAS_AGENT_FIRECRACKER_VERSION")
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -99,8 +100,8 @@ func run() error {
 	// 抓取必须由部署显式设置 FIREPAAS_AGENT_METRICS_BIND，并以网络 ACL 限制
 	// Prometheus 所在可信网段。必须在 runtime.Assemble 之前设置全局 meter
 	// provider——hypeman 各管理器在构造时从全局 provider 取 meter。
-	meter := initAgentMetrics(ctx, envOr("FIREPAAS_AGENT_METRICS_PORT", ""),
-		envOr("FIREPAAS_AGENT_METRICS_BIND", "127.0.0.1"))
+	meter := initAgentMetrics(ctx, env.Get("FIREPAAS_AGENT_METRICS_PORT", ""),
+		env.Get("FIREPAAS_AGENT_METRICS_BIND", "127.0.0.1"))
 
 	cfg, err := runtime.LoadConfig()
 	if err != nil {
@@ -125,21 +126,21 @@ func run() error {
 		return fmt.Errorf("ensure system files: %w", err)
 	}
 
-	ledgerPath := envOr("FIREPAAS_AGENT_LEDGER_PATH", filepath.Join(cfg.DataDir, "agent", "ledger.json"))
+	ledgerPath := env.Get("FIREPAAS_AGENT_LEDGER_PATH", filepath.Join(cfg.DataDir, "agent", "ledger.json"))
 	ledger, err := state.Open(ledgerPath)
 	if err != nil {
 		return err
 	}
 	// generation fence（P0-2）：machine → 已知最高 generation 高水位，
 	// 拒绝早于高水位的变更请求（重启保留；machine 删除后仍拒绝旧 re-create）。
-	fencesPath := envOr("FIREPAAS_AGENT_FENCES_PATH", filepath.Join(cfg.DataDir, "agent", "fences.json"))
+	fencesPath := env.Get("FIREPAAS_AGENT_FENCES_PATH", filepath.Join(cfg.DataDir, "agent", "fences.json"))
 	fences, err := state.OpenFences(fencesPath)
 	if err != nil {
 		return err
 	}
 	// 节点级 fabric 快照与高水位（ADR-0040 §18，T3）：ApplyFabric 全量替换
 	// 后崩溃安全落盘；重启后旧代请求继续被拒。
-	fabricPath := envOr("FIREPAAS_AGENT_FABRIC_PATH", filepath.Join(cfg.DataDir, "agent", "fabric.json"))
+	fabricPath := env.Get("FIREPAAS_AGENT_FABRIC_PATH", filepath.Join(cfg.DataDir, "agent", "fabric.json"))
 	fabric, err := state.OpenFabric(fabricPath)
 	if err != nil {
 		return err
@@ -149,7 +150,7 @@ func run() error {
 	// 启动时清理一次，之后每小时一次。fence 侧额外绑定 machine 存活（R2-6）：
 	// 活 machine 的高水位必须随 machine 存活，年龄窗口不适用；实例清单
 	// 不可得时跳过本轮 fence GC（不清单≠已死，误回收会让过期请求复活）。
-	retention, err := time.ParseDuration(envOr("FIREPAAS_AGENT_LEDGER_RETENTION", "24h"))
+	retention, err := time.ParseDuration(env.Get("FIREPAAS_AGENT_LEDGER_RETENTION", "24h"))
 	if err != nil || retention <= 0 {
 		return fmt.Errorf("invalid FIREPAAS_AGENT_LEDGER_RETENTION: %v", err)
 	}
@@ -198,15 +199,15 @@ func run() error {
 	// nft-fallback = emergency 模式。bridge 已删除（§24 兼容性行为变更：
 	// 移除 slotManager == nil 的 M1 遗留路径）。能力二选一上报：
 	// network.ebpf.v1 / network.nftfallback.v1（§12）。
-	networkBackend := envOr("FIREPAAS_NETWORK_BACKEND", "ebpf")
+	networkBackend := env.Get("FIREPAAS_NETWORK_BACKEND", "ebpf")
 	egressPort80 := envIntDefault("FIREPAAS_EGRESS_PROXY_PORT80", 18080)
 	egressPort443 := envIntDefault("FIREPAAS_EGRESS_PROXY_PORT443", 18443)
 	var slotBackend slot.Backend
 	// 同主机多 agent（ADR-0040 双节点 spike）：slot 名字/veth 地址池可配。
 	// 注意：nft fallback 后端使用全局 fp-isolation 表名，仅单 agent 主机支持；
 	// 双节点必须双双 ebpf。
-	slotNamePrefix := envOr("FIREPAAS_SLOT_NAME_PREFIX", "fp")
-	slotVethCIDR := envOr("FIREPAAS_SLOT_VETH_CIDR", slot.VethRange)
+	slotNamePrefix := env.Get("FIREPAAS_SLOT_NAME_PREFIX", "fp")
+	slotVethCIDR := env.Get("FIREPAAS_SLOT_VETH_CIDR", slot.VethRange)
 	var fabricPolicyBackend api.FabricPolicyWriter
 	netCapability := capabilities.NetworkNftFallbackV1
 	// ebpfActive：fabric（mesh）数据面只在 eBPF 后端可用（§12：nft fallback
@@ -216,7 +217,7 @@ func run() error {
 	switch networkBackend {
 	case "ebpf":
 		if err := ebpf.Probe(); err != nil {
-			if !strings.EqualFold(envOr("FIREPAAS_EBPF_FALLBACK", "true"), "true") {
+			if !strings.EqualFold(env.Get("FIREPAAS_EBPF_FALLBACK", "true"), "true") {
 				return fmt.Errorf("ebpf datapath unavailable and FIREPAAS_EBPF_FALLBACK=false (fail closed): %w", err)
 			}
 			slog.Warn("ebpf probe failed, falling back to nft (emergency mode)", "error", err)
@@ -228,11 +229,11 @@ func run() error {
 				EgressProxy80:  egressPort80,
 				EgressProxy443: egressPort443,
 				// 同主机多节点：bpffs 固定目录可配（默认 /sys/fs/bpf/firepaas）。
-				PinDir: envOr("FIREPAAS_EBPF_PIN_DIR", ""),
+				PinDir: env.Get("FIREPAAS_EBPF_PIN_DIR", ""),
 				// root 出口 NAT（T3）：eBPF 后端不建 nft fp-isolation 表，
 				// 必须自管 slot veth 源段 masquerade（ADR-0040 §7）。
 				VethCIDR:     slotVethCIDR,
-				RootNATTable: envOr("FIREPAAS_EBPF_ROOT_NAT_TABLE", ""),
+				RootNATTable: env.Get("FIREPAAS_EBPF_ROOT_NAT_TABLE", ""),
 				// G3（§21）：低基数指标（attach 失败/回落事件/策略代）。
 				Observer: newEbpfObserver(meter),
 			})
@@ -360,13 +361,13 @@ func run() error {
 		}
 	}
 	// M5.1：镜像解包大小准入（默认 4096MiB；0 = 不限）。
-	if v, err := strconv.ParseInt(envOr("FIREPAAS_IMAGE_MAX_UNPACK_MIB", "4096"), 10, 64); err == nil && v >= 0 {
+	if v, err := strconv.ParseInt(env.Get("FIREPAAS_IMAGE_MAX_UNPACK_MIB", "4096"), 10, 64); err == nil && v >= 0 {
 		adapter.SetMaxUnpackMib(v)
 	}
 	// v1.2-B（ADR-0024）：默认 one-shot 通道（vsock tmpfs + release gate，
 	// 值不落盘）。unsafe-persisted-env 已废弃，保留一个版本：明知 secret
 	// 会明文持久化到节点 metadata.json，下版本删除。
-	injectionMode := envOr("FIREPAAS_SECRET_INJECTION", machine.SecretInjectionOneShot)
+	injectionMode := env.Get("FIREPAAS_SECRET_INJECTION", machine.SecretInjectionOneShot)
 	adapter.SetSecretInjection(injectionMode)
 	if injectionMode == machine.SecretInjectionUnsafePersistedEnv {
 		slog.Warn("FIREPAAS_SECRET_INJECTION=unsafe-persisted-env is DEPRECATED: " +
@@ -375,7 +376,7 @@ func run() error {
 		slog.Warn("unknown FIREPAAS_SECRET_INJECTION; secret-bearing creates will be rejected", "mode", injectionMode)
 	}
 	// M4.5：standby 实例的首流量同步唤醑（autoresume）。
-	if strings.EqualFold(envOr("FIREPAAS_AGENT_AUTORESUME", "true"), "false") {
+	if strings.EqualFold(env.Get("FIREPAAS_AGENT_AUTORESUME", "true"), "false") {
 		adapter.SetAutoResume(false)
 		slog.Info("agent autoresume disabled")
 	}
@@ -389,7 +390,7 @@ func run() error {
 			otelmetric.WithAttributes(attribute.String("machine_id", machineID)))
 		slog.Info("autoresume wake", "machine_id", machineID, "took", took.Round(time.Millisecond))
 	})
-	if strings.EqualFold(envOr("FIREPAAS_AGENT_AUTOSTANDBY", "true"), "true") {
+	if strings.EqualFold(env.Get("FIREPAAS_AGENT_AUTOSTANDBY", "true"), "true") {
 		if err := startAutoStandby(ctx, set.Instances, probeReg, meter); err != nil {
 			slog.Warn("auto-standby controller disabled", "error", err)
 		}
@@ -504,7 +505,7 @@ func run() error {
 	// W3（§12/§24）：meshMode 单次解析后复用（与下发开关同值，避免双读漂移）；
 	// mesh.eastwest.v1 只在 ebpf 可用且显式 eastwest 时广告（WG 建联失败走
 	// fail-closed 退出，不静默缺席）。
-	meshMode := strings.ToLower(strings.TrimSpace(envOr("FIREPAAS_MESH", "disabled")))
+	meshMode := strings.ToLower(strings.TrimSpace(env.Get("FIREPAAS_MESH", "disabled")))
 	meshCapability := ""
 	if ebpfActive && meshMode == "eastwest" {
 		meshCapability = capabilities.MeshEastWestV1
@@ -527,16 +528,16 @@ func run() error {
 		}))
 
 	// M4（ADR-0006 收口）：proxy credential 验证材料（仅 SHA-256 摘要落盘）。
-	credsPath := envOr("FIREPAAS_AGENT_CREDS_PATH", filepath.Join(cfg.DataDir, "agent", "credentials.json"))
+	credsPath := env.Get("FIREPAAS_AGENT_CREDS_PATH", filepath.Join(cfg.DataDir, "agent", "credentials.json"))
 	creds, err := state.OpenCreds(credsPath)
 	if err != nil {
 		return err
 	}
 	// 兼容开关：默认强制 create 携带 execution-bound credential。
-	requireCred := strings.ToLower(envOr("FIREPAAS_PROXY_CREDENTIAL_REQUIRED", "true")) != "false"
+	requireCred := strings.ToLower(env.Get("FIREPAAS_PROXY_CREDENTIAL_REQUIRED", "true")) != "false"
 	// v1.1（ADR-0018）：PullImage（部署预取）磁盘水位守护（已用比例 ≥ 阈值拒绝）。
 	diskWatermark := 0.9
-	if v, err := strconv.ParseFloat(envOr("FIREPAAS_PREFETCH_DISK_WATERMARK", "0.9"), 64); err == nil && v > 0 &&
+	if v, err := strconv.ParseFloat(env.Get("FIREPAAS_PREFETCH_DISK_WATERMARK", "0.9"), 64); err == nil && v > 0 &&
 		v <= 1 {
 		diskWatermark = v
 	}
@@ -559,13 +560,13 @@ func run() error {
 				"mesh=eastwest requires the eBPF datapath; nft fallback node will NOT join the mesh (no WG device, no mesh routes, fabric policy unavailable)",
 			)
 		} else {
-			wgPort, err := strconv.ParseUint(envOr("FIREPAAS_MESH_WG_PORT", "51820"), 10, 16)
+			wgPort, err := strconv.ParseUint(env.Get("FIREPAAS_MESH_WG_PORT", "51820"), 10, 16)
 			if err != nil || wgPort == 0 {
-				return fmt.Errorf("invalid FIREPAAS_MESH_WG_PORT: %v", envOr("FIREPAAS_MESH_WG_PORT", "51820"))
+				return fmt.Errorf("invalid FIREPAAS_MESH_WG_PORT: %v", env.Get("FIREPAAS_MESH_WG_PORT", "51820"))
 			}
 			wgMgr, err := wg.New(wg.Options{
 				// 同主机多节点（双节点 spike）：WG 设备名可配，避免共享内核设备。
-				Iface:      envOr("FIREPAAS_MESH_WG_IFACE", "fp-wg0"),
+				Iface:      env.Get("FIREPAAS_MESH_WG_IFACE", "fp-wg0"),
 				KeyDir:     filepath.Join(cfg.DataDir, "agent", "fabric"),
 				ListenPort: uint16(wgPort),
 				Fabric:     fabric,
@@ -626,10 +627,10 @@ func run() error {
 		server.WithDiskWatermark(diskWatermark),
 		server.WithAdmissionDiskWatermark(envFloat("FIREPAAS_ADMISSION_DISK_WATERMARK", 0.9)),
 		server.WithRuntimeLimits(
-			envInt("FIREPAAS_RUNTIME_MAX_SESSIONS", 16),
-			int64(envInt("FIREPAAS_RUNTIME_MAX_BYTES", 100<<20)),
-			envDur("FIREPAAS_RUNTIME_MAX_DURATION", 15*time.Minute),
-			envDur("FIREPAAS_RUNTIME_IDLE_TIMEOUT", time.Minute)))
+			env.Int("FIREPAAS_RUNTIME_MAX_SESSIONS", 16),
+			int64(env.Int("FIREPAAS_RUNTIME_MAX_BYTES", 100<<20)),
+			env.Dur("FIREPAAS_RUNTIME_MAX_DURATION", 15*time.Minute),
+			env.Dur("FIREPAAS_RUNTIME_IDLE_TIMEOUT", time.Minute)))
 
 	lis, err := net.Listen("tcp", net.JoinHostPort(bind, port))
 	if err != nil {
@@ -724,7 +725,7 @@ func run() error {
 		// 切断全部在途 RPC（流的客户端侧按确定性重试语义处理，幂等性由
 		// operation ledger/fence 兜底）。proxy 走直接 Close（服务端推送的
 		// workload 响应没有优雅排空语义，close 即可）。
-		graceful := envDur("FIREPAAS_AGENT_GRACEFUL_STOP_TIMEOUT", 30*time.Second)
+		graceful := env.Dur("FIREPAAS_AGENT_GRACEFUL_STOP_TIMEOUT", 30*time.Second)
 		done := make(chan struct{})
 		go func() {
 			grpcServer.GracefulStop()
@@ -746,54 +747,6 @@ func run() error {
 		}
 		return nil
 	}
-}
-
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
-}
-
-// envDur 解析时长环境变量（非法/非正值回退默认）。
-func envDur(key string, def time.Duration) time.Duration {
-	v := os.Getenv(key)
-	if v == "" {
-		return def
-	}
-	d, err := time.ParseDuration(v)
-	if err != nil || d <= 0 {
-		return def
-	}
-	return d
-}
-
-// envFloat 解析 (0,1) 区间的浮点环境变量（非法/越界回退默认并告警）。
-func envFloat(key string, def float64) float64 {
-	v := os.Getenv(key)
-	if v == "" {
-		return def
-	}
-	f, err := strconv.ParseFloat(v, 64)
-	if err != nil || f <= 0 || f >= 1 {
-		slog.Warn("invalid env value; using default", "key", key, "value", v, "default", def)
-		return def
-	}
-	return f
-}
-
-// envInt 解析正整数环境变量（非法/非正值回退默认并告警）。
-func envInt(key string, def int) int {
-	v := os.Getenv(key)
-	if v == "" {
-		return def
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil || n <= 0 {
-		slog.Warn("invalid env value; using default", "key", key, "value", v, "default", def)
-		return def
-	}
-	return n
 }
 
 // liveSlotInstances 从 hypeman 实例清单构建 slot 对账的存活实例视图。
@@ -844,12 +797,28 @@ func slotReconcileInterval() time.Duration {
 // 而误删 live slot。datapath 是 api.Datapath（ADR-0040 §11）：对账逻辑与
 // 具体后端解耦，为 eBPF datapath 复用。
 // watchFabricDNS 周期把 fabric 快照的 NodePrefix 映射为节点本地 DNS 监听
-// 地址（"[基址]:53"，幂等重绑）。快照无前缀（首拍前/mesh 未生效）不启动；
-// 错误降级记日志（下轮重试）。
-func watchFabricDNS(ctx context.Context, srv *dnsserver.Server, fabric *state.Fabric) {
+// watchFabricLoop 是 fabric 快照驱动的周期 Ensure 共享循环（5s）：
+// 首拍立即执行一次，之后每 tick 一次；错误由 tick 闭包自行降级记日志，
+// ctx 取消即退出。watchFabricDNS/Ingress 的差异只在 tick 闭包里
+// （地址推导 + Ensure 目标不同），ticker/select 只保留一份实现。
+func watchFabricLoop(ctx context.Context, tick func()) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
+		tick()
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// watchFabricDNS 周期把 fabric 快照的 NodePrefix 映射为节点本地 DNS 监听
+// 地址（"[基址]:53"，幂等重绑）。快照无前缀（首拍前/mesh 未生效）不启动；
+// 错误降级记日志（下轮重试）。
+func watchFabricDNS(ctx context.Context, srv *dnsserver.Server, fabric *state.Fabric) {
+	watchFabricLoop(ctx, func() {
 		snap := fabric.Current()
 		if snap.NodePrefix != "" {
 			if prefix, err := netip.ParsePrefix(snap.NodePrefix); err == nil {
@@ -859,30 +828,18 @@ func watchFabricDNS(ctx context.Context, srv *dnsserver.Server, fabric *state.Fa
 				}
 			}
 		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-	}
+	})
 }
 
 // watchFabricIngress 周期把 fabric 快照的 NodePrefix 映射为 fabric ingress
 // 监听（"[节点 ULA]:port"，幂等重绑）。快照无前缀（首拍前）不启动；错误
 // 降级记日志（下轮重试）——edge 会因 mesh:endpoint 不可达回落 legacy。
 func watchFabricIngress(ctx context.Context, srv *fabricingress.Server, fabric *state.Fabric) {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-	for {
+	watchFabricLoop(ctx, func() {
 		if err := srv.Ensure(ctx, fabric.Current().NodePrefix); err != nil {
 			slog.Warn("fabric ingress ensure", "error", err)
 		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-	}
+	})
 }
 
 func startSlotReconcileLoop(ctx context.Context, mgr instances.Manager, datapath api.Datapath, interval time.Duration) {
@@ -915,6 +872,25 @@ func startSlotReconcileLoop(ctx context.Context, mgr instances.Manager, datapath
 			}
 		}
 	}()
+}
+
+// envFloat 解析 (0,1) 区间的浮点环境变量（非法/越界回退默认并告警）。
+// 解析复用 shared/pkg/env.Float，区间检查保留本地（包内测试契约见 main_env_test.go）。
+func envFloat(key string, def float64) float64 {
+	f := env.Float(key, def)
+	if f <= 0 || f >= 1 {
+		if raw := os.Getenv(key); raw != "" {
+			slog.Warn("invalid env value; using default", "key", key, "value", raw, "default", def)
+		}
+		return def
+	}
+	return f
+}
+
+// envInt 解析正整数环境变量（非法/非正值回退默认并告警）。
+// 解析复用 shared/pkg/env.Int（包内测试契约见 main_env_test.go）。
+func envInt(key string, def int) int {
+	return env.Int(key, def)
 }
 
 // envIntDefault 解析整数环境变量（0 合法，非法/负值回退默认；egress 端口用）。
@@ -1040,7 +1016,7 @@ func agentServerTLS(meter otelmetric.Meter) (*tls.Config, *mtls.CertManager, err
 		}
 	}
 	cm, err := mtls.NewCertManager(certFile, keyFile,
-		envDur("FIREPAAS_AGENT_TLS_CERT_RELOAD_INTERVAL", time.Minute),
+		env.Dur("FIREPAAS_AGENT_TLS_CERT_RELOAD_INTERVAL", time.Minute),
 		slog.Default().With("component", "mtls"), hook)
 	if err != nil {
 		return nil, nil, err
@@ -1082,7 +1058,7 @@ func startAutoStandby(
 		return fmt.Errorf("instance manager lacks auto-standby runtime persistence")
 	}
 	maxConcurrent := 4
-	if v, err := strconv.Atoi(envOr("FIREPAAS_AUTOSTANDBY_MAX_CONCURRENT", "4")); err == nil && v > 0 {
+	if v, err := strconv.Atoi(env.Get("FIREPAAS_AUTOSTANDBY_MAX_CONCURRENT", "4")); err == nil && v > 0 {
 		maxConcurrent = v
 	}
 	// 快照同步间隔：hypeman 默认 5min——实例 Created→Running 的转变没有
@@ -1090,7 +1066,7 @@ func startAutoStandby(
 	// 控制器只能靠快照发现新就绪实例。缩短到 30s：每次同步 = 一次
 	// ListInstances + 一次 conntrack dump + 全实例刷新（廉价）。
 	syncInterval := 30 * time.Second
-	if v, err := time.ParseDuration(envOr("FIREPAAS_AUTOSTANDBY_SYNC_INTERVAL", "30s")); err == nil && v > 0 {
+	if v, err := time.ParseDuration(env.Get("FIREPAAS_AUTOSTANDBY_SYNC_INTERVAL", "30s")); err == nil && v > 0 {
 		syncInterval = v
 	}
 	opts := autostandby.ControllerOptions{

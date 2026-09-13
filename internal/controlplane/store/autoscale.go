@@ -35,29 +35,56 @@ func DefaultAutoscalePolicy() AutoscalePolicy {
 	}
 }
 
+// autoscaleBounds 是 ADR-0041 §1 边界的单一事实表（Validate 与 clamp 共用，
+// 数值变更只改一处；错误文案与钳制语义不变）。
+var autoscaleBounds = struct {
+	minReplicas       [2]int
+	maxReplicas       [2]int
+	targetConcurrency [2]int
+	scaleDownDelaySec [2]int
+	panicThreshold    [2]float64
+}{
+	minReplicas:       [2]int{0, 100},
+	maxReplicas:       [2]int{1, 100},
+	targetConcurrency: [2]int{1, 256},
+	scaleDownDelaySec: [2]int{30, 600},
+	panicThreshold:    [2]float64{1.5, 5.0},
+}
+
+// clampBound 把 v 钳制到 [lo,hi]（整数/浮点通用，避免每字段手写双分支）。
+func clampBound[T int | float64](v, lo, hi T) T {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
 // ValidateAutoscalePolicy 校验策略（API 层 400 + store 侧写入前双保险）。
 // 约束（ADR-0041 §1）：0<=min<=max<=100 且 max>=1；1<=target<=256；
 // 30<=delay<=600；1.5<=panic<=5.0。
 func ValidateAutoscalePolicy(p AutoscalePolicy) error {
-	if p.MinReplicas < 0 || p.MaxReplicas < 0 {
+	if p.MinReplicas < autoscaleBounds.minReplicas[0] || p.MaxReplicas < autoscaleBounds.minReplicas[0] {
 		return fmt.Errorf("min_replicas and max_replicas must be >= 0")
 	}
-	if p.MaxReplicas < 1 {
+	if p.MaxReplicas < autoscaleBounds.maxReplicas[0] {
 		return fmt.Errorf("max_replicas must be >= 1 (max=0 would pin an enabled app at zero replicas)")
 	}
-	if p.MaxReplicas > 100 {
+	if p.MaxReplicas > autoscaleBounds.maxReplicas[1] {
 		return fmt.Errorf("max_replicas must be <= 100")
 	}
 	if p.MinReplicas > p.MaxReplicas {
 		return fmt.Errorf("min_replicas must be <= max_replicas")
 	}
-	if p.TargetConcurrency < 1 || p.TargetConcurrency > 256 {
+	if p.TargetConcurrency < autoscaleBounds.targetConcurrency[0] || p.TargetConcurrency > autoscaleBounds.targetConcurrency[1] {
 		return fmt.Errorf("target_concurrency must be in [1,256]")
 	}
-	if p.ScaleDownDelaySec < 30 || p.ScaleDownDelaySec > 600 {
+	if p.ScaleDownDelaySec < autoscaleBounds.scaleDownDelaySec[0] || p.ScaleDownDelaySec > autoscaleBounds.scaleDownDelaySec[1] {
 		return fmt.Errorf("scale_down_delay_sec must be in [30,600]")
 	}
-	if p.PanicThreshold < 1.5 || p.PanicThreshold > 5.0 {
+	if p.PanicThreshold < autoscaleBounds.panicThreshold[0] || p.PanicThreshold > autoscaleBounds.panicThreshold[1] {
 		return fmt.Errorf("panic_threshold must be in [1.5,5.0]")
 	}
 	return nil
@@ -66,36 +93,14 @@ func ValidateAutoscalePolicy(p AutoscalePolicy) error {
 // clampAutoscalePolicy 防脏行：读时钳制到合法域（DB 无 CHECK 约束，
 // 历史/手工行可能越界；决策循环读此口径，不信任裸列值）。
 func clampAutoscalePolicy(p AutoscalePolicy) AutoscalePolicy {
-	if p.MinReplicas < 0 {
-		p.MinReplicas = 0
-	}
-	if p.MaxReplicas < 1 {
-		p.MaxReplicas = 1
-	}
-	if p.MaxReplicas > 100 {
-		p.MaxReplicas = 100
-	}
+	p.MinReplicas = clampBound(p.MinReplicas, autoscaleBounds.minReplicas[0], autoscaleBounds.minReplicas[1])
+	p.MaxReplicas = clampBound(p.MaxReplicas, autoscaleBounds.maxReplicas[0], autoscaleBounds.maxReplicas[1])
 	if p.MinReplicas > p.MaxReplicas {
 		p.MinReplicas = p.MaxReplicas
 	}
-	if p.TargetConcurrency < 1 {
-		p.TargetConcurrency = 1
-	}
-	if p.TargetConcurrency > 256 {
-		p.TargetConcurrency = 256
-	}
-	if p.ScaleDownDelaySec < 30 {
-		p.ScaleDownDelaySec = 30
-	}
-	if p.ScaleDownDelaySec > 600 {
-		p.ScaleDownDelaySec = 600
-	}
-	if p.PanicThreshold < 1.5 {
-		p.PanicThreshold = 1.5
-	}
-	if p.PanicThreshold > 5.0 {
-		p.PanicThreshold = 5.0
-	}
+	p.TargetConcurrency = clampBound(p.TargetConcurrency, autoscaleBounds.targetConcurrency[0], autoscaleBounds.targetConcurrency[1])
+	p.ScaleDownDelaySec = clampBound(p.ScaleDownDelaySec, autoscaleBounds.scaleDownDelaySec[0], autoscaleBounds.scaleDownDelaySec[1])
+	p.PanicThreshold = clampBound(p.PanicThreshold, autoscaleBounds.panicThreshold[0], autoscaleBounds.panicThreshold[1])
 	return p
 }
 

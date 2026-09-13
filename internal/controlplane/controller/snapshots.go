@@ -564,10 +564,16 @@ func AvailableRestoreModes(d RestoreDecision, memoryCap, filesystemCap bool) []s
 	return modes
 }
 
+// IsMemoryKind 判定快照 kind 是否为 memory（大小写不敏感；空串为 false）。
+// httpapi 预检与 controller 派发共用，避免 EqualFold("MEMORY") 四处重复。
+func IsMemoryKind(kind string) bool {
+	return strings.EqualFold(kind, "MEMORY")
+}
+
 // SnapshotCapability returns the node feature required to consume a snapshot
 // without restore-mode conversion (fork).
 func SnapshotCapability(kind string) string {
-	if strings.EqualFold(kind, "MEMORY") {
+	if IsMemoryKind(kind) {
 		return capabilities.SnapshotMemoryV1
 	}
 	return capabilities.SnapshotFilesystemV1

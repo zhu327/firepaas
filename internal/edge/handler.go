@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/zhu327/firepaas/internal/capabilities"
 	"github.com/zhu327/firepaas/internal/controlplane/catalog"
 	"github.com/zhu327/firepaas/internal/controlplane/traffic"
 	"github.com/zhu327/firepaas/internal/edge/mesh"
@@ -839,14 +840,15 @@ func (h *Handler) selectBackend(route *catalog.Route, pin string) (catalog.Backe
 		if b.Draining {
 			continue
 		}
-		// readiness 白名单与 publisher 契约严格一致：machineServing()
-		// (internal/controlplane/routepublisher/publisher.go) 只发布
-		// ObservedReadiness ∈ {READY, UNCONFIGURED} 的 backend，任何其它值
+		// readiness 白名单与 publisher 契约严格一致：capabilities.IsServingReadiness
+		// 只放行 ObservedReadiness ∈ {READY, UNCONFIGURED} 的 backend，任何其它值
 		//（空串、NOT_READY、未知/拼写漂移）表示投影异常，拒绝并计数，
 		// 不把"空"当作"未完成探针"放行。
-		switch b.Readiness {
-		case "READY", "UNCONFIGURED":
+		if capabilities.IsServingReadiness(b.Readiness) {
 			eligible = append(eligible, b)
+			continue
+		}
+		switch b.Readiness {
 		case "":
 			h.cnt.backendIneligibleEmpty.Add(1)
 		case "NOT_READY":

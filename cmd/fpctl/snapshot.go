@@ -32,8 +32,9 @@ func runSnapshot(args []string) error {
 	}
 	switch args[0] {
 	case "create":
-		if len(args) < 2 {
-			return errors.New("usage: fpctl snapshot create <machine_id> [flags]")
+		machineID, err := oneArg(args[1:], "usage: fpctl snapshot create <machine_id> [flags]")
+		if err != nil {
+			return err
 		}
 		fs := flag.NewFlagSet("snapshot create", flag.ExitOnError)
 		kind := fs.String("kind", "memory", "memory|filesystem")
@@ -43,35 +44,24 @@ func runSnapshot(args []string) error {
 		retention := fs.String("retention-class", "", "retention class")
 		idem := idemKeyFlag(fs)
 		_ = fs.Parse(args[2:])
-		body := map[string]any{"kind": *kind, "name": *name, "compression": *compression, "retention_class": *retention}
-		if *level >= 0 {
-			body["compression_level"] = *level
-		}
-		return doIdem("POST", "/v1/machines/"+url.PathEscape(args[1])+"/snapshots", body, nil, resolveIdemKey(*idem))
+		body := map[string]any{"kind": *kind, "compression": *compression}
+		put(body, "name", *name)
+		put(body, "retention_class", *retention)
+		putAny(body, "compression_level", *level, *level >= 0)
+		return doRequest(apiClient, "POST", "/v1/machines/"+url.PathEscape(machineID)+"/snapshots", body, nil, resolveIdemKey(*idem), true)
 	case "ls":
 		fs := flag.NewFlagSet("snapshot ls", flag.ExitOnError)
-		project := fs.String("project", defaultProject(""), "filter by project id")
+		project := projectFlag(fs, "")
 		_ = fs.Parse(args[1:])
-		path := "/v1/snapshots"
-		if *project != "" {
-			path += "?project_id=" + url.QueryEscape(*project)
-		}
-		return do("GET", path, nil, nil)
+		return do("GET", withQuery("/v1/snapshots", map[string]string{"project_id": *project}), nil, nil)
 	case "show":
-		id, err := oneArg(args[1:], "usage: fpctl snapshot show <snapshot_id>")
-		if err != nil {
-			return err
-		}
-		return do("GET", "/v1/snapshots/"+url.PathEscape(id), nil, nil)
+		return getByID(args[1:], "usage: fpctl snapshot show <snapshot_id>", "/v1/snapshots")
 	case "rm":
-		id, err := oneArg(args[1:], "usage: fpctl snapshot rm <snapshot_id>")
+		return deleteByID(args[1:], "usage: fpctl snapshot rm <snapshot_id>", "/v1/snapshots")
+	case "schedule-set":
+		machineID, err := oneArg(args[1:], "usage: fpctl snapshot schedule-set <machine_id> --interval <sec>")
 		if err != nil {
 			return err
-		}
-		return do("DELETE", "/v1/snapshots/"+url.PathEscape(id), nil, nil)
-	case "schedule-set":
-		if len(args) < 2 {
-			return errors.New("usage: fpctl snapshot schedule-set <machine_id> --interval <sec>")
 		}
 		fs := flag.NewFlagSet("snapshot schedule-set", flag.ExitOnError)
 		interval := fs.Int("interval", 3600, "interval seconds (>= 60)")
@@ -87,7 +77,7 @@ func runSnapshot(args []string) error {
 			"max_count": *maxCount, "max_age_seconds": *maxAge,
 			"compression": *compression, "enabled": enabled,
 		}
-		return do("POST", "/v1/machines/"+url.PathEscape(args[1])+"/snapshot-schedules", body, nil)
+		return do("POST", "/v1/machines/"+url.PathEscape(machineID)+"/snapshot-schedules", body, nil)
 	case "schedule-ls":
 		id, err := oneArg(args[1:], "usage: fpctl snapshot schedule-ls <machine_id>")
 		if err != nil {
@@ -95,18 +85,20 @@ func runSnapshot(args []string) error {
 		}
 		return do("GET", "/v1/machines/"+url.PathEscape(id)+"/snapshot-schedules", nil, nil)
 	case "schedule-rm":
-		if len(args) < 3 {
-			return errors.New("usage: fpctl snapshot schedule-rm <machine_id> <schedule_id>")
+		machineID, scheduleID, err := twoArgs(args[1:], "usage: fpctl snapshot schedule-rm <machine_id> <schedule_id>")
+		if err != nil {
+			return err
 		}
 		return do(
 			"DELETE",
-			"/v1/machines/"+url.PathEscape(args[1])+"/snapshot-schedules/"+url.PathEscape(args[2]),
+			"/v1/machines/"+url.PathEscape(machineID)+"/snapshot-schedules/"+url.PathEscape(scheduleID),
 			nil,
 			nil,
 		)
 	case "fork":
-		if len(args) < 2 {
-			return errors.New("usage: fpctl snapshot fork <snapshot_id> --app <app_id> --ttl <sec>")
+		snapID, err := oneArg(args[1:], "usage: fpctl snapshot fork <snapshot_id> --app <app_id> --ttl <sec>")
+		if err != nil {
+			return err
 		}
 		fs := flag.NewFlagSet("snapshot fork", flag.ExitOnError)
 		app := fs.String("app", "", "host app id (required, same project)")
@@ -118,19 +110,21 @@ func runSnapshot(args []string) error {
 			return errors.New("usage: fpctl snapshot fork <snapshot_id> --app <app_id> --ttl <sec>")
 		}
 		body := map[string]any{"app_id": *app, "ttl_seconds": *ttl, "restore_mode": *mode}
-		return doIdem("POST", "/v1/snapshots/"+url.PathEscape(args[1])+"/fork", body, nil, resolveIdemKey(*idem))
+		return doRequest(apiClient, "POST", "/v1/snapshots/"+url.PathEscape(snapID)+"/fork", body, nil, resolveIdemKey(*idem), true)
 	case "preflight":
-		if len(args) < 2 {
-			return errors.New("usage: fpctl snapshot preflight <snapshot_id> [--restore-mode M]")
+		snapID, err := oneArg(args[1:], "usage: fpctl snapshot preflight <snapshot_id> [--restore-mode M]")
+		if err != nil {
+			return err
 		}
 		fs := flag.NewFlagSet("snapshot preflight", flag.ExitOnError)
 		mode := fs.String("restore-mode", "", "memory|filesystem|auto (default auto)")
 		_ = fs.Parse(args[2:])
-		return do("POST", "/v1/snapshots/"+url.PathEscape(args[1])+"/preflight",
+		return do("POST", "/v1/snapshots/"+url.PathEscape(snapID)+"/preflight",
 			map[string]any{"restore_mode": *mode}, nil)
 	case "rescue":
-		if len(args) < 2 {
-			return errors.New("usage: fpctl snapshot rescue <machine_id> --snapshot <snap_id>")
+		machineID, err := oneArg(args[1:], "usage: fpctl snapshot rescue <machine_id> --snapshot <snap_id>")
+		if err != nil {
+			return err
 		}
 		fs := flag.NewFlagSet("snapshot rescue", flag.ExitOnError)
 		snap := fs.String("snapshot", "", "snapshot id (required)")
@@ -141,7 +135,7 @@ func runSnapshot(args []string) error {
 			return errors.New("usage: fpctl snapshot rescue <machine_id> --snapshot <snap_id>")
 		}
 		body := map[string]any{"snapshot_id": *snap, "restore_mode": *mode}
-		return doIdem("POST", "/v1/machines/"+url.PathEscape(args[1])+"/rescue", body, nil, resolveIdemKey(*idem))
+		return doRequest(apiClient, "POST", "/v1/machines/"+url.PathEscape(machineID)+"/rescue", body, nil, resolveIdemKey(*idem), true)
 	default:
 		return fmt.Errorf("unknown snapshot command %q", args[0])
 	}

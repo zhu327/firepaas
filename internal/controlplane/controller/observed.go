@@ -1021,11 +1021,11 @@ func (c *Controller) expireMachines(ctx context.Context) error {
 		c.userEvent(ctx, project, m.AppID, m.ID, store.UserEventMachineExpired, nil)
 		c.metrics.Inc("firepaas_machine_expiry_total", nil, 1)
 		op, err := c.store.EnqueueDelete(ctx, project, m.ID, exec, opID, m.Generation, raw)
+		if errors.Is(err, store.ErrRequestConflict) {
+			slog.Warn("ttl delete idempotency conflict", "machine_id", m.ID, "error", err)
+			continue
+		}
 		if err != nil {
-			if errors.Is(err, store.ErrRequestConflict) {
-				slog.Warn("ttl delete idempotency conflict", "machine_id", m.ID, "error", err)
-				continue
-			}
 			slog.Error("enqueue ttl delete", "machine_id", m.ID, "error", err)
 			continue
 		}

@@ -113,7 +113,7 @@ func (a *API) putProjectQuota(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body store.ProjectQuotaDetail
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil {
+	if err := decodeJSONBody(w, r, &body, 1<<16, false); err != nil {
 		writeErr(w, 400, "invalid quota body: "+err.Error())
 		return
 	}
@@ -173,7 +173,7 @@ func (a *API) putRateLimits(w http.ResponseWriter, r *http.Request) {
 		StreamRate    float64 `json:"stream_rate"`
 		StreamBurst   float64 `json:"stream_burst"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil {
+	if err := decodeJSONBody(w, r, &body, 1<<16, false); err != nil {
 		writeErr(w, 400, "invalid rate limit body: "+err.Error())
 		return
 	}

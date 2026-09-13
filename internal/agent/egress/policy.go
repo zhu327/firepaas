@@ -66,6 +66,21 @@ type Policy struct {
 }
 
 // FromProto 解析并归一 proto 策略。返回 error 时 p 为 nil。
+func parseCIDRList(raws []string, field string) ([]netip.Prefix, error) {
+	out := make([]netip.Prefix, 0, len(raws))
+	for i, raw := range raws {
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(raw))
+		if err != nil {
+			return nil, fmt.Errorf("egress %s[%d] %q: %w", field, i, raw, err)
+		}
+		if prefix.Addr().Is6() {
+			return nil, fmt.Errorf("egress %s[%d] %q: IPv6 egress is not supported", field, i, raw)
+		}
+		out = append(out, prefix.Masked())
+	}
+	return out, nil
+}
+
 func FromProto(p *pb.EgressPolicySpec) (*Policy, error) {
 	if p == nil {
 		return nil, nil
@@ -81,26 +96,16 @@ func FromProto(p *pb.EgressPolicySpec) (*Policy, error) {
 	default:
 		return nil, fmt.Errorf("invalid egress mode %d", p.GetMode())
 	}
-	for i, raw := range p.GetAllowedCidrs() {
-		prefix, err := netip.ParsePrefix(strings.TrimSpace(raw))
-		if err != nil {
-			return nil, fmt.Errorf("egress allowed_cidrs[%d] %q: %w", i, raw, err)
-		}
-		if prefix.Addr().Is6() {
-			return nil, fmt.Errorf("egress allowed_cidrs[%d] %q: IPv6 egress is not supported", i, raw)
-		}
-		out.AllowedCIDRs = append(out.AllowedCIDRs, prefix.Masked())
+	allowed, err := parseCIDRList(p.GetAllowedCidrs(), "allowed_cidrs")
+	if err != nil {
+		return nil, err
 	}
-	for i, raw := range p.GetDeniedCidrs() {
-		prefix, err := netip.ParsePrefix(strings.TrimSpace(raw))
-		if err != nil {
-			return nil, fmt.Errorf("egress denied_cidrs[%d] %q: %w", i, raw, err)
-		}
-		if prefix.Addr().Is6() {
-			return nil, fmt.Errorf("egress denied_cidrs[%d] %q: IPv6 egress is not supported", i, raw)
-		}
-		out.DeniedCIDRs = append(out.DeniedCIDRs, prefix.Masked())
+	out.AllowedCIDRs = allowed
+	denied, err := parseCIDRList(p.GetDeniedCidrs(), "denied_cidrs")
+	if err != nil {
+		return nil, err
 	}
+	out.DeniedCIDRs = denied
 	for i, raw := range p.GetAllowedDomains() {
 		normalized, err := normalizeDomain(raw)
 		if err != nil {
@@ -264,58 +269,90 @@ type Decision struct {
 	CIDRAuthorized bool
 }
 
+// cidrOutcome 是 CIDR 决策矩阵的纯决策结果（不含审计 Reason 文案，由
+// 调用方按各自口径填充——DecideForProxied 用 resolved 口径，DecideByCIDR
+// 用 destination 口径）。
+type cidrOutcome int
+
+const (
+	cidrDenied    cidrOutcome = iota // 任一命中 denied_cidrs → 拒绝（deny 优先）
+	cidrAllowed                      // 命中 allowed_cidrs → 放行（CIDR 授权）
+	cidrModeAllow                    // unrestricted 默认放行
+	cidrModeDeny                     // deny_all 默认拒绝
+	cidrNeedHost                     // allowlist 未命中 → 走 host/domain 分支
+	cidrUnknown                      // 未知模式 → fail closed
+)
+
+// decideCIDR 合并 DecideForProxied 与 DecideByCIDR 的 CIDR 决策矩阵
+// （纯函数）：denied 优先于 allowed；unrestricted 默认放行；deny_all
+// 默认拒绝；allowlist 未命中时返回 cidrNeedHost 由调用方走域名分支。
+func decideCIDR(mode Mode, deniedHit, allowedHit bool) cidrOutcome {
+	switch mode {
+	case ModeUnrestricted:
+		if deniedHit {
+			return cidrDenied
+		}
+		return cidrModeAllow
+	case ModeDenyAll:
+		if deniedHit {
+			return cidrDenied
+		}
+		if allowedHit {
+			return cidrAllowed
+		}
+		return cidrModeDeny
+	case ModeAllowlist:
+		if deniedHit {
+			return cidrDenied
+		}
+		if allowedHit {
+			return cidrAllowed
+		}
+		return cidrNeedHost
+	}
+	// 未知模式 fail closed（保持原“unknown mode”拒绝口径，不因命中翻转）。
+	return cidrUnknown
+}
+
 // DecideForProxied 判定经透明代理的 80/443 连接。host 空 = 无 Host/SNI
 // （ECH/非标准请求）；resolved 是本连接可信解析得到的 A/AAAA 集合（可为空）。
 // 调用方保证已对 resolved 逐项做过保留段检查；这里只负责策略矩阵。
 // 空 resolved = fail closed（ADR-0027：解析失败/集合为空必须拒绝）。
 func (p *Policy) DecideForProxied(host string, resolved []netip.Addr) Decision {
 	host = NormalizeHost(host)
-	denied := func() bool {
-		for _, a := range resolved {
-			if containsCIDR(p.DeniedCIDRs, a) {
-				return true
-			}
-		}
-		return false
-	}
-	allowedByCIDR := false
+	deniedHit := false
 	for _, a := range resolved {
-		if containsCIDR(p.AllowedCIDRs, a) {
-			allowedByCIDR = true
+		if containsCIDR(p.DeniedCIDRs, a) {
+			deniedHit = true
 			break
 		}
 	}
-	switch p.Mode {
-	case ModeUnrestricted:
-		if denied() {
-			return Decision{Allow: false, MatchType: "cidr_denied", Reason: "resolved address in denied_cidrs"}
+	allowedHit := false
+	for _, a := range resolved {
+		if containsCIDR(p.AllowedCIDRs, a) {
+			allowedHit = true
+			break
 		}
+	}
+	switch decideCIDR(p.Mode, deniedHit, allowedHit) {
+	case cidrDenied:
+		return Decision{Allow: false, MatchType: "cidr_denied", Reason: "resolved address in denied_cidrs"}
+	case cidrAllowed:
+		return Decision{
+			Allow:          true,
+			MatchType:      "cidr_allowed",
+			Reason:         "resolved address in allowed_cidrs",
+			CIDRAuthorized: true,
+		}
+	case cidrModeAllow:
 		return Decision{Allow: true, MatchType: "mode_default", Reason: "unrestricted mode"}
-	case ModeDenyAll:
-		if denied() {
-			return Decision{Allow: false, MatchType: "cidr_denied", Reason: "resolved address in denied_cidrs"}
-		}
-		if allowedByCIDR {
-			return Decision{
-				Allow:          true,
-				MatchType:      "cidr_allowed",
-				Reason:         "resolved address in allowed_cidrs",
-				CIDRAuthorized: true,
-			}
-		}
+	case cidrModeDeny:
 		return Decision{Allow: false, MatchType: "mode_default", Reason: "deny_all mode"}
-	case ModeAllowlist:
-		if denied() {
-			return Decision{Allow: false, MatchType: "cidr_denied", Reason: "resolved address in denied_cidrs"}
-		}
-		if allowedByCIDR {
-			return Decision{
-				Allow:          true,
-				MatchType:      "cidr_allowed",
-				Reason:         "resolved address in allowed_cidrs",
-				CIDRAuthorized: true,
-			}
-		}
+	case cidrUnknown:
+		return Decision{Allow: false, MatchType: "mode_default", Reason: "unknown mode"}
+	}
+	// cidrNeedHost（allowlist 未命中）：走 host/domain 分支。
+	if p.Mode == ModeAllowlist {
 		if host == "" {
 			// 无 Host/SNI/ECH：域名规则无法保护，allowlist-only 默认拒绝。
 			return Decision{
@@ -339,27 +376,18 @@ func (p *Policy) DecideForProxied(host string, resolved []netip.Addr) Decision {
 // DecideByCIDR 判定非 80/443 TCP 与 UDP（只按 CIDR 矩阵；deny_all/allowlist
 // 默认拒绝，unrestricted 默认放行）。audit 用。
 func (p *Policy) DecideByCIDR(addr netip.Addr) Decision {
-	switch p.Mode {
-	case ModeUnrestricted:
-		if containsCIDR(p.DeniedCIDRs, addr) {
-			return Decision{Allow: false, MatchType: "cidr_denied", Reason: "destination in denied_cidrs"}
-		}
+	deniedHit := containsCIDR(p.DeniedCIDRs, addr)
+	allowedHit := containsCIDR(p.AllowedCIDRs, addr)
+	switch decideCIDR(p.Mode, deniedHit, allowedHit) {
+	case cidrDenied:
+		return Decision{Allow: false, MatchType: "cidr_denied", Reason: "destination in denied_cidrs"}
+	case cidrAllowed:
+		return Decision{Allow: true, MatchType: "cidr_allowed", Reason: "destination in allowed_cidrs"}
+	case cidrModeAllow:
 		return Decision{Allow: true, MatchType: "mode_default", Reason: "unrestricted mode"}
-	case ModeDenyAll:
-		if containsCIDR(p.DeniedCIDRs, addr) {
-			return Decision{Allow: false, MatchType: "cidr_denied", Reason: "destination in denied_cidrs"}
-		}
-		if containsCIDR(p.AllowedCIDRs, addr) {
-			return Decision{Allow: true, MatchType: "cidr_allowed", Reason: "destination in allowed_cidrs"}
-		}
+	case cidrModeDeny:
 		return Decision{Allow: false, MatchType: "mode_default", Reason: "deny_all mode"}
-	case ModeAllowlist:
-		if containsCIDR(p.DeniedCIDRs, addr) {
-			return Decision{Allow: false, MatchType: "cidr_denied", Reason: "destination in denied_cidrs"}
-		}
-		if containsCIDR(p.AllowedCIDRs, addr) {
-			return Decision{Allow: true, MatchType: "cidr_allowed", Reason: "destination in allowed_cidrs"}
-		}
+	case cidrNeedHost:
 		return Decision{
 			Allow:     false,
 			MatchType: "mode_default",

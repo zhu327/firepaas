@@ -599,10 +599,10 @@ func (b *Backend) ApplyEgress(ctx context.Context, ref slot.SlotRef, snap *api.P
 	// 落表：内层先清后写，再挂外层，最后写 mode（读端任一中间态仍是旧
 	// 快照或空条目；空外层条目 = unrestricted，崩溃窗口 fail-open 等价
 	// 重启前空表语义，重放后收敛——见 Backend 注释）。
-	if err := b.clearMaps(deny); err != nil {
+	if err := clearHashMap[lpm4Key, uint8](deny); err != nil {
 		return err
 	}
-	if err := b.clearMaps(allow); err != nil {
+	if err := clearHashMap[lpm4Key, uint8](allow); err != nil {
 		return err
 	}
 	for _, p := range denied {
@@ -887,18 +887,6 @@ func (b *Backend) putLPM(m *ebpf.Map, p netip.Prefix) error {
 type lpm4Key struct {
 	Prefixlen uint32
 	Data      uint32
-}
-
-func (b *Backend) clearMaps(m *ebpf.Map) error {
-	iter := m.Iterate()
-	var key lpm4Key
-	var val uint8
-	for iter.Next(&key, &val) {
-		if err := m.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
-			return fmt.Errorf("ebpf: clear map: %w", err)
-		}
-	}
-	return iter.Err()
 }
 
 func ipv4Key(ip string) (uint32, error) {

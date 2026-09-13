@@ -429,14 +429,34 @@ func policyTimeout(p *healthcheck.Policy) time.Duration {
 	return d
 }
 
+// probeTimeout 是探针网络 IO 的硬上限（防 SSRF 型慢响应卡死 worker）；
+// 单探针实际超时由 policyTimeout（截断到剩余预算）的 per-request ctx 控制
+// （P3：此前硬编码 2s 截断用户配置）。集中一处，checkHTTP/checkTCP 与
+// dialer 共用，不改值。
+const probeTimeout = 30 * time.Second
+
+// sharedHTTPClient 返回探针共享 HTTP 客户端基（Timeout 硬上限统一一处）。
+func sharedHTTPClient() *http.Client {
+	return &http.Client{Timeout: probeTimeout}
+}
+
+// endpointFor 合并 checkHTTP/checkTCP 的前置守卫：实例无网络地址直接
+// 失败，否则返回拨号/host 用的 endpoint（ip:port）。
+func endpointFor(inst healthcheck.Instance, port uint16) (string, bool) {
+	if !inst.NetworkEnabled || inst.IP == "" {
+		return "", false
+	}
+	return net.JoinHostPort(inst.IP, strconv.Itoa(int(port))), true
+}
+
 // ProbeHTTPClient 是探针共享 HTTP 客户端（agentd 装配 RecordingRunner 用）。
-func ProbeHTTPClient() *http.Client { return probeHTTPClient() }
+func ProbeHTTPClient() *http.Client { return sharedHTTPClient() }
 
 // probeHTTPClient 是探针共享 HTTP 客户端。Timeout 是硬上限（防 SSRF 型
 // 慢响应卡死 worker）；单探针实际超时由 policyTimeout（截断到剩余预算）
 // 的 per-request ctx 控制（P3：此前硬编码 2s 截断用户配置）。
 func probeHTTPClient() *http.Client {
-	return &http.Client{Timeout: 30 * time.Second}
+	return sharedHTTPClient()
 }
 
 func maxInt(a, b int) int {
@@ -465,13 +485,11 @@ func NewRecordingRunner(inner healthcheck.ProbeRunner, reg *probeflow.Registry) 
 		return inner
 	}
 	r := &RecordingRunner{inner: inner, reg: reg}
-	r.client = &http.Client{
-		Timeout: 30 * time.Second,
-		Transport: &http.Transport{
-			DialContext:         r.recordingDialContext(reg),
-			DisableKeepAlives:   true,
-			MaxIdleConnsPerHost: 0,
-		},
+	r.client = sharedHTTPClient()
+	r.client.Transport = &http.Transport{
+		DialContext:         r.recordingDialContext(reg),
+		DisableKeepAlives:   true,
+		MaxIdleConnsPerHost: 0,
 	}
 	return r
 }
@@ -501,7 +519,7 @@ func (r *RecordingRunner) recordingDialContext(
 		dst := netip.AddrPortFrom(dstIP.Unmap(), uint16(dstPort))
 		var srcPort uint16
 		dialer := &net.Dialer{
-			Timeout: 30 * time.Second,
+			Timeout: probeTimeout,
 			Control: func(network, address string, c syscall.RawConn) error {
 				var opErr error
 				err := c.Control(func(fd uintptr) {
@@ -571,12 +589,13 @@ func (r *RecordingRunner) checkHTTP(
 	inst healthcheck.Instance,
 	check healthcheck.HTTPCheck,
 ) healthcheck.ProbeResult {
-	if !inst.NetworkEnabled || inst.IP == "" {
+	endpoint, ok := endpointFor(inst, check.Port)
+	if !ok {
 		return healthcheck.ProbeResult{Success: false, Error: "instance has no network address"}
 	}
 	u := url.URL{
 		Scheme: check.Scheme,
-		Host:   net.JoinHostPort(inst.IP, strconv.Itoa(int(check.Port))),
+		Host:   endpoint,
 		Path:   check.Path,
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
@@ -605,11 +624,11 @@ func (r *RecordingRunner) checkTCP(
 	inst healthcheck.Instance,
 	check healthcheck.TCPCheck,
 ) healthcheck.ProbeResult {
-	if !inst.NetworkEnabled || inst.IP == "" {
+	endpoint, ok := endpointFor(inst, check.Port)
+	if !ok {
 		return healthcheck.ProbeResult{Success: false, Error: "instance has no network address"}
 	}
-	conn, err := r.recordingDialContext(r.reg)(ctx, "tcp",
-		net.JoinHostPort(inst.IP, strconv.Itoa(int(check.Port))))
+	conn, err := r.recordingDialContext(r.reg)(ctx, "tcp", endpoint)
 	if err != nil {
 		return healthcheck.ProbeResult{Success: false, Error: err.Error()}
 	}

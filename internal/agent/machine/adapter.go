@@ -887,9 +887,8 @@ func (a *Adapter) GetEndpointForPort(
 	if err != nil {
 		return "", 0, fmt.Errorf("get instance %s: %w", machineID, err)
 	}
-	if executionID != "" && inst.Tags[tagExecution] != executionID {
-		return "", 0, fmt.Errorf("execution mismatch for %s: want %s got %s",
-			machineID, executionID, inst.Tags[tagExecution])
+	if err := checkExecution(inst.Tags, executionID, machineID); err != nil {
+		return "", 0, err
 	}
 	// M4.5 autoresume：首个流量请求触发 standby→Running 同步恢复。
 	// 失败返回错误（502/503 由 proxy 转化）；控制器侧不感知此路径——
@@ -1014,10 +1013,7 @@ func redactSecretEnv(env map[string]string, secretKeysTag string) map[string]str
 }
 
 func ingressPort(n *pb.NetworkSpec) string {
-	if n == nil || n.IngressPort == 0 {
-		return "8080"
-	}
-	return strconv.FormatUint(n.IngressPort, 10)
+	return strconv.Itoa(ingressPortInt(n))
 }
 
 func ingressPortInt(n *pb.NetworkSpec) int {
@@ -1146,16 +1142,9 @@ func (a *Adapter) deliverSecrets(ctx context.Context, instanceID string, env map
 // executionID 非空时校验实例当前 execution 与之匹配（P3-18：旧代操作
 // 不误停新代实例；与 GetEndpoint/Delete 同一纪律）。
 func (a *Adapter) Pause(ctx context.Context, machineID, executionID string) (*pb.Machine, error) {
-	inst, err := a.instances.GetInstance(ctx, machineID)
+	inst, err := a.resolveLifecycle(ctx, machineID, executionID)
 	if err != nil {
-		if errors.Is(err, instances.ErrNotFound) {
-			return nil, fmt.Errorf("%w: %s", ErrMachineNotFound, machineID)
-		}
-		return nil, fmt.Errorf("get instance %s: %w", machineID, err)
-	}
-	if executionID != "" && inst.Tags[tagExecution] != executionID {
-		return nil, fmt.Errorf("execution mismatch for %s: want %s got %s",
-			machineID, executionID, inst.Tags[tagExecution])
+		return nil, err
 	}
 	// v1.2-B（ADR-0024 §9）：接收过 secret 的 execution 禁止 memory snapshot。
 	// standby = pause+snapshot+释放 VMM，快照会捕获 tmpfs 内的 secret。
@@ -1189,16 +1178,9 @@ func (a *Adapter) reattachSlot(ctx context.Context, machineID string, inst *inst
 // 释放了网络，restore 在 root ns 重建 TAP）——失败则本 op 报错重试，
 // RestoreInstance 对已 Running 实例幂等，重试安全。
 func (a *Adapter) Resume(ctx context.Context, machineID, executionID string) (*pb.Machine, error) {
-	inst, err := a.instances.GetInstance(ctx, machineID)
+	inst, err := a.resolveLifecycle(ctx, machineID, executionID)
 	if err != nil {
-		if errors.Is(err, instances.ErrNotFound) {
-			return nil, fmt.Errorf("%w: %s", ErrMachineNotFound, machineID)
-		}
-		return nil, fmt.Errorf("get instance %s: %w", machineID, err)
-	}
-	if executionID != "" && inst.Tags[tagExecution] != executionID {
-		return nil, fmt.Errorf("execution mismatch for %s: want %s got %s",
-			machineID, executionID, inst.Tags[tagExecution])
+		return nil, err
 	}
 	inst, err = a.instances.RestoreInstance(ctx, inst.Id)
 	if err != nil {
@@ -1210,21 +1192,37 @@ func (a *Adapter) Resume(ctx context.Context, machineID, executionID string) (*p
 	return mapMachine(inst), nil
 }
 
+// resolveLifecycle 合并 Pause/Resume/ConvergePause/ConvergeResume 的公共前奏：
+// GetInstance + NotFound→ErrMachineNotFound 映射 + execution 校验。
+// Converge* 调用方把 ErrMachineNotFound 转为 Found=false（幂等收敛语义）。
+func (a *Adapter) resolveLifecycle(
+	ctx context.Context,
+	machineID, executionID string,
+) (*instances.Instance, error) {
+	inst, err := a.instances.GetInstance(ctx, machineID)
+	if err != nil {
+		if errors.Is(err, instances.ErrNotFound) {
+			return nil, fmt.Errorf("%w: %s", ErrMachineNotFound, machineID)
+		}
+		return nil, fmt.Errorf("get instance %s: %w", machineID, err)
+	}
+	if err := checkExecution(inst.Tags, executionID, machineID); err != nil {
+		return nil, err
+	}
+	return inst, nil
+}
+
 // ConvergePause（R2 claimed lifecycle）观测 machine 是否已收敛到暂停目标态
 // （Standby/Paused）：Found=true 即认领上次 pause claim 的效果。machine 不
 // 存在或尚未收敛时 Found=false，协议层重跑幂等的 Pause。execution 不匹配
 // 仍返回错误（旧代操作不得触碰新代实例）。
 func (a *Adapter) ConvergePause(ctx context.Context, machineID, executionID string) (*pb.Machine, bool, error) {
-	inst, err := a.instances.GetInstance(ctx, machineID)
+	inst, err := a.resolveLifecycle(ctx, machineID, executionID)
 	if err != nil {
-		if errors.Is(err, instances.ErrNotFound) {
+		if errors.Is(err, ErrMachineNotFound) {
 			return nil, false, nil
 		}
-		return nil, false, fmt.Errorf("converge pause: get instance %s: %w", machineID, err)
-	}
-	if executionID != "" && inst.Tags[tagExecution] != executionID {
-		return nil, false, fmt.Errorf("execution mismatch for %s: want %s got %s",
-			machineID, executionID, inst.Tags[tagExecution])
+		return nil, false, err
 	}
 	if inst.State == instances.StateStandby || inst.State == instances.StatePaused {
 		return mapMachine(inst), true, nil
@@ -1236,16 +1234,12 @@ func (a *Adapter) ConvergePause(ctx context.Context, machineID, executionID stri
 // 已收敛仍重放幂等 slot 重挂——崩溃窗口（restore 成功、reattach 之前崩溃）
 // 必须补上，否则 VM Running 但无数据面（与 RecoverRestore 的收敛纪律同源）。
 func (a *Adapter) ConvergeResume(ctx context.Context, machineID, executionID string) (*pb.Machine, bool, error) {
-	inst, err := a.instances.GetInstance(ctx, machineID)
+	inst, err := a.resolveLifecycle(ctx, machineID, executionID)
 	if err != nil {
-		if errors.Is(err, instances.ErrNotFound) {
+		if errors.Is(err, ErrMachineNotFound) {
 			return nil, false, nil
 		}
-		return nil, false, fmt.Errorf("converge resume: get instance %s: %w", machineID, err)
-	}
-	if executionID != "" && inst.Tags[tagExecution] != executionID {
-		return nil, false, fmt.Errorf("execution mismatch for %s: want %s got %s",
-			machineID, executionID, inst.Tags[tagExecution])
+		return nil, false, err
 	}
 	if inst.State != instances.StateRunning {
 		return nil, false, nil

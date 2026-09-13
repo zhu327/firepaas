@@ -44,22 +44,16 @@ func withIdentity(ctx context.Context, id identity) context.Context {
 	return context.WithValue(ctx, identCtxKey{}, id)
 }
 
-var scopeRank = map[string]int{"read": 1, "debug": 2, "write": 2, "admin": 3}
-
-func maxRank(scopes []string) int {
-	r := 0
-	for _, s := range scopes {
-		if v, ok := scopeRank[s]; ok && v > r {
-			r = v
-		}
-	}
-	return r
+// bearerToken 抽取 Authorization: Bearer <token>（无前缀/多余空格容错，
+// 返回去空格后的 token；缺失返回空串）。api.go metrics 与 auth 共用。
+func bearerToken(r *http.Request) string {
+	return strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
 }
 
 // scopeGrants：scope → 授予的能力集合（v1.5 RBAC 拆分：deploy 与 exec 互斥可分）。
 //
 //   - read：只读
-//   - exec / debug（历史别名）：logs/exec/cp（read + exec）
+//   - exec / debug（历史别名，init 中别名化共享同一集合）：logs/exec/cp（read + exec）
 //   - deploy：app 创建/部署/扩缩/回滚/删除（read + deploy）
 //   - write（历史兼容）：全部非 admin mutation（read + exec + deploy + write）
 //   - admin：一切（含项目配额写、节点运维、自助 key 的越权边界）
@@ -69,7 +63,6 @@ func maxRank(scopes []string) int {
 var scopeGrants = map[string]map[string]bool{
 	"read":   {"read": true},
 	"exec":   {"read": true, "exec": true, "debug": true},
-	"debug":  {"read": true, "exec": true, "debug": true},
 	"deploy": {"read": true, "deploy": true},
 	"write": {
 		"read": true, "exec": true, "debug": true,
@@ -79,6 +72,11 @@ var scopeGrants = map[string]map[string]bool{
 		"read": true, "exec": true, "debug": true,
 		"deploy": true, "write": true, "admin": true,
 	},
+}
+
+func init() {
+	// debug 是 exec 的历史别名：共享同一授予集合，避免字面量漂移。
+	scopeGrants["debug"] = scopeGrants["exec"]
 }
 
 // scopeAllows 判定 scopes 是否授予 need 能力。未知 scope 永不授予。
@@ -405,7 +403,7 @@ func (a *API) auth(next http.HandlerFunc) http.HandlerFunc {
 		}
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
-		got := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+		got := bearerToken(r)
 		if got == "" {
 			writeErr(w, 401, "unauthorized")
 			return

@@ -67,15 +67,21 @@ func (s *Server) createVolumeClaimed(
 	return out, nil
 }
 
+// ceilMiB 把字节数向上取整为 MiB（至少 1，预算单位与 admit 一致）。
+func ceilMiB(sizeBytes uint64) int64 {
+	wantMib := int64((sizeBytes + 1024*1024 - 1) / (1024 * 1024))
+	if wantMib < 1 {
+		wantMib = 1
+	}
+	return wantMib
+}
+
 // registerVolumeInflight 登记在途 volume 磁盘预算（MiB 向上取整，预算单位
 // 与 admit 一致），返回释放函数。R2-8：节点级准入把并发 create volume /
 // dataset import / overlay attach 的预算核算串行化——先加后查（与 create
 // 的 P3-7 同型），同一 admit 视野里的请求必然互见。
 func (s *Server) registerVolumeInflight(sizeBytes uint64) func() {
-	wantMib := int64((sizeBytes + 1024*1024 - 1) / (1024 * 1024))
-	if wantMib < 1 {
-		wantMib = 1
-	}
+	wantMib := ceilMiB(sizeBytes)
 	s.inflightVolumeDisk.Add(wantMib)
 	return func() { s.inflightVolumeDisk.Add(-wantMib) }
 }
@@ -287,14 +293,10 @@ func (s *Server) ListVolumes(ctx context.Context, _ *pb.ListVolumesRequest) (*pb
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	// v1.4-B：ListVolumes 无过滤语义，响应恒为节点全量 volume inventory。
-	generation := s.inventoryGeneration.Add(1)
-	observedAt := time.Now().Unix()
+	generation, observedAt, observation := s.nextInventoryObservation(true)
 	return &pb.ListVolumesResponse{
 		Volumes:  list,
 		Complete: true, ObservationGeneration: generation, ObservedAtUnix: observedAt,
-		Observation: &pb.InventoryObservation{
-			Complete: true, Epoch: s.inventoryEpoch,
-			Generation: generation, ObservedAtUnix: observedAt,
-		},
+		Observation: observation,
 	}, nil
 }

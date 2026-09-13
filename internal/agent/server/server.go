@@ -11,7 +11,6 @@ import (
 	"log/slog"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/kernel/hypeman/lib/images"
@@ -498,26 +497,22 @@ func (s *Server) machineLifecycle(
 
 // diskStatsFraction 返回 dataDir 所在文件系统已用比例（0-1）；不可用时返回 0。
 func diskStatsFraction(dataDir string) float64 {
-	total, used := diskStats(dataDir)
+	total, used := info.DiskStats(dataDir)
 	if total == 0 {
 		return 0
 	}
 	return float64(used) / float64(total)
 }
 
-// diskStats 复用 info 包的 statfs 逻辑（避免重复实现）。
-func diskStats(dataDir string) (totalMib, usedMib uint64) {
-	if dataDir == "" {
-		dataDir = "/"
+// nextInventoryObservation 分配单调递增的 inventory generation 并构造
+// InventoryObservation 样板（ListSnapshots/ListVolumes 共享）。
+func (s *Server) nextInventoryObservation(complete bool) (uint64, int64, *pb.InventoryObservation) {
+	generation := s.inventoryGeneration.Add(1)
+	observedAt := time.Now().Unix()
+	return generation, observedAt, &pb.InventoryObservation{
+		Complete: complete, Epoch: s.inventoryEpoch,
+		Generation: generation, ObservedAtUnix: observedAt,
 	}
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs(dataDir, &stat); err != nil {
-		return 0, 0
-	}
-	bsize := uint64(stat.Bsize)
-	total := stat.Blocks * bsize
-	free := stat.Bfree * bsize
-	return total / mib, (total - free) / mib
 }
 
 const mib = 1024 * 1024

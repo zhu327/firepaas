@@ -115,6 +115,25 @@ func defaultProject(def string) string {
 	return def
 }
 
+// projectFlag 注册 --project flag，缺省值语义与原调用点一致（def 保持 "" 或 "dev"）。
+func projectFlag(fs *flag.FlagSet, def string) *string {
+	return fs.String("project", defaultProject(def), "project id")
+}
+
+// withQuery 拼接 query：空值省略，非空经 url.Values 编码（按键排序）。
+func withQuery(base string, params map[string]string) string {
+	q := url.Values{}
+	for k, v := range params {
+		if v != "" {
+			q.Set(k, v)
+		}
+	}
+	if len(q) == 0 {
+		return base
+	}
+	return base + "?" + q.Encode()
+}
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		var ex exitError
@@ -236,16 +255,39 @@ func printUsage(w io.Writer) {
 `, version, defaultAPIAddr)
 }
 
-// secretFlags 收集 --secret VAR=NAME[@VERSION]（可重复）。
-type secretFlags []string
+// repeatable 收集可重复 flag（--secret/--env/--label/--scope/--node），统一替代
+// 原 secretFlags/envFlags/stringSliceValue。KV 校验不在 Set 做，由 parseKV/
+// toMap/refsJSON 在使用处报错（错误仍为 usage 错误，文案保持原 --env/--secret 前缀）。
+type repeatable []string
 
-func (f *secretFlags) String() string { return strings.Join(*f, ",") }
-func (f *secretFlags) Set(v string) error {
+func (f *repeatable) String() string { return strings.Join(*f, ",") }
+func (f *repeatable) Set(v string) error {
 	if v == "" {
-		return errors.New("empty --secret binding")
+		return errors.New("empty value")
 	}
 	*f = append(*f, v)
 	return nil
+}
+
+func (f repeatable) toMap() (map[string]string, error) {
+	out := make(map[string]string, len(f))
+	for _, kv := range f {
+		k, v, err := parseKV(kv, true)
+		if err != nil {
+			return nil, fmt.Errorf("bad --env pair %q (want KEY=VAL)", kv)
+		}
+		out[k] = v
+	}
+	return out, nil
+}
+
+// parseKV 解析 KEY=VAL；allowEmptyVal=false 时拒绝空值（"K=" 报错）。
+func parseKV(v string, allowEmptyVal bool) (string, string, error) {
+	parts := strings.SplitN(v, "=", 2)
+	if len(parts) != 2 || parts[0] == "" || (!allowEmptyVal && parts[1] == "") {
+		return "", "", fmt.Errorf("bad pair %q (want KEY=VAL)", v)
+	}
+	return parts[0], parts[1], nil
 }
 
 // refsJSON 把 VAR=NAME[@V] 列表转成 API 的 secret_refs JSON。
@@ -254,13 +296,12 @@ func (f *secretFlags) Set(v string) error {
 func refsJSON(specs []string) (map[string]any, error) {
 	refs := map[string]any{}
 	for _, spec := range specs {
-		parts := strings.SplitN(spec, "=", 2)
-		if len(parts) != 2 || parts[0] == "" {
+		k, name, err := parseKV(spec, true)
+		if err != nil {
 			return nil, fmt.Errorf("bad --secret %q (want VAR=NAME[@VERSION])", spec)
 		}
-		name := parts[1]
 		if name == "" {
-			refs[parts[0]] = nil
+			refs[k] = nil
 			continue
 		}
 		entry := map[string]any{"secret": name}
@@ -272,7 +313,7 @@ func refsJSON(specs []string) (map[string]any, error) {
 			entry["secret"] = name[:i]
 			entry["version"] = ver
 		}
-		refs[parts[0]] = entry
+		refs[k] = entry
 	}
 	return refs, nil
 }
@@ -282,7 +323,7 @@ func runSecrets(args []string) error {
 		return errors.New("usage: fpctl secrets <set|ls|rm>")
 	}
 	fs := flag.NewFlagSet("secrets", flag.ExitOnError)
-	project := fs.String("project", defaultProject("dev"), "project id")
+	project := projectFlag(fs, "dev")
 	switch args[0] {
 	case "set":
 		setfs := flag.NewFlagSet("set", flag.ExitOnError)
@@ -294,7 +335,7 @@ func runSecrets(args []string) error {
 			"",
 			"secret value; omitted or '-' reads stdin (never echoed; avoids argv/ps leak)",
 		)
-		setfs.StringVar(project, "project", defaultProject("dev"), "project id")
+		project = projectFlag(setfs, "dev")
 		_ = setfs.Parse(args[1:])
 		if name == "" {
 			return errors.New("--name is required")
@@ -318,17 +359,17 @@ func runSecrets(args []string) error {
 		return do("POST", "/v1/secrets", body, out)
 	case "ls":
 		_ = fs.Parse(args[1:])
-		return do("GET", "/v1/secrets?project_id="+url.QueryEscape(*project), nil, nil)
+		return do("GET", withQuery("/v1/secrets", map[string]string{"project_id": *project}), nil, nil)
 	case "rm":
 		rmfs := flag.NewFlagSet("rm", flag.ExitOnError)
-		rmfs.StringVar(project, "project", defaultProject("dev"), "project id")
+		project = projectFlag(rmfs, "dev")
 		_ = rmfs.Parse(args[1:])
 		if rmfs.NArg() < 1 {
 			return errors.New("usage: fpctl secrets rm <name>")
 		}
 		return do(
 			"DELETE",
-			"/v1/secrets/"+url.PathEscape(rmfs.Arg(0))+"?project_id="+url.QueryEscape(*project),
+			withQuery("/v1/secrets/"+url.PathEscape(rmfs.Arg(0)), map[string]string{"project_id": *project}),
 			nil,
 			nil,
 		)
@@ -344,26 +385,24 @@ func runApp(args []string) error {
 	switch args[0] {
 	case "create":
 		fs := flag.NewFlagSet("create", flag.ExitOnError)
-		var hostname, image, appID, project, nodePool, antiAffinity string
+		var hostname, image, appID, nodePool, antiAffinity string
 		var hcHTTP, hcTCP string
 		var vcpu, mem, port, replicas int64
 		var standbyIdle int64
 		var hcInterval, hcTimeout, hcThreshold int64
-		var sf secretFlags
+		var sf repeatable
 		var services serviceFlags
-		var secretList *secretFlags
-		var envSpecs, labelSpecs envFlags
+		var envSpecs, labelSpecs repeatable
 		fs.StringVar(&hostname, "hostname", "", "hostname (required)")
 		fs.StringVar(&image, "image", "", "image ref (required)")
 		fs.StringVar(&appID, "app", "", "app id (default: generated)")
-		fs.StringVar(&project, "project", defaultProject(""), "project id (default: identity project)")
+		project := projectFlag(fs, "")
 		fs.Int64Var(&vcpu, "vcpu", 1, "vcpus")
 		fs.Int64Var(&mem, "mem", 512, "memory MiB")
 		fs.Int64Var(&port, "port", 8080, "ingress port")
 		fs.Int64Var(&replicas, "replicas", 1, "replicas")
 		fs.Int64Var(&standbyIdle, "auto-standby-idle", 0, "auto-standby idle timeout seconds (0 = disabled)")
 		fs.Var(&services, "service", "service NAME=PORT (repeatable, v1.1 multi-port)")
-		secretList = &sf
 		fs.Var(&sf, "secret", "secret binding VAR=NAME[@VERSION] (repeatable)")
 		fs.Var(&envSpecs, "env", "env var KEY=VAL (repeatable)")
 		fs.Var(&labelSpecs, "label", "placement label KEY=VAL (repeatable)")
@@ -382,32 +421,32 @@ func runApp(args []string) error {
 			"hostname": hostname, "image": image, "vcpu": vcpu,
 			"mem_mib": mem, "port": port, "replicas": replicas,
 		}
-		if project != "" {
-			body["project_id"] = project
-		}
+		put(body, "project_id", *project)
 		if len(envSpecs) > 0 {
-			body["env"] = envSpecs.toMap()
+			env, err := envSpecs.toMap()
+			if err != nil {
+				return err
+			}
+			body["env"] = env
 		}
 		if len(labelSpecs) > 0 {
-			body["labels"] = labelSpecs.toMap()
+			labels, err := labelSpecs.toMap()
+			if err != nil {
+				return err
+			}
+			body["labels"] = labels
 		}
-		if nodePool != "" {
-			body["node_pool"] = nodePool
-		}
+		put(body, "node_pool", nodePool)
 		aa, err := normalizeAntiAffinity(antiAffinity)
 		if err != nil {
 			return err
 		}
-		if aa != "" {
-			body["anti_affinity"] = aa
-		}
+		put(body, "anti_affinity", aa)
 		hc, err := buildHealthCheck(hcHTTP, hcTCP, hcInterval, hcTimeout, hcThreshold)
 		if err != nil {
 			return err
 		}
-		if hc != nil {
-			body["health_check"] = hc
-		}
+		putAny(body, "health_check", hc, hc != nil)
 		if len(services) > 0 {
 			if port != 0 && port != 8080 && port != int64(services[0].InternalPort) {
 				return fmt.Errorf("--port conflicts with first --service")
@@ -418,11 +457,9 @@ func runApp(args []string) error {
 		if standbyIdle > 0 {
 			body["auto_standby"] = map[string]any{"enabled": true, "idle_timeout_seconds": standbyIdle}
 		}
-		if appID != "" {
-			body["app_id"] = appID
-		}
-		if secretList != nil && len(*secretList) > 0 {
-			refs, err := refsJSON(*secretList)
+		put(body, "app_id", appID)
+		if len(sf) > 0 {
+			refs, err := refsJSON(sf)
 			if err != nil {
 				return err
 			}
@@ -453,7 +490,7 @@ func runApp(args []string) error {
 		var services serviceFlags
 		fs.StringVar(&image, "image", "", "image ref (default: inherit active deployment)")
 		fs.StringVar(&envSpec, "env", "", "env vars KEY=VAL, comma-separated")
-		var secretSpecs secretFlags
+		var secretSpecs repeatable
 		fs.Var(&secretSpecs, "secret", "secret binding VAR=NAME[@VERSION] (repeatable)")
 		fs.Int64Var(&port, "port", 0, "ingress port (0 = inherit)")
 		fs.StringVar(&strategy, "strategy", "", "rollout strategy: bluegreen (default) | rolling")
@@ -473,18 +510,10 @@ func runApp(args []string) error {
 			}
 			body["secret_refs"] = refs
 		}
-		if image != "" {
-			body["image"] = image
-		}
-		if port != 0 {
-			body["port"] = port
-		}
-		if len(services) > 0 {
-			body["services"] = []serviceBody(services)
-		}
-		if strategy != "" {
-			body["strategy"] = strategy
-		}
+		put(body, "image", image)
+		putAny(body, "port", port, port != 0)
+		putAny(body, "services", []serviceBody(services), len(services) > 0)
+		put(body, "strategy", strategy)
 		if standbyIdle >= 0 {
 			if standbyIdle == 0 {
 				body["auto_standby"] = map[string]any{"enabled": false}
@@ -495,25 +524,26 @@ func runApp(args []string) error {
 		if envSpec != "" {
 			env := map[string]string{}
 			for _, kv := range strings.Split(envSpec, ",") {
-				parts := strings.SplitN(kv, "=", 2)
-				if len(parts) != 2 || parts[0] == "" {
+				k, v, err := parseKV(kv, true)
+				if err != nil {
 					return fmt.Errorf("bad --env pair %q (want KEY=VAL)", kv)
 				}
-				env[parts[0]] = parts[1]
+				env[k] = v
 			}
 			body["env"] = env
 		}
 		return do("POST", "/v1/apps/"+url.PathEscape(appID)+"/deployments", body, nil)
 
 	case "scale":
-		if len(args) < 3 {
-			return errors.New("usage: fpctl app scale <app_id> <replicas>")
+		appID, replicas, err := twoArgs(args[1:], "usage: fpctl app scale <app_id> <replicas>")
+		if err != nil {
+			return err
 		}
 		var n int
-		if _, err := fmt.Sscanf(args[2], "%d", &n); err != nil {
-			return fmt.Errorf("bad replicas %q", args[2])
+		if _, err := fmt.Sscanf(replicas, "%d", &n); err != nil {
+			return fmt.Errorf("bad replicas %q", replicas)
 		}
-		return do("POST", "/v1/apps/"+url.PathEscape(args[1])+"/scale", map[string]any{"replicas": n}, nil)
+		return do("POST", "/v1/apps/"+url.PathEscape(appID)+"/scale", map[string]any{"replicas": n}, nil)
 
 	case "rollback":
 		appID, err := oneArg(args[1:], "fpctl app rollback <app_id>")
@@ -548,19 +578,62 @@ func oneArg(args []string, usage string) (string, error) {
 	return args[0], nil
 }
 
+func twoArgs(args []string, usage string) (string, string, error) {
+	if len(args) < 2 || args[0] == "" || args[1] == "" {
+		return "", "", errors.New(usage)
+	}
+	return args[0], args[1], nil
+}
+
+func getByID(args []string, usage, base string) error {
+	id, err := oneArg(args, usage)
+	if err != nil {
+		return err
+	}
+	return do("GET", base+"/"+url.PathEscape(id), nil, nil)
+}
+
+func deleteByID(args []string, usage, base string) error {
+	id, err := oneArg(args, usage)
+	if err != nil {
+		return err
+	}
+	return do("DELETE", base+"/"+url.PathEscape(id), nil, nil)
+}
+
+func postByID(args []string, usage, base, suffix string) error {
+	id, err := oneArg(args, usage)
+	if err != nil {
+		return err
+	}
+	return do("POST", base+"/"+url.PathEscape(id)+suffix, map[string]any{}, nil)
+}
+
+// put 仅在 v 非空时设 body[k]，收敛 create/deploy 的 if x != "" 堆砌。
+func put(body map[string]any, k, v string) {
+	if v != "" {
+		body[k] = v
+	}
+}
+
+// putAny 在 ok 为真时设 body[k]，用于非字符串（map/slice/int）条件字段。
+func putAny(body map[string]any, k string, v any, ok bool) {
+	if ok {
+		body[k] = v
+	}
+}
+
+func orDefault(s, def string) string {
+	if s == "" {
+		return def
+	}
+	return s
+}
+
 // do 发起普通（非流式）请求，使用 30s 响应头超时的共享客户端。
+// 长轮询/内部读取直调 doRequest（longClient/emit=false），不经此 wrapper。
 func do(method, path string, body, out any) error {
 	return doRequest(apiClient, method, path, body, out, "", true)
-}
-
-// doLong 用于 wait 长轮询（服务端上限 5 分钟）：不套用 30s 头超时。
-func doLong(method, path string, body, out any) error {
-	return doRequest(longClient, method, path, body, out, "", true)
-}
-
-// doSilent 与 do 同语义，但即使 --json 也不产生输出（命令内部读取）。
-func doSilent(method, path string, body, out any) error {
-	return doRequest(apiClient, method, path, body, out, "", false)
 }
 
 func doRequest(client *http.Client, method, path string, body, out any, idemKey string, emit bool) error {

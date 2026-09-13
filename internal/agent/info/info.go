@@ -137,7 +137,7 @@ func (p *Provider) AdmissionSnapshot() (vcpuTotal, memTotalMib, vcpuAllocated, m
 // diskTotalMib 为 data 盘总量（statfs）；diskAllocatedMib 为已承诺 overlay
 // 之和（注入函数；未注入 = 0，调用方仅做水位检查）。
 func (p *Provider) DiskAdmissionSnapshot() (diskTotalMib, diskAllocatedMib uint64) {
-	diskTotalMib, _ = diskStats(p.dataDir)
+	diskTotalMib, _ = DiskStats(p.dataDir)
 	if p.diskAllocatedMib != nil {
 		diskAllocatedMib = p.diskAllocatedMib()
 	}
@@ -151,7 +151,7 @@ func (p *Provider) SetDiskAllocatedFunc(f func() uint64) { p.diskAllocatedMib = 
 func (p *Provider) Response() *pb.ServiceInfoResponse {
 	totalMem := memTotal()
 	availMem := memAvailable()
-	diskTotal, diskUsed := diskStats(p.dataDir)
+	diskTotal, diskUsed := DiskStats(p.dataDir)
 	memAllocated := uint64(0)
 	if p.memAllocatedMib != nil {
 		memAllocated = p.memAllocatedMib()
@@ -312,8 +312,9 @@ func memAvailable() uint64 {
 	return readMeminfoField("MemFree")
 }
 
-// diskStats 返回 dataDir 所在文件系统的总量/已用量（MiB）。statfs 失败时返回 0。
-func diskStats(dataDir string) (totalMib, usedMib uint64) {
+// DiskStats 返回 dataDir 所在文件系统的总量/已用量（MiB）。statfs 失败时返回 0。
+// server 包的磁盘水位检查复用本函数（唯一实现，避免各自抄写漂移）。
+func DiskStats(dataDir string) (totalMib, usedMib uint64) {
 	if dataDir == "" {
 		dataDir = "/"
 	}

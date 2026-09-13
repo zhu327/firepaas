@@ -35,34 +35,30 @@ func hostSampler(ctx context.Context, reg *metrics.Registry) {
 
 func sampleHostInto(reg *metrics.Registry) {
 	// FD 用量：/proc/sys/fs/file-nr = "allocated unused max"。
-	if v, ok := firstField("/proc/sys/fs/file-nr"); ok {
+	if v, ok := readUintField("/proc/sys/fs/file-nr", 0); ok {
 		reg.Set("firepaas_host_fds_allocated", nil, v)
-		if m, ok2 := thirdField("/proc/sys/fs/file-nr"); ok2 {
+		if m, ok2 := readUintField("/proc/sys/fs/file-nr", 2); ok2 {
 			reg.Set("firepaas_host_fds_max", nil, m)
 		}
 	}
-	// inode：/proc/sys/fs/inode-nr = "allocated free"（free 在第二列，
-	// 所以上限直接用缺省 3.6M——只上报 allocated/free 供趋势）。
-	if v, ok := firstField("/proc/sys/fs/inode-nr"); ok {
-		reg.Set("firepaas_host_inodes_allocated", nil, v)
-	}
-	if v, ok := firstField("/proc/sys/fs/inode-state"); ok {
-		// inode-state 第一列 = nr_inodes。
+	// inode：只取 inode-state 第一列（nr_inodes）。inode-nr 与其重复
+	//（双写会以后者覆盖前者），不再单独上报，只保留一次 Set。
+	if v, ok := readUintField("/proc/sys/fs/inode-state", 0); ok {
 		reg.Set("firepaas_host_inodes_allocated", nil, v)
 	}
 	// conntrack：计数 + 上限。
-	if v, ok := firstField("/proc/sys/net/netfilter/nf_conntrack_count"); ok {
+	if v, ok := readUintField("/proc/sys/net/netfilter/nf_conntrack_count", 0); ok {
 		reg.Set("firepaas_host_conntrack_count", nil, v)
 	}
-	if v, ok := firstField("/proc/sys/net/netfilter/nf_conntrack_max"); ok {
+	if v, ok := readUintField("/proc/sys/net/netfilter/nf_conntrack_max", 0); ok {
 		reg.Set("firepaas_host_conntrack_max", nil, v)
 	}
 	// entropy。
-	if v, ok := firstField("/proc/sys/kernel/random/entropy_avail"); ok {
+	if v, ok := readUintField("/proc/sys/kernel/random/entropy_avail", 0); ok {
 		reg.Set("firepaas_host_entropy_avail", nil, v)
 	}
 	// load1（float → x100 存整型，规则里除以 100）。
-	if f, ok := load1(); ok {
+	if f, ok := readFloatField("/proc/loadavg", 0); ok {
 		reg.Set("firepaas_host_load1_x100", nil, uint64(f*100))
 	}
 	// 内存可用（MemAvailable kB）。
@@ -72,46 +68,31 @@ func sampleHostInto(reg *metrics.Registry) {
 	slog.Debug("host gauges sampled")
 }
 
-// firstField 返回文件里第一个空格分隔的整型。
-func firstField(path string) (uint64, bool) {
+// readUintField 返回文件里第 index 个空格分隔的整型（0-based）。
+func readUintField(path string, index int) (uint64, bool) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return 0, false
 	}
 	f := strings.Fields(string(data))
-	if len(f) == 0 {
+	if len(f) <= index || index < 0 {
 		return 0, false
 	}
-	v, err := strconv.ParseUint(f[0], 10, 64)
-	if err != nil {
-		return 0, false
-	}
-	return v, true
-}
-
-func thirdField(path string) (uint64, bool) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0, false
-	}
-	f := strings.Fields(string(data))
-	if len(f) < 3 {
-		return 0, false
-	}
-	v, err := strconv.ParseUint(f[2], 10, 64)
+	v, err := strconv.ParseUint(f[index], 10, 64)
 	return v, err == nil
 }
 
-func load1() (float64, bool) {
-	data, err := os.ReadFile("/proc/loadavg")
+// readFloatField 返回文件里第 index 个空格分隔的浮点（0-based）。
+func readFloatField(path string, index int) (float64, bool) {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return 0, false
 	}
 	f := strings.Fields(string(data))
-	if len(f) == 0 {
+	if len(f) <= index || index < 0 {
 		return 0, false
 	}
-	v, err := strconv.ParseFloat(f[0], 64)
+	v, err := strconv.ParseFloat(f[index], 64)
 	return v, err == nil
 }
 

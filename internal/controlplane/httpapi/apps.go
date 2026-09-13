@@ -80,7 +80,7 @@ type autoStandbyBody struct {
 
 func (a *API) createApp(w http.ResponseWriter, r *http.Request) {
 	var body createAppBody
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
+	if err := decodeJSONBody(w, r, &body, 1<<20, false); err != nil {
 		writeErr(w, 400, "bad request: "+err.Error())
 		return
 	}
@@ -292,7 +292,7 @@ type deployBody struct {
 
 func (a *API) deployApp(w http.ResponseWriter, r *http.Request) {
 	var body deployBody
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
+	if err := decodeJSONBody(w, r, &body, 1<<20, false); err != nil {
 		writeErr(w, 400, "bad request: "+err.Error())
 		return
 	}
@@ -383,7 +383,7 @@ func (a *API) scaleApp(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Replicas int `json:"replicas"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
+	if err := decodeJSONBody(w, r, &body, 1<<20, false); err != nil {
 		writeErr(w, 400, "bad request: "+err.Error())
 		return
 	}
@@ -480,18 +480,18 @@ func (a *API) deleteApp(w http.ResponseWriter, r *http.Request) {
 				Generation: m.Generation, OperationID: opID, Request: raw,
 			}
 		})
+	if errors.Is(err, store.ErrNotFound) {
+		writeErr(w, 404, "app not found")
+		return
+	}
+	if errors.Is(err, store.ErrRequestConflict) {
+		// 评审回流：同幂等键、不同请求体的历史脏数据会让删除整体回滚，
+		// 客户端需要一个可识别、可动作的信号而非不区分的 500。
+		slog.Warn("app delete blocked by idempotency conflict (legacy dirty row?)", "app_id", appID)
+		writeErr(w, 409, "delete blocked by conflicting in-flight operation; contact operator to reconcile")
+		return
+	}
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			writeErr(w, 404, "app not found")
-			return
-		}
-		if errors.Is(err, store.ErrRequestConflict) {
-			// 评审回流：同幂等键、不同请求体的历史脏数据会让删除整体回滚，
-			// 客户端需要一个可识别、可动作的信号而非不区分的 500。
-			slog.Warn("app delete blocked by idempotency conflict (legacy dirty row?)", "app_id", appID)
-			writeErr(w, 409, "delete blocked by conflicting in-flight operation; contact operator to reconcile")
-			return
-		}
 		writeInternalErr(w, r, err)
 		return
 	}
@@ -574,7 +574,7 @@ func (a *API) setAppSecretRefs(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		SecretRefs map[string]store.SecretRef `json:"secret_refs"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
+	if err := decodeJSONBody(w, r, &body, 1<<20, false); err != nil {
 		writeErr(w, 400, "bad request: "+err.Error())
 		return
 	}

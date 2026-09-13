@@ -21,6 +21,20 @@ var ErrGuestOpsUnsupported = errors.New("guest operations unsupported by instanc
 // ErrStaleExecution 表示请求绑定旧 execution（ADR-0025：立即拒绝）。
 var ErrStaleExecution = errors.New("execution mismatch")
 
+// checkExecution 校验实例当前 execution 与请求一致（空 want 跳过，
+// 与 Pause/GetEndpoint 同一纪律）。不匹配返回包装 ErrStaleExecution 的
+// 错误，调用方可用 errors.Is 识别 fencing 拒绝。
+func checkExecution(instTags map[string]string, want, machineID string) error {
+	if want == "" {
+		return nil
+	}
+	if got := instTags[tagExecution]; got != want {
+		return fmt.Errorf("%w: machine %s want %s got %s",
+			ErrStaleExecution, machineID, want, got)
+	}
+	return nil
+}
+
 // logStreamProvider 是 hypeman instances.Manager 的日志能力子集。
 type logStreamProvider interface {
 	StreamInstanceLogs(
@@ -47,9 +61,8 @@ func (a *Adapter) resolveGuest(ctx context.Context, machineID, executionID strin
 		}
 		return nil, fmt.Errorf("get instance %s: %w", machineID, err)
 	}
-	if executionID != "" && inst.Tags[tagExecution] != executionID {
-		return nil, fmt.Errorf("%w: machine %s want %s got %s",
-			ErrStaleExecution, machineID, executionID, inst.Tags[tagExecution])
+	if err := checkExecution(inst.Tags, executionID, machineID); err != nil {
+		return nil, err
 	}
 	return inst, nil
 }

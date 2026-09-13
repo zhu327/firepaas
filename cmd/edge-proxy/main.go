@@ -25,6 +25,7 @@ import (
 	edgesvc "github.com/zhu327/firepaas/internal/edge"
 	edgemesh "github.com/zhu327/firepaas/internal/edge/mesh"
 	"github.com/zhu327/firepaas/internal/security/mtls"
+	"github.com/zhu327/firepaas/shared/pkg/env"
 	"github.com/zhu327/firepaas/shared/pkg/logging"
 )
 
@@ -55,19 +56,19 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	port := envOr("FIREPAAS_EDGE_PORT", "80")
+	port := env.Get("FIREPAAS_EDGE_PORT", "80")
 	tlsPort := os.Getenv("FIREPAAS_EDGE_TLS_LISTEN")
-	staleWindow := envDurOr("FIREPAAS_EDGE_STALE_WINDOW", staleDefault)
-	freshTTL := envDurOr("FIREPAAS_EDGE_FRESH_TTL", freshTTLDefault)
-	hardConcurrency := int64(envFloatOr("FIREPAAS_EDGE_HARD_CONCURRENCY", hardConcurrencyDefault))
+	staleWindow := env.Dur("FIREPAAS_EDGE_STALE_WINDOW", staleDefault)
+	freshTTL := env.Dur("FIREPAAS_EDGE_FRESH_TTL", freshTTLDefault)
+	hardConcurrency := int64(env.Float("FIREPAAS_EDGE_HARD_CONCURRENCY", hardConcurrencyDefault))
 	if hardConcurrency <= 0 {
 		hardConcurrency = hardConcurrencyDefault
 	}
 
-	rdb := redis.NewClient(&redis.Options{Addr: envOr("FIREPAAS_REDIS_ADDR", "127.0.0.1:6379")})
+	rdb := redis.NewClient(&redis.Options{Addr: env.Get("FIREPAAS_REDIS_ADDR", "127.0.0.1:6379")})
 	defer func() { _ = rdb.Close() }()
 
-	certReload := envDurOr("FIREPAAS_EDGE_CERT_RELOAD_INTERVAL", certReloadDefault)
+	certReload := env.Dur("FIREPAAS_EDGE_CERT_RELOAD_INTERVAL", certReloadDefault)
 	gauges := newCertExpiryGauges()
 	agentTLS, agentCertMgr, err := loadAgentTLS(certReload, gauges)
 	if err != nil {
@@ -90,24 +91,24 @@ func run() error {
 	}
 	edgePorts := listenerPorts(port, tlsPort, extraPorts)
 	tokens := edgesvc.NewTokenClient(
-		envOr("FIREPAAS_API_ADDR", "http://127.0.0.1:8080"),
+		env.Get("FIREPAAS_API_ADDR", "http://127.0.0.1:8080"),
 		os.Getenv("FIREPAAS_API_TOKEN"),
 		30*time.Second,
 	)
 	tokens.SetStaleWindow(staleWindow)
-	if n := envIntOr("FIREPAAS_EDGE_TOKEN_CACHE_MAX", 0); n > 0 { // F：token 缓存容量上限
+	if n := env.Int("FIREPAAS_EDGE_TOKEN_CACHE_MAX", 0); n > 0 { // F：token 缓存容量上限
 		tokens.MaxEntries = n
 	}
 	counters := &edgesvc.Counters{}
 	routes := edgesvc.NewRouteCache(freshTTL, staleWindow)
-	if n := envIntOr("FIREPAAS_EDGE_ROUTE_CACHE_MAX", 0); n > 0 { // P1-16 容量上限
+	if n := env.Int("FIREPAAS_EDGE_ROUTE_CACHE_MAX", 0); n > 0 { // P1-16 容量上限
 		routes.MaxEntries = n
 	}
 	limiter := edgesvc.NewRateLimiter(
-		envFloatOr("FIREPAAS_EDGE_RATE_LIMIT", 100),
-		envFloatOr("FIREPAAS_EDGE_RATE_BURST", 200),
+		env.Float("FIREPAAS_EDGE_RATE_LIMIT", 100),
+		env.Float("FIREPAAS_EDGE_RATE_BURST", 200),
 	)
-	if n := envIntOr("FIREPAAS_EDGE_RATELIMIT_BUCKETS_MAX", 0); n > 0 { // P1-16 容量上限
+	if n := env.Int("FIREPAAS_EDGE_RATELIMIT_BUCKETS_MAX", 0); n > 0 { // P1-16 容量上限
 		limiter.MaxBuckets = n
 	}
 	// G2d（ADR-0040 §14）：edge 经 mesh 直达节点（凭证路由终结器）。
@@ -116,30 +117,30 @@ func run() error {
 	// 置到控制面 FIREPAAS_MESH_EDGE_PUBKEY）+ mesh:peer/mesh:endpoint 投影
 	//（fabric reconciler 写）。
 	var direct *edgemesh.Transport
-	if strings.EqualFold(envOr("FIREPAAS_EDGE_MESH_DIRECT", "false"), "true") {
+	if strings.EqualFold(env.Get("FIREPAAS_EDGE_MESH_DIRECT", "false"), "true") {
 		wgHub := edgemesh.NewWG(
-			envOr("FIREPAAS_EDGE_MESH_IFACE", "fp-edge0"),
-			envOr("FIREPAAS_EDGE_MESH_KEYDIR", "/var/lib/firepaas/edge/mesh"),
-			uint16(envIntOr("FIREPAAS_EDGE_MESH_PORT", 51821)),
+			env.Get("FIREPAAS_EDGE_MESH_IFACE", "fp-edge0"),
+			env.Get("FIREPAAS_EDGE_MESH_KEYDIR", "/var/lib/firepaas/edge/mesh"),
+			uint16(env.Int("FIREPAAS_EDGE_MESH_PORT", 51821)),
 		)
 		pub, err := wgHub.PublicKey(ctx)
 		if err != nil {
 			return fmt.Errorf("edge mesh wg key: %w", err)
 		}
 		slog.Info("edge mesh wg public key (configure as FIREPAAS_MESH_EDGE_PUBKEY)", "pubkey", pub)
-		go edgemesh.SyncLoop(ctx, wgHub, rdb, envDurOr("FIREPAAS_EDGE_MESH_SYNC_INTERVAL", 10*time.Second),
-			envOr("FIREPAAS_MESH_EDGE_ID", "edge-hub"))
+		go edgemesh.SyncLoop(ctx, wgHub, rdb, env.Dur("FIREPAAS_EDGE_MESH_SYNC_INTERVAL", 10*time.Second),
+			env.Get("FIREPAAS_MESH_EDGE_ID", "edge-hub"))
 		endpoints := edgemesh.NewEndpoints(rdb,
-			envDurOr("FIREPAAS_EDGE_MESH_ENDPOINT_TTL", 5*time.Second),
+			env.Dur("FIREPAAS_EDGE_MESH_ENDPOINT_TTL", 5*time.Second),
 			staleWindow)
 		direct = edgemesh.NewTransport(endpoints)
 	}
 	// ADR-0041：per-hostname 并发信号记账 + 5s 上报（autoscale:{host}，
 	// 20s TTL）。只写 TTL 键，旧 controller 不读，独立可回滚；失败只记
 	// 指标，不阻塞转发。
-	autoscaleTracker := edgesvc.NewAutoscaleTracker(envIntOr("FIREPAAS_EDGE_AUTOSCALE_MAX_HOSTS", 0))
+	autoscaleTracker := edgesvc.NewAutoscaleTracker(env.Int("FIREPAAS_EDGE_AUTOSCALE_MAX_HOSTS", 0))
 	autoscaleReporter := edgesvc.NewAutoscaleReporter(rdb, resolveAutoscaleEdgeID(),
-		autoscaleTracker, counters, envDurOr("FIREPAAS_EDGE_AUTOSCALE_INTERVAL", 0))
+		autoscaleTracker, counters, env.Dur("FIREPAAS_EDGE_AUTOSCALE_INTERVAL", 0))
 	go autoscaleReporter.Run(ctx)
 	dataHandler := edgesvc.NewHandler(edgesvc.Config{
 		Catalog: catalog.New(rdb), Routes: routes, Tokens: tokens, Limiter: limiter,
@@ -223,7 +224,7 @@ func loadAgentTLS(reloadEvery time.Duration, gauges *certExpiryGauges) (*tls.Con
 	key := os.Getenv("FIREPAAS_EDGE_TLS_KEY")
 	ca := os.Getenv("FIREPAAS_EDGE_TLS_CA")
 	if cert == "" && key == "" && ca == "" {
-		if isTruthy(os.Getenv("FIREPAAS_EDGE_ALLOW_INSECURE_DEV")) {
+		if env.Bool("FIREPAAS_EDGE_ALLOW_INSECURE_DEV", false) {
 			slog.Warn(
 				"FIREPAAS_EDGE_ALLOW_INSECURE_DEV=true：edge→agent :5107 使用明文 HTTP，仅限本地开发，生产必须配置 FIREPAAS_EDGE_TLS_CERT/KEY/CA",
 			)
@@ -236,7 +237,7 @@ func loadAgentTLS(reloadEvery time.Duration, gauges *certExpiryGauges) (*tls.Con
 	if cert == "" || key == "" || ca == "" {
 		return nil, nil, errors.New("FIREPAAS_EDGE_TLS_CERT/KEY/CA must be set together")
 	}
-	mgr, err := mtls.NewCertManager(cert, key, reloadEvery, nil, func(expiry time.Time) {
+	mgr, err := newManagedCert(cert, key, reloadEvery, func(expiry time.Time) {
 		gauges.set(cert, expiry)
 	})
 	if err != nil {
@@ -260,7 +261,7 @@ func loadServerCertificates(
 	if (cert == "") != (key == "") {
 		return nil, errors.New("FIREPAAS_EDGE_SERVER_CERT and FIREPAAS_EDGE_SERVER_KEY must be set together")
 	}
-	if tlsPort != "" && cert == "" && !isTruthy(os.Getenv("FIREPAAS_ALLOW_INSECURE_DEV")) {
+	if tlsPort != "" && cert == "" && !env.Bool("FIREPAAS_ALLOW_INSECURE_DEV", false) {
 		return nil, errors.New(
 			"public edge TLS requires FIREPAAS_EDGE_SERVER_CERT/KEY (set FIREPAAS_ALLOW_INSECURE_DEV=true only for local development)",
 		)
@@ -268,13 +269,19 @@ func loadServerCertificates(
 	if cert == "" {
 		return nil, nil
 	}
-	mgr, err := mtls.NewCertManager(cert, key, reloadEvery, nil, func(expiry time.Time) {
+	mgr, err := newManagedCert(cert, key, reloadEvery, func(expiry time.Time) {
 		gauges.set(cert, expiry)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("edge server cert: %w", err)
 	}
 	return mgr, nil
+}
+
+// newManagedCert 创建热重载的证书管理器并注册到期回调（契约 C-1）。
+// 调用方保留各自的材料校验与错误文案；本函数只收敛 NewCertManager 调用。
+func newManagedCert(certFile, keyFile string, reload time.Duration, onExpiry func(time.Time)) (*mtls.CertManager, error) {
+	return mtls.NewCertManager(certFile, keyFile, reload, nil, onExpiry)
 }
 
 // certExpiryGauges 汇总各 CertManager 上报的证书到期时间，并在 metrics 端点
@@ -317,7 +324,7 @@ func (g *certExpiryGauges) WritePrometheus(w io.Writer) {
 }
 
 func startMetrics(counters *edgesvc.Counters, handler *edgesvc.Handler, gauges *certExpiryGauges) error {
-	port := envOr("FIREPAAS_EDGE_METRICS_PORT", "")
+	port := env.Get("FIREPAAS_EDGE_METRICS_PORT", "")
 	if port == "" {
 		return nil
 	}
@@ -442,18 +449,6 @@ func stripPort(hostport string) string {
 	return host
 }
 
-func isTruthy(v string) bool {
-	b, err := strconv.ParseBool(strings.TrimSpace(v))
-	return err == nil && b
-}
-
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
-}
-
 // resolveAutoscaleEdgeID 解析 autoscale reporter 的 edge 身份
 // （ADR-0041 §2：FIREPAAS_EDGE_ID → FIREPAAS_MESH_EDGE_ID → hostname）。
 func resolveAutoscaleEdgeID() string {
@@ -462,32 +457,4 @@ func resolveAutoscaleEdgeID() string {
 		os.Getenv("FIREPAAS_MESH_EDGE_ID"),
 		os.Hostname,
 	)
-}
-
-func envDurOr(key string, def time.Duration) time.Duration {
-	if v := os.Getenv(key); v != "" {
-		if d, e := time.ParseDuration(v); e == nil && d > 0 {
-			return d
-		}
-	}
-	return def
-}
-
-func envFloatOr(key string, def float64) float64 {
-	if v := os.Getenv(key); v != "" {
-		var f float64
-		if _, e := fmt.Sscanf(v, "%g", &f); e == nil {
-			return f
-		}
-	}
-	return def
-}
-
-func envIntOr(key string, def int) int {
-	if v := os.Getenv(key); v != "" {
-		if n, e := strconv.Atoi(v); e == nil {
-			return n
-		}
-	}
-	return def
 }

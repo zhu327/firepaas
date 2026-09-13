@@ -29,6 +29,42 @@ var version = "dev"
 func (s *stringSlice) String() string     { return strings.Join(*s, ",") }
 func (s *stringSlice) Set(v string) error { *s = append(*s, v); return nil }
 
+// fencing 是 create/delete 共用的幂等围栏三元组（machine + generation + operation）。
+type fencing struct {
+	machineID  string
+	generation uint64
+	operation  string
+}
+
+func addFencingFlags(fs *flag.FlagSet, f *fencing) {
+	fs.StringVar(&f.machineID, "machine-id", "", "stable machine id")
+	fs.Uint64Var(&f.generation, "generation", 1, "fencing generation")
+	fs.StringVar(&f.operation, "operation", "", "fencing operation id (required)")
+}
+
+func (f *fencing) validate() error {
+	if f.machineID == "" || f.operation == "" {
+		return fmt.Errorf("-machine-id and -operation are required")
+	}
+	return nil
+}
+
+// parseSecretEnv 解析可重复的 KEY=VALUE secret（行为不变：空 key/value 均拒绝）。
+func parseSecretEnv(secrets []string) (map[string]string, error) {
+	if len(secrets) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]string, len(secrets))
+	for _, kv := range secrets {
+		parts := strings.SplitN(kv, "=", 2)
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			return nil, fmt.Errorf("-secret must be KEY=VALUE, got %q", kv)
+		}
+		out[parts[0]] = parts[1]
+	}
+	return out, nil
+}
+
 func main() {
 	addr := flag.String("addr", "127.0.0.1:5108", "agent gRPC address")
 	showVersion := flag.Bool("version", false, "print version and exit")
@@ -87,7 +123,8 @@ func main() {
 		print(resp)
 	case "create":
 		fs := flag.NewFlagSet("create", flag.ExitOnError)
-		machineID := fs.String("machine-id", "", "stable machine id")
+		var fence fencing
+		addFencingFlags(fs, &fence)
 		image := fs.String("image", "docker.io/library/nginx:alpine", "OCI image ref")
 		vcpus := fs.Uint64("vcpus", 1, "vcpus")
 		mem := fs.Uint64("mem-mib", 512, "memory MiB")
@@ -95,8 +132,6 @@ func main() {
 		app := fs.String("app", "demo", "app id")
 		deployment := fs.String("deployment", "demo-1", "deployment id")
 		execution := fs.String("execution", "exec-1", "execution id")
-		generation := fs.Uint64("generation", 1, "fencing generation")
-		operation := fs.String("operation", "", "fencing operation id (required)")
 		hostname := fs.String("hostname", "", "route hostname (spec.hostname)")
 		port := fs.Uint64("port", 0, "ingress port (spec.network.ingress_port)")
 		proxyCredential := fs.String("proxy-credential", "", "execution-bound proxy credential")
@@ -104,8 +139,8 @@ func main() {
 		var secrets stringSlice
 		fs.Var(&secrets, "secret", "secret env KEY=VALUE (repeatable); value must not echo in response")
 		_ = fs.Parse(args[1:])
-		if *machineID == "" || *operation == "" {
-			fatal(fmt.Errorf("-machine-id and -operation are required"))
+		if err := fence.validate(); err != nil {
+			fatal(err)
 		}
 		spec := &pb.MachineSpec{
 			ProjectId:    *project,
@@ -123,23 +158,18 @@ func main() {
 		if *port != 0 {
 			spec.Network = &pb.NetworkSpec{IngressPort: *port}
 		}
+		secretEnv, err := parseSecretEnv(secrets)
+		if err != nil {
+			fatal(err)
+		}
 		req := &pb.CreateMachineRequest{
-			MachineId:       *machineID,
-			Generation:      *generation,
-			OperationId:     *operation,
+			MachineId:       fence.machineID,
+			Generation:      fence.generation,
+			OperationId:     fence.operation,
 			Spec:            spec,
 			ProxyCredential: *proxyCredential,
 			SecretLeaseId:   *secretLeaseID,
-		}
-		for _, kv := range secrets {
-			parts := strings.SplitN(kv, "=", 2)
-			if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-				fatal(fmt.Errorf("-secret must be KEY=VALUE, got %q", kv))
-			}
-			if req.SecretEnv == nil {
-				req.SecretEnv = map[string]string{}
-			}
-			req.SecretEnv[parts[0]] = parts[1]
+			SecretEnv:       secretEnv,
 		}
 		resp, err := pb.NewMachineServiceClient(conn).CreateMachine(ctx, req)
 		if err != nil {
@@ -148,19 +178,18 @@ func main() {
 		print(resp)
 	case "delete":
 		fs := flag.NewFlagSet("delete", flag.ExitOnError)
-		machineID := fs.String("machine-id", "", "machine id")
+		var fence fencing
+		addFencingFlags(fs, &fence)
 		execution := fs.String("execution", "", "execution id")
-		generation := fs.Uint64("generation", 1, "fencing generation")
-		operation := fs.String("operation", "", "fencing operation id (required)")
 		_ = fs.Parse(args[1:])
-		if *machineID == "" || *operation == "" {
-			fatal(fmt.Errorf("-machine-id and -operation are required"))
+		if err := fence.validate(); err != nil {
+			fatal(err)
 		}
 		req := &pb.DeleteMachineRequest{
-			MachineId:   *machineID,
+			MachineId:   fence.machineID,
 			ExecutionId: *execution,
-			Generation:  *generation,
-			OperationId: *operation,
+			Generation:  fence.generation,
+			OperationId: fence.operation,
 		}
 		if _, err := pb.NewMachineServiceClient(conn).DeleteMachine(ctx, req); err != nil {
 			fatal(err)

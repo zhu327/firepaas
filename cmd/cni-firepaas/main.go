@@ -28,6 +28,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -43,6 +44,37 @@ import (
 
 const cniVersion = "1.0.0"
 
+// cniError 是 CNI 错误协议输出（stdout JSON；code 语义见 spec）。
+type cniError struct {
+	CniVersion string `json:"cniVersion"`
+	Code       int    `json:"code"`
+	Msg        string `json:"msg"`
+}
+
+// cniVersionReply 是 VERSION 命令输出。
+type cniVersionReply struct {
+	CniVersion        string   `json:"cniVersion"`
+	SupportedVersions []string `json:"supportedVersions"`
+}
+
+// cniResult 是 ADD 成功输出（CNI Result 1.0.0；无 dns）。
+type cniResult struct {
+	CniVersion string     `json:"cniVersion"`
+	Interfaces []cniIface `json:"interfaces"`
+	IPs        []cniIP    `json:"ips"`
+}
+
+type cniIface struct {
+	Name    string `json:"name"`
+	Sandbox string `json:"sandbox"`
+}
+
+type cniIP struct {
+	Version   string `json:"version"`
+	Address   string `json:"address"`
+	Interface int    `json:"interface"`
+}
+
 func main() {
 	if err := run(); err != nil {
 		// CNI 错误协议：stdout JSON {cniVersion, code, msg}；code 语义见
@@ -51,10 +83,10 @@ func main() {
 		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "fence") {
 			code = 500 // 拒绝/永久类
 		}
-		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
-			"cniVersion": cniVersion,
-			"code":       code,
-			"msg":        err.Error(),
+		_ = json.NewEncoder(os.Stdout).Encode(cniError{
+			CniVersion: cniVersion,
+			Code:       code,
+			Msg:        err.Error(),
 		})
 		os.Exit(1)
 	}
@@ -151,9 +183,9 @@ func run() error {
 	}
 	if in.Command == "VERSION" {
 		// VERSION 无 fence 要求（纯能力声明，不触碰状态）。
-		return json.NewEncoder(os.Stdout).Encode(map[string]any{
-			"cniVersion":        cniVersion,
-			"supportedVersions": []string{"0.4.0", cniVersion},
+		return json.NewEncoder(os.Stdout).Encode(cniVersionReply{
+			CniVersion:        cniVersion,
+			SupportedVersions: []string{"0.4.0", cniVersion},
 		})
 	}
 	// 其余命令一律要求 fence。
@@ -164,7 +196,7 @@ func run() error {
 	// bundle：stdin JSON（agent 协议；CNI 的 prevResult 与本协议共存于
 	// 同一 stdin 由 agent 序列化为 bundle.prev_result——简化：bundle 优先）。
 	var bundle slotBundle
-	if err := json.NewDecoder(strings.NewReader(string(in.PrevResult))).Decode(&bundle); err != nil {
+	if err := json.Unmarshal(in.PrevResult, &bundle); err != nil {
 		return fmt.Errorf("bad slot bundle (agent must serialize slotBundle JSON, not a runtime prevResult): %w", err)
 	}
 	if bundle.MachineID == "" {
@@ -252,10 +284,7 @@ func bundleBackend(bundle slotBundle) (slot.Backend, error) {
 		if err := ebpf.Probe(); err != nil {
 			return nil, fmt.Errorf("cni ebpf backend unavailable: %w", err)
 		}
-		pinDir := bundle.EbpfPinDir
-		if pinDir == "" {
-			pinDir = ebpf.PinRoot
-		}
+		pinDir := cmp.Or(bundle.EbpfPinDir, ebpf.PinRoot)
 		return ebpf.New(ebpf.Options{
 			PinDir:         pinDir,
 			EgressProxy80:  bundle.ProxyPort80,
@@ -271,23 +300,22 @@ func bundleBackend(bundle slotBundle) (slot.Backend, error) {
 // writeResult 输出 CNI Result 1.0.0（interfaces/ips；无 dns——.internal
 // 由节点本地 DNS 承担，不改 resolver 配置）。
 func writeResult(st api.NetnsState, bundle slotBundle) error {
-	result := map[string]any{
-		"cniVersion": cniVersion,
-		"interfaces": []map[string]any{
-			{"name": filepath.Base(st.Tap), "sandbox": fmt.Sprintf("fp-slot-%d", st.Index)},
+	result := cniResult{
+		CniVersion: cniVersion,
+		Interfaces: []cniIface{
+			{Name: filepath.Base(st.Tap), Sandbox: fmt.Sprintf("fp-slot-%d", st.Index)},
 		},
+		IPs: []cniIP{},
 	}
-	ips := []map[string]any{}
 	if st.GuestIP != "" {
-		ips = append(ips, map[string]any{
-			"version": "4", "address": st.GuestIP, "interface": 0,
+		result.IPs = append(result.IPs, cniIP{
+			Version: "4", Address: st.GuestIP, Interface: 0,
 		})
 	}
 	if bundle.GuestIP6 != "" {
-		ips = append(ips, map[string]any{
-			"version": "6", "address": bundle.GuestIP6 + "/128", "interface": 0,
+		result.IPs = append(result.IPs, cniIP{
+			Version: "6", Address: bundle.GuestIP6 + "/128", Interface: 0,
 		})
 	}
-	result["ips"] = ips
 	return json.NewEncoder(os.Stdout).Encode(result)
 }

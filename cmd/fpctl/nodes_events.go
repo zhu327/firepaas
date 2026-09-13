@@ -24,13 +24,14 @@ func runNodes(args []string) error {
 		_ = flag.NewFlagSet("nodes ls", flag.ExitOnError).Parse(args[1:])
 		return do("GET", "/v1/nodes", nil, nil)
 	case "drain":
-		if len(args) < 2 {
-			return errors.New("usage: fpctl nodes drain <node_id> [--evacuate]")
+		nodeID, err := oneArg(args[1:], "usage: fpctl nodes drain <node_id> [--evacuate]")
+		if err != nil {
+			return err
 		}
 		fs := flag.NewFlagSet("nodes drain", flag.ExitOnError)
 		evacuate := fs.Bool("evacuate", false, "evacuate存量 machine（换代重建到其它节点）")
 		_ = fs.Parse(args[2:])
-		return do("POST", "/v1/nodes/"+url.PathEscape(args[1])+"/drain",
+		return do("POST", "/v1/nodes/"+url.PathEscape(nodeID)+"/drain",
 			map[string]any{"evacuate": *evacuate}, nil)
 	case "ready":
 		id, err := oneArg(args[1:], "usage: fpctl nodes ready <node_id>")
@@ -53,42 +54,28 @@ func runEvents(args []string) error {
 	switch args[0] {
 	case "ls":
 		fs := flag.NewFlagSet("events ls", flag.ExitOnError)
-		project := fs.String(
-			"project",
-			defaultProject(""),
-			"project id (required for root; scoped keys default to own)",
-		)
+		project := projectFlag(fs, "")
 		app := fs.String("app", "", "filter by app id")
 		machine := fs.String("machine", "", "filter by machine id")
 		typ := fs.String("type", "", "filter by event type")
 		limit := fs.Int("limit", 200, "max events (1-1000)")
 		_ = fs.Parse(args[1:])
-		q := url.Values{}
-		if *project != "" {
-			q.Set("project_id", *project)
-		}
-		if *app != "" {
-			q.Set("app_id", *app)
-		}
-		if *machine != "" {
-			q.Set("machine_id", *machine)
-		}
-		if *typ != "" {
-			q.Set("type", *typ)
-		}
-		q.Set("limit", fmt.Sprint(*limit))
-		return do("GET", "/v1/events?"+q.Encode(), nil, nil)
+		return do("GET", withQuery("/v1/events", map[string]string{
+			"project_id": *project,
+			"app_id":     *app,
+			"machine_id": *machine,
+			"type":       *typ,
+			"limit":      fmt.Sprint(*limit),
+		}), nil, nil)
 	case "scheduler":
 		fs := flag.NewFlagSet("events scheduler", flag.ExitOnError)
 		limit := fs.Int("limit", 200, "max events")
-		project := fs.String("project", defaultProject(""), "filter by project id")
+		project := projectFlag(fs, "")
 		_ = fs.Parse(args[1:])
-		q := url.Values{}
-		q.Set("limit", fmt.Sprint(*limit))
-		if *project != "" {
-			q.Set("project_id", *project)
-		}
-		return do("GET", "/v1/system/scheduler-events?"+q.Encode(), nil, nil)
+		return do("GET", withQuery("/v1/system/scheduler-events", map[string]string{
+			"limit":      fmt.Sprint(*limit),
+			"project_id": *project,
+		}), nil, nil)
 	default:
 		return fmt.Errorf("unknown events command %q", args[0])
 	}

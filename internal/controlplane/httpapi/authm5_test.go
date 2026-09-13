@@ -204,15 +204,33 @@ func TestScopeAllowsDeployExecSplit(t *testing.T) {
 }
 
 func TestScopeRankOrdering(t *testing.T) {
-	if scopeRank["read"] >= scopeRank["debug"] || scopeRank["debug"] > scopeRank["write"] ||
-		scopeRank["write"] >= scopeRank["admin"] {
-		t.Fatalf("scope ordering broken: %v", scopeRank)
+	// 序关系经授予集合体现（scopeRank/maxRank 已删除）：read < debug/exec <= write < admin；
+	// 未知 scope 永不授予（等价 maxRank 忽略未知）。
+	if scopeAllows([]string{"read"}, "exec") {
+		t.Fatal("read must not grant exec (read < debug)")
 	}
-	if maxRank([]string{"read", "write", "bogus"}) != scopeRank["write"] {
-		t.Fatalf("maxRank must ignore unknown scopes")
+	for _, need := range []string{"read", "exec", "debug"} {
+		if !scopeAllows([]string{"debug"}, need) || !scopeAllows([]string{"exec"}, need) {
+			t.Fatalf("debug/exec alias must grant %s", need)
+		}
 	}
-	if maxRank(nil) != 0 {
-		t.Fatalf("maxRank(nil) != 0")
+	if scopeAllows([]string{"debug"}, "deploy") {
+		t.Fatal("debug must not grant deploy")
+	}
+	if !scopeAllows([]string{"write"}, "exec") || !scopeAllows([]string{"write"}, "deploy") {
+		t.Fatal("write must grant exec and deploy (debug <= write)")
+	}
+	if scopeAllows([]string{"write"}, "admin") {
+		t.Fatal("write must not grant admin (write < admin)")
+	}
+	if !scopeAllows([]string{"admin"}, "admin") {
+		t.Fatal("admin must grant admin")
+	}
+	if scopeAllows([]string{"bogus"}, "read") || scopeAllows(nil, "read") {
+		t.Fatal("unknown/nil scope must not grant")
+	}
+	if !scopeAllows([]string{"read", "write", "bogus"}, "deploy") {
+		t.Fatal("unknown scopes must be ignored, write still grants deploy")
 	}
 }
 

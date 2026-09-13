@@ -110,3 +110,11 @@ func SetOf(ids []string) map[string]bool {
 	}
 	return out
 }
+
+// IsServingReadiness 判定 observed readiness 是否可服务（ADR-0008）：
+// READY 与 UNCONFIGURED 等价可服务（未配置探针视同就绪）；其余值
+// （空串、NOT_READY、未知/拼写漂移）一律不可服务。路由发布、切流、
+// wait 与 edge 选路四处共用同一白名单，避免语义漂移。
+func IsServingReadiness(s string) bool {
+	return s == "READY" || s == "UNCONFIGURED"
+}

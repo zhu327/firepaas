@@ -28,6 +28,13 @@ var ErrNoHostInfo = errors.New("no host/sni information")
 // errSniffTooLarge 是嗅探读取超限（fail closed；不发往 upstream）。
 var errSniffTooLarge = errors.New("http header too large")
 
+// httpMethodSet 是 PeekHTTPHost 识别的请求方法全集（与原 9 连 HasPrefix
+// 集合精确一致，不增删；查表替代重复前缀分支）。
+var httpMethodSet = map[string]struct{}{
+	"GET": {}, "POST": {}, "PUT": {}, "HEAD": {}, "PATCH": {},
+	"DELETE": {}, "OPTIONS": {}, "CONNECT": {}, "TRACE": {},
+}
+
 // PeekHTTPHost 从 reader 读取一个 HTTP 请求头，提取 Host（大小写归一）。
 // 无 Host（HTTP/1.0）返回 ErrNoHostInfo；prefix 包含读到的全部字节。
 func PeekHTTPHost(r *bufio.Reader) (*PeekResult, error) {
@@ -39,11 +46,13 @@ func PeekHTTPHost(r *bufio.Reader) (*PeekResult, error) {
 	}
 	// 请求行只用于格式校验；Host 必须来自 Host 头或绝对 URI。
 	requestLine := strings.TrimSpace(line)
-	if requestLine == "" || !strings.HasPrefix(requestLine, "GET ") && !strings.HasPrefix(requestLine, "POST ") &&
-		!strings.HasPrefix(requestLine, "PUT ") && !strings.HasPrefix(requestLine, "HEAD ") &&
-		!strings.HasPrefix(requestLine, "PATCH ") && !strings.HasPrefix(requestLine, "DELETE ") &&
-		!strings.HasPrefix(requestLine, "OPTIONS ") && !strings.HasPrefix(requestLine, "CONNECT ") &&
-		!strings.HasPrefix(requestLine, "TRACE ") {
+	// 方法取首个空格前的 token 查白名单：与原逐个 HasPrefix(m+" ") 等价
+	//（方法名不含空格；无空格/空行/未知方法都按无 Host 处理）。
+	method := ""
+	if i := strings.IndexByte(requestLine, ' '); i > 0 {
+		method = requestLine[:i]
+	}
+	if _, ok := httpMethodSet[method]; !ok {
 		// 首行不是 HTTP 请求（可能非 HTTP 协议）：按无 Host 处理。
 		return &PeekResult{Host: "", Prefix: buf.Bytes()}, ErrNoHostInfo
 	}

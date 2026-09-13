@@ -95,7 +95,7 @@ func (a *API) createSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body createSnapshotBody
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
+	if err := decodeJSONBody(w, r, &body, 1<<20, false); err != nil {
 		writeErr(w, 400, "bad request: "+err.Error())
 		return
 	}
@@ -324,7 +324,7 @@ func (a *API) snapshotPreflight(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body snapshotPreflightBody
-	_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body) // 空 body 合法；仅约束上限
+	_ = decodeJSONBody(w, r, &body, 1<<20, true) // 空 body 合法；仅约束上限
 	mode := strings.ToLower(body.RestoreMode)
 	if mode == "" {
 		mode = "auto"
@@ -415,7 +415,7 @@ func (a *API) snapshotPreflight(w http.ResponseWriter, r *http.Request) {
 			"target_key": targetKey,
 			"kind":       snap.Kind,
 			"structured": map[string]bool{
-				"kind_is_memory":     strings.EqualFold(snap.Kind, "MEMORY"),
+				"kind_is_memory":     controller.IsMemoryKind(snap.Kind),
 				"source_key_present": snap.CompatibilityKey != "",
 				"target_key_present": targetKey != "",
 				"keys_match":         snap.CompatibilityKey != "" && snap.CompatibilityKey == targetKey,
@@ -450,7 +450,7 @@ func (a *API) upsertSnapshotSchedule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body snapshotScheduleBody
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
+	if err := decodeJSONBody(w, r, &body, 1<<20, false); err != nil {
 		writeErr(w, 400, "bad request: "+err.Error())
 		return
 	}
@@ -579,7 +579,7 @@ func (a *API) forkSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body forkSnapshotBody
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
+	if err := decodeJSONBody(w, r, &body, 1<<20, false); err != nil {
 		writeErr(w, 400, "bad request: "+err.Error())
 		return
 	}
@@ -625,7 +625,7 @@ func (a *API) forkSnapshot(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 409, "fork target node is not healthy or lacks capability "+required)
 		return
 	}
-	if strings.EqualFold(snap.Kind, "MEMORY") && (snap.CompatibilityKey == "" ||
+	if controller.IsMemoryKind(snap.Kind) && (snap.CompatibilityKey == "" ||
 		target.SnapshotCompatibilityKey != snap.CompatibilityKey) {
 		writeErr(w, 409, "fork memory snapshot compatibility mismatch")
 		return
@@ -652,7 +652,7 @@ func (a *API) forkSnapshot(w http.ResponseWriter, r *http.Request) {
 		ProjectID: snap.ProjectID, AppID: body.AppID, MachineID: machineID,
 		ExecutionID: executionID, NodeID: snap.NodeID, ExpiresAt: &expiresAt,
 		RequiredFeature: required, TargetCompatibilityKey: target.SnapshotCompatibilityKey,
-		RequireMemoryCompatible: strings.EqualFold(snap.Kind, "MEMORY"),
+		RequireMemoryCompatible: controller.IsMemoryKind(snap.Kind),
 	}, store.EnqueueOperationParams{
 		OperationID: opID, ProjectID: snap.ProjectID, MachineID: machineID,
 		ExecutionID: executionID, Generation: 1, Kind: "fork",
@@ -671,7 +671,7 @@ func (a *API) forkSnapshot(w http.ResponseWriter, r *http.Request) {
 func (a *API) rescueMachine(w http.ResponseWriter, r *http.Request) {
 	machineID := r.PathValue("id")
 	var body rescueMachineBody
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
+	if err := decodeJSONBody(w, r, &body, 1<<20, false); err != nil {
 		writeErr(w, 400, "bad request: "+err.Error())
 		return
 	}
@@ -872,7 +872,7 @@ func (a *API) selectVolumeNode(ctx context.Context, requested, feature string, s
 // createVolume 创建 LOCAL_RW 空卷（硬钉 origin node）。
 func (a *API) createVolume(w http.ResponseWriter, r *http.Request) {
 	var body createVolumeBody
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
+	if err := decodeJSONBody(w, r, &body, 1<<20, false); err != nil {
 		writeErr(w, 400, "bad request: "+err.Error())
 		return
 	}
@@ -1114,7 +1114,7 @@ func (a *API) attachVolume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body attachVolumeBody
-	_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body) // 空 body 合法；仅约束上限
+	_ = decodeJSONBody(w, r, &body, 1<<20, true) // 空 body 合法；仅约束上限
 	if body.OverlaySizeBytes < 0 {
 		writeErr(w, 400, "overlay_size_bytes must not be negative")
 		return

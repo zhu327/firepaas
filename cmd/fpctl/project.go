@@ -40,17 +40,9 @@ func runProject(args []string) error {
 		_ = flag.NewFlagSet("project ls", flag.ExitOnError).Parse(args[1:])
 		return do("GET", "/v1/projects", nil, nil)
 	case "show":
-		id, err := oneArg(args[1:], "usage: fpctl project show <id>")
-		if err != nil {
-			return err
-		}
-		return do("GET", "/v1/projects/"+url.PathEscape(id), nil, nil)
+		return getByID(args[1:], "usage: fpctl project show <id>", "/v1/projects")
 	case "rm":
-		id, err := oneArg(args[1:], "usage: fpctl project rm <id>")
-		if err != nil {
-			return err
-		}
-		return do("DELETE", "/v1/projects/"+url.PathEscape(id), nil, nil)
+		return deleteByID(args[1:], "usage: fpctl project rm <id>", "/v1/projects")
 	case "quota":
 		return runProjectQuota(args[1:])
 	case "ratelimits":
@@ -72,8 +64,9 @@ func runProjectQuota(args []string) error {
 		}
 		return do("GET", "/v1/projects/"+url.PathEscape(id)+"/quota", nil, nil)
 	case "set":
-		if len(args) < 2 {
-			return errors.New("usage: fpctl project quota set <project_id> [flags]")
+		id, err := oneArg(args[1:], "usage: fpctl project quota set <project_id> [flags]")
+		if err != nil {
+			return err
 		}
 		fs := flag.NewFlagSet("quota set", flag.ExitOnError)
 		var vcpu, mem, disk, machConc, sessConc int64
@@ -85,13 +78,12 @@ func runProjectQuota(args []string) error {
 		fs.Int64Var(&sessConc, "runtime-session-concurrency", 0, "runtime session concurrency")
 		fs.Int64Var(&revision, "revision", 0, "quota revision (0 = auto-fetch current)")
 		_ = fs.Parse(args[2:])
-		id := args[1]
 		if revision == 0 {
 			// 未显式指定则先读当前 revision（并发冲突时服务端返回 409，调用方重试）。
 			var cur struct {
 				Revision int64 `json:"revision"`
 			}
-			if err := doSilent("GET", "/v1/projects/"+url.PathEscape(id)+"/quota", nil, &cur); err != nil {
+			if err := doRequest(apiClient, "GET", "/v1/projects/"+url.PathEscape(id)+"/quota", nil, &cur, "", false); err != nil {
 				return err
 			}
 			revision = cur.Revision
@@ -119,8 +111,9 @@ func runProjectRateLimits(args []string) error {
 		}
 		return do("GET", "/v1/projects/"+url.PathEscape(id)+"/rate-limits", nil, nil)
 	case "set":
-		if len(args) < 2 {
-			return errors.New("usage: fpctl project ratelimits set <project_id> [flags]")
+		id, err := oneArg(args[1:], "usage: fpctl project ratelimits set <project_id> [flags]")
+		if err != nil {
+			return err
 		}
 		fs := flag.NewFlagSet("ratelimits set", flag.ExitOnError)
 		var rr, rb, mr, mb, sr, sb float64
@@ -131,7 +124,6 @@ func runProjectRateLimits(args []string) error {
 		fs.Float64Var(&sr, "stream-rate", 0, "stream rate")
 		fs.Float64Var(&sb, "stream-burst", 0, "stream burst")
 		_ = fs.Parse(args[2:])
-		id := args[1]
 		body := map[string]any{
 			"read_rate": rr, "read_burst": rb,
 			"mutation_rate": mr, "mutation_burst": mb,

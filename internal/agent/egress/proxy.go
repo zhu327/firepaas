@@ -206,6 +206,20 @@ func (p *Proxy) stage(machineID, executionID, projectID, appID, guestIP string, 
 	}, guestIP: addr}, nil
 }
 
+// ipForMachine 返回 machineID 当前绑定的 guest IP（无绑定返回零值）。
+// 调用方必须持有 p.mu（读或写锁）：Register/current 在同一临界区内
+// 快照 entry 与 IP，保证两者一致。
+func (p *Proxy) ipForMachine(machineID string) netip.Addr {
+	if e := p.byMach[machineID]; e != nil {
+		for ip, cur := range p.byIP {
+			if cur == e {
+				return ip
+			}
+		}
+	}
+	return netip.Addr{}
+}
+
 // current returns a staging-compatible snapshot of the currently published entry.
 func (p *Proxy) current(machineID string) (*stagedEntry, bool) {
 	p.mu.RLock()
@@ -214,14 +228,7 @@ func (p *Proxy) current(machineID string) (*stagedEntry, bool) {
 	if e == nil {
 		return nil, false
 	}
-	var guestIP netip.Addr
-	for ip, cur := range p.byIP {
-		if cur == e {
-			guestIP = ip
-			break
-		}
-	}
-	return &stagedEntry{entry: e, guestIP: guestIP}, true
+	return &stagedEntry{entry: e, guestIP: p.ipForMachine(machineID)}, true
 }
 
 // swap publishes the already validated policy and IP binding in one critical section.
@@ -250,21 +257,17 @@ func (p *Proxy) swap(staged *stagedEntry) error {
 	return nil
 }
 
-// Register 注册/更新 machine 的 execution policy。Manager 使用 stage+swap
-// 将 policy 与 IP 一次发布；直接调用时保留已有 IP 绑定。
+// Register 注册/更新 machine 的 execution policy（保留已有 IP 绑定）。
+// 简单路径：完整的发布协议（stage → 数据面快照 → swap）在 Manager.Apply；
+// 直接调用本方法仅做 stage+swap，不碰数据面，仅用于单测与无数据面后端场景。
 func (p *Proxy) Register(machineID, executionID, projectID, appID string, policy *Policy) error {
 	if policy == nil {
 		return p.Unregister(machineID)
 	}
 	guestIP := ""
 	p.mu.RLock()
-	if existing := p.byMach[machineID]; existing != nil {
-		for ip, entry := range p.byIP {
-			if entry == existing {
-				guestIP = ip.String()
-				break
-			}
-		}
+	if addr := p.ipForMachine(machineID); addr.IsValid() {
+		guestIP = addr.String()
 	}
 	p.mu.RUnlock()
 	staged, err := p.stage(machineID, executionID, projectID, appID, guestIP, policy)
@@ -412,21 +415,17 @@ func (p *Proxy) handle(ctx context.Context, conn net.Conn, idx int) {
 		prefix   []byte
 		upstream net.Conn
 	)
-	switch idx {
-	case 0:
-		peek, err := PeekHTTPHost(br)
+	// 80/443 仅嗅探器不同（HTTP Host vs TLS SNI），后续 dial/审计单路径。
+	peekFn := PeekHTTPHost
+	readErrPrefix := "read http request: "
+	if idx == 1 {
+		peekFn = PeekTLSSNI
+		readErrPrefix = "read tls clienthello: "
+	}
+	if idx == 0 || idx == 1 {
+		peek, err := peekFn(br)
 		if err != nil && !errors.Is(err, ErrNoHostInfo) {
-			record.Reason = "read http request: " + err.Error()
-			p.finishDeny(entry, record, decision, conn)
-			return
-		}
-		record.Host = peek.Host
-		prefix = peek.Prefix
-		upstream, decision = p.dialFor(entry.Policy, peek.Host, protoPort(idx), peek.Prefix)
-	case 1:
-		peek, err := PeekTLSSNI(br)
-		if err != nil && !errors.Is(err, ErrNoHostInfo) {
-			record.Reason = "read tls clienthello: " + err.Error()
+			record.Reason = readErrPrefix + err.Error()
 			p.finishDeny(entry, record, decision, conn)
 			return
 		}

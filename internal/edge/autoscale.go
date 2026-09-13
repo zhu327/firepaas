@@ -44,9 +44,6 @@ const (
 	defaultAutoscaleMaxHosts = 10000
 )
 
-// autoscaleKey 返回信号键（hostname 与 route cache key 同口径，不做额外规范化）。
-func autoscaleKey(hostname string) string { return "autoscale:" + hostname }
-
 // hostWindow 是单个 5s 采样窗的短窗计数。
 type hostWindow struct {
 	rps          int64
@@ -292,7 +289,7 @@ func (r *AutoscaleReporter) Report(ctx context.Context) {
 		if err != nil {
 			continue
 		}
-		key := autoscaleKey(host)
+		key := catalog.AutoscaleKey(host)
 		if err := r.rdb.Eval(ctx, autoscaleReportLua,
 			[]string{key}, r.edgeID, string(raw), int64(r.ttl/time.Second)).Err(); err != nil {
 			r.counters.autoscaleReportErrors.Add(1)

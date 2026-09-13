@@ -149,7 +149,7 @@ func (a *API) eligiblePrewarmNodes(
 func (a *API) prewarmImage(w http.ResponseWriter, r *http.Request) {
 	limits := a.limits
 	var body prewarmBody
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
+	if err := decodeJSONBody(w, r, &body, 1<<20, false); err != nil {
 		writeErr(w, 400, "bad request: "+err.Error())
 		return
 	}
@@ -394,7 +394,7 @@ type imagePinBody struct {
 func (a *API) createImagePin(w http.ResponseWriter, r *http.Request) {
 	limits := a.limits
 	var body imagePinBody
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
+	if err := decodeJSONBody(w, r, &body, 1<<20, false); err != nil {
 		writeErr(w, 400, "bad request: "+err.Error())
 		return
 	}

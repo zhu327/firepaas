@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/zhu327/firepaas/internal/capabilities"
 	agentv1 "github.com/zhu327/firepaas/internal/contracts/agentv1"
 	"github.com/zhu327/firepaas/internal/controlplane/agentclient"
 	"github.com/zhu327/firepaas/internal/controlplane/store"
@@ -459,13 +460,13 @@ func (c *Controller) enqueueUserDelete(ctx context.Context, m store.Machine, rea
 	}
 	op, err := c.store.EnqueueDelete(ctx, project, m.ID, m.CurrentExecutionID,
 		opID, m.Generation, raw)
+	if errors.Is(err, store.ErrRequestConflict) {
+		// 同 execution 下的重复删除请求体必然一致；冲突只来自异常路径，
+		// 记事件供审计，不中断对账循环。
+		c.recordEvent(ctx, "scale", m.ID, opID, "", "user delete idempotency conflict: "+err.Error(), nil)
+		return nil
+	}
 	if err != nil {
-		if errors.Is(err, store.ErrRequestConflict) {
-			// 同 execution 下的重复删除请求体必然一致；冲突只来自异常路径，
-			// 记事件供审计，不中断对账循环。
-			c.recordEvent(ctx, "scale", m.ID, opID, "", "user delete idempotency conflict: "+err.Error(), nil)
-			return nil
-		}
 		return err
 	}
 	if op.Status == "PENDING" {
@@ -493,8 +494,7 @@ func allReady(machines []store.Machine, replicas int) bool {
 		default:
 			continue
 		}
-		switch m.ObservedReadiness {
-		case "READY", "UNCONFIGURED":
+		if capabilities.IsServingReadiness(m.ObservedReadiness) {
 			ready[m.ReplicaOrdinal] = true
 		}
 	}
@@ -513,11 +513,7 @@ func machineServing(m store.Machine) bool {
 	default:
 		return false
 	}
-	switch m.ObservedReadiness {
-	case "READY", "UNCONFIGURED":
-		return true
-	}
-	return false
+	return capabilities.IsServingReadiness(m.ObservedReadiness)
 }
 
 // applyDeploymentSpecExtras 把 deployment 的 v1.1 扩展字段（auto_standby、

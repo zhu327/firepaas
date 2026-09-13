@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"net/url"
-	"strings"
 )
 
 // runImages 实现 v1.4-C（docs/v1.4-plan.md §7）的镜像预热/覆盖率/pin CLI。
@@ -37,27 +36,12 @@ func runImages(args []string) error {
 
 func nodeTargetFlags(fs *flag.FlagSet, nodePool *string, nodeIDs *[]string) {
 	fs.StringVar(nodePool, "node-pool", "", "target node pool")
-	fs.Var(stringSliceFlag(nodeIDs), "node", "target node id (repeatable)")
-}
-
-type stringSliceValue []string
-
-func (s *stringSliceValue) String() string { return strings.Join(*s, ",") }
-func (s *stringSliceValue) Set(v string) error {
-	if v == "" {
-		return errors.New("empty --node value")
-	}
-	*s = append(*s, v)
-	return nil
-}
-
-func stringSliceFlag(target *[]string) *stringSliceValue {
-	return (*stringSliceValue)(target)
+	fs.Var((*repeatable)(nodeIDs), "node", "target node id (repeatable)")
 }
 
 func runImagesPrewarm(args []string) error {
 	fs := flag.NewFlagSet("images prewarm", flag.ExitOnError)
-	project := fs.String("project", defaultProject("dev"), "project id")
+	project := projectFlag(fs, "dev")
 	image := fs.String("image", "", "digest-pinned image ref (registry/app@sha256:...)")
 	var nodePool string
 	var nodeIDs []string
@@ -70,13 +54,9 @@ func runImagesPrewarm(args []string) error {
 		)
 	}
 	body := map[string]any{"project_id": *project, "image_ref": *image}
-	if nodePool != "" {
-		body["node_pool"] = nodePool
-	}
-	if len(nodeIDs) > 0 {
-		body["node_ids"] = nodeIDs
-	}
-	return doIdem("POST", "/v1/images/prewarm", body, nil, resolveIdemKey(*idem))
+	put(body, "node_pool", nodePool)
+	putAny(body, "node_ids", nodeIDs, len(nodeIDs) > 0)
+	return doRequest(apiClient, "POST", "/v1/images/prewarm", body, nil, resolveIdemKey(*idem), true)
 }
 
 func runImagesCoverage(args []string) error {
@@ -88,43 +68,34 @@ func runImagesCoverage(args []string) error {
 	if *image == "" && *digest == "" {
 		return errors.New("usage: fpctl images coverage --image <ref> | --digest sha256:... [--node-pool p]")
 	}
-	q := url.Values{}
-	if *image != "" {
-		q.Set("image_ref", *image)
-	}
-	if *digest != "" {
-		q.Set("digest", *digest)
-	}
-	if *nodePool != "" {
-		q.Set("node_pool", *nodePool)
-	}
-	return do("GET", "/v1/images/coverage?"+q.Encode(), nil, nil)
+	return do("GET", withQuery("/v1/images/coverage", map[string]string{
+		"image_ref": *image,
+		"digest":    *digest,
+		"node_pool": *nodePool,
+	}), nil, nil)
 }
 
 func runImagesPins(args []string) error {
 	fs := flag.NewFlagSet("images pins", flag.ExitOnError)
-	project := fs.String("project", defaultProject(""), "filter by project id (default: own/Global sees all)")
+	project := projectFlag(fs, "")
 	_ = fs.Parse(args)
-	path := "/v1/images/pins"
-	if *project != "" {
-		path += "?project_id=" + url.QueryEscape(*project)
-	}
-	return do("GET", path, nil, nil)
+	return do("GET", withQuery("/v1/images/pins", map[string]string{"project_id": *project}), nil, nil)
 }
 
 func runImagesUnpin(args []string) error {
-	if len(args) < 1 {
-		return errors.New("usage: fpctl images unpin <pin_id> [--idempotency-key K]")
+	pinID, err := oneArg(args, "usage: fpctl images unpin <pin_id> [--idempotency-key K]")
+	if err != nil {
+		return err
 	}
 	fs := flag.NewFlagSet("images unpin", flag.ExitOnError)
 	idem := idemKeyFlag(fs)
 	_ = fs.Parse(args[1:])
-	return doIdem("DELETE", "/v1/images/pins/"+url.PathEscape(args[0]), nil, nil, resolveIdemKey(*idem))
+	return doRequest(apiClient, "DELETE", "/v1/images/pins/"+url.PathEscape(pinID), nil, nil, resolveIdemKey(*idem), true)
 }
 
 func runImagesPin(args []string) error {
 	fs := flag.NewFlagSet("images pin", flag.ExitOnError)
-	project := fs.String("project", defaultProject("dev"), "project id")
+	project := projectFlag(fs, "dev")
 	image := fs.String("image", "", "digest-pinned image ref")
 	ttl := fs.Int64("ttl", 3600, "pin TTL seconds")
 	reason := fs.String("reason", "", "pin reason (audited)")
@@ -142,11 +113,7 @@ func runImagesPin(args []string) error {
 		"project_id": *project, "image_ref": *image,
 		"ttl_seconds": *ttl, "reason": *reason,
 	}
-	if nodePool != "" {
-		body["node_pool"] = nodePool
-	}
-	if len(nodeIDs) > 0 {
-		body["node_ids"] = nodeIDs
-	}
-	return doIdem("POST", "/v1/images/pins", body, nil, resolveIdemKey(*idem))
+	put(body, "node_pool", nodePool)
+	putAny(body, "node_ids", nodeIDs, len(nodeIDs) > 0)
+	return doRequest(apiClient, "POST", "/v1/images/pins", body, nil, resolveIdemKey(*idem), true)
 }

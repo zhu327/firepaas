@@ -7,7 +7,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"time"
 
 	"github.com/zhu327/firepaas/internal/agent/machine"
 	"github.com/zhu327/firepaas/internal/agent/mutation"
@@ -99,17 +98,13 @@ func (s *Server) ListSnapshots(ctx context.Context, req *pb.ListSnapshotsRequest
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	complete := req.GetMachineId() == "" && req.GetSnapshotId() == ""
-	generation := s.inventoryGeneration.Add(1)
-	observedAt := time.Now().Unix()
+	generation, observedAt, observation := s.nextInventoryObservation(complete)
 	return &pb.ListSnapshotsResponse{
 		Snapshots: list,
 		// v1.4-B：无过滤参数 = 节点全量 inventory（控制面可推导 MISSING）。
 		// 带过滤的查询是子集视图，不得声称完整。
 		Complete: complete, ObservationGeneration: generation, ObservedAtUnix: observedAt,
-		Observation: &pb.InventoryObservation{
-			Complete: complete, Epoch: s.inventoryEpoch,
-			Generation: generation, ObservedAtUnix: observedAt,
-		},
+		Observation: observation,
 	}, nil
 }
 

@@ -16,7 +16,6 @@
 package httpapi
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
 	"time"
@@ -87,7 +86,7 @@ func (a *API) createAPIKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var b createAPIKeyBody
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&b); err != nil {
+	if err := decodeJSONBody(w, r, &b, 1<<20, false); err != nil {
 		writeErr(w, 400, "bad request: "+err.Error())
 		return
 	}
@@ -244,18 +243,18 @@ func (a *API) rotateAPIKey(w http.ResponseWriter, r *http.Request) {
 	keyID := r.PathValue("id")
 	var body rotateAPIKeyBody
 	if raw := r.Body; raw != nil {
-		_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body)
+		_ = decodeJSONBody(w, r, &body, 1<<20, true)
 	}
 	target, err := a.apiKeys.GetByID(r.Context(), keyID)
-	if err != nil {
-		if errors.Is(err, apikeys.ErrNotFound) {
-			if identityIsGlobal(id) {
-				writeErr(w, 404, "api key not found")
-			} else {
-				writeJSON(w, 200, map[string]string{"id": keyID, "status": "revoked"})
-			}
-			return
+	if errors.Is(err, apikeys.ErrNotFound) {
+		if identityIsGlobal(id) {
+			writeErr(w, 404, "api key not found")
+		} else {
+			writeJSON(w, 200, map[string]string{"id": keyID, "status": "revoked"})
 		}
+		return
+	}
+	if err != nil {
 		writeInternalErr(w, r, err)
 		return
 	}
@@ -286,11 +285,11 @@ func (a *API) rotateAPIKey(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	nk, plain, err := a.apiKeys.Create(r.Context(), target.Name, target.Scopes, target.ProjectID, ttl)
+	if errors.Is(err, apikeys.ErrInvalidInput) {
+		writeErr(w, 400, err.Error())
+		return
+	}
 	if err != nil {
-		if errors.Is(err, apikeys.ErrInvalidInput) {
-			writeErr(w, 400, err.Error())
-			return
-		}
 		writeInternalErr(w, r, err)
 		return
 	}

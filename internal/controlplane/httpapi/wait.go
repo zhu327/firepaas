@@ -9,7 +9,6 @@
 package httpapi
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -17,6 +16,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/zhu327/firepaas/internal/capabilities"
 	"github.com/zhu327/firepaas/internal/controlplane/store"
 	"github.com/zhu327/firepaas/internal/security/redact"
 )
@@ -89,25 +89,13 @@ func (a *API) waitMachine(w http.ResponseWriter, r *http.Request) {
 		}
 		switch {
 		case m.DesiredState == "DELETED":
-			writeJSON(w, 200, map[string]any{
-				"outcome": "terminal", "status": "terminal",
-				"terminal_reason": "deleted", "execution_id": m.CurrentExecutionID,
-				"generation": m.Generation,
-			})
+			writeTerminal(w, m, "deleted")
 			return
 		case m.RestartBlocked:
-			writeJSON(w, 200, map[string]any{
-				"outcome": "terminal", "status": "terminal",
-				"terminal_reason": "restart_blocked", "execution_id": m.CurrentExecutionID,
-				"generation": m.Generation,
-			})
+			writeTerminal(w, m, "restart_blocked")
 			return
 		case m.ObservedState == "STOPPED" && m.RestartMode == "NEVER":
-			writeJSON(w, 200, map[string]any{
-				"outcome": "terminal", "status": "terminal",
-				"terminal_reason": "stopped", "execution_id": m.CurrentExecutionID,
-				"generation": m.Generation,
-			})
+			writeTerminal(w, m, "stopped")
 			return
 		case machineReady(m):
 			// 目标语义是“execution X ready”（ADR-0026 §10）：RUNNING 但未
@@ -133,17 +121,23 @@ func (a *API) waitMachine(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// writeTerminal 写 machine wait 的终态响应（deleted/restart_blocked/stopped
+// 三分支共用同一字面量，避免 terminal_reason 漂移）。
+func writeTerminal(w http.ResponseWriter, m *store.Machine, reason string) {
+	writeJSON(w, 200, map[string]any{
+		"outcome": "terminal", "status": "terminal",
+		"terminal_reason": reason, "execution_id": m.CurrentExecutionID,
+		"generation": m.Generation,
+	})
+}
+
 // machineReady 判定 machine 是否达到“ready”目标（v1.2-D，ADR-0008/0026）。
 func machineReady(m *store.Machine) bool {
 	if m.ObservedState != "RUNNING" && m.ObservedState != "PAUSED" {
 		return false
 	}
-	switch m.ObservedReadiness {
-	case "READY", "UNCONFIGURED":
-		return true
-	default: // UNKNOWN / NOT_READY / 空
-		return false
-	}
+	// UNKNOWN / NOT_READY / 空一律未就绪。
+	return capabilities.IsServingReadiness(m.ObservedReadiness)
 }
 
 // waitOperation 等待 operation 进入终态（SUCCEEDED|FAILED）。
@@ -263,7 +257,7 @@ type machineTTLBody struct {
 func (a *API) updateMachineTTL(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var body machineTTLBody
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
+	if err := decodeJSONBody(w, r, &body, 1<<20, false); err != nil {
 		writeErr(w, 400, "bad request: "+err.Error())
 		return
 	}

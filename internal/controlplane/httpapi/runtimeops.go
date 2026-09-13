@@ -177,7 +177,7 @@ func (a *API) machineExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var open execOpen
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, runtimeMaxBody)).Decode(&open); err != nil {
+	if err := decodeJSONBody(w, r, &open, runtimeMaxBody, false); err != nil {
 		writeErr(w, 400, "bad request: "+err.Error())
 		return
 	}

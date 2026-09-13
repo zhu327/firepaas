@@ -10,7 +10,6 @@
 package httpapi
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
 
@@ -71,7 +70,7 @@ func (a *API) getAutoscale(w http.ResponseWriter, r *http.Request) {
 func (a *API) putAutoscale(w http.ResponseWriter, r *http.Request) {
 	appID := r.PathValue("id")
 	var body autoscaleBody
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
+	if err := decodeJSONBody(w, r, &body, 1<<20, false); err != nil {
 		writeErr(w, 400, "bad request: "+err.Error())
 		return
 	}

@@ -69,12 +69,20 @@ func runExec(args []string) error {
 		}
 	}
 	if sep >= 0 {
-		machineID = firstOr(args[:sep], "")
-		flags = args[1:sep]
+		if sep > 0 {
+			machineID = args[0]
+		}
+		if sep > 1 {
+			flags = args[1:sep]
+		}
 		cmd = args[sep+1:]
 	} else {
-		machineID = firstOr(args[:1], "")
-		flags = args[1:]
+		if len(args) > 0 {
+			machineID = args[0]
+		}
+		if len(args) > 1 {
+			flags = args[1:]
+		}
 	}
 	if machineID == "" || len(cmd) == 0 {
 		return errors.New(
@@ -83,13 +91,16 @@ func runExec(args []string) error {
 	}
 	fs := flag.NewFlagSet("exec", flag.ExitOnError)
 	cwd := fs.String("cwd", "", "working directory")
-	var envFlags envFlags
-	fs.Var(&envFlags, "env", "env var KEY=VAL (repeatable; values may contain any characters)")
+	var envVars repeatable
+	fs.Var(&envVars, "env", "env var KEY=VAL (repeatable; values may contain any characters)")
 	tty := fs.Bool("tty", false, "allocate pseudo-TTY")
 	rows := fs.Uint("rows", 0, "terminal rows (tty)")
 	cols := fs.Uint("cols", 0, "terminal cols (tty)")
 	_ = fs.Parse(flags)
-	env := envFlags.toMap()
+	env, err := envVars.toMap()
+	if err != nil {
+		return err
+	}
 	// 非交互 stdin：管道/文件输入整体作为一帧 base64 下发（避免逐字节 RPC）。
 	// 上限与 agentd gRPC MaxRecvMsgSize（16MiB）留出帧开销后对齐。
 	stdinB64 := ""
@@ -114,8 +125,7 @@ func runExec(args []string) error {
 	if err != nil {
 		return err
 	}
-
-	resp, err := rawRequest(
+	resp, err := fetchChecked(
 		"POST",
 		"/v1/machines/"+url.PathEscape(machineID)+"/exec",
 		bytes.NewReader(rawBody),
@@ -125,10 +135,6 @@ func runExec(args []string) error {
 		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode >= 300 {
-		raw, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("POST exec: %s (%s)", resp.Status, strings.TrimSpace(string(raw)))
-	}
 	dec := json.NewDecoder(resp.Body)
 	for {
 		var ev execOutputEvent
@@ -185,15 +191,9 @@ func runCP(args []string) error {
 		if len(args) == 5 {
 			operationID = args[4]
 		}
-		resp, err := rawRequest(
+		resp, err := fetchChecked(
 			"PUT",
-			"/v1/machines/"+url.PathEscape(
-				machineID,
-			)+"/files?path="+urlQuery(
-				remote,
-			)+"&operation_id="+urlQuery(
-				operationID,
-			),
+			"/v1/machines/"+url.PathEscape(machineID)+"/files?path="+url.QueryEscape(remote)+"&operation_id="+url.QueryEscape(operationID),
 			f,
 			"application/octet-stream",
 		)
@@ -202,9 +202,6 @@ func runCP(args []string) error {
 		}
 		defer func() { _ = resp.Body.Close() }()
 		raw, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode >= 300 {
-			return fmt.Errorf("PUT files: %s (%s)", resp.Status, strings.TrimSpace(string(raw)))
-		}
 		fmt.Println(string(raw))
 		return nil
 	case "down":
@@ -212,9 +209,9 @@ func runCP(args []string) error {
 			return errors.New("usage: fpctl cp <machine_id> down <guest_path> <local_file>")
 		}
 		remote, local := args[2], args[3]
-		resp, err := rawRequest(
+		resp, err := fetchChecked(
 			"GET",
-			"/v1/machines/"+url.PathEscape(machineID)+"/files?path="+urlQuery(remote),
+			"/v1/machines/"+url.PathEscape(machineID)+"/files?path="+url.QueryEscape(remote),
 			nil,
 			"",
 		)
@@ -222,10 +219,6 @@ func runCP(args []string) error {
 			return err
 		}
 		defer func() { _ = resp.Body.Close() }()
-		if resp.StatusCode >= 300 {
-			raw, _ := io.ReadAll(resp.Body)
-			return fmt.Errorf("GET files: %s (%s)", resp.Status, strings.TrimSpace(string(raw)))
-		}
 		return downloadAtomically(resp, local)
 	default:
 		return fmt.Errorf("unknown cp direction %q (want up|down)", args[1])
@@ -236,10 +229,8 @@ func runCP(args []string) error {
 // 原始 HTTP 辅助（流式；不复用 do 的整包 JSON 语义）
 // ---------------------------------------------------------------------------
 
-func apiBase() string { return apiAddr() }
-
 func rawRequest(method, path string, body io.Reader, contentType string) (*http.Response, error) {
-	req, err := http.NewRequest(method, apiBase()+path, body)
+	req, err := http.NewRequest(method, apiAddr()+path, body)
 	if err != nil {
 		return nil, err
 	}
@@ -250,6 +241,21 @@ func rawRequest(method, path string, body io.Reader, contentType string) (*http.
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	return longClient.Do(req)
+}
+
+// fetchChecked 发起流式请求并统一检查状态码，成功返回 Body 仍打开的 resp
+// （调用方负责 Close），失败返回包含状态与 body 片段的错误。
+func fetchChecked(method, path string, body io.Reader, contentType string) (*http.Response, error) {
+	resp, err := rawRequest(method, path, body, contentType)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("%s %s: %s (%s)", method, path, resp.Status, strings.TrimSpace(string(raw)))
+	}
+	return resp, nil
 }
 
 func doRawStream(method, path string, body io.Reader, w io.Writer, headers map[string]string) error {
@@ -299,42 +305,6 @@ const runtimeMaxDownload int64 = 100 << 20
 
 func newOperationID() string {
 	return fmt.Sprintf("exec-%d-%d", time.Now().UnixNano(), os.Getpid())
-}
-
-func firstOr(list []string, def string) string {
-	if len(list) > 0 {
-		return list[0]
-	}
-	return def
-}
-
-func urlQuery(v string) string {
-	// 用标准库完整转义（&/+/%/空格等都会破坏 query 语义）；路径合法性
-	// 由 API/agent 的白名单校验负责。
-	return url.QueryEscape(v)
-}
-
-// envFlags 实现 flag.Value：--env KEY=VAL（可重复；值可含任意字符，含逗号）。
-type envFlags []string
-
-func (f *envFlags) String() string { return strings.Join(*f, ",") }
-
-func (f *envFlags) Set(v string) error {
-	parts := strings.SplitN(v, "=", 2)
-	if len(parts) != 2 || parts[0] == "" {
-		return fmt.Errorf("bad --env pair %q (want KEY=VAL)", v)
-	}
-	*f = append(*f, v)
-	return nil
-}
-
-func (f envFlags) toMap() map[string]string {
-	out := make(map[string]string, len(f))
-	for _, kv := range f {
-		parts := strings.SplitN(kv, "=", 2)
-		out[parts[0]] = parts[1]
-	}
-	return out
 }
 
 // isTerminalInput 保守判断 stdin 是否为终端（不可判定时视为管道）。

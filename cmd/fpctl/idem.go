@@ -37,7 +37,4 @@ func resolveIdemKey(flagVal string) string {
 	return key
 }
 
-// doIdem 与 do 同语义，额外透传 Idempotency-Key 请求头（key 为空则不发）。
-func doIdem(method, path string, body, out any, key string) error {
-	return doRequest(apiClient, method, path, body, out, key, true)
-}
+// 幂等键经 doRequest(idemKey) 透传（key 为空则不发头），调用点直调 doRequest。

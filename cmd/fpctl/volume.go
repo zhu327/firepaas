@@ -24,7 +24,7 @@ func runVolume(args []string) error {
 	switch args[0] {
 	case "create":
 		fs := flag.NewFlagSet("volume create", flag.ExitOnError)
-		project := fs.String("project", defaultProject("dev"), "project id")
+		project := projectFlag(fs, "dev")
 		name := fs.String("name", "", "volume name (required)")
 		mode := fs.String("mode", "LOCAL_RW", "LOCAL_RW|DATASET_RO")
 		sizeGib := fs.Int("size-gib", 0, "size GiB (required, > 0)")
@@ -43,28 +43,17 @@ func runVolume(args []string) error {
 		return do("POST", "/v1/volumes", body, nil)
 	case "ls":
 		fs := flag.NewFlagSet("volume ls", flag.ExitOnError)
-		project := fs.String("project", defaultProject(""), "filter by project id")
+		project := projectFlag(fs, "")
 		_ = fs.Parse(args[1:])
-		path := "/v1/volumes"
-		if *project != "" {
-			path += "?project_id=" + url.QueryEscape(*project)
-		}
-		return do("GET", path, nil, nil)
+		return do("GET", withQuery("/v1/volumes", map[string]string{"project_id": *project}), nil, nil)
 	case "show":
-		id, err := oneArg(args[1:], "usage: fpctl volume show <volume_id>")
-		if err != nil {
-			return err
-		}
-		return do("GET", "/v1/volumes/"+url.PathEscape(id), nil, nil)
+		return getByID(args[1:], "usage: fpctl volume show <volume_id>", "/v1/volumes")
 	case "rm":
-		id, err := oneArg(args[1:], "usage: fpctl volume rm <volume_id>")
+		return deleteByID(args[1:], "usage: fpctl volume rm <volume_id>", "/v1/volumes")
+	case "attach":
+		machineID, err := oneArg(args[1:], "usage: fpctl volume attach <machine_id> --volume <id> --mount-path <p>")
 		if err != nil {
 			return err
-		}
-		return do("DELETE", "/v1/volumes/"+url.PathEscape(id), nil, nil)
-	case "attach":
-		if len(args) < 2 {
-			return errors.New("usage: fpctl volume attach <machine_id> --volume <id> --mount-path <p>")
 		}
 		fs := flag.NewFlagSet("volume attach", flag.ExitOnError)
 		vol := fs.String("volume", "", "volume id (required)")
@@ -80,13 +69,14 @@ func runVolume(args []string) error {
 		}
 		return do(
 			"POST",
-			"/v1/machines/"+url.PathEscape(args[1])+"/volume-attach?volume_id="+url.QueryEscape(*vol),
+			withQuery("/v1/machines/"+url.PathEscape(machineID)+"/volume-attach", map[string]string{"volume_id": *vol}),
 			body,
 			nil,
 		)
 	case "detach":
-		if len(args) < 2 {
-			return errors.New("usage: fpctl volume detach <machine_id> --volume <id>")
+		machineID, err := oneArg(args[1:], "usage: fpctl volume detach <machine_id> --volume <id>")
+		if err != nil {
+			return err
 		}
 		fs := flag.NewFlagSet("volume detach", flag.ExitOnError)
 		vol := fs.String("volume", "", "volume id (required)")
@@ -94,7 +84,7 @@ func runVolume(args []string) error {
 		if *vol == "" {
 			return errors.New("usage: fpctl volume detach <machine_id> --volume <id>")
 		}
-		return do("POST", "/v1/machines/"+url.PathEscape(args[1])+"/volume-detach?volume_id="+url.QueryEscape(*vol),
+		return do("POST", withQuery("/v1/machines/"+url.PathEscape(machineID)+"/volume-detach", map[string]string{"volume_id": *vol}),
 			map[string]any{}, nil)
 	default:
 		return fmt.Errorf("unknown volume command %q", args[0])
