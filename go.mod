@@ -7,7 +7,7 @@ require (
 	github.com/cilium/ebpf v0.22.0
 	github.com/distribution/reference v0.6.0
 	github.com/google/uuid v1.6.0
-	github.com/jackc/pgx/v5 v5.10.0
+	github.com/jackc/pgx/v5 v5.11.0
 	github.com/kernel/hypeman v0.0.0-00010101000000-000000000000
 	github.com/miekg/dns v1.1.68
 	github.com/prometheus/client_golang v1.23.0
@@ -87,6 +87,7 @@ require (
 	github.com/sirupsen/logrus v1.9.4 // indirect
 	github.com/u-root/u-root v0.15.0 // indirect
 	github.com/u-root/uio v0.0.0-20240224005618-d2acac8f3701 // indirect
+	github.com/ugorji/go/codec v1.2.12 // indirect
 	github.com/vbatts/go-mtree v0.6.1-0.20250911112631-8307d76bc1b9 // indirect
 	github.com/vbatts/tar-split v0.12.1 // indirect
 	github.com/vishvananda/netlink v1.3.1 // indirect
