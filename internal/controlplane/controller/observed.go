@@ -154,9 +154,18 @@ func (c *Controller) syncObserved(ctx context.Context) error {
 				continue
 			}
 			// 节点持续失联：把该节点上的 machine 保守置 UNKNOWN（摘路由）。
-			rows, _ := c.store.ListMachinesOnNode(ctx, v.agentID)
+			// store 失败不改变决策语义：本轮跳过该节点的标记（不摘路由、
+			// 不记事件），下一拍 List 成功后自愈；只记 Warn + 指标。
+			rows, err := c.store.ListMachinesOnNode(ctx, v.agentID)
+			if err != nil {
+				c.controllerStoreError("list_machines_on_node", err, "node", v.agentID)
+				continue
+			}
 			for _, m := range rows {
-				_ = c.store.MarkMachineObservedMissing(ctx, m.ID)
+				if err := c.store.MarkMachineObservedMissing(ctx, m.ID); err != nil {
+					c.controllerStoreError("mark_observed_missing", err, "machine_id", m.ID, "node", v.agentID)
+					continue
+				}
 				c.recordEvent(ctx, "reconcile", m.ID, "", v.agentID, "node unreachable, observed UNKNOWN", nil)
 			}
 			continue
@@ -185,16 +194,52 @@ func (c *Controller) syncObserved(ctx context.Context) error {
 	return nil
 }
 
-// publishGauges：M5.2/M5.3 观测 gauge 快照（每 sync 周期刷新，供 /metrics + 告警规则）。
-func (c *Controller) publishGauges(ctx context.Context, views []nodeView, machines []store.Machine) {
-	unhealthy := 0
+// nodeGaugeCounts 统计节点 gauge 快照：nodemanager.Status 取值域为
+// HEALTHY|DRAINING|UNHEALTHY|UNKNOWN，只有 HEALTHY 视为健康；DRAINING
+// 单独计数（供排水告警），不计入 unhealthy——排水是计划内状态，计入
+// unhealthy 会让 FirePaasNodesUnhealthy 在每次排水时触发 critical（review P2）。
+func nodeGaugeCounts(views []nodeView) (total, unhealthy, draining uint64) {
+	total = uint64(len(views))
 	for _, v := range views {
-		if v.status != "READY" {
+		switch v.status {
+		case "HEALTHY":
+		case "DRAINING":
+			draining++
+		default:
 			unhealthy++
 		}
 	}
-	c.metrics.Set("firepaas_nodes_unhealthy", nil, uint64(unhealthy))
-	c.metrics.Set("firepaas_nodes_total", nil, uint64(len(views)))
+	return total, unhealthy, draining
+}
+
+// observedStateCounts 按 observed state 聚合非 DELETED 机器（gauge 发布用）。
+func observedStateCounts(machines []store.Machine) map[string]uint64 {
+	byState := map[string]uint64{}
+	for _, m := range machines {
+		if m.DesiredState == "DELETED" {
+			continue
+		}
+		byState[m.ObservedState]++
+	}
+	return byState
+}
+
+// controllerStoreError 记录一次 controller store 失败：Warn +
+// firepaas_controller_store_errors_total{op}。只做观测，不改变调用方的
+// 决策语义（失败分支仍按原逻辑继续，下一拍自愈）。
+func (c *Controller) controllerStoreError(op string, err error, attrs ...any) {
+	c.metrics.DescribeCounter("firepaas_controller_store_errors_total",
+		"control-plane controller store failures by operation")
+	c.metrics.Inc("firepaas_controller_store_errors_total", map[string]string{"op": op}, 1)
+	slog.Warn("controller store error", append([]any{"op", op, "error", err}, attrs...)...)
+}
+
+// publishGauges：M5.2/M5.3 观测 gauge 快照（每 sync 周期刷新，供 /metrics + 告警规则）。
+func (c *Controller) publishGauges(ctx context.Context, views []nodeView, machines []store.Machine) {
+	total, unhealthy, draining := nodeGaugeCounts(views)
+	c.metrics.Set("firepaas_nodes_unhealthy", nil, unhealthy)
+	c.metrics.Set("firepaas_nodes_total", nil, total)
+	c.metrics.Set("firepaas_nodes_draining", nil, draining)
 	// v1.2-E/F（ADR-0035 / v1.2-plan §9）：节点磁盘 requested/总量 gauge
 	//（label=node_id，有界集合；水位与 GC 触发的观测面）。
 	for _, v := range views {
@@ -211,14 +256,7 @@ func (c *Controller) publishGauges(ctx context.Context, views []nodeView, machin
 
 	// P2-8：先清 family 再 Set——机器状态消失后旧 {state=...} 序列不得残留。
 	c.metrics.ResetFamily("firepaas_machines_observed")
-	byState := map[string]uint64{}
-	for _, m := range machines {
-		if m.DesiredState == "DELETED" {
-			continue
-		}
-		byState[m.ObservedState]++
-	}
-	for state, n := range byState {
+	for state, n := range observedStateCounts(machines) {
 		c.metrics.Set("firepaas_machines_observed", map[string]string{"state": state}, n)
 	}
 	if n, err := c.store.CountOperations(ctx, "PENDING"); err == nil {
@@ -269,8 +307,13 @@ func (c *Controller) processAgentMachine(ctx context.Context, m *pb.Machine, v n
 		c.recordEvent(ctx, "autostandby", m.MachineId, "", v.agentID,
 			"machine entered standby (idle); readiness frozen, wake on next request", nil)
 	}
-	_ = c.store.UpdateMachineObserved(ctx, m.MachineId, m.ExecutionId,
-		m.State.String(), m.SlotIp, m.Readiness.String())
+	// observed 写回失败不改变决策语义：只影响本轮快照（buildRoutes 读到的是
+	// 上一拍的值），下一拍 List 重新上报自愈；不阻断后续 egress/secret/
+	// restart 派生（它们读 agent 观测值，不读刚写入的行）。
+	if err := c.store.UpdateMachineObserved(ctx, m.MachineId, m.ExecutionId,
+		m.State.String(), m.SlotIp, m.Readiness.String()); err != nil {
+		c.controllerStoreError("update_machine_observed", err, "machine_id", m.MachineId)
+	}
 
 	// v1.3-A（ADR-0027）：egress 拒绝摘要入 PG（counter 语义；agent 上报
 	// 当前 execution 的聚合计数）。

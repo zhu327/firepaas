@@ -72,6 +72,10 @@ func grpcErrStatus(err error) (int, string) {
 		return 429, "runtime session limit reached"
 	case codes.InvalidArgument:
 		return 400, "agent rejected request as invalid"
+	case codes.PermissionDenied:
+		// W3.2：agent 节点策略开关（FIREPAAS_AGENT_ALLOW_EXEC=0）的拒绝——
+		// 不是 agent 故障，不得落进 502 默认分支。
+		return 403, "operation denied by node policy"
 	default:
 		// 不受信分支：传输错误/未知 gRPC 错误可能携内部细节（拨号地址、栈），
 		// 只回固定文案，细节由调用方中间件/日志可见。

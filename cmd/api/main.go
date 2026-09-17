@@ -147,6 +147,11 @@ func run() error {
 	cat := catalog.New(rdb)
 	resv := reservations.New(rdb, 120*time.Second)
 	reg := metrics.New()
+	// W2.1：释放回路的可观测性（release_epoch_moved）与 acquire/failed 同
+	// 指标名不同 result；钩子在 Error 路径调用，不得阻塞释放。
+	resv.EmitMetric = func(name string, labels map[string]string) {
+		reg.Inc(name, labels, 1)
+	}
 	// review 2026-09-10：控制面 RED 指标的策展 HELP（auto-type 已可用，
 	// HELP 文本只能显式声明）。
 	reg.DescribeCounter("firepaas_api_requests_total",

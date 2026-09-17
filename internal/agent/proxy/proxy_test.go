@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kernel/hypeman/lib/images"
 	"github.com/kernel/hypeman/lib/instances"
@@ -175,5 +176,123 @@ func TestProxyStripsRequestIDBeforeWorkload(t *testing.T) {
 	}
 	if got := <-guestSaw; got != "" {
 		t.Fatalf("internal request id forwarded to workload: %q", got)
+	}
+}
+
+// timestub 是 guard 时间的确定性替身（并发测试不用任意 sleep）。
+type timestub struct {
+	cur time.Time
+}
+
+func (s *timestub) fn() time.Time { return s.cur }
+
+func timestubNow(now time.Time) *timestub { return &timestub{cur: now} }
+
+// stubCreds 是 ServeCredential 测试替身：hit 时返回固定归属。
+type stubCreds struct {
+	machineID, executionID string
+	lookups                int
+}
+
+func (s *stubCreds) Verify(machineID, executionID, raw string) bool {
+	return raw != "" && machineID == s.machineID && executionID == s.executionID
+}
+
+func (s *stubCreds) LookupByDigest(raw string) (string, string, bool) {
+	s.lookups++
+	if raw == "good-cred" {
+		return s.machineID, s.executionID, true
+	}
+	return "", "", false
+}
+
+func credentialTestProxy(creds credentialVerifier) *Proxy {
+	p := NewForTest(creds, func(machineID, executionID string, wantPort int) (string, int, error) {
+		return "127.0.0.1", 1, nil // 端口 1 拒绝连接 → transport 502，只断言 guard 语义
+	})
+	return p
+}
+
+// W3.3：ServeCredential 命中记 ok；miss 记 denied 且 403 不泄细节。
+func TestServeCredentialCountsOKAndDenied(t *testing.T) {
+	creds := &stubCreds{machineID: "m1", executionID: "e1"}
+	p := credentialTestProxy(creds)
+
+	rr := httptest.NewRecorder()
+	p.ServeCredential(rr, httptest.NewRequest(http.MethodGet, "http://agent/", nil), "good-cred", 0)
+	if rr.Code != http.StatusBadGateway { // guard 通过，终点不可达是 transport 语义
+		t.Fatalf("hit status = %d, want 502", rr.Code)
+	}
+	rr = httptest.NewRecorder()
+	p.ServeCredential(rr, httptest.NewRequest(http.MethodGet, "http://agent/", nil), "bad-cred", 0)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("miss status = %d, want 403", rr.Code)
+	}
+	stats := p.CredentialLookupStats()
+	if stats["ok"] != 1 || stats["denied"] != 1 {
+		t.Fatalf("stats = %v, want ok=1 denied=1", stats)
+	}
+}
+
+// W3.3：全局 lookup 天花板耗尽后回 429 并记 limited（回查 CPU 被限）。
+func TestServeCredentialLookupCeiling(t *testing.T) {
+	creds := &stubCreds{machineID: "m1", executionID: "e1"}
+	p := credentialTestProxy(creds)
+	now := timestubNow(time.Now())
+	p.nowFn = now.fn
+	p.credMu.Lock()
+	p.credTokens = 1
+	p.credLast = now.cur
+	p.credMu.Unlock()
+
+	rr := httptest.NewRecorder()
+	p.ServeCredential(rr, httptest.NewRequest(http.MethodGet, "http://agent/", nil), "good-cred", 0)
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("first status = %d, want 502", rr.Code)
+	}
+	rr = httptest.NewRecorder()
+	p.ServeCredential(rr, httptest.NewRequest(http.MethodGet, "http://agent/", nil), "good-cred", 0)
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("limited status = %d, want 429", rr.Code)
+	}
+	if got := p.CredentialLookupStats()["limited"]; got != 1 {
+		t.Fatalf("limited counter = %d, want 1", got)
+	}
+}
+
+// W3.3（P2 修正）：miss 风暴只耗尽 miss 桶（回 429），绝不阻塞合法凭证——
+// 命中只受 lookup 天花板约束，每次请求仍查表。
+func TestServeCredentialMissNeverBlocksValid(t *testing.T) {
+	creds := &stubCreds{machineID: "m1", executionID: "e1"}
+	p := credentialTestProxy(creds)
+	p.SetCredentialLimits(1000, 1) // miss 桶：1 rps，突发 2
+
+	// 突发内两个 miss 正常 403，之后 miss 回 429（扫描者速率被封顶）。
+	for i := 0; i < 2; i++ {
+		rr := httptest.NewRecorder()
+		p.ServeCredential(rr, httptest.NewRequest(http.MethodGet, "http://agent/", nil), "bad-cred", 0)
+		if rr.Code != http.StatusForbidden {
+			t.Fatalf("miss %d status = %d, want 403", i, rr.Code)
+		}
+	}
+	rr := httptest.NewRecorder()
+	p.ServeCredential(rr, httptest.NewRequest(http.MethodGet, "http://agent/", nil), "bad-cred", 0)
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("exhausted miss bucket status = %d, want 429", rr.Code)
+	}
+
+	// miss 桶空不影响合法凭证：仍查表并放行到 transport。
+	before := creds.lookups
+	rr = httptest.NewRecorder()
+	p.ServeCredential(rr, httptest.NewRequest(http.MethodGet, "http://agent/", nil), "good-cred", 0)
+	if rr.Code != http.StatusBadGateway { // guard 通过，终点不可达是 transport 语义
+		t.Fatalf("valid status = %d, want 502", rr.Code)
+	}
+	if creds.lookups != before+1 {
+		t.Fatal("valid credential must always consult the table, even with an empty miss bucket")
+	}
+	stats := p.CredentialLookupStats()
+	if stats["denied"] != 2 || stats["limited"] != 1 || stats["ok"] != 1 {
+		t.Fatalf("stats = %v, want denied=2 limited=1 ok=1", stats)
 	}
 }

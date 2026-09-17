@@ -1070,3 +1070,13 @@ func (h *Handler) WriteInflightPrometheus(w http.ResponseWriter) {
 		_, _ = fmt.Fprintf(w, "firepaas_edge_backend_inflight{machine_id=%q} %d\n", id, v)
 	}
 }
+
+// InflightTotal 返回当前 in-flight 总量与非零 backend 数（W1.1 LABEL_MACHINE=0
+// 的聚合输出用：直接读 snapshot 求和，不经 Prometheus 文本渲染→解析往返）。
+func (h *Handler) InflightTotal() (total int64, backends int) {
+	for _, v := range h.inflight.snapshot() {
+		total += v
+		backends++
+	}
+	return total, backends
+}

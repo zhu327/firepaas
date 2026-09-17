@@ -17,12 +17,16 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	guestpb "github.com/kernel/hypeman/lib/guest"
 	"github.com/zhu327/firepaas/internal/agent/machine"
 	"github.com/zhu327/firepaas/internal/agent/mutation"
+	"github.com/zhu327/firepaas/internal/security/redact"
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -65,6 +69,126 @@ func WithRuntimeLimits(maxSessions int, maxBytes int64, maxDuration, idleTimeout
 
 // sessionSem 限制并发 guest 会话数（v1.2-C：100 次建立/断开后资源回到基线）。
 type sessionSem chan struct{}
+
+// maxRuntimeSessionsPerMachine（W3.2）：单 machine 并发 Exec/CopyTo 上限。
+// 全局上限 16（runtimeLimits）；单租户 4 会话即封顶，剩余容量留给其他租户。
+// 可调常量：改动需同步更新 RuntimeAccessStats 注释与单测。
+const maxRuntimeSessionsPerMachine = 4
+
+// runtimeAccessCounters（W3.2）：运行时通道允许/拒绝计数。
+// Prometheus 导出名冻结为 firepaas_agent_runtime_access_total{op,decision}，
+// decision ∈ allow|disabled|machine_limit|session_limit。agentd /metrics 接线
+// 是 Phase2（需改 cmd/agentd/main.go，本波次 allowlist 之外）；本包只提供
+// 内存计数 + RuntimeAccessStats 快照。
+type runtimeAccessCounters struct {
+	execAllowed              atomic.Uint64
+	execDeniedDisabled       atomic.Uint64
+	execDeniedMachineLimit   atomic.Uint64
+	execDeniedSessionLimit   atomic.Uint64
+	copyToAllowed            atomic.Uint64
+	copyToDeniedDisabled     atomic.Uint64
+	copyToDeniedMachineLimit atomic.Uint64
+	copyToDeniedSessionLimit atomic.Uint64
+}
+
+// RuntimeAccessStats 返回运行时通道计数快照（key 形如 "exec\x00allow"）。
+// 标签是 **admission 决策**（allow = 通过节点开关/会话上限准入；disabled/
+// machine_limit/session_limit = 对应拒绝），不随会话最终成败变化；会话级
+// 失败见审计日志（decision=error）。
+func (s *Server) RuntimeAccessStats() map[string]uint64 {
+	return map[string]uint64{
+		"exec\x00allow":            s.runtimeAccess.execAllowed.Load(),
+		"exec\x00disabled":         s.runtimeAccess.execDeniedDisabled.Load(),
+		"exec\x00machine_limit":    s.runtimeAccess.execDeniedMachineLimit.Load(),
+		"exec\x00session_limit":    s.runtimeAccess.execDeniedSessionLimit.Load(),
+		"copy-to\x00allow":         s.runtimeAccess.copyToAllowed.Load(),
+		"copy-to\x00disabled":      s.runtimeAccess.copyToDeniedDisabled.Load(),
+		"copy-to\x00machine_limit": s.runtimeAccess.copyToDeniedMachineLimit.Load(),
+		"copy-to\x00session_limit": s.runtimeAccess.copyToDeniedSessionLimit.Load(),
+	}
+}
+
+// acquireMachineSlot 占用一个 per-machine 会话槽；满时返回 ok=false。
+// 调用方必须在会话结束时调用 release（defer）。
+func (s *Server) acquireMachineSlot(machineID string) (release func(), ok bool) {
+	s.machineSessionsMu.Lock()
+	defer s.machineSessionsMu.Unlock()
+	if s.machineSessions == nil {
+		s.machineSessions = map[string]int{}
+	}
+	if s.machineSessions[machineID] >= maxRuntimeSessionsPerMachine {
+		return nil, false
+	}
+	s.machineSessions[machineID]++
+	return func() {
+		s.machineSessionsMu.Lock()
+		defer s.machineSessionsMu.Unlock()
+		if s.machineSessions[machineID] <= 1 {
+			delete(s.machineSessions, machineID)
+			return
+		}
+		s.machineSessions[machineID]--
+	}, true
+}
+
+// auditExec（W3.2）：Exec 允许/拒绝的统一审计事件，每次会话一条。只记
+// argv[0]（二进制名）与 env 键名（值永不记录；敏感键经 redact 打码为
+// [REDACTED]，复用 internal/security/redact）。decision ∈ allow|deny|error：
+// deny = 准入策略拒绝，error = 已准入但会话失败（dial/exec），allow = 正常
+// 结束。secret/credential 不进日志/result/Redis。
+// 事件类型名 runtime.exec.allow / runtime.exec.deny 预留给控制面 user_events
+// 投影消费——agent 无 PG 句柄，controller 侧落库为设计项（Phase1 不写码，
+// 需改 internal/controlplane，本波次 allowlist 之外）。
+func (s *Server) auditExec(machineID, executionID string, argv []string, env map[string]string, decision, reason string, bytes int64, took time.Duration) {
+	argv0 := ""
+	if len(argv) > 0 {
+		argv0 = argv[0]
+	}
+	slog.Info("runtime exec audit",
+		"kind", "exec", "machine_id", machineID, "execution_id", executionID,
+		"argv0", argv0, "env_keys", execEnvKeys(env),
+		"decision", decision, "reason", reason,
+		"bytes", bytes, "duration_ms", took.Milliseconds())
+}
+
+// execEnvKeys 返回排序后的 env 键名（只记键不记值；敏感键打码）。
+// redact.IsSensitive 之外再加 env 专用子串检查：常见的大写下划线键
+// （如 API_TOKEN）经归一化后与 redact 表中的下划线形态错位，这里按
+// 无分隔符小写做二次判定（redact 包本波次不可改，只收紧本路径）。
+func execEnvKeys(env map[string]string) []string {
+	out := make([]string, 0, len(env))
+	redacted := false
+	for k := range env {
+		if isSensitiveEnvKey(k) {
+			// 敏感键统一折叠为单个标记：逐键输出会泄露敏感变量个数。
+			redacted = true
+			continue
+		}
+		out = append(out, k)
+	}
+	if redacted {
+		out = append(out, "[REDACTED]")
+	}
+	sort.Strings(out)
+	return out
+}
+
+func isSensitiveEnvKey(k string) bool {
+	if redact.IsSensitive(k) {
+		return true
+	}
+	n := strings.ToLower(k)
+	n = strings.ReplaceAll(n, "_", "")
+	n = strings.ReplaceAll(n, "-", "")
+	n = strings.ReplaceAll(n, ".", "")
+	n = strings.ReplaceAll(n, " ", "")
+	for _, sub := range []string{"token", "secret", "credential", "password", "bearer", "apikey"} {
+		if strings.Contains(n, sub) {
+			return true
+		}
+	}
+	return false
+}
 
 func (s *Server) acquire(context.Context) (release func(), err error) {
 	select {
@@ -302,11 +426,33 @@ func (s *Server) Exec(stream pb.MachineService_ExecServer) error {
 	}
 	requestHash := hashRequest(open)
 
+	// W3.2：节点总开关（mutation claim 之前拒绝，不烧 operation_id）。
+	if !s.allowExec {
+		s.runtimeAccess.execDeniedDisabled.Add(1)
+		s.auditExec(open.MachineId, open.ExecutionId, open.Command, open.Env,
+			"deny", "disabled by node policy (FIREPAAS_AGENT_ALLOW_EXEC=0)", 0, 0)
+		return status.Error(codes.PermissionDenied, "exec disabled by node policy")
+	}
+	releaseMachine, ok := s.acquireMachineSlot(open.MachineId)
+	if !ok {
+		s.runtimeAccess.execDeniedMachineLimit.Add(1)
+		s.auditExec(open.MachineId, open.ExecutionId, open.Command, open.Env,
+			"deny", "per-machine runtime session limit reached", 0, 0)
+		return status.Error(codes.ResourceExhausted, "per-machine runtime session limit reached")
+	}
+	defer releaseMachine()
+
 	release, err := s.acquire(stream.Context())
 	if err != nil {
+		s.runtimeAccess.execDeniedSessionLimit.Add(1)
+		s.auditExec(open.MachineId, open.ExecutionId, open.Command, open.Env,
+			"deny", "runtime session limit reached", 0, 0)
 		return err
 	}
 	defer release()
+	// 准入完成：allow 计 admission 决策而非会话结果（后续 dial/exec 失败由
+	// 审计 decision=error 表达，不落到 deny 标签）。
+	s.runtimeAccess.execAllowed.Add(1)
 
 	created, _ := json.Marshal(map[string]string{"status": "created", "execution_id": open.ExecutionId})
 	claimed, claimErr := mutation.ClaimExec(
@@ -325,8 +471,8 @@ func (s *Server) Exec(stream pb.MachineService_ExecServer) error {
 	defer durationCancel()
 	dialer, err := s.machines.GuestDialer(durationCtx, open.MachineId, open.ExecutionId)
 	if err != nil {
-		s.auditRuntime("exec", open.MachineId, open.ExecutionId,
-			commandDigest(open.Command), 0, 0, err)
+		s.auditExec(open.MachineId, open.ExecutionId, open.Command, open.Env,
+			"error", "guest dial failed", 0, 0)
 		return mapGuestOpError(err)
 	}
 
@@ -414,13 +560,13 @@ func (s *Server) Exec(stream pb.MachineService_ExecServer) error {
 		if stream.Context().Err() == nil {
 			_ = sender.send(&pb.ExecOutput{Frame: &pb.ExecOutput_Error{Error: execErr.Error()}})
 		}
-		s.auditRuntime("exec", open.MachineId, open.ExecutionId,
-			commandDigest(open.Command), budget.total(), time.Since(start), execErr)
+		s.auditExec(open.MachineId, open.ExecutionId, open.Command, open.Env,
+			"error", "exec failed", budget.total(), time.Since(start))
 		return nil // 已把错误作为会话级帧发出；流按正常结束
 	}
 	_ = sender.send(&pb.ExecOutput{Frame: &pb.ExecOutput_ExitCode{ExitCode: int32(exit.Code)}})
-	s.auditRuntime("exec", open.MachineId, open.ExecutionId,
-		commandDigest(open.Command), budget.total(), time.Since(start), nil)
+	s.auditExec(open.MachineId, open.ExecutionId, open.Command, open.Env,
+		"allow", "ok", budget.total(), time.Since(start))
 	return nil
 }
 
@@ -442,11 +588,30 @@ func (s *Server) CopyTo(stream pb.MachineService_CopyToServer) error {
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
 
+	// W3.2：节点总开关（mutation claim 之前拒绝，不烧 operation_id）。
+	if !s.allowExec {
+		s.runtimeAccess.copyToDeniedDisabled.Add(1)
+		s.auditRuntime("cp-to", open.MachineId, open.ExecutionId, pathDigest(open.Path), 0, 0,
+			errors.New("copy disabled by node policy"))
+		return status.Error(codes.PermissionDenied, "copy disabled by node policy")
+	}
+	releaseMachine, ok := s.acquireMachineSlot(open.MachineId)
+	if !ok {
+		s.runtimeAccess.copyToDeniedMachineLimit.Add(1)
+		s.auditRuntime("cp-to", open.MachineId, open.ExecutionId, pathDigest(open.Path), 0, 0,
+			errors.New("per-machine runtime session limit reached"))
+		return status.Error(codes.ResourceExhausted, "per-machine runtime session limit reached")
+	}
+	defer releaseMachine()
+
 	release, err := s.acquire(stream.Context())
 	if err != nil {
+		s.runtimeAccess.copyToDeniedSessionLimit.Add(1)
 		return err
 	}
 	defer release()
+	// 准入完成：allow 记 admission 决策（与 Exec 同口径）。
+	s.runtimeAccess.copyToAllowed.Add(1)
 
 	ctx, cancel, touch := s.runtimeBoundary(stream.Context())
 	defer cancel()
@@ -716,23 +881,7 @@ func (s *Server) auditRuntime(kind, machineID, executionID, digest string, bytes
 		"duration_ms", took.Milliseconds(), "result", result)
 }
 
-func commandDigest(argv []string) string {
-	sum := sha256.Sum256([]byte(joinForDigest(argv)))
-	return hex.EncodeToString(sum[:4])
-}
-
 func pathDigest(p string) string {
 	sum := sha256.Sum256([]byte(p))
 	return hex.EncodeToString(sum[:4])
-}
-
-func joinForDigest(argv []string) string {
-	out := ""
-	for i, a := range argv {
-		if i > 0 {
-			out += "\x00"
-		}
-		out += a
-	}
-	return out
 }

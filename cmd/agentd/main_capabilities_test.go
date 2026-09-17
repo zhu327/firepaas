@@ -114,3 +114,20 @@ func TestAgentFeatureIDsMeshRequiresExplicitMode(t *testing.T) {
 		t.Fatalf("mesh mode must advertise both mesh and ebpf: %v", got)
 	}
 }
+
+// W3.2：allowExec=false 时能力投影必须摘除 exec/copy（控制面 409），
+// logs 等其他能力不受影响；=true 时原样返回。
+func TestExecCapabilityFilter(t *testing.T) {
+	in := []string{
+		capabilities.GuestExecV1, capabilities.GuestCopyV1,
+		capabilities.GuestLogsV1, capabilities.SecretOneShotV1,
+	}
+	if got := execCapabilityFilter(in, true); !slices.Equal(got, in) {
+		t.Fatalf("allowExec=true must pass through: %v", got)
+	}
+	got := execCapabilityFilter(in, false)
+	want := []string{capabilities.GuestLogsV1, capabilities.SecretOneShotV1}
+	if !slices.Equal(got, want) {
+		t.Fatalf("allowExec=false features = %v, want %v", got, want)
+	}
+}

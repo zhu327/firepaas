@@ -466,7 +466,15 @@ func ValidateEgressPolicy(p *pb.EgressPolicySpec) error {
 //
 // 存量 deployment 不走本函数（controller/placement/reconciler 继续用
 // ValidateEgressPolicy）：否则升级后既有 unrestricted+domains 行会被
-// placement 判为 egress.invalid-policy 而硬过滤成不可调度。
+// placement 判为 egress.invalid-policy 而硬过滤成不可调度。存量行不做
+// migration 改写（W3.4），需要人工确认时用下面 SQL 列出（egress_policy 为
+// protojson：mode=UNRESTRICTED 显式写入，而 MODE_UNSPECIFIED/缺省会被
+// protojson 省略，因此必须 COALESCE 才能同时命中两类）：
+//
+// SELECT id, app_id, generation, egress_policy
+// FROM deployments
+// WHERE COALESCE(egress_policy->>'mode','MODE_UNSPECIFIED') IN ('MODE_UNSPECIFIED','UNRESTRICTED')
+// AND jsonb_array_length(COALESCE(egress_policy->'allowed_domains','[]')) > 0;
 func ValidateEgressPolicySubmission(p *pb.EgressPolicySpec) error {
 	if err := ValidateEgressPolicy(p); err != nil {
 		return err
@@ -475,7 +483,13 @@ func ValidateEgressPolicySubmission(p *pb.EgressPolicySpec) error {
 		return nil
 	}
 	if len(p.GetAllowedDomains()) > 0 && p.GetMode() != pb.EgressPolicySpec_ALLOWLIST {
-		return fmt.Errorf("egress allowed_domains requires mode ALLOWLIST, got mode %d", p.GetMode())
+		// W3.4：缺口显式提示——域名仅由 allowlist 透明代理在 TCP 80/443
+		// 执行（HTTP Host / TLS SNI，ADR-0027 §3）；其余端口/协议一律按
+		// CIDR，unrestricted/deny_all 下域名会被静默忽略（前者等于 fail-open）。
+		return fmt.Errorf(
+			"egress allowed_domains requires mode ALLOWLIST, got mode %d "+
+				"(domains only constrain TCP 80/443; use allowed_cidrs for the rest)",
+			p.GetMode())
 	}
 	return nil
 }

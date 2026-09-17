@@ -86,6 +86,9 @@ job "firepaas-edge" {
       provider = "nomad"
       # Do not expose this service outside the observability ACL boundary.
       tags = ["metrics", "prometheus-scrape"]
+      # 注意：若给 edge 配置 FIREPAAS_EDGE_METRICS_TOKEN，本 check 会因 401
+      # 失败（check 不带 Authorization 头）；启用 token 时须同步给 check
+      # 加 header 或改用 script check，默认不设 token 则不受影响。
       check {
         type     = "http"
         path     = "/metrics"
@@ -108,9 +111,12 @@ job "firepaas-edge" {
         FIREPAAS_EDGE_TLS_CA      = "secrets/agent-ca.crt"
         FIREPAAS_EDGE_SERVER_CERT = "secrets/edge-server.crt"
         FIREPAAS_EDGE_SERVER_KEY  = "secrets/edge-server.key"
-        # 固定端口以匹配上方 static port；Prometheus 经 firepaas-edge-metrics
-        # 服务发现抓取（host network 下未授权网段不可达）。
+        # 固定端口以匹配上方 static port；metrics 默认只绑 loopback，
+        # host network + 跨主机 Prometheus/Nomad check 必须显式绑 0.0.0.0
+        # （与 agent.hcl 的 FIREPAAS_AGENT_METRICS_BIND 同一纪律），
+        # 再由网络 ACL 只放行 observability 网段。
         FIREPAAS_EDGE_METRICS_PORT = "9465"
+        FIREPAAS_EDGE_METRICS_BIND = "0.0.0.0"
       }
       # Variables carry PEM contents; templates materialize them inside the
       # allocation with restrictive permissions rather than relying on host paths.

@@ -68,6 +68,12 @@ func (c *Controller) reconcileOperations(ctx context.Context) error {
 	// 状态构建，与串行时代一致）。
 	if len(ops) > 0 {
 		dispatchBounded(ctx, ops, c.cfg.DispatchWorkers, c.lockMachine, c.dispatchOne)
+		if ctx.Err() != nil {
+			// ctx 已取消（leader 失权/进程关闭）：跳过尾部 buildRoutes。
+			// 半批派发后的路由快照不完整，且取消下的 store 写回不可靠；
+			// 路由等下一任期重建（Redis 投影可重建，不作业务结论）。
+			return ctx.Err()
+		}
 		return c.buildRoutes(ctx)
 	}
 	return nil
@@ -81,6 +87,9 @@ func dispatchBounded(ctx context.Context, ops []store.Operation, workers int,
 ) {
 	if workers <= 1 || len(ops) <= 1 {
 		for _, op := range ops {
+			if ctx.Err() != nil {
+				return
+			}
 			unlock := lock(op.MachineID)
 			process(ctx, op)
 			unlock()
@@ -101,7 +110,16 @@ func dispatchBounded(ctx context.Context, ops []store.Operation, workers int,
 		}()
 	}
 	for _, op := range ops {
-		ch <- op
+		select {
+		case ch <- op:
+		case <-ctx.Done():
+			// ctx 取消（leader 失权/进程关闭）：不再投喂，关闭通道放行
+			// worker；在途 RPC 的派生 ctx 随之取消而快速收敛，不再各吃满
+			// 一个 AgentRPCTimeout。未派发 op 留待下一任期重领（claim 语义）。
+			close(ch)
+			wg.Wait()
+			return
+		}
 	}
 	close(ch)
 	wg.Wait()

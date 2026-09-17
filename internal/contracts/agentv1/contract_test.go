@@ -1,6 +1,7 @@
 package agentv1
 
 import (
+	"strings"
 	"testing"
 
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
@@ -544,5 +545,27 @@ func TestValidateEgressPolicyDomainMode(t *testing.T) {
 				t.Fatalf("structural validator must stay tolerant for stored rows: %v", err)
 			}
 		})
+	}
+}
+
+// W3.4：新写 unrestricted+domains 的拒绝文案必须显式提示 80/443 缺口与 CIDR 去向。
+func TestValidateEgressPolicySubmissionHintsDomainScope(t *testing.T) {
+	spec := &pb.EgressPolicySpec{
+		Mode:             pb.EgressPolicySpec_UNRESTRICTED,
+		AllowedDomains:   []string{"example.com"},
+		PolicyGeneration: 1,
+	}
+	err := ValidateEgressPolicySubmission(spec)
+	if err == nil {
+		t.Fatal("unrestricted+domains new write must be rejected")
+	}
+	for _, want := range []string{"ALLOWLIST", "80/443", "allowed_cidrs"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("submission error must mention %q, got: %v", want, err)
+		}
+	}
+	// 存量行：结构校验保持宽容（不碰 migration），新写仍然拒绝。
+	if err := ValidateEgressPolicy(spec); err != nil {
+		t.Fatalf("structural validator must stay tolerant for stored rows: %v", err)
 	}
 }

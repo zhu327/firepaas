@@ -22,6 +22,14 @@ import (
 )
 
 // ServerConfig 构造 require-and-verify-client-cert 的服务端 TLS 配置。
+//
+// W3.1：MinVersion 固定 TLS 1.3（Go 对 1.3 的密码套件不可配置且默认安全，
+// 无需 CipherSuites 白名单）。选择依据：在仓库内全部对端均为 Go >= 1.25
+// （均支持 TLS 1.3），单测做真实握手回归；若未来测出旧 client 不兼容，回滚
+// 方案为 MinVersion 退回 TLS12 + CipherSuites 限定 ECDHE+AESGCM/ChaCha20 +
+// PreferServerCipherSuites=true（见 git 历史 revert 本三处 MinVersion）。
+// per-node 身份/吊销/revoke API（ADR-0006 延期项）Phase1 只留设计指向，
+// 不写码：见 ADR-0006 “仍为延期项”。
 func ServerConfig(certFile, keyFile, caFile string) (*tls.Config, error) {
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
@@ -35,7 +43,7 @@ func ServerConfig(certFile, keyFile, caFile string) (*tls.Config, error) {
 		Certificates: []tls.Certificate{cert},
 		ClientCAs:    pool,
 		ClientAuth:   tls.RequireAndVerifyClientCert,
-		MinVersion:   tls.VersionTLS12,
+		MinVersion:   tls.VersionTLS13,
 	}, nil
 }
 
@@ -51,12 +59,17 @@ func ServerConfigWithManager(cm *CertManager, caFile string) (*tls.Config, error
 		GetCertificate: cm.GetCertificate,
 		ClientCAs:      pool,
 		ClientAuth:     tls.RequireAndVerifyClientCert,
-		MinVersion:     tls.VersionTLS12,
+		MinVersion:     tls.VersionTLS13,
 	}, nil
 }
 
 // ClientConfig 构造客户端 TLS 配置（serverName 通常为 agentd/127.0.0.1）。
+// W3.1：serverName 为空直接返回错误——空 ServerName 会退化为按 IP/无校验
+// 握手语义，fail-closed 拒绝启动，而不是在握手时才暴露。
 func ClientConfig(certFile, keyFile, caFile, serverName string) (*tls.Config, error) {
+	if strings.TrimSpace(serverName) == "" {
+		return nil, errors.New("server name is required (empty ServerName disables hostname verification)")
+	}
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
 		return nil, fmt.Errorf("load client keypair: %w", err)
@@ -69,9 +82,13 @@ func ClientConfig(certFile, keyFile, caFile, serverName string) (*tls.Config, er
 		Certificates: []tls.Certificate{cert},
 		RootCAs:      pool,
 		ServerName:   serverName,
-		MinVersion:   tls.VersionTLS12,
+		MinVersion:   tls.VersionTLS13,
 	}, nil
 }
+
+// RootCAs 从 PEM 文件加载 CA 池：供非 mTLS 的自建 TLS client（如 edge
+// 回源控制面 API）复用同一校验材料加载纪律（空/解析失败即错误）。
+func RootCAs(caFile string) (*x509.CertPool, error) { return loadCA(caFile) }
 
 func loadCA(caFile string) (*x509.CertPool, error) {
 	pem, err := os.ReadFile(caFile)

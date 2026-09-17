@@ -237,12 +237,11 @@ var ErrImageTooBig = errors.New("image unpack size exceeds limit")
 
 // ErrSecretEnvInjectionUnsupported 表示 secret_env 注入被拒绝：默认 fail
 // closed，因为 hypeman 的 Env 会明文持久化到节点 metadata.json，没有可
-// 验证的 one-shot 注入 API（M5 评审决策：安全默认 + 受控 opt-in）。
-// 受信/实验室环境可显式 FIREPAAS_SECRET_INJECTION=unsafe-persisted-env
-// 恢复 M4 注入语义（明知 secret 会落盘）；v1.1 交付真 one-shot 通道后移除。
+// 验证的 one-shot 注入 API（M5 评审决策：安全默认）。W1.2 起
+// unsafe-persisted-env 已删除：该值映射为 off，与 unknown mode 同路径拒绝。
 var ErrSecretEnvInjectionUnsupported = errors.New(
-	"secret_env injection is unsupported: no safe one-shot injection API " +
-		"(opt-in via FIREPAAS_SECRET_INJECTION=unsafe-persisted-env on trusted nodes)")
+	"secret_env injection is unsupported: no safe one-shot injection API ",
+)
 
 // SecretInjectionMode：secret_env 注入策略。
 const (
@@ -252,9 +251,8 @@ const (
 	// guest channel 写入 guest tmpfs（0700/0400），entrypoint 由 release gate
 	// 阻塞到 marker 写入；值不进入 hypeman Env/metadata/config disk。
 	SecretInjectionOneShot = "oneshot"
-	// SecretInjectionUnsafePersistedEnv：M4 语义——合并进 hypeman Env。
-	// 明知 hypeman 会把 Env 明文持久化到 metadata.json，仅限受信环境；
-	// 已废弃（ADR-0024 §10），保留一个版本，下版本删除。
+	// SecretInjectionUnsafePersistedEnv：M4 语义（已删除，W1.2）。保留常量仅供
+	// 配置映射与存量值识别：resolveSecretInjection 将其映射为 off，走 fail-closed。
 	SecretInjectionUnsafePersistedEnv = "unsafe-persisted-env"
 )
 
@@ -553,18 +551,13 @@ func (a *Adapter) Create(ctx context.Context, req *pb.CreateMachineRequest) (*pb
 		}
 	}()
 	// secret_env 模式分派（ADR-0024）：oneshot = vsock tmpfs 通道（默认）；
-	// unsafe-persisted-env = M4 明文 Env（已废弃，保留一个版本）；其余拒绝。
+	// 其余一律拒绝。unsafe-persisted-env 已删除（W1.2 + review P1）：库层亦
+	// 拒绝，不再合并进 hypeman Env 明文持久化；常量仅保留供配置映射识别。
 	oneShot := false
 	if len(req.GetSecretEnv()) != 0 {
 		switch a.secretInjection {
 		case SecretInjectionOneShot:
 			oneShot = true
-		case SecretInjectionUnsafePersistedEnv:
-			// legacy 路径不支持 lease：unsafe 模式无投递状态上报，控制面
-			// 无法推进 lease 状态机（ADR-0024）；组合即拒绝。
-			if req.GetSecretLeaseId() != "" {
-				return nil, fmt.Errorf("unsafe-persisted-env does not support secret leases; use oneshot mode")
-			}
 		default:
 			return nil, ErrSecretEnvInjectionUnsupported
 		}

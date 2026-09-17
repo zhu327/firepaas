@@ -365,15 +365,19 @@ func run() error {
 		adapter.SetMaxUnpackMib(v)
 	}
 	// v1.2-B（ADR-0024）：默认 one-shot 通道（vsock tmpfs + release gate，
-	// 值不落盘）。unsafe-persisted-env 已废弃，保留一个版本：明知 secret
-	// 会明文持久化到节点 metadata.json，下版本删除。
-	injectionMode := env.Get("FIREPAAS_SECRET_INJECTION", machine.SecretInjectionOneShot)
+	// 值不落盘）。W1.2：unsafe-persisted-env 已删除（ADR-0024 §10 到期）——
+	// 与 unknown mode 同路径 fail-closed：secret-bearing create 在 adapter
+	// 层被 ErrSecretEnvInjectionUnsupported 拒绝，server 映射为 InvalidArgument，
+	// 控制面记终态 + firepaas_secret_create_failclosed_total。off 下无 secret
+	// 能力上报（agentFeatureIDs 只认 oneshot），与删除前一致。
+	rawMode := env.Get("FIREPAAS_SECRET_INJECTION", machine.SecretInjectionOneShot)
+	injectionMode := resolveSecretInjection(rawMode)
 	adapter.SetSecretInjection(injectionMode)
-	if injectionMode == machine.SecretInjectionUnsafePersistedEnv {
-		slog.Warn("FIREPAAS_SECRET_INJECTION=unsafe-persisted-env is DEPRECATED: " +
-			"secrets will be persisted in plaintext node metadata; it will be removed next release")
+	if rawMode == machine.SecretInjectionUnsafePersistedEnv {
+		slog.Error("FIREPAAS_SECRET_INJECTION=unsafe-persisted-env was removed: "+
+			"secret-bearing creates will be rejected; use oneshot mode", "mode", rawMode)
 	} else if injectionMode != machine.SecretInjectionOneShot && injectionMode != machine.SecretInjectionOff {
-		slog.Warn("unknown FIREPAAS_SECRET_INJECTION; secret-bearing creates will be rejected", "mode", injectionMode)
+		slog.Error("unknown FIREPAAS_SECRET_INJECTION; secret-bearing creates will be rejected", "mode", rawMode)
 	}
 	// M4.5：standby 实例的首流量同步唤醑（autoresume）。
 	if strings.EqualFold(env.Get("FIREPAAS_AGENT_AUTORESUME", "true"), "false") {
@@ -510,7 +514,11 @@ func run() error {
 	if ebpfActive && meshMode == "eastwest" {
 		meshCapability = capabilities.MeshEastWestV1
 	}
-	infoProvider.SetCapabilities(agentProtocolVersion, agentFeatureIDs(
+	// W3.2：Exec/CopyTo 节点开关与能力上报必须同源——关闭时同时摘除
+	// guest.exec.v1/guest.copy.v1，控制面在行动时准入（409）而不是先放行
+	// 再由 agent 以 PermissionDenied（映射为 502）拒绝。
+	allowExec := server.AllowExecFromEnv()
+	infoProvider.SetCapabilities(agentProtocolVersion, execCapabilityFilter(agentFeatureIDs(
 		injectionMode,
 		egressFeatureIDs,
 		netCapability,
@@ -519,7 +527,7 @@ func run() error {
 		adapter.SnapshotScrubAvailable(),
 		adapter.ImageQuarantineAvailable(),
 		adapter.VolumeQuarantineAvailable(),
-	),
+	), allowExec),
 		instances.SnapshotCompatibilityKey(instances.StoredMetadata{
 			HypervisorType: hypervisor.TypeFirecracker, HypervisorVersion: fcVersion,
 			KernelVersion: string(
@@ -621,6 +629,7 @@ func run() error {
 	}
 	srv := server.New(adapter, ledger, fences, infoProvider,
 		server.WithCreds(creds), server.WithCredentialRequired(requireCred),
+		server.WithAllowExec(allowExec),
 		server.WithFabric(fabric),
 		server.WithUnderlay(underlay),
 		server.WithFabricPolicy(fabricPolicyBackend),
@@ -650,6 +659,11 @@ func run() error {
 		defer certMgr.Close()
 	}
 	workloadProxy := proxy.NewWithVerifier(adapter, creds)
+	// W3.3（P2 修正）：fabric ingress 凭证回查限流（<=0 = 默认 1000/50 rps）。
+	workloadProxy.SetCredentialLimits(
+		env.Float("FIREPAAS_AGENT_INGRESS_LOOKUP_RPS", 0),
+		env.Float("FIREPAAS_AGENT_INGRESS_MISS_RPS", 0),
+	)
 	proxyHandler := http.Handler(workloadProxy)
 	// G2d（§14）：fabric ingress 终结器复用同一 proxy（endpoint 解析与
 	// autoresume 语义一致）；仅 mesh=eastwest 时随快照绑定节点 ULA。
@@ -918,11 +932,40 @@ func splitNonEmpty(raw, sep string) []string {
 	return out
 }
 
+// resolveSecretInjection 把 FIREPAAS_SECRET_INJECTION 原始值映射为 adapter
+// 实际生效模式。unsafe-persisted-env 已删除：映射为 off，使其走与 unknown
+// mode 相同的 fail-closed 路径（secret-bearing create 被拒绝）；oneshot/off/
+// 其余值原样透传（其余未知值由 adapter 默认分支拒绝）。
+func resolveSecretInjection(raw string) string {
+	if raw == machine.SecretInjectionUnsafePersistedEnv {
+		return machine.SecretInjectionOff
+	}
+	return raw
+}
+
 // agentFeatureIDs 从实际 secret 注入模式与 egress/网络装配推导安全能力。环境变量
 // 只是默认能力的减法 allowlist，不能在 unsafe/off/unknown 模式伪造
 // secret.oneshot.v1，也不能在 egress 未装配时伪造 egress 能力。
 // meshCapability（W3 §12）：ebpf 可用且显式 eastwest 才传 mesh.eastwest.v1；
 // 空串 = 不上报（§0 gate 前/回退节点绝不广告，避免 mesh 服务被调度过去）。
+// execCapabilityFilter（W3.2）：FIREPAAS_AGENT_ALLOW_EXEC=0 时从能力投影中
+// 摘除 guest 运维通道（exec/copy）；logs 等其他能力不受影响。控制面
+// requireFeature 依据同一投影做行动时准入，因此关闭开关后 API 返回 409
+// capability not supported，而不是先放行再由 agent PermissionDenied（502）。
+func execCapabilityFilter(features []string, allowExec bool) []string {
+	if allowExec {
+		return features
+	}
+	out := make([]string, 0, len(features))
+	for _, f := range features {
+		if f == capabilities.GuestExecV1 || f == capabilities.GuestCopyV1 {
+			continue
+		}
+		out = append(out, f)
+	}
+	return out
+}
+
 func agentFeatureIDs(
 	secretMode string,
 	egressIDs []string,

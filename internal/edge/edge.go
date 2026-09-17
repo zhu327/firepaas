@@ -17,7 +17,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -51,6 +53,14 @@ type TokenClient struct {
 	hc    *http.Client
 	// MaxEntries 是缓存容量上限；<=0 时使用 defaultTokenCacheMaxEntries。
 	MaxEntries int
+	// RequireTLS（W3.3）：回源地址必须为 https，否则每次回源直接失败
+	// （fail-closed）。默认 false：仓库内部控制面 API 目前只有明文监听
+	// （iac/README 的 api_addr 即 http://），默认强制会让既有部署与全部
+	// lab e2e 断流；非 https 时每个进程告警一次，绝不静默。API 侧终结
+	// TLS 后由装配点置 true（FIREPAAS_EDGE_API_REQUIRE_TLS），库不读环境
+	// 变量。
+	RequireTLS bool
+	warnedHTTP atomic.Bool
 	mu         sync.Mutex
 	cache      *lruCache[tokenEntry]
 	flights    map[string]*tokenFlight
@@ -67,6 +77,10 @@ type tokenFlight struct {
 
 // defaultTokenStale 与 edge route 缓存的 stale 窗口同源（120s，可配）。
 const defaultTokenStale = 120 * time.Second
+
+// maxTokenStaleWindow（W3.3）：token serve-stale 上限 120s（与架构 §4.3
+// 控制面断流预算对齐）。超配经 SetStaleWindow 钳制并 Warn，不静默接受。
+const maxTokenStaleWindow = 120 * time.Second
 
 // defaultTokenCacheMaxEntries 是 TokenClient 的默认容量上限
 // （FIREPAAS_EDGE_TOKEN_CACHE_MAX 可覆盖；F 与 RouteCache/RateLimiter 同一
@@ -97,10 +111,17 @@ func (t *TokenClient) maxEntries() int {
 
 // SetStaleWindow 覆盖 token serve-stale 窗口（edge main 启动时对齐
 // FIREPAAS_EDGE_STALE_WINDOW；窗口语义与路由缓存一致）。
+// W3.3：超过 maxTokenStaleWindow 的配置钳制到上限并 Warn。
 func (t *TokenClient) SetStaleWindow(d time.Duration) {
-	if d > 0 {
-		t.stale = d
+	if d <= 0 {
+		return
 	}
+	if d > maxTokenStaleWindow {
+		slog.Warn("token stale window exceeds cap; clamping",
+			"requested", d, "cap", maxTokenStaleWindow)
+		d = maxTokenStaleWindow
+	}
+	t.stale = d
 }
 
 func (t *TokenClient) disabled() bool { return t == nil || t.addr == "" || t.token == "" }
@@ -187,8 +208,37 @@ var errTokenExecutionMismatch = errors.New("traffic-token execution mismatch")
 // errTokenEmpty 防御回源返回 (空, nil)；见 Get 中的说明。
 var errTokenEmpty = errors.New("traffic-token fetch returned empty token")
 
+// SetHTTPClient 覆盖回源 client（nil 忽略 = 保持内置 5s 默认）。装配点
+// 注入自定义 Transport（内网 CA 等）；库不读环境变量。
+func (t *TokenClient) SetHTTPClient(hc *http.Client) {
+	if hc != nil {
+		t.hc = hc
+	}
+}
+
 // fetch 回源控制面 traffic-token 端点（锁外调用）。
+// W3.3：TLS 策略由装配点显式决策。RequireTLS=true 时非 https 直接失败
+// （fail-closed）；false 时保持既有部署兼容，但每个进程告警一次（回源承载
+// bearer 与 execution-bound 凭证，明文即泄露，能上 TLS 就必须上：
+// FIREPAAS_EDGE_API_REQUIRE_TLS + FIREPAAS_EDGE_API_CA）。
 func (t *TokenClient) fetch(ctx context.Context, machineID, executionID string) (string, error) {
+	u, err := url.Parse(t.addr)
+	if err != nil {
+		return "", fmt.Errorf("traffic-token endpoint %q: %v", t.addr, err)
+	}
+	if u.Scheme != "https" {
+		if t.RequireTLS {
+			return "", fmt.Errorf(
+				"traffic-token endpoint must use https (got scheme %q); "+
+					"serve the control-plane API over TLS or unset FIREPAAS_EDGE_API_REQUIRE_TLS",
+				u.Scheme)
+		}
+		if t.warnedHTTP.CompareAndSwap(false, true) {
+			slog.Warn("traffic-token backsource is not using https; "+
+				"bearer and execution credentials cross the network in plaintext",
+				"endpoint", t.addr)
+		}
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		fmt.Sprintf("%s/v1/machines/%s/traffic-token", t.addr, machineID), nil)
 	if err != nil {

@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	edgesvc "github.com/zhu327/firepaas/internal/edge"
 )
 
 func TestParseExtraPorts(t *testing.T) {
@@ -72,7 +74,55 @@ func TestListenerPorts(t *testing.T) {
 	}
 }
 
-// W4：/healthz 返回带版本的 JSON，且不得落到数据面 handler。
+// W1.1：metrics Bearer 鉴权（FIREPAAS_EDGE_METRICS_TOKEN 非空时启用）。
+func TestEdgeMetricsAuthorized(t *testing.T) {
+	withAuth := func(v string) *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+		if v != "" {
+			r.Header.Set("Authorization", v)
+		}
+		return r
+	}
+	if !edgeMetricsAuthorized(withAuth("Bearer s3cret"), "s3cret") {
+		t.Fatal("correct bearer token must be authorized")
+	}
+	for name, v := range map[string]string{
+		"missing header": "",
+		"wrong token":    "Bearer wrong",
+		"wrong scheme":   "Token s3cret",
+		"empty bearer":   "Bearer ",
+	} {
+		if edgeMetricsAuthorized(withAuth(v), "s3cret") {
+			t.Fatalf("%s must be rejected", name)
+		}
+	}
+}
+
+// W1.1：FIREPAAS_EDGE_METRICS_LABEL_MACHINE 默认 1（保持兼容），=0 关闭。
+func TestEdgeMetricsLabelMachine(t *testing.T) {
+	if !edgeMetricsLabelMachine() {
+		t.Fatal("unset must default to per-machine labels (compat)")
+	}
+	t.Setenv("FIREPAAS_EDGE_METRICS_LABEL_MACHINE", "1")
+	if !edgeMetricsLabelMachine() {
+		t.Fatal("=1 must keep per-machine labels")
+	}
+	t.Setenv("FIREPAAS_EDGE_METRICS_LABEL_MACHINE", "0")
+	if edgeMetricsLabelMachine() {
+		t.Fatal("=0 must disable per-machine labels")
+	}
+}
+
+// W1.1：LABEL_MACHINE=0 时输出无标签总量；无数据时不输出（与原行为一致）。
+func TestWriteInflightAggregatedEmpty(t *testing.T) {
+	h := newTestAggregateHandler()
+	var sb strings.Builder
+	writeInflightAggregated(&sb, h)
+	if sb.Len() != 0 {
+		t.Fatalf("empty inflight must produce no output, got %q", sb.String())
+	}
+}
+
 func TestVersionedHealthz(t *testing.T) {
 	called := false
 	h := withVersionedHealthz(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
@@ -100,4 +150,9 @@ func TestVersionedHealthz(t *testing.T) {
 	if !called {
 		t.Fatal("non-healthz path must delegate to the data-plane handler")
 	}
+}
+
+// newTestAggregateHandler 构造空 inflight 的 Handler（聚合输出测试用）。
+func newTestAggregateHandler() *edgesvc.Handler {
+	return edgesvc.NewHandler(edgesvc.Config{})
 }

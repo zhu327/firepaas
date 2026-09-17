@@ -15,6 +15,8 @@ import (
 	"github.com/zhu327/firepaas/internal/controlplane/secrets"
 	"github.com/zhu327/firepaas/internal/controlplane/store"
 	"github.com/zhu327/firepaas/internal/controlplane/traffic"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // 5xx body 固定文案，不回吐内部错误原文。
@@ -319,5 +321,17 @@ func TestGetSecretMetaPGFailureIs5xx(t *testing.T) {
 	}
 	if strings.Contains(rec.Body.String(), "dial") || strings.Contains(rec.Body.String(), "pq:") {
 		t.Fatalf("5xx body must not leak driver text, got %q", rec.Body.String())
+	}
+}
+
+// W3.2：agent 节点策略拒绝（PermissionDenied，FIREPAAS_AGENT_ALLOW_EXEC=0）
+// 映射为 403，不落进 502 “agent error”默认分支。
+func TestGrpcErrStatusPermissionDenied(t *testing.T) {
+	code, msg := grpcErrStatus(status.Error(codes.PermissionDenied, "exec disabled by node policy"))
+	if code != http.StatusForbidden {
+		t.Fatalf("code = %d, want 403", code)
+	}
+	if msg != "operation denied by node policy" {
+		t.Fatalf("msg = %q", msg)
 	}
 }

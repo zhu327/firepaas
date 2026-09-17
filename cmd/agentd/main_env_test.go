@@ -3,7 +3,21 @@ package main
 import (
 	"testing"
 	"time"
+
+	"github.com/zhu327/firepaas/internal/agent/machine"
 )
+
+// W1.2：unsafe-persisted-env 已删除，映射为 off（与 unknown 同路径 fail-closed）。
+func TestResolveSecretInjection(t *testing.T) {
+	if got := resolveSecretInjection(machine.SecretInjectionUnsafePersistedEnv); got != machine.SecretInjectionOff {
+		t.Fatalf("unsafe-persisted-env must resolve to off, got %q", got)
+	}
+	for _, mode := range []string{machine.SecretInjectionOneShot, machine.SecretInjectionOff, "bogus"} {
+		if got := resolveSecretInjection(mode); got != mode {
+			t.Fatalf("mode %q must pass through, got %q", mode, got)
+		}
+	}
+}
 
 // env 解析卫生：非法/越界值回退默认（告警行为属日志侧，断言可见返回值）。
 func TestEnvIntInvalidValuesFallBack(t *testing.T) {

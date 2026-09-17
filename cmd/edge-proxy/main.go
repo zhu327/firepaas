@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -95,6 +96,28 @@ func run() error {
 		os.Getenv("FIREPAAS_API_TOKEN"),
 		30*time.Second,
 	)
+	// W3.3（修正）：token 回源 TLS 由装配点显式决策。仓库内控制面 API 目前
+	// 只有明文监听（iac/README 的 api_addr 即 http://），默认强制 https 会让
+	// 既有部署与全部 lab e2e 断流；因此默认保持兼容 + 启动告警，API 侧终结
+	// TLS 后置 FIREPAAS_EDGE_API_REQUIRE_TLS=true 收紧为 fail-closed，私有
+	// CA 经 FIREPAAS_EDGE_API_CA 注入。库不读环境变量。
+	tokens.RequireTLS = env.Bool("FIREPAAS_EDGE_API_REQUIRE_TLS", false)
+	if !tokens.RequireTLS {
+		slog.Warn("traffic-token backsource TLS not enforced; " +
+			"set FIREPAAS_EDGE_API_REQUIRE_TLS=true once the control-plane API serves https")
+	}
+	if caFile := os.Getenv("FIREPAAS_EDGE_API_CA"); caFile != "" {
+		pool, err := mtls.RootCAs(caFile)
+		if err != nil {
+			return fmt.Errorf("FIREPAAS_EDGE_API_CA: %w", err)
+		}
+		tokens.SetHTTPClient(&http.Client{
+			Timeout: 5 * time.Second,
+			Transport: &http.Transport{TLSClientConfig: &tls.Config{
+				RootCAs: pool, MinVersion: tls.VersionTLS12,
+			}},
+		})
+	}
 	tokens.SetStaleWindow(staleWindow)
 	if n := env.Int("FIREPAAS_EDGE_TOKEN_CACHE_MAX", 0); n > 0 { // F：token 缓存容量上限
 		tokens.MaxEntries = n
@@ -328,20 +351,65 @@ func startMetrics(counters *edgesvc.Counters, handler *edgesvc.Handler, gauges *
 	if port == "" {
 		return nil
 	}
+	// W1.1 暴露面收敛：metrics 默认只绑 loopback（此前 net.Listen(":"+port)
+	// = 0.0.0.0，对外暴露且无鉴权）。跨主机抓取必须显式设置
+	// FIREPAAS_EDGE_METRICS_BIND（如 0.0.0.0）并以网络 ACL 限制来源。
+	bind := env.Get("FIREPAAS_EDGE_METRICS_BIND", "127.0.0.1")
+	token := os.Getenv("FIREPAAS_EDGE_METRICS_TOKEN")
+	labelMachine := edgeMetricsLabelMachine()
 	mux := http.NewServeMux()
-	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		// FIREPAAS_EDGE_METRICS_TOKEN 非空时要求 Authorization: Bearer，否则 401。
+		if token != "" && !edgeMetricsAuthorized(r, token) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		counters.WritePrometheus(w)
-		handler.WriteInflightPrometheus(w)
+		if labelMachine {
+			handler.WriteInflightPrometheus(w)
+		} else {
+			writeInflightAggregated(w, handler)
+		}
 		handler.WriteRouteRevisionRejectsPrometheus(w)
 		gauges.WritePrometheus(w)
 	})
-	listener, err := net.Listen("tcp", ":"+port)
+	listener, err := net.Listen("tcp", net.JoinHostPort(bind, port))
 	if err != nil {
-		return fmt.Errorf("listen metrics :%s: %w", port, err)
+		return fmt.Errorf("listen metrics %s:%s: %w", bind, port, err)
 	}
 	serve(newEdgeServer(mux), listener, "edge metrics serve")
 	return nil
+}
+
+// edgeMetricsLabelMachine 解析 FIREPAAS_EDGE_METRICS_LABEL_MACHINE
+// （默认 1：保持 per-machine machine_id 标签兼容；=0 关闭标签输出）。
+// machine_id 基数随 machine 数量线性增长，高 churn 下会撑爆 Prometheus
+// series；只需要总量视角时设 0（聚合为无标签总量，不丢信号）。
+func edgeMetricsLabelMachine() bool {
+	return strings.TrimSpace(os.Getenv("FIREPAAS_EDGE_METRICS_LABEL_MACHINE")) != "0"
+}
+
+// edgeMetricsAuthorized 校验 /metrics 的 Bearer token（常量时间比较防时序侧信道）。
+func edgeMetricsAuthorized(r *http.Request, token string) bool {
+	const prefix = "Bearer "
+	got := r.Header.Get("Authorization")
+	if !strings.HasPrefix(got, prefix) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(got, prefix)), []byte(token)) == 1
+}
+
+// writeInflightAggregated 把 per-machine inflight 聚合为无标签总量输出
+// （LABEL_MACHINE=0 时的替代：保留信号，不保留基数；无数据时与原行为一致不输出）。
+func writeInflightAggregated(w io.Writer, handler *edgesvc.Handler) {
+	total, backends := handler.InflightTotal()
+	if backends == 0 {
+		return
+	}
+	_, _ = fmt.Fprint(w,
+		"# HELP firepaas_edge_backend_inflight in-flight requests summed over backends (per-machine labels disabled)\n# TYPE firepaas_edge_backend_inflight gauge\n")
+	_, _ = fmt.Fprintf(w, "firepaas_edge_backend_inflight %d\n", total)
 }
 
 // newEdgeServer 统一 edge 全部 http.Server 的超时口径：仅 ReadHeaderTimeout

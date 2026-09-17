@@ -545,3 +545,77 @@ func TestConcurrentAcquiresAcrossRebuild(t *testing.T) {
 		}
 	}
 }
+
+// W2.1：释放与 Reset（epoch 切换）交错时单 Lua 释放的记账精确性。
+// 旧 Get→release 两次脚本在切换窗口内会把 debit 落到 replay 后的新 epoch
+// （或在记录已消失时静默成功）；新路径一次脚本内读指针+扣减，释放真相由
+// 返回值 0/1 表达：命中恰好扣减一次，未命中报 ErrNotHeld 并打点
+// release_epoch_moved。本测试不用 sleep：顺序的 Reset 即确定性的交错
+// （切指针与快照同脚本原子，顺序调用覆盖“切换前/后释放”两种有序结果）。
+func TestReleaseResetInterleave(t *testing.T) {
+	m, _ := testManager(t)
+	ctx := context.Background()
+	var metricHits []string
+	m.EmitMetric = func(name string, labels map[string]string) {
+		metricHits = append(metricHits, name+labels["result"])
+	}
+
+	acquire := func(opID, nodeID string) {
+		t.Helper()
+		if err := m.Acquire(ctx, opID, nodeID, "dev", 2, 1024, 1, 64, 65536, 1048576, 100, 32768, 1048576); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustPending := func(node string, want [2]int64) {
+		t.Helper()
+		pending, err := m.PendingByNode(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pending[node] != want {
+			t.Fatalf("pending %s = %v, want %v", node, pending[node], want)
+		}
+	}
+
+	// 切换前获取 → 切换后释放：replay 进新 epoch 的记录一次扣减，账目归零。
+	acquire("op-r1", "n1")
+	if _, err := m.Reset(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Release(ctx, "op-r1"); err != nil {
+		t.Fatalf("release across switch: %v", err)
+	}
+	mustPending("n1", [2]int64{0, 0})
+	if len(metricHits) != 0 {
+		t.Fatalf("successful release must not emit metrics, got %v", metricHits)
+	}
+
+	// 重复释放：记录已消失 → ErrNotHeld + release_epoch_moved 打点。
+	if err := m.Release(ctx, "op-r1"); !errors.Is(err, ErrNotHeld) {
+		t.Fatalf("double release must be ErrNotHeld, got %v", err)
+	}
+	if len(metricHits) != 1 || metricHits[0] != "firepaas_reservations_totalrelease_epoch_moved" {
+		t.Fatalf("missed release must emit release_epoch_moved once, got %v", metricHits)
+	}
+
+	// Commit 走同一路径：连续两次切换后提交仍恰好一次。
+	acquire("op-c1", "n2")
+	if _, err := m.Reset(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Reset(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Commit(ctx, "op-c1"); err != nil {
+		t.Fatalf("commit across two switches: %v", err)
+	}
+	mustPending("n2", [2]int64{0, 0})
+
+	// 从未持有的 op：ErrNotHeld + 打点（与 epoch 切走不可区分，见 releaseIfHeld 注释）。
+	if err := m.Commit(ctx, "op-never"); !errors.Is(err, ErrNotHeld) {
+		t.Fatalf("release of never-held op must be ErrNotHeld, got %v", err)
+	}
+	if len(metricHits) != 2 {
+		t.Fatalf("want 2 release_epoch_moved hits, got %v", metricHits)
+	}
+}

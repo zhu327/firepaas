@@ -365,3 +365,151 @@ func (s *copyFromRecorder) SetTrailer(metadata.MD)          {}
 func (s *copyFromRecorder) Context() context.Context        { return s.ctx }
 func (s *copyFromRecorder) SendMsg(any) error               { return nil }
 func (s *copyFromRecorder) RecvMsg(any) error               { return nil }
+
+// W3.2：FIREPAAS_AGENT_ALLOW_EXEC=0 时 Exec/CopyTo 直接 PermissionDenied
+// （mutation claim 之前，不烧 operation_id）+ 计数。
+func TestExecDisabledByNodePolicy(t *testing.T) {
+	s := runtimeServer(t)
+	s.allowExec = false
+	stream := &execFakeStream{
+		ctx: context.Background(),
+		frames: []*pb.ExecInput{{Frame: &pb.ExecInput_Open{Open: &pb.ExecOpen{
+			MachineId: "m1", ExecutionId: "exec-1", OperationId: "op-deny-1",
+			Command: []string{"/bin/sh"}, Env: map[string]string{"TOKEN": "s3cr3t"},
+		}}}},
+	}
+	if err := s.Exec(stream); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("want PermissionDenied when exec disabled, got %v", err)
+	}
+	if got := s.RuntimeAccessStats()["exec\x00disabled"]; got != 1 {
+		t.Fatalf("exec disabled counter = %d, want 1", got)
+	}
+}
+
+func TestCopyToDisabledByNodePolicy(t *testing.T) {
+	s := runtimeServer(t)
+	s.allowExec = false
+	stream := &copyToFakeStream{
+		ctx: context.Background(),
+		frames: []*pb.CopyToInput{{Frame: &pb.CopyToInput_Open{Open: &pb.CopyToOpen{
+			MachineId: "m1", ExecutionId: "exec-1", Generation: 1,
+			OperationId: "op-copy-deny", Path: "/tmp/file",
+		}}}},
+	}
+	if err := s.CopyTo(stream); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("want PermissionDenied when copy disabled, got %v", err)
+	}
+	if got := s.RuntimeAccessStats()["copy-to\x00disabled"]; got != 1 {
+		t.Fatalf("copy-to disabled counter = %d, want 1", got)
+	}
+}
+
+// W3.2：per-machine 并发上限——单 machine 占满 4 槽后新的 Exec 被拒绝，
+// 不影响其他 machine；释放后恢复。
+func TestExecPerMachineLimit(t *testing.T) {
+	s := runtimeServer(t)
+	var releases []func()
+	for i := 0; i < maxRuntimeSessionsPerMachine; i++ {
+		rel, ok := s.acquireMachineSlot("m1")
+		if !ok {
+			t.Fatalf("slot %d should be acquired", i)
+		}
+		releases = append(releases, rel)
+	}
+	if _, ok := s.acquireMachineSlot("m1"); ok {
+		t.Fatal("5th slot on same machine must be rejected")
+	}
+	// 其他 machine 不受影响（防单租户占满的语义）。
+	if _, ok := s.acquireMachineSlot("m2"); !ok {
+		t.Fatal("other machine must still acquire slots")
+	} else {
+		s.machineSessionsMu.Lock()
+		delete(s.machineSessions, "m2")
+		s.machineSessionsMu.Unlock()
+	}
+	for _, rel := range releases {
+		rel()
+	}
+	if _, ok := s.acquireMachineSlot("m1"); !ok {
+		t.Fatal("slots must be reusable after release")
+	} else {
+		s.machineSessionsMu.Lock()
+		delete(s.machineSessions, "m1")
+		s.machineSessionsMu.Unlock()
+	}
+}
+
+func TestExecMachineLimitDeniesWithResourceExhausted(t *testing.T) {
+	s := runtimeServer(t)
+	var releases []func()
+	for i := 0; i < maxRuntimeSessionsPerMachine; i++ {
+		rel, ok := s.acquireMachineSlot("m1")
+		if !ok {
+			t.Fatal("setup slot acquisition failed")
+		}
+		releases = append(releases, rel)
+	}
+	defer func() {
+		for _, rel := range releases {
+			rel()
+		}
+	}()
+	stream := &execFakeStream{
+		ctx: context.Background(),
+		frames: []*pb.ExecInput{{Frame: &pb.ExecInput_Open{Open: &pb.ExecOpen{
+			MachineId: "m1", ExecutionId: "exec-1", OperationId: "op-limit-1",
+			Command: []string{"/bin/sh"},
+		}}}},
+	}
+	if err := s.Exec(stream); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("want ResourceExhausted on per-machine limit, got %v", err)
+	}
+	if got := s.RuntimeAccessStats()["exec\x00machine_limit"]; got != 1 {
+		t.Fatalf("exec machine_limit counter = %d, want 1", got)
+	}
+}
+
+// W3.2：审计只记 argv[0] + 脱敏 env 键（值永不出现；敏感键打码）。
+func TestExecEnvKeysRedacted(t *testing.T) {
+	keys := execEnvKeys(map[string]string{
+		"PATH":             "/bin",
+		"HOME":             "/root",
+		"API_TOKEN":        "s3cr3t",
+		"proxy_credential": "cred",
+		"MY_SECRET_VALUE":  "x",
+	})
+	joined := strings.Join(keys, ",")
+	for _, leaked := range []string{"s3cr3t", "cred", "/root", "API_TOKEN", "proxy_credential", "MY_SECRET_VALUE"} {
+		if strings.Contains(joined, leaked) {
+			t.Fatalf("audit env keys leak %q: %v", leaked, keys)
+		}
+	}
+	foundPath, foundRedacted := false, false
+	for _, k := range keys {
+		if k == "PATH" {
+			foundPath = true
+		}
+		if k == "[REDACTED]" {
+			foundRedacted = true
+		}
+	}
+	if !foundPath || !foundRedacted {
+		t.Fatalf("want PATH kept and sensitive keys redacted: %v", keys)
+	}
+}
+
+// W3.2：环境变量默认保持兼容（未设置/1 → 启用；0 → 关闭）。
+func TestAllowExecFromEnv(t *testing.T) {
+	t.Setenv("FIREPAAS_AGENT_ALLOW_EXEC", "")
+	if !AllowExecFromEnv() {
+		t.Fatal("unset must default to enabled")
+	}
+	t.Setenv("FIREPAAS_AGENT_ALLOW_EXEC", "0")
+	if AllowExecFromEnv() {
+		t.Fatal("0 must disable")
+	}
+	t.Setenv("FIREPAAS_AGENT_ALLOW_EXEC", "1")
+	if !AllowExecFromEnv() {
+		t.Fatal("1 must enable")
+	}
+}

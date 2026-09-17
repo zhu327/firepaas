@@ -3,8 +3,10 @@ package mtls
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 )
@@ -85,7 +87,11 @@ func (m *CertManager) NotAfter() time.Time {
 // ClientTLSConfig 构造客户端 TLS 配置：证书经 CertManager 热重载提供。
 // RootCAs 只在构造时加载一次（CA 轮换不在契约 C-1 范围内，重签同级 CA
 // 需进程重启；证书本身轮换通过热重载覆盖）。
+// W3.1：与 ClientConfig 同约束——MinVersion TLS 1.3，serverName 为空拒绝。
 func (m *CertManager) ClientTLSConfig(caFile, serverName string) (*tls.Config, error) {
+	if strings.TrimSpace(serverName) == "" {
+		return nil, errors.New("server name is required (empty ServerName disables hostname verification)")
+	}
 	pool, err := loadCA(caFile)
 	if err != nil {
 		return nil, err
@@ -94,7 +100,7 @@ func (m *CertManager) ClientTLSConfig(caFile, serverName string) (*tls.Config, e
 		GetClientCertificate: m.GetClientCertificate,
 		RootCAs:              pool,
 		ServerName:           serverName,
-		MinVersion:           tls.VersionTLS12,
+		MinVersion:           tls.VersionTLS13,
 	}, nil
 }
 

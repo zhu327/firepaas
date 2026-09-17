@@ -563,8 +563,8 @@ func TestEnsureImageReadySizeLimit(t *testing.T) {
 	}
 }
 
-// M5 评审决策：secret_env 默认 fail-closed；opt-in（unsafe-persisted-env）
-// 恢复 M4 注入语义。
+// M5 评审决策：secret_env 默认 fail-closed。unsafe-persisted-env 已删除
+// （W1.2 + review P1）：opt-in 同样拒绝，不再恢复 M4 明文注入语义。
 func TestSecretEnvInjectionPolicy(t *testing.T) {
 	im := &fakeInstances{}
 	img := &fakeImages{}
@@ -576,13 +576,10 @@ func TestSecretEnvInjectionPolicy(t *testing.T) {
 	if _, err := a.Create(context.Background(), req); !errors.Is(err, ErrSecretEnvInjectionUnsupported) {
 		t.Fatalf("default must fail closed, got %v", err)
 	}
-	// opt-in 放行（值进入 hypeman Env）。
+	// 已删除的 opt-in 同样拒绝（不再合并进 hypeman Env 明文持久化）。
 	a.SetSecretInjection(SecretInjectionUnsafePersistedEnv)
-	if _, err := a.Create(context.Background(), req); err != nil {
-		t.Fatalf("opt-in injection must pass: %v", err)
-	}
-	if v, ok := im.created.Env["TOKEN"]; !ok || v != "v" {
-		t.Fatalf("secret not injected into env: %+v", im.created.Env)
+	if _, err := a.Create(context.Background(), req); !errors.Is(err, ErrSecretEnvInjectionUnsupported) {
+		t.Fatalf("removed unsafe mode must fail closed, got %v", err)
 	}
 }
 

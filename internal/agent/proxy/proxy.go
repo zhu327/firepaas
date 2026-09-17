@@ -17,6 +17,8 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/zhu327/firepaas/internal/agent/machine"
@@ -58,7 +60,45 @@ type Proxy struct {
 	machines endpointResolver
 	creds    credentialVerifier // nil = 不校验凭证（测试/过渡期）
 	reverse  *httputil.ReverseProxy
+
+	// W3.3：ServeCredential 的令牌桶守卫（内存状态，单节点语义——每个
+	// agent 独立 guard，无跨节点协调；进程重启状态清零）。两层设计（P2
+	// 修正，替换“单一全局桶按全量请求扣减”）：
+	//  1) 查表前扣 lookup 桶：Creds.LookupByDigest 是 mutex 下的
+	//     O(在役 machine) 恒时扫描，全局天花板保护 agent 本体；
+	//  2) 未命中后扣 miss 桶：扫描者用坏凭证打满自己的 403 速率，
+	//     合法（命中）凭证只受 lookup 天花板约束，不会被 miss 风暴 429；
+	//     不做全局 miss 熔断（熔断即未认证 DoS 开关，review P1）。
+	// 两者均可用 SetCredentialLimits 调整（默认见下方常量）。
+	credMu        sync.Mutex
+	credTokens    float64 // lookup 桶剩余令牌
+	credMissToks  float64 // miss 桶剩余令牌
+	credRate      float64 // lookup 桶速率（token/s）
+	credBurst     float64 // lookup 桶容量
+	credMissRate  float64 // miss 桶速率
+	credMissBurst float64 // miss 桶容量
+	credLast      time.Time
+	credLookups   map[string]*atomic.Uint64
+	nowFn         func() time.Time
 }
+
+// W3.3 凭证 guard 默认值（SetCredentialLimits / 环境变量可覆盖）：
+// lookup 是回查 CPU 天花板，取正常 mesh ingress 流量的量级；miss 桶只限制
+// 扫描者的 403 产出。突发 = 2×速率。
+const (
+	defaultCredentialLookupRPS   = 1000
+	defaultCredentialLookupBurst = 2 * defaultCredentialLookupRPS
+	defaultCredentialMissRPS     = 50
+	defaultCredentialMissBurst   = 2 * defaultCredentialMissRPS
+)
+
+// 凭证查找结果标签（Prometheus 导出名冻结为
+// firepaas_proxy_credential_lookup_total{result}，见 CredentialLookupStats）。
+const (
+	credentialResultOK      = "ok"
+	credentialResultDenied  = "denied"
+	credentialResultLimited = "limited"
+)
 
 // credentialVerifier 校验 execution-bound proxy credential（M4）。
 type credentialVerifier interface {
@@ -88,11 +128,13 @@ func NewForTest(
 	creds credentialVerifier,
 	resolve func(machineID, executionID string, wantPort int) (string, int, error),
 ) *Proxy {
-	return &Proxy{
+	p := &Proxy{
 		machines: resolverFunc(resolve),
 		creds:    creds,
 		reverse:  newReverseProxy(),
 	}
+	p.initCredentialGuard()
+	return p
 }
 
 type resolverFunc func(machineID, executionID string, wantPort int) (string, int, error)
@@ -107,7 +149,100 @@ func (f resolverFunc) GetEndpointForPort(
 
 // NewWithVerifier 构造带 credential 校验的 Proxy。
 func NewWithVerifier(machines *machine.Adapter, creds credentialVerifier) *Proxy {
-	return &Proxy{machines: machines, creds: creds, reverse: newReverseProxy()}
+	p := &Proxy{machines: machines, creds: creds, reverse: newReverseProxy()}
+	p.initCredentialGuard()
+	return p
+}
+
+// initCredentialGuard 初始化凭证 guard 状态（构造器共用）。
+func (p *Proxy) initCredentialGuard() {
+	p.nowFn = time.Now
+	p.credRate = defaultCredentialLookupRPS
+	p.credBurst = defaultCredentialLookupBurst
+	p.credMissRate = defaultCredentialMissRPS
+	p.credMissBurst = defaultCredentialMissBurst
+	p.credTokens = p.credBurst
+	p.credMissToks = p.credMissBurst
+	p.credLast = p.nowFn()
+	p.credLookups = map[string]*atomic.Uint64{}
+}
+
+// SetCredentialLimits 覆盖 ingress 凭证限流（<=0 = 保持当前值）。装配点启动
+// 时调用一次；调用后两个桶重置为满额。
+func (p *Proxy) SetCredentialLimits(lookupRPS, missRPS float64) {
+	p.credMu.Lock()
+	defer p.credMu.Unlock()
+	if lookupRPS > 0 {
+		p.credRate, p.credBurst = lookupRPS, 2*lookupRPS
+	}
+	if missRPS > 0 {
+		p.credMissRate, p.credMissBurst = missRPS, 2*missRPS
+	}
+	p.credTokens = p.credBurst
+	p.credMissToks = p.credMissBurst
+	p.credLast = p.nowFn()
+}
+
+// CredentialLookupStats 返回凭证查找计数快照（W3.3，key = result 标签）。
+// Prometheus 导出名冻结为 firepaas_proxy_credential_lookup_total{result}，
+// result ∈ ok|denied|limited。agentd /metrics 接线是 Phase2
+// （需改 cmd/agentd/main.go，本波次 allowlist 之外）；本包只提供内存计数 +
+// 本快照。secret/credential 原值永不进指标 label（仅结果分类）。
+func (p *Proxy) CredentialLookupStats() map[string]uint64 {
+	p.credMu.Lock()
+	defer p.credMu.Unlock()
+	out := make(map[string]uint64, len(p.credLookups))
+	for k, v := range p.credLookups {
+		out[k] = v.Load()
+	}
+	return out
+}
+
+func (p *Proxy) countCredentialLookup(result string) {
+	p.credMu.Lock()
+	defer p.credMu.Unlock()
+	c, ok := p.credLookups[result]
+	if !ok {
+		c = &atomic.Uint64{}
+		p.credLookups[result] = c
+	}
+	c.Add(1)
+}
+
+// refillLocked 按流逝时间补充两个桶（调用方持有 credMu）。
+func (p *Proxy) refillLocked(now time.Time) {
+	elapsed := now.Sub(p.credLast).Seconds()
+	if elapsed <= 0 {
+		return
+	}
+	p.credTokens = min(p.credTokens+elapsed*p.credRate, p.credBurst)
+	p.credMissToks = min(p.credMissToks+elapsed*p.credMissRate, p.credMissBurst)
+	p.credLast = now
+}
+
+// takeCredentialLookup 在查表前扣减全局 lookup 桶；桶空返回 false（调用方 429）。
+func (p *Proxy) takeCredentialLookup() bool {
+	p.credMu.Lock()
+	defer p.credMu.Unlock()
+	p.refillLocked(p.nowFn())
+	if p.credTokens < 1 {
+		return false
+	}
+	p.credTokens--
+	return true
+}
+
+// takeCredentialMiss 在未命中后扣减 miss 桶；桶空返回 false（调用方 429）。
+// 命中不扣 miss 桶——miss 风暴不得影响合法凭证。
+func (p *Proxy) takeCredentialMiss() bool {
+	p.credMu.Lock()
+	defer p.credMu.Unlock()
+	p.refillLocked(p.nowFn())
+	if p.credMissToks < 1 {
+		return false
+	}
+	p.credMissToks--
+	return true
 }
 
 func newReverseProxy() *httputil.ReverseProxy {
@@ -213,15 +348,31 @@ func (p *Proxy) serveTarget(w http.ResponseWriter, r *http.Request, machineID, e
 // ServeCredential 是 G2d fabric ingress 入口（ADR-0040 §14）：凭证是唯一
 // 路由依据（无 X-Firepaas-Machine/Execution 头）；由 creds 反查归属后走
 // 共享转发路径。wantPort = 目标 service 端口（0 = 主端口）。
+// W3.3（P2 修正）：两层令牌桶——查表前扣全局 lookup 桶（回查 CPU 天花板），
+// 未命中后扣 miss 桶（扫描者 403 速率）；命中流量不受 miss 风暴影响。
+// 所有拒绝都不区分细节、不回显凭证、不记凭证原值日志。
 func (p *Proxy) ServeCredential(w http.ResponseWriter, r *http.Request, rawCredential string, wantPort int) {
 	if p.creds == nil {
+		p.countCredentialLookup(credentialResultDenied)
 		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if !p.takeCredentialLookup() {
+		p.countCredentialLookup(credentialResultLimited)
+		http.Error(w, "too many requests", http.StatusTooManyRequests)
 		return
 	}
 	machineID, executionID, ok := p.creds.LookupByDigest(rawCredential)
 	if !ok {
+		if !p.takeCredentialMiss() {
+			p.countCredentialLookup(credentialResultLimited)
+			http.Error(w, "too many requests", http.StatusTooManyRequests)
+			return
+		}
+		p.countCredentialLookup(credentialResultDenied)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
+	p.countCredentialLookup(credentialResultOK)
 	p.serveTarget(w, r, machineID, executionID, wantPort)
 }

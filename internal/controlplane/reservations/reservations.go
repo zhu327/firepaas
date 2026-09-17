@@ -21,6 +21,11 @@
 // epoch）→ 派发 agent → Commit/Fail（释放 pending）。TTL 过期由
 // rebuildLeases 兜底（PruneStaleOps 清非活跃 op → Reset 全量重建）。
 //
+// W2.1：释放走 releaseIfHeld 单 Lua（读指针 + 查记录 + 扣减 + DEL 一次原子
+// 脚本）。旧的 Get→release 两次脚本在 Reset 切 epoch 的窗口内会把 debit 落到
+// replay 后的新 epoch（旧 epoch 增量残留到 TTL），或在记录已消失时静默成功；
+// 新路径返回 0/1 即释放真相，0 视为 ErrNotHeld 并经 EmitMetric 打点。
+//
 // Reset 语义重写（D-3）：不再"清零全部 hash + 按存活 op 键重放"，而是在一
 // 个原子 Lua 里：INCR epoch_seq 得新 epoch → 从旧 epoch 的 ops 集合把存活
 // op 记录重放进新 epoch（hash 重建 + op 键以剩余 TTL 复制）→ SET
@@ -74,12 +79,16 @@ type Record struct {
 
 // Manager 封装预约脚本。
 type Manager struct {
-	rdb     *redis.Client
-	ttl     time.Duration
-	acquire *redis.Script
-	release *redis.Script
-	reset   *redis.Script
-	get     *redis.Script
+	rdb           *redis.Client
+	ttl           time.Duration
+	acquire       *redis.Script
+	releaseIfHeld *redis.Script
+	reset         *redis.Script
+	get           *redis.Script
+	// EmitMetric 是计数器钩子（nil = 丢弃，保持 New 签名兼容）：释放路径以
+	// （name="firepaas_reservations_total", labels={"result": ...}）形态上报，
+	// cmd/api 装配时接到 metrics.Registry。
+	EmitMetric func(name string, labels map[string]string)
 }
 
 // New 构造 Manager。ttl<=0 时默认 120s。
@@ -179,7 +188,14 @@ redis.call('SADD', pfx .. 'projects', project_id)
 redis.call('SADD', pfx .. 'ops', op_id)
 redis.call('SET', op_key, cjson.encode(data), 'EX', ttl)
 return 1`),
-		release: redis.NewScript(`
+		releaseIfHeld: redis.NewScript(`
+-- W2.1 单 Lua 释放（KEYS[1]=resv:active，ARGV[1]=opID）：脚本内读 active
+-- 指针 → 查本 epoch 的 op 记录 → 存在则扣减 hash 并 DEL 返回 1，否则 0。
+-- 指针读取与扣减同脚本原子：Reset 切 epoch 只能发生在脚本之前或之后，
+-- 要么命中 replay 后的新 epoch 记录（恰好一次扣减），要么返回 0（记录
+-- 已过期/被 Prune/从未持有），不存在“Get 命中旧 epoch、release 落空新
+-- epoch 还静默成功”的窗口。0 的两种成因（从未持有 vs epoch 切走）不用
+-- 额外读区分——额外读会重新打开竞态；统一记 release_epoch_moved。
 local active = redis.call('GET', KEYS[1]) or '0'
 local pfx = 'resv:' .. active .. ':'
 local op_id = ARGV[1]
@@ -350,19 +366,26 @@ func (m *Manager) Release(ctx context.Context, opID string) error {
 	return m.releasePending(ctx, opID)
 }
 
+// releasePending 经 releaseIfHeld 单 Lua 释放（W2.1）：不再先 Get 再 release。
+// 返回 0（本 epoch 无记录：从未持有，或 Reset 已切 epoch/记录已过期被 Prune）
+// 视为 ErrNotHeld 并打点 firepaas_reservations_total{result="release_epoch_moved"}。
 func (m *Manager) releasePending(ctx context.Context, opID string) error {
-	rec, err := m.Get(ctx, opID)
-	if err != nil {
-		return err
-	}
-	if rec == nil {
-		return ErrNotHeld
-	}
-	_, err = m.release.Run(ctx, m.rdb, []string{activeKey}, opID).Int()
+	held, err := m.releaseIfHeld.Run(ctx, m.rdb, []string{activeKey}, opID).Int()
 	if err != nil {
 		return fmt.Errorf("reservation release %s: %w", opID, err)
 	}
+	if held == 0 {
+		m.emitMetric("firepaas_reservations_total", map[string]string{"result": "release_epoch_moved"})
+		return ErrNotHeld
+	}
 	return nil
+}
+
+// emitMetric 经 EmitMetric 钩子打点（钩子为 nil 时丢弃，不阻塞释放路径）。
+func (m *Manager) emitMetric(name string, labels map[string]string) {
+	if m.EmitMetric != nil {
+		m.EmitMetric(name, labels)
+	}
 }
 
 // Get 读取预约记录；不存在返回 nil。读取经 get 脚本在 active epoch 内

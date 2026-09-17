@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -660,5 +661,56 @@ func TestRouteCacheRevisionGuardKeepsServeStale(t *testing.T) {
 func loaderRevisioned(rev int64, machine string) Load {
 	return func(ctx context.Context, key string) (any, error) {
 		return &catalog.Route{Revision: rev, Backends: []catalog.Backend{{MachineID: machine}}}, nil
+	}
+}
+
+// W3.3：TLS 策略由装配点决策——默认兼容（http 可用 + 告警一次），
+// RequireTLS=true 时非 https 直接失败（fail-closed）。
+func TestTokenClientRequireTLS(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, `{"token":"tok","execution_id":"exec-1"}`)
+	}))
+	defer srv.Close()
+
+	// 默认：既有部署（明文 API）保持可运行。
+	tc := NewTokenClient(srv.URL, "bearer", 30*time.Second)
+	if tok, _, err := tc.Get(context.Background(), "m1", "exec-1"); err != nil || tok != "tok" {
+		t.Fatalf("default must keep legacy http fetch working: token=%q err=%v", tok, err)
+	}
+
+	// 显式收紧：非 https 在回源前拒绝，错误指引装配开关。
+	tc = NewTokenClient(srv.URL, "bearer", 30*time.Second)
+	tc.RequireTLS = true
+	if _, _, err := tc.Get(context.Background(), "m1", "exec-1"); err == nil {
+		t.Fatal("http fetch must be rejected when RequireTLS is set")
+	} else if !strings.Contains(err.Error(), "https") || !strings.Contains(err.Error(), "FIREPAAS_EDGE_API_REQUIRE_TLS") {
+		t.Fatalf("error must guide to https and the assembly switch, got: %v", err)
+	}
+}
+
+// W3.3：stale 上限 120s——超配钳制（与架构 §4.3 断流预算对齐）。
+func TestTokenClientStaleWindowCapped(t *testing.T) {
+	tc := NewTokenClient("https://127.0.0.1:8080", "bearer", 30*time.Second)
+	tc.SetStaleWindow(10 * time.Minute)
+	if tc.stale != maxTokenStaleWindow {
+		t.Fatalf("stale = %v, want cap %v", tc.stale, maxTokenStaleWindow)
+	}
+	tc.SetStaleWindow(30 * time.Second)
+	if tc.stale != 30*time.Second {
+		t.Fatalf("stale = %v, want 30s", tc.stale)
+	}
+}
+
+// W1.1（review P2 code-judo）：InflightTotal 直接读 snapshot 求和，不经文本往返。
+func TestInflightTotal(t *testing.T) {
+	h := testHandler(nil, 8)
+	if total, backends := h.InflightTotal(); total != 0 || backends != 0 {
+		t.Fatalf("empty: total=%d backends=%d, want 0/0", total, backends)
+	}
+	h.inflight.acquire("m1")
+	h.inflight.acquire("m1")
+	h.inflight.acquire("m2")
+	if total, backends := h.InflightTotal(); total != 3 || backends != 2 {
+		t.Fatalf("total=%d backends=%d, want 3/2", total, backends)
 	}
 }
