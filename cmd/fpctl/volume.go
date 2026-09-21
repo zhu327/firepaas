@@ -84,8 +84,12 @@ func runVolume(args []string) error {
 		if *vol == "" {
 			return errors.New("usage: fpctl volume detach <machine_id> --volume <id>")
 		}
-		return do("POST", withQuery("/v1/machines/"+url.PathEscape(machineID)+"/volume-detach", map[string]string{"volume_id": *vol}),
-			map[string]any{}, nil)
+		return do(
+			"POST",
+			withQuery("/v1/machines/"+url.PathEscape(machineID)+"/volume-detach", map[string]string{"volume_id": *vol}),
+			map[string]any{},
+			nil,
+		)
 	default:
 		return fmt.Errorf("unknown volume command %q", args[0])
 	}

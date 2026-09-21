@@ -193,7 +193,13 @@ func runCP(args []string) error {
 		}
 		resp, err := fetchChecked(
 			"PUT",
-			"/v1/machines/"+url.PathEscape(machineID)+"/files?path="+url.QueryEscape(remote)+"&operation_id="+url.QueryEscape(operationID),
+			"/v1/machines/"+url.PathEscape(
+				machineID,
+			)+"/files?path="+url.QueryEscape(
+				remote,
+			)+"&operation_id="+url.QueryEscape(
+				operationID,
+			),
 			f,
 			"application/octet-stream",
 		)

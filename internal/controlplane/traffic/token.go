@@ -19,7 +19,7 @@ import (
 )
 
 // HeaderCredential 是 edge→agent proxy 携带凭证的请求头。
-const HeaderCredential = "X-Firepaas-Credential"
+const HeaderCredential = "X-Firepaas-Credential" //nolint:gosec // G101：HTTP 头名，非凭证值
 
 // Signer 持有 HMAC 密钥。
 type Signer struct {

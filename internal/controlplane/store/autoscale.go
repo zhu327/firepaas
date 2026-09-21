@@ -78,10 +78,12 @@ func ValidateAutoscalePolicy(p AutoscalePolicy) error {
 	if p.MinReplicas > p.MaxReplicas {
 		return fmt.Errorf("min_replicas must be <= max_replicas")
 	}
-	if p.TargetConcurrency < autoscaleBounds.targetConcurrency[0] || p.TargetConcurrency > autoscaleBounds.targetConcurrency[1] {
+	if p.TargetConcurrency < autoscaleBounds.targetConcurrency[0] ||
+		p.TargetConcurrency > autoscaleBounds.targetConcurrency[1] {
 		return fmt.Errorf("target_concurrency must be in [1,256]")
 	}
-	if p.ScaleDownDelaySec < autoscaleBounds.scaleDownDelaySec[0] || p.ScaleDownDelaySec > autoscaleBounds.scaleDownDelaySec[1] {
+	if p.ScaleDownDelaySec < autoscaleBounds.scaleDownDelaySec[0] ||
+		p.ScaleDownDelaySec > autoscaleBounds.scaleDownDelaySec[1] {
 		return fmt.Errorf("scale_down_delay_sec must be in [30,600]")
 	}
 	if p.PanicThreshold < autoscaleBounds.panicThreshold[0] || p.PanicThreshold > autoscaleBounds.panicThreshold[1] {
@@ -98,9 +100,21 @@ func clampAutoscalePolicy(p AutoscalePolicy) AutoscalePolicy {
 	if p.MinReplicas > p.MaxReplicas {
 		p.MinReplicas = p.MaxReplicas
 	}
-	p.TargetConcurrency = clampBound(p.TargetConcurrency, autoscaleBounds.targetConcurrency[0], autoscaleBounds.targetConcurrency[1])
-	p.ScaleDownDelaySec = clampBound(p.ScaleDownDelaySec, autoscaleBounds.scaleDownDelaySec[0], autoscaleBounds.scaleDownDelaySec[1])
-	p.PanicThreshold = clampBound(p.PanicThreshold, autoscaleBounds.panicThreshold[0], autoscaleBounds.panicThreshold[1])
+	p.TargetConcurrency = clampBound(
+		p.TargetConcurrency,
+		autoscaleBounds.targetConcurrency[0],
+		autoscaleBounds.targetConcurrency[1],
+	)
+	p.ScaleDownDelaySec = clampBound(
+		p.ScaleDownDelaySec,
+		autoscaleBounds.scaleDownDelaySec[0],
+		autoscaleBounds.scaleDownDelaySec[1],
+	)
+	p.PanicThreshold = clampBound(
+		p.PanicThreshold,
+		autoscaleBounds.panicThreshold[0],
+		autoscaleBounds.panicThreshold[1],
+	)
 	return p
 }
 

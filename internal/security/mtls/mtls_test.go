@@ -121,10 +121,14 @@ func TestUnaryServerIdentityInterceptor(t *testing.T) {
 	called := false
 	handler := func(context.Context, any) (any, error) { called = true; return nil, nil }
 
-	if _, err := interceptor(tlsPeerContext("edge-proxy"), nil, nil, handler); status.Code(err) != codes.PermissionDenied || called {
+	if _, err := interceptor(tlsPeerContext("edge-proxy"), nil, nil, handler); status.Code(
+		err,
+	) != codes.PermissionDenied ||
+		called {
 		t.Fatalf("wrong CN: code=%v called=%v", status.Code(err), called)
 	}
-	if _, err := interceptor(context.Background(), nil, nil, handler); status.Code(err) != codes.Unauthenticated || called {
+	if _, err := interceptor(context.Background(), nil, nil, handler); status.Code(err) != codes.Unauthenticated ||
+		called {
 		t.Fatalf("no peer: code=%v called=%v", status.Code(err), called)
 	}
 	if _, err := interceptor(tlsPeerContext("control-plane"), nil, nil, handler); err != nil || !called {

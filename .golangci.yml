@@ -6,6 +6,44 @@ linters:
   default: standard
   enable:
     - misspell
+    # 渐进收紧（先修后启）：SQL 行集错误检查、HTTP 响应体关闭、安全规则。
+    - rowserrcheck
+    - bodyclose
+    - gosec
+  settings:
+    gosec:
+      # gosec 在本仓库有大量结构性告警（执行网络工具、从配置拼路径、调度用
+      # math/rand、日志携带变量），逐条修复既无收益也非真实风险。按“先修后
+      # 启”只保留可行动的规则，下方按类排除噪声；剩余规则（如 G101/G117/
+      # G602/G301）的少量命中以 //nolint:gosec 就地标注理由。
+      excludes:
+        # 分析器 panic：G115 conversion-overflow 在含 sha256 常量时 panic
+        # （gosec v2.23.0），无法启用。
+        - G115
+        # G204 子进程调用（ip/nft/wg/firecracker 等均为参数化调用，非注入）。
+        - G204
+        # G304 从变量拼文件路径（配置/data 目录，非不可信输入）。
+        - G304
+        # G306 WriteFile 权限（主要为测试临时文件）。
+        - G306
+        # G404 math/rand（Best-of-K 采样与仿真，非安全用途）。
+        - G404
+        # G703 路径穿越 taint（durablewrite 的 tmp 名由受控 path 派生）。
+        - G703
+        # G704 SSRF taint（对节点/registry/edge 的 URL 来自受控拓扑）。
+        - G704
+        # G705 XSS taint（仅 tools/ontime 调试工具）。
+        - G705
+        # G706 日志注入 taint（记录 env 变量值，非不可信输入）。
+        - G706
+        # G114 ListenAndServe （仅 tools/ontime 调试工具）。
+        - G114
+        # G104 未处理的错误（清理/关闭路径上的故意忽略）。
+        - G104
+        # G102 绑定全部接口（仅 netns 测试）。
+        - G102
+        # G702 命令注入 taint（仅测试内 re-exec os.Args[0] 的 netns 助手）。
+        - G702
   exclusions:
     generated: lax
     presets:

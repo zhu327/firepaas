@@ -38,7 +38,7 @@ type SealedRow struct {
 
 // SecretRef 引用：按 project 内 name 解析，version 缺省 = 最新。
 type SecretRef struct {
-	Secret  string `json:"secret"`
+	Secret  string `json:"secret"` //nolint:gosec // G117：引用 secret 名，非值
 	Version *int64 `json:"version,omitempty"`
 }
 
@@ -62,7 +62,7 @@ func ParseSecretRef(s string) (SecretRef, error) {
 	return ref, nil
 }
 
-const secretCols = `id, project_id, name, version, key_version, created_at`
+const secretCols = `id, project_id, name, version, key_version, created_at` //nolint:gosec // G101：列名含 secret，非凭证
 
 // NextSecretVersion 返回该 secret 的下一个版本号（写入前的取号；AAD 需要
 // version 先行）。并发同 name 写入靠 UNIQUE(project,name,version) 冲突失败。

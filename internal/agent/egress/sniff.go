@@ -231,14 +231,14 @@ func parseServerNameExt(ext []byte) (string, bool) {
 	}
 	list := ext[2 : 2+listLen]
 	for i := 0; i+3 <= len(list); {
-		nameType := list[i]
-		nameLen := int(binary.BigEndian.Uint16(list[i+1 : i+3]))
+		nameType := list[i]                                      //nolint:gosec // G602：i+3<=len(list) 保证
+		nameLen := int(binary.BigEndian.Uint16(list[i+1 : i+3])) //nolint:gosec // G602：同上边界
 		i += 3
 		if i+nameLen > len(list) {
 			break
 		}
 		if nameType == 0x00 { // host_name
-			host := string(list[i : i+nameLen])
+			host := string(list[i : i+nameLen]) //nolint:gosec // G602：上一行 break 保证不越界
 			if host != "" {
 				return host, true
 			}

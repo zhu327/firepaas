@@ -121,13 +121,30 @@ func TestEnsureAppAndEnqueueCreateResurrectsTombstone(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 严格变体：拒绝复活（ADR-0026 守卫语义不回归）。
-	if _, err := s.EnsureAppAndEnqueueCreate(ctx, project, appID, appID+".test", "img", 1, 512, 1024, 80,
-		machineID, depID, "exec-new-strict", "op-resurrect-strict-"+sfx, 1, 1, []byte(`{}`), nil); err == nil {
+	if _, err := s.EnsureAppAndEnqueueCreate(ctx, CreateMachineParams{ProjectID: project, AppID: appID, Hostname: appID + ".test", ImageRef: "img", VCPU: 1, MemMIB: 512, DiskMIB: 1024, IngressPort: 80, MachineID: machineID, DeploymentID: depID, ExecutionID: "exec-new-strict", OperationID: "op-resurrect-strict-" + sfx, Generation: 1, ReplicaOrdinal: 1, RequestJSON: []byte(`{}`)}); err == nil {
 		t.Fatal("strict variant must reject tombstone resurrection")
 	}
 	// 复活变体：允许对账路径显式复活（换 execution、清 observed/node、generation 不回退）。
-	op, err := s.EnsureAppAndEnqueueCreateResurrect(ctx, project, appID, appID+".test", "img", 1, 512, 1024, 80,
-		machineID, depID, "exec-new", "op-resurrect-ok-"+sfx, 1, 1, []byte(`{}`), nil)
+	op, err := s.EnsureAppAndEnqueueCreateResurrect(
+		ctx,
+		CreateMachineParams{
+			ProjectID:      project,
+			AppID:          appID,
+			Hostname:       appID + ".test",
+			ImageRef:       "img",
+			VCPU:           1,
+			MemMIB:         512,
+			DiskMIB:        1024,
+			IngressPort:    80,
+			MachineID:      machineID,
+			DeploymentID:   depID,
+			ExecutionID:    "exec-new",
+			OperationID:    "op-resurrect-ok-" + sfx,
+			Generation:     1,
+			ReplicaOrdinal: 1,
+			RequestJSON:    []byte(`{}`),
+		},
+	)
 	if err != nil {
 		t.Fatalf("resurrect variant must accept tombstone: %v", err)
 	}

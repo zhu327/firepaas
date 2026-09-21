@@ -24,6 +24,16 @@
 5. 窗口确认：升级期间写路径短暂不可用是可接受的（canary 期间 leader 锁会
    切换）；安排低峰窗口并通告。
 
+## 升级顺序约束（agentd ↔ 控制面）
+
+控制面 `agentclient.Dial` 以 30s keepalive 心跳探测 agent 半开连接；agentd
+必须把 gRPC `EnforcementPolicy.MinTime` 放宽到 10s，才不会把该客户端判为
+`too_many_pings` 并反复 GOAWAY（旧 agentd 默认 `MinTime=5m` 且不允许无流
+心跳）。因此含此变更的发布：**先升级 agentd（服务端），再升级控制面
+（客户端）**；回滚顺序相反（先回滚控制面，再回滚 agentd）。跳过顺序时表现为
+控制面对 agent 的 RPC 间歇 UNAVAILABLE/连接重置，直到 agentd 追平。agentd
+侧操作见 `scripts/lab/upgrade-agentd.sh`。
+
 ## 发布流程（API）
 
 `control-plane.hcl` 已声明 `update { canary=1, max_parallel=1,
@@ -96,6 +106,7 @@ nomad job revert firepaas-edge <recorded-stable-version>
 - schema 级纠正走"新的前向迁移"（不回收版本号）；数据级恢复走
   `scripts/lab/pg-restore-rehearsal.sh` 演练过的备份恢复链路。
 - 回滚后按"后置检查"逐项复核，并把事故时间线归档为 events。
+- 涉及 agentd 的版本按"升级顺序约束"反向回滚：先回滚控制面，再回滚 agentd。
 
 ## 关联
 

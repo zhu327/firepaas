@@ -303,7 +303,11 @@ func loadServerCertificates(
 
 // newManagedCert 创建热重载的证书管理器并注册到期回调（契约 C-1）。
 // 调用方保留各自的材料校验与错误文案；本函数只收敛 NewCertManager 调用。
-func newManagedCert(certFile, keyFile string, reload time.Duration, onExpiry func(time.Time)) (*mtls.CertManager, error) {
+func newManagedCert(
+	certFile, keyFile string,
+	reload time.Duration,
+	onExpiry func(time.Time),
+) (*mtls.CertManager, error) {
 	return mtls.NewCertManager(certFile, keyFile, reload, nil, onExpiry)
 }
 
@@ -407,8 +411,10 @@ func writeInflightAggregated(w io.Writer, handler *edgesvc.Handler) {
 	if backends == 0 {
 		return
 	}
-	_, _ = fmt.Fprint(w,
-		"# HELP firepaas_edge_backend_inflight in-flight requests summed over backends (per-machine labels disabled)\n# TYPE firepaas_edge_backend_inflight gauge\n")
+	_, _ = fmt.Fprint(
+		w,
+		"# HELP firepaas_edge_backend_inflight in-flight requests summed over backends (per-machine labels disabled)\n# TYPE firepaas_edge_backend_inflight gauge\n",
+	)
 	_, _ = fmt.Fprintf(w, "firepaas_edge_backend_inflight %d\n", total)
 }
 

@@ -49,7 +49,10 @@ func runWait(args []string) error {
 	}
 	switch args[0] {
 	case "machine":
-		machineID, err := oneArg(args[1:], "usage: fpctl wait machine <machine_id> --execution <exec_id> [--timeout-ms N]")
+		machineID, err := oneArg(
+			args[1:],
+			"usage: fpctl wait machine <machine_id> --execution <exec_id> [--timeout-ms N]",
+		)
 		if err != nil {
 			return err
 		}
@@ -60,10 +63,18 @@ func runWait(args []string) error {
 		if *exec == "" {
 			return errors.New("usage: fpctl wait machine <machine_id> --execution <exec_id> [--timeout-ms N]")
 		}
-		return doRequest(longClient, "GET", withQuery("/v1/machines/"+url.PathEscape(machineID)+"/wait", map[string]string{
-			"execution_id": *exec,
-			"timeout_ms":   strconv.Itoa(*timeout),
-		}), nil, nil, "", true)
+		return doRequest(
+			longClient,
+			"GET",
+			withQuery("/v1/machines/"+url.PathEscape(machineID)+"/wait", map[string]string{
+				"execution_id": *exec,
+				"timeout_ms":   strconv.Itoa(*timeout),
+			}),
+			nil,
+			nil,
+			"",
+			true,
+		)
 	case "operation":
 		opID, err := oneArg(args[1:], "usage: fpctl wait operation <operation_id> [--timeout-ms N]")
 		if err != nil {
@@ -87,10 +98,18 @@ func runWait(args []string) error {
 		if *generation <= 0 {
 			return errors.New("usage: fpctl wait rollout <rollout_id> --generation G [--timeout-ms N]")
 		}
-		return doRequest(longClient, "GET", withQuery("/v1/rollouts/"+url.PathEscape(rolloutID)+"/wait", map[string]string{
-			"generation": strconv.FormatInt(*generation, 10),
-			"timeout_ms": strconv.Itoa(*timeout),
-		}), nil, nil, "", true)
+		return doRequest(
+			longClient,
+			"GET",
+			withQuery("/v1/rollouts/"+url.PathEscape(rolloutID)+"/wait", map[string]string{
+				"generation": strconv.FormatInt(*generation, 10),
+				"timeout_ms": strconv.Itoa(*timeout),
+			}),
+			nil,
+			nil,
+			"",
+			true,
+		)
 	default:
 		return fmt.Errorf("unknown wait command %q", args[0])
 	}

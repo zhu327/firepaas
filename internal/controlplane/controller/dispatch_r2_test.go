@@ -34,7 +34,7 @@ import (
 // ---------------------------------------------------------------------------
 
 func newLockController() *Controller {
-	return &Controller{machineLocks: map[string]*machineDispatchLock{}}
+	return &Controller{state: newReconcileState()}
 }
 
 // 一个挂死的操作不得拖累其他 machine：4 worker 下全部快 op 必须在挂死

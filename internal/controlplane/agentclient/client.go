@@ -14,6 +14,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
@@ -67,6 +68,16 @@ func Dial(addr string) (*Client, error) {
 	} else {
 		return nil, fmt.Errorf("agent mTLS required: set FIREPAAS_AGENT_TLS_CERT/KEY/CA (or FIREPAAS_AGENT_TLS_ALLOW_INSECURE=true for dev)")
 	}
+	// keepalive：主动探测空闲通道上的半开连接（idle 后对端静默消失），使下一个
+	// RPC 快速在新建连接上重试，而不必等满 AgentRPCTimeout（默认 2m）。必须与
+	// agentd 的 KeepaliveEnforcementPolicy 配套：旧版 agentd 默认 MinTime=5m，
+	// 会以 GOAWAY(too_many_pings) 断开 30s 心跳的客户端——升级顺序为先 agentd
+	// （服务端）后控制面（客户端），回滚相反。
+	opts = append(opts, grpc.WithKeepaliveParams(keepalive.ClientParameters{
+		Time:                30 * time.Second,
+		Timeout:             10 * time.Second,
+		PermitWithoutStream: true,
+	}))
 	conn, err := grpc.NewClient(addr, opts...)
 	if err != nil {
 		if clientCertMgr != nil {

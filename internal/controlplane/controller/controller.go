@@ -105,6 +105,46 @@ const fabricTrustDomain = "firepaas.local"
 // 同口径（有声明时取 deployments.services 首条 Name，原样保留空串）。
 const fabricDefaultService = "default"
 
+// reconcileState 是 leader 任期内不持久化的进程内对账状态：各环的去重集合与
+// 派发互斥锁。原为 Controller 上的散落可变 map + 锁（各自在 Run 里做 nil-guard）；
+// 收进单一子结构后由 st() 统一惰性初始化，Controller 不再需要逐字段防御。
+// 环间共享内存态按环归属（见 Run 注释）。
+type reconcileState struct {
+	// nodeListFailures 记录节点连续 List 失败次数（P3-9：单次抖动不摘路由）。
+	nodeListFailures map[string]int
+	// prefetchedRollouts（v1.1，ADR-0018）：本轮 leader 任期内已下发过预取的
+	// rollout（尽力而为的去重；leader 切换后重发一次无害——镜像拉取幂等）。
+	prefetchedRollouts map[string]bool
+	// evacuatedNodes（v1.1，ADR-0021）：已记过“驱离完成”事件的节点。
+	evacuatedNodes map[string]bool
+	// reportedOrphans（v1.4-B）：已报过 orphan 事件的本地 artifact（node:type:id）。
+	reportedOrphans map[string]bool
+	// machineLocks（R2 评审 P1）：派发路径的进程内 per-machine 互斥。
+	machineLocksMu sync.Mutex
+	machineLocks   map[string]*machineDispatchLock
+}
+
+func newReconcileState() *reconcileState {
+	return &reconcileState{
+		nodeListFailures:   map[string]int{},
+		prefetchedRollouts: map[string]bool{},
+		evacuatedNodes:     map[string]bool{},
+		reportedOrphans:    map[string]bool{},
+		machineLocks:       map[string]*machineDispatchLock{},
+	}
+}
+
+// st 返回进程内对账状态，首次调用时惰性初始化（New 已预置；直接构造
+// Controller 的测试与 Run 无需再逐字段 nil-guard）。
+func (c *Controller) st() *reconcileState {
+	c.stateOnce.Do(func() {
+		if c.state == nil {
+			c.state = newReconcileState()
+		}
+	})
+	return c.state
+}
+
 // Controller 执行 reconcile。
 type Controller struct {
 	store     *store.Store
@@ -117,26 +157,10 @@ type Controller struct {
 	routes    *routepublisher.Publisher
 	cfg       Config
 
-	// nodeListFailures 记录节点连续 List 失败次数（P3-9：单次抖动不摘路由）。
-	nodeListFailures map[string]int
-
-	// prefetchedRollouts（v1.1，ADR-0018）：本轮 leader 任期内已下发过预取的
-	// rollout（尽力而为的去重；leader 切换后重发一次无害——镜像拉取幂等）。
-	prefetchedRollouts map[string]bool
-
-	// evacuatedNodes（v1.1，ADR-0021）：已记过“驱离完成”事件的节点，避免
-	// 每 5s 重复记事件。驱离进度不持久化（由剩余 machine 数自然推导）。
-	evacuatedNodes map[string]bool
-
-	// reportedOrphans（v1.4-B）：已报过 orphan 事件的本地 artifact
-	//（node:type:id），避免每周期重复记事件；orphan bytes 指标每周期重算。
-	reportedOrphans map[string]bool
-
-	// machineLocks（R2 评审 P1）：派发路径的进程内 per-machine 互斥——
-	// 有界并发下同一批（或跨批 claim）的、面向同一台 machine 的 op 必须串行，
-	// 否则两个 worker 会并行派发同机的 pause/resume 或 create+delete。
-	machineLocksMu sync.Mutex
-	machineLocks   map[string]*machineDispatchLock
+	// state 是 leader 任期内不持久化的进程内对账状态（各环去重集合 +
+	// 派发互斥锁）；经 st() 惰性初始化，直接构造的测试无需预置字段。
+	state     *reconcileState
+	stateOnce sync.Once
 
 	// autoscale（ADR-0041）：leader 进程内决策状态（不持久化；
 	// leader 切换/重启后重置 = 推迟缩容，保守方向）。
@@ -250,9 +274,7 @@ func New(st *store.Store, cat *catalog.Catalog, nm *nodemanager.Manager,
 		store: st, cat: cat, nodes: nm, resv: resv, placer: placer,
 		placement: placement.New(st, nm, resv, placer, reg, cfg.ReservationCompensationTimeout), metrics: reg,
 		routes: routesPub, cfg: cfg,
-		nodeListFailures:   map[string]int{},
-		prefetchedRollouts: map[string]bool{}, evacuatedNodes: map[string]bool{},
-		reportedOrphans: map[string]bool{}, machineLocks: map[string]*machineDispatchLock{},
+		state:               newReconcileState(),
 		userEventsRetention: cfg.UserEventsRetention, gc: cfg.GC, scrub: cfg.Scrub,
 		schedulerEventsRetention: cfg.SchedulerEventsRetention,
 	}
@@ -269,24 +291,10 @@ func New(st *store.Store, cat *catalog.Catalog, nm *nodemanager.Manager,
 // evacuatedNodes→evacuation、reportedOrphans→node-resources、
 // autoscale 状态→autoscale），machineLocks 自带互斥。
 func (c *Controller) Run(ctx context.Context) error {
-	if c.nodeListFailures == nil { // 防御：New 已初始化，测试可直接构造
-		c.nodeListFailures = map[string]int{}
-	}
-	if c.prefetchedRollouts == nil {
-		c.prefetchedRollouts = map[string]bool{}
-	}
-	if c.evacuatedNodes == nil {
-		c.evacuatedNodes = map[string]bool{}
-	}
-	if c.reportedOrphans == nil {
-		c.reportedOrphans = map[string]bool{}
-	}
-	if c.machineLocks == nil { // 防御：测试可直接构造
-		c.machineLocks = map[string]*machineDispatchLock{}
-	}
 	// 有界去重表：超限重置（孤儿事件可重复上报，但不会无限增长）。
-	if len(c.reportedOrphans) > 4096 {
-		c.reportedOrphans = map[string]bool{}
+	// 进程内对账状态经 st() 惰性初始化（New 已预置），此处不再逐字段防御。
+	if len(c.st().reportedOrphans) > 4096 {
+		c.st().reportedOrphans = map[string]bool{}
 	}
 
 	// P1-1（启动回收）：单写者不变量——刚获得 leader 锁时，任何 CLAIMED

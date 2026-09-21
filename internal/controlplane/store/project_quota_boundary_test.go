@@ -34,12 +34,26 @@ func TestProjectUsageCountsPendingRequestAtQuotaBoundary(t *testing.T) {
 
 	enqueue := func(n int, vcpu int64) {
 		t.Helper()
-		_, err := s.EnsureAppAndEnqueueCreate(ctx, project,
-			fmt.Sprintf("app-qb%d", n), fmt.Sprintf("qb%d.local", n), "img:1",
-			vcpu, 512, 1024, 80,
-			fmt.Sprintf("m-qb%d-%s", n, suffix), fmt.Sprintf("dep-qb%d", n),
-			fmt.Sprintf("exec-qb%d-%s", n, suffix), fmt.Sprintf("op-qb%d-%s", n, suffix),
-			1, 0, []byte(`{"generation":"1"}`), nil)
+		_, err := s.EnsureAppAndEnqueueCreate(
+			ctx,
+			CreateMachineParams{
+				ProjectID:      project,
+				AppID:          fmt.Sprintf("app-qb%d", n),
+				Hostname:       fmt.Sprintf("qb%d.local", n),
+				ImageRef:       "img:1",
+				VCPU:           vcpu,
+				MemMIB:         512,
+				DiskMIB:        1024,
+				IngressPort:    80,
+				MachineID:      fmt.Sprintf("m-qb%d-%s", n, suffix),
+				DeploymentID:   fmt.Sprintf("dep-qb%d", n),
+				ExecutionID:    fmt.Sprintf("exec-qb%d-%s", n, suffix),
+				OperationID:    fmt.Sprintf("op-qb%d-%s", n, suffix),
+				Generation:     1,
+				ReplicaOrdinal: 0,
+				RequestJSON:    []byte(`{"generation":"1"}`),
+			},
+		)
 		if err != nil {
 			t.Fatal(err)
 		}

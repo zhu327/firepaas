@@ -443,8 +443,8 @@ func (c *Controller) reconcileSnapshotIntegrity(ctx context.Context, n store.Nod
 			continue
 		}
 		orphanBytes += item.GetSizeBytes()
-		if !c.reportedOrphans["snapshot:"+n.ID+":"+id] {
-			c.reportedOrphans["snapshot:"+n.ID+":"+id] = true
+		if !c.st().reportedOrphans["snapshot:"+n.ID+":"+id] {
+			c.st().reportedOrphans["snapshot:"+n.ID+":"+id] = true
 			c.recordEvent(ctx, "inventory", "", "", n.ID,
 				fmt.Sprintf("orphan snapshot artifact %s (%d bytes); report-only", id, item.GetSizeBytes()), nil)
 		}

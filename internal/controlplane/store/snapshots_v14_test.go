@@ -152,9 +152,7 @@ func TestRescuePreflightMismatchPreservesExecutionAndRoute(t *testing.T) {
 	}
 	t.Cleanup(func() { cleanupProject(t, s, project) })
 	machineID := "m-rescue-mismatch"
-	if _, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-rescue-mismatch", "rescue-mismatch.local", "img:1",
-		1, 512, 0, 80, machineID, "dep-rescue-mismatch", "exec-old", "op-create-rescue-mismatch",
-		1, 0, []byte(`{}`), nil); err != nil {
+	if _, err := s.EnsureAppAndEnqueueCreate(ctx, CreateMachineParams{ProjectID: project, AppID: "app-rescue-mismatch", Hostname: "rescue-mismatch.local", ImageRef: "img:1", VCPU: 1, MemMIB: 512, DiskMIB: 0, IngressPort: 80, MachineID: machineID, DeploymentID: "dep-rescue-mismatch", ExecutionID: "exec-old", OperationID: "op-create-rescue-mismatch", Generation: 1, ReplicaOrdinal: 0, RequestJSON: []byte(`{}`)}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.UpsertNode(ctx, Node{

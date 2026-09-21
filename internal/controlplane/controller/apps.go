@@ -424,11 +424,24 @@ func (c *Controller) enqueueAppMachineCreate(
 	// 墓碑行（scale down 后）由 app owner 显式复活：v1.2-D 复活守卫只拦
 	// 用户直建/快照类重放，不拦 owner 自己的 scale up 决策（否则 2→1→2
 	// 永久死锁——多节点验收finding D2）。存活行走同一代幂等入队。
-	op, err := c.store.EnsureAppAndEnqueueCreateResurrect(ctx, app.ProjectID, app.ID, app.Hostname,
-		dep.ImageRef, dep.VCPU, dep.MemMIB,
-		int64(agentv1.EffectiveDiskMib(spec.GetDiskMib())), dep.Port,
-		machineID, dep.ID, executionID,
-		req.OperationId, dep.Generation, ordinal, raw, placementJSONFor(spec.Placement))
+	op, err := c.store.EnsureAppAndEnqueueCreateResurrect(ctx, store.CreateMachineParams{
+		ProjectID:      app.ProjectID,
+		AppID:          app.ID,
+		Hostname:       app.Hostname,
+		ImageRef:       dep.ImageRef,
+		VCPU:           dep.VCPU,
+		MemMIB:         dep.MemMIB,
+		DiskMIB:        int64(agentv1.EffectiveDiskMib(spec.GetDiskMib())),
+		IngressPort:    dep.Port,
+		MachineID:      machineID,
+		DeploymentID:   dep.ID,
+		ExecutionID:    executionID,
+		OperationID:    req.OperationId,
+		Generation:     dep.Generation,
+		ReplicaOrdinal: ordinal,
+		RequestJSON:    raw,
+		PlacementJSON:  placementJSONFor(spec.Placement),
+	})
 	if err != nil {
 		return err
 	}
@@ -622,10 +635,10 @@ func rollingOldGenerationDeleteAllowed(rolloutStatus string, target []store.Mach
 // 异步下发 PullImage。尽力而为：失败/超时只记调度事件（prefetch_failed），
 // 不阻塞 rollout、不计入重试预算；镜像拉取幂等（leader 切换重发无害）。
 func (c *Controller) maybePrefetchRolloutImage(ctx context.Context, r *store.Rollout, toDep *store.Deployment) {
-	if c.prefetchedRollouts[r.ID] {
+	if c.st().prefetchedRollouts[r.ID] {
 		return
 	}
-	c.prefetchedRollouts[r.ID] = true
+	c.st().prefetchedRollouts[r.ID] = true
 	// 镜像 digest（准入已保证 digest-pinned；无 @ 后缀时不预取）。
 	ref := toDep.ImageRef
 	i := strings.LastIndex(ref, "@")

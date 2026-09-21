@@ -21,9 +21,26 @@ func TestProjectUsageIncludesAllocatedAndPending(t *testing.T) {
 	t.Cleanup(func() { cleanupProject(t, s, project) })
 
 	machineID := "m-usage-" + fmt.Sprint(os.Getpid())
-	op, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-usage", "usage.local", "img:1",
-		2, 1024, 0, 80, machineID, "dep-usage", "exec-1", "op-usage-"+fmt.Sprint(os.Getpid()),
-		1, 0, []byte(`{}`), nil)
+	op, err := s.EnsureAppAndEnqueueCreate(
+		ctx,
+		CreateMachineParams{
+			ProjectID:      project,
+			AppID:          "app-usage",
+			Hostname:       "usage.local",
+			ImageRef:       "img:1",
+			VCPU:           2,
+			MemMIB:         1024,
+			DiskMIB:        0,
+			IngressPort:    80,
+			MachineID:      machineID,
+			DeploymentID:   "dep-usage",
+			ExecutionID:    "exec-1",
+			OperationID:    "op-usage-" + fmt.Sprint(os.Getpid()),
+			Generation:     1,
+			ReplicaOrdinal: 0,
+			RequestJSON:    []byte(`{}`),
+		},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,9 +69,26 @@ func TestProjectMachineUsageCountsCurrentCreateAndRestartOnce(t *testing.T) {
 	t.Cleanup(func() { cleanupProject(t, s, project) })
 
 	machineID := "m-machine-usage-" + suffix
-	op, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-machine-usage", "machine-usage.local", "img:1",
-		1, 512, 1024, 80, machineID, "dep-machine-usage", "exec-1", "op-machine-usage-1-"+suffix,
-		1, 0, []byte(`{"generation":"1"}`), nil)
+	op, err := s.EnsureAppAndEnqueueCreate(
+		ctx,
+		CreateMachineParams{
+			ProjectID:      project,
+			AppID:          "app-machine-usage",
+			Hostname:       "machine-usage.local",
+			ImageRef:       "img:1",
+			VCPU:           1,
+			MemMIB:         512,
+			DiskMIB:        1024,
+			IngressPort:    80,
+			MachineID:      machineID,
+			DeploymentID:   "dep-machine-usage",
+			ExecutionID:    "exec-1",
+			OperationID:    "op-machine-usage-1-" + suffix,
+			Generation:     1,
+			ReplicaOrdinal: 0,
+			RequestJSON:    []byte(`{"generation":"1"}`),
+		},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,9 +101,26 @@ func TestProjectMachineUsageCountsCurrentCreateAndRestartOnce(t *testing.T) {
 	if err := s.CompleteOperation(ctx, op.ID, "SUCCEEDED", []byte(`{}`), ""); err != nil {
 		t.Fatal(err)
 	}
-	_, err = s.EnsureAppAndEnqueueCreate(ctx, project, "app-machine-usage", "machine-usage.local", "img:1",
-		1, 512, 1024, 80, machineID, "dep-machine-usage", "exec-2", "op-machine-usage-2-"+suffix,
-		2, 0, []byte(`{"generation":"2"}`), nil)
+	_, err = s.EnsureAppAndEnqueueCreate(
+		ctx,
+		CreateMachineParams{
+			ProjectID:      project,
+			AppID:          "app-machine-usage",
+			Hostname:       "machine-usage.local",
+			ImageRef:       "img:1",
+			VCPU:           1,
+			MemMIB:         512,
+			DiskMIB:        1024,
+			IngressPort:    80,
+			MachineID:      machineID,
+			DeploymentID:   "dep-machine-usage",
+			ExecutionID:    "exec-2",
+			OperationID:    "op-machine-usage-2-" + suffix,
+			Generation:     2,
+			ReplicaOrdinal: 0,
+			RequestJSON:    []byte(`{"generation":"2"}`),
+		},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,9 +146,7 @@ func TestEnsureCreateRejectsImmutableOwnershipConflict(t *testing.T) {
 	machineID := "m-owned-" + sfx
 	deploymentID := "dep-owned-" + sfx
 	firstOp := "op-owned-1-" + sfx
-	if _, err := s.EnsureAppAndEnqueueCreate(ctx, ownerProject, appID, appID+".test", "img:1",
-		1, 512, 0, 80, machineID, deploymentID, "exec-1", firstOp,
-		1, 0, []byte(`{"request":1}`), nil); err != nil {
+	if _, err := s.EnsureAppAndEnqueueCreate(ctx, CreateMachineParams{ProjectID: ownerProject, AppID: appID, Hostname: appID + ".test", ImageRef: "img:1", VCPU: 1, MemMIB: 512, DiskMIB: 0, IngressPort: 80, MachineID: machineID, DeploymentID: deploymentID, ExecutionID: "exec-1", OperationID: firstOp, Generation: 1, ReplicaOrdinal: 0, RequestJSON: []byte(`{"request":1}`)}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -110,9 +159,26 @@ func TestEnsureCreateRejectsImmutableOwnershipConflict(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := s.EnsureAppAndEnqueueCreate(ctx, tc.project, tc.app, tc.app+".test", "img:2",
-				2, 1024, 0, 8080, machineID, tc.deployment, "exec-attacker", tc.operation,
-				9, 4, []byte(`{"request":2}`), nil)
+			_, err := s.EnsureAppAndEnqueueCreate(
+				ctx,
+				CreateMachineParams{
+					ProjectID:      tc.project,
+					AppID:          tc.app,
+					Hostname:       tc.app + ".test",
+					ImageRef:       "img:2",
+					VCPU:           2,
+					MemMIB:         1024,
+					DiskMIB:        0,
+					IngressPort:    8080,
+					MachineID:      machineID,
+					DeploymentID:   tc.deployment,
+					ExecutionID:    "exec-attacker",
+					OperationID:    tc.operation,
+					Generation:     9,
+					ReplicaOrdinal: 4,
+					RequestJSON:    []byte(`{"request":2}`),
+				},
+			)
 			if !errors.Is(err, ErrOwnershipConflict) || !errors.Is(err, ErrRequestConflict) {
 				t.Fatalf("want typed ownership/request conflict, got %v", err)
 			}
@@ -155,9 +221,26 @@ func TestEnsureCreateRejectsExistingDeploymentForOtherApp(t *testing.T) {
 	}
 
 	opID := "op-dep-conflict-" + sfx
-	_, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-dep-other-"+sfx, "dep-other-"+sfx+".test", "img",
-		1, 512, 0, 80, "m-dep-conflict-"+sfx, "dep-shared-"+sfx, "exec-1", opID,
-		1, 0, []byte(`{}`), nil)
+	_, err := s.EnsureAppAndEnqueueCreate(
+		ctx,
+		CreateMachineParams{
+			ProjectID:      project,
+			AppID:          "app-dep-other-" + sfx,
+			Hostname:       "dep-other-" + sfx + ".test",
+			ImageRef:       "img",
+			VCPU:           1,
+			MemMIB:         512,
+			DiskMIB:        0,
+			IngressPort:    80,
+			MachineID:      "m-dep-conflict-" + sfx,
+			DeploymentID:   "dep-shared-" + sfx,
+			ExecutionID:    "exec-1",
+			OperationID:    opID,
+			Generation:     1,
+			ReplicaOrdinal: 0,
+			RequestJSON:    []byte(`{}`),
+		},
+	)
 	if !errors.Is(err, ErrOwnershipConflict) {
 		t.Fatalf("want deployment ownership conflict, got %v", err)
 	}
@@ -336,8 +419,26 @@ func TestFailedCreateAttempts(t *testing.T) {
 	sfx := fmt.Sprintf("%d", os.Getpid())
 	ensure := func(opID, exec string, gen int64) {
 		t.Helper()
-		op, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-a", "h.local", "img:1",
-			1, 512, 0, 80, "m-att-"+sfx, "dep-a", exec, opID+"-"+sfx, gen, 0, []byte(`{}`), nil)
+		op, err := s.EnsureAppAndEnqueueCreate(
+			ctx,
+			CreateMachineParams{
+				ProjectID:      project,
+				AppID:          "app-a",
+				Hostname:       "h.local",
+				ImageRef:       "img:1",
+				VCPU:           1,
+				MemMIB:         512,
+				DiskMIB:        0,
+				IngressPort:    80,
+				MachineID:      "m-att-" + sfx,
+				DeploymentID:   "dep-a",
+				ExecutionID:    exec,
+				OperationID:    opID + "-" + sfx,
+				Generation:     gen,
+				ReplicaOrdinal: 0,
+				RequestJSON:    []byte(`{}`),
+			},
+		)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -347,8 +448,26 @@ func TestFailedCreateAttempts(t *testing.T) {
 	}
 	succeed := func(opID, exec string, gen int64) {
 		t.Helper()
-		op, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-a", "h.local", "img:1",
-			1, 512, 0, 80, "m-att-"+sfx, "dep-a", exec, opID+"-"+sfx, gen, 0, []byte(`{}`), nil)
+		op, err := s.EnsureAppAndEnqueueCreate(
+			ctx,
+			CreateMachineParams{
+				ProjectID:      project,
+				AppID:          "app-a",
+				Hostname:       "h.local",
+				ImageRef:       "img:1",
+				VCPU:           1,
+				MemMIB:         512,
+				DiskMIB:        0,
+				IngressPort:    80,
+				MachineID:      "m-att-" + sfx,
+				DeploymentID:   "dep-a",
+				ExecutionID:    exec,
+				OperationID:    opID + "-" + sfx,
+				Generation:     gen,
+				ReplicaOrdinal: 0,
+				RequestJSON:    []byte(`{}`),
+			},
+		)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -384,8 +503,7 @@ func TestEnsureCreateGenerationMonotonic(t *testing.T) {
 	t.Cleanup(func() { cleanupProject(t, s, project) })
 
 	sfx := fmt.Sprintf("%d", os.Getpid())
-	if _, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-m", "m.local", "img:1",
-		1, 512, 0, 80, "m-mono-"+sfx, "dep-m", "exec-1", "op-m1-"+sfx, 1, 0, []byte(`{}`), nil); err != nil {
+	if _, err := s.EnsureAppAndEnqueueCreate(ctx, CreateMachineParams{ProjectID: project, AppID: "app-m", Hostname: "m.local", ImageRef: "img:1", VCPU: 1, MemMIB: 512, DiskMIB: 0, IngressPort: 80, MachineID: "m-mono-" + sfx, DeploymentID: "dep-m", ExecutionID: "exec-1", OperationID: "op-m1-" + sfx, Generation: 1, ReplicaOrdinal: 0, RequestJSON: []byte(`{}`)}); err != nil {
 		t.Fatal(err)
 	}
 	// 模拟换代重建已把水位推到 5（recreateMachine bump 路径）。
@@ -394,8 +512,7 @@ func TestEnsureCreateGenerationMonotonic(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 用户/重试用 gen=1 重试：GREATEST 必须保住 5。
-	if _, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-m", "m.local", "img:1",
-		1, 512, 0, 80, "m-mono-"+sfx, "dep-m", "exec-9", "op-m2-"+sfx, 1, 0, []byte(`{}`), nil); err != nil {
+	if _, err := s.EnsureAppAndEnqueueCreate(ctx, CreateMachineParams{ProjectID: project, AppID: "app-m", Hostname: "m.local", ImageRef: "img:1", VCPU: 1, MemMIB: 512, DiskMIB: 0, IngressPort: 80, MachineID: "m-mono-" + sfx, DeploymentID: "dep-m", ExecutionID: "exec-9", OperationID: "op-m2-" + sfx, Generation: 1, ReplicaOrdinal: 0, RequestJSON: []byte(`{}`)}); err != nil {
 		t.Fatal(err)
 	}
 	m, err := s.GetMachine(ctx, "m-mono-"+sfx)
@@ -406,8 +523,7 @@ func TestEnsureCreateGenerationMonotonic(t *testing.T) {
 		t.Fatalf("generation must stay monotonic at 5, got %d", m.Generation)
 	}
 	// 更高的 generation 正常推进。
-	if _, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-m", "m.local", "img:1",
-		1, 512, 0, 80, "m-mono-"+sfx, "dep-m", "exec-10", "op-m3-"+sfx, 6, 0, []byte(`{}`), nil); err != nil {
+	if _, err := s.EnsureAppAndEnqueueCreate(ctx, CreateMachineParams{ProjectID: project, AppID: "app-m", Hostname: "m.local", ImageRef: "img:1", VCPU: 1, MemMIB: 512, DiskMIB: 0, IngressPort: 80, MachineID: "m-mono-" + sfx, DeploymentID: "dep-m", ExecutionID: "exec-10", OperationID: "op-m3-" + sfx, Generation: 6, ReplicaOrdinal: 0, RequestJSON: []byte(`{}`)}); err != nil {
 		t.Fatal(err)
 	}
 	m, _ = s.GetMachine(ctx, "m-mono-"+sfx)
@@ -428,9 +544,7 @@ func TestMarkMachineObservedMissingPreservesLastObservation(t *testing.T) {
 	}
 	t.Cleanup(func() { cleanupProject(t, s, project) })
 	machineID := "m-missing-" + fmt.Sprint(os.Getpid())
-	if _, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-missing", "missing.local", "img:1",
-		1, 512, 0, 80, machineID, "dep-missing", "exec-1", "op-missing-"+fmt.Sprint(os.Getpid()),
-		1, 0, []byte(`{}`), nil); err != nil {
+	if _, err := s.EnsureAppAndEnqueueCreate(ctx, CreateMachineParams{ProjectID: project, AppID: "app-missing", Hostname: "missing.local", ImageRef: "img:1", VCPU: 1, MemMIB: 512, DiskMIB: 0, IngressPort: 80, MachineID: machineID, DeploymentID: "dep-missing", ExecutionID: "exec-1", OperationID: "op-missing-" + fmt.Sprint(os.Getpid()), Generation: 1, ReplicaOrdinal: 0, RequestJSON: []byte(`{}`)}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.UpdateMachineObserved(ctx, machineID, "exec-1", "RUNNING", "10.0.0.1", "READY"); err != nil {
@@ -462,9 +576,7 @@ func TestUpdateObservedRejectsStaleExecution(t *testing.T) {
 	}
 	t.Cleanup(func() { cleanupProject(t, s, project) })
 	machineID := "m-observed-cas-" + fmt.Sprint(os.Getpid())
-	if _, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-observed-cas", "cas.local", "img:1",
-		1, 512, 0, 80, machineID, "dep-cas", "exec-current", "op-cas-"+fmt.Sprint(os.Getpid()),
-		2, 0, []byte(`{}`), nil); err != nil {
+	if _, err := s.EnsureAppAndEnqueueCreate(ctx, CreateMachineParams{ProjectID: project, AppID: "app-observed-cas", Hostname: "cas.local", ImageRef: "img:1", VCPU: 1, MemMIB: 512, DiskMIB: 0, IngressPort: 80, MachineID: machineID, DeploymentID: "dep-cas", ExecutionID: "exec-current", OperationID: "op-cas-" + fmt.Sprint(os.Getpid()), Generation: 2, ReplicaOrdinal: 0, RequestJSON: []byte(`{}`)}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.UpdateMachineObserved(ctx, machineID, "exec-stale", "RUNNING", "10.0.0.1", "READY"); err != nil {
@@ -488,9 +600,7 @@ func TestEnqueueRescueReplacementAtomic(t *testing.T) {
 	}
 	t.Cleanup(func() { cleanupProject(t, s, project) })
 	machineID := "m-rescue-" + fmt.Sprint(os.Getpid())
-	if _, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-rescue", "rescue.local", "img:1",
-		1, 512, 0, 80, machineID, "dep-rescue", "exec-old", "op-create-rescue-"+fmt.Sprint(os.Getpid()),
-		1, 0, []byte(`{}`), nil); err != nil {
+	if _, err := s.EnsureAppAndEnqueueCreate(ctx, CreateMachineParams{ProjectID: project, AppID: "app-rescue", Hostname: "rescue.local", ImageRef: "img:1", VCPU: 1, MemMIB: 512, DiskMIB: 0, IngressPort: 80, MachineID: machineID, DeploymentID: "dep-rescue", ExecutionID: "exec-old", OperationID: "op-create-rescue-" + fmt.Sprint(os.Getpid()), Generation: 1, ReplicaOrdinal: 0, RequestJSON: []byte(`{}`)}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.UpdateMachineNodeAndObserved(ctx, machineID, "node-1", "exec-old", "RUNNING", "10.0.0.2", "READY"); err != nil {
@@ -559,8 +669,7 @@ func TestEnsureCreateExecutionChangeClearsObserved(t *testing.T) {
 	t.Cleanup(func() { cleanupProject(t, s, project) })
 
 	sfx := fmt.Sprintf("%d", os.Getpid())
-	if _, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-c", "c.local", "img:1",
-		1, 512, 0, 80, "m-clr-"+sfx, "dep-c", "exec-1", "op-c1-"+sfx, 1, 0, []byte(`{}`), nil); err != nil {
+	if _, err := s.EnsureAppAndEnqueueCreate(ctx, CreateMachineParams{ProjectID: project, AppID: "app-c", Hostname: "c.local", ImageRef: "img:1", VCPU: 1, MemMIB: 512, DiskMIB: 0, IngressPort: 80, MachineID: "m-clr-" + sfx, DeploymentID: "dep-c", ExecutionID: "exec-1", OperationID: "op-c1-" + sfx, Generation: 1, ReplicaOrdinal: 0, RequestJSON: []byte(`{}`)}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.UpdateMachineNodeAndObserved(ctx, "m-clr-"+sfx, "n1", "exec-1",
@@ -569,8 +678,7 @@ func TestEnsureCreateExecutionChangeClearsObserved(t *testing.T) {
 	}
 
 	// 换代重建：exec-1 → exec-2。旧 RUNNING 观测必须清空，节点回空。
-	if _, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-c", "c.local", "img:1",
-		1, 512, 0, 80, "m-clr-"+sfx, "dep-c", "exec-2", "op-c2-"+sfx, 2, 0, []byte(`{}`), nil); err != nil {
+	if _, err := s.EnsureAppAndEnqueueCreate(ctx, CreateMachineParams{ProjectID: project, AppID: "app-c", Hostname: "c.local", ImageRef: "img:1", VCPU: 1, MemMIB: 512, DiskMIB: 0, IngressPort: 80, MachineID: "m-clr-" + sfx, DeploymentID: "dep-c", ExecutionID: "exec-2", OperationID: "op-c2-" + sfx, Generation: 2, ReplicaOrdinal: 0, RequestJSON: []byte(`{}`)}); err != nil {
 		t.Fatal(err)
 	}
 	m, err := s.GetMachine(ctx, "m-clr-"+sfx)
@@ -586,8 +694,7 @@ func TestEnsureCreateExecutionChangeClearsObserved(t *testing.T) {
 		"RUNNING", "10.100.0.3", "UNCONFIGURED"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-c", "c.local", "img:1",
-		1, 512, 0, 80, "m-clr-"+sfx, "dep-c", "exec-2", "op-c3-"+sfx, 2, 0, []byte(`{}`), nil); err != nil {
+	if _, err := s.EnsureAppAndEnqueueCreate(ctx, CreateMachineParams{ProjectID: project, AppID: "app-c", Hostname: "c.local", ImageRef: "img:1", VCPU: 1, MemMIB: 512, DiskMIB: 0, IngressPort: 80, MachineID: "m-clr-" + sfx, DeploymentID: "dep-c", ExecutionID: "exec-2", OperationID: "op-c3-" + sfx, Generation: 2, ReplicaOrdinal: 0, RequestJSON: []byte(`{}`)}); err != nil {
 		t.Fatal(err)
 	}
 	m, _ = s.GetMachine(ctx, "m-clr-"+sfx)
@@ -637,9 +744,26 @@ func TestCreateDispatchedToAgent(t *testing.T) {
 		t.Fatalf("only reap exists: ok=%v err=%v", ok, err)
 	}
 	// 带 dispatch node 的 create
-	_, err = st.EnsureAppAndEnqueueCreate(ctx, project, "app-disp", "app-disp.local",
-		"img", 1, 512, 0, 80, "m-disp", "dep-disp", "exec-x", "op-disp-c1", 1, 0,
-		[]byte(`{}`), nil)
+	_, err = st.EnsureAppAndEnqueueCreate(
+		ctx,
+		CreateMachineParams{
+			ProjectID:      project,
+			AppID:          "app-disp",
+			Hostname:       "app-disp.local",
+			ImageRef:       "img",
+			VCPU:           1,
+			MemMIB:         512,
+			DiskMIB:        0,
+			IngressPort:    80,
+			MachineID:      "m-disp",
+			DeploymentID:   "dep-disp",
+			ExecutionID:    "exec-x",
+			OperationID:    "op-disp-c1",
+			Generation:     1,
+			ReplicaOrdinal: 0,
+			RequestJSON:    []byte(`{}`),
+		},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}

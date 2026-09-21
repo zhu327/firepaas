@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math"
 	"math/rand"
 	"net"
 	"net/http"
@@ -19,6 +18,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/expfmt"
 	"github.com/zhu327/firepaas/internal/capabilities"
 	"github.com/zhu327/firepaas/internal/controlplane/catalog"
 	"github.com/zhu327/firepaas/internal/controlplane/traffic"
@@ -67,7 +69,7 @@ type Counters struct {
 	req2xx, req4xx, req5xx atomic.Uint64
 
 	histOnce                             sync.Once
-	routeLookup, tokenFetch, upstreamRTT *latencyHistogram
+	routeLookup, tokenFetch, upstreamRTT prometheus.Histogram
 }
 
 // observeRequest 在 handler 出口记录最终响应码分类。每客户端请求恰好
@@ -87,74 +89,62 @@ func (c *Counters) observeRequest(status int) {
 // defaultLatencyBuckets 是延迟直方图的固定秒桶（Prometheus 默认桶的裁剪版）。
 var defaultLatencyBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5}
 
-// latencyHistogram 是最小固定桶直方图（秒），与既有 hand-rolled 指标风格一致。
-type latencyHistogram struct {
-	bounds []float64
-	counts []atomic.Uint64 // len(bounds)+1；最后一格即 +Inf
-	sum    atomic.Uint64   // math.Float64bits 位存累计值
-	count  atomic.Uint64
-}
-
-func newLatencyHistogram(bounds []float64) *latencyHistogram {
-	return &latencyHistogram{bounds: bounds, counts: make([]atomic.Uint64, len(bounds)+1)}
-}
-
-func (h *latencyHistogram) observe(seconds float64) {
-	i := 0
-	for i < len(h.bounds) && seconds > h.bounds[i] {
-		i++
+// writePromHistogram 用 prometheus/client_golang 的 exposition 编码把单个
+// histogram 以 Prometheus text format 写出（替代原 hand-rolled 直方图，见
+// ensureHistograms）。指标名与 help 由 MetricFamily 承载，直方图本身无 label。
+func writePromHistogram(w http.ResponseWriter, h prometheus.Histogram, name, help string) {
+	var m dto.Metric
+	if err := h.Write(&m); err != nil {
+		slog.Warn("encode prometheus histogram", "metric", name, "error", err)
+		return
 	}
-	h.counts[i].Add(1)
-	h.count.Add(1)
-	for {
-		old := h.sum.Load()
-		if h.sum.CompareAndSwap(old, math.Float64bits(math.Float64frombits(old)+seconds)) {
-			return
-		}
+	mf := &dto.MetricFamily{
+		Name:   &name,
+		Help:   &help,
+		Type:   dto.MetricType_HISTOGRAM.Enum(),
+		Metric: []*dto.Metric{&m},
 	}
-}
-
-func (h *latencyHistogram) writePrometheus(w http.ResponseWriter, name, help string) {
-	_, _ = fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s histogram\n", name, help, name)
-	var cumulative uint64
-	for i, b := range h.bounds {
-		cumulative += h.counts[i].Load()
-		_, _ = fmt.Fprintf(w, "%s_bucket{le=%q} %d\n", name, strconv.FormatFloat(b, 'g', -1, 64), cumulative)
-	}
-	cumulative += h.counts[len(h.bounds)].Load()
-	_, _ = fmt.Fprintf(
-		w,
-		"%s_bucket{le=\"+Inf\"} %d\n%s_sum %g\n%s_count %d\n",
-		name, cumulative, name, math.Float64frombits(h.sum.Load()), name, h.count.Load(),
-	)
+	_ = expfmt.NewEncoder(w, expfmt.NewFormat(expfmt.TypeTextPlain)).Encode(mf)
 }
 
 // ensureHistograms 惰性初始化直方图（允许调用方零值构造 &Counters{}）。
 func (c *Counters) ensureHistograms() {
 	c.histOnce.Do(func() {
-		c.routeLookup = newLatencyHistogram(defaultLatencyBuckets)
-		c.tokenFetch = newLatencyHistogram(defaultLatencyBuckets)
-		c.upstreamRTT = newLatencyHistogram(defaultLatencyBuckets)
+		c.routeLookup = prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "firepaas_edge_route_lookup_seconds",
+			Help:    "route catalog lookup latency (cache hits included)",
+			Buckets: defaultLatencyBuckets,
+		})
+		c.tokenFetch = prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "firepaas_edge_token_fetch_seconds",
+			Help:    "traffic token fetch latency (cache hits included)",
+			Buckets: defaultLatencyBuckets,
+		})
+		c.upstreamRTT = prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "firepaas_edge_upstream_rtt_seconds",
+			Help:    "upstream agent proxy round-trip (WS/SSE sessions report session duration)",
+			Buckets: defaultLatencyBuckets,
+		})
 	})
 }
 
 // observeRouteLookup 记录一次路由查询（含本地缓存命中）耗时，秒。
 func (c *Counters) observeRouteLookup(seconds float64) {
 	c.ensureHistograms()
-	c.routeLookup.observe(seconds)
+	c.routeLookup.Observe(seconds)
 }
 
 // observeTokenFetch 记录一次 traffic token 获取（含本地缓存命中）耗时，秒。
 func (c *Counters) observeTokenFetch(seconds float64) {
 	c.ensureHistograms()
-	c.tokenFetch.observe(seconds)
+	c.tokenFetch.Observe(seconds)
 }
 
 // observeUpstreamRTT 记录一次转发给 agent proxy 的耗时，秒。
 // 对 WS/SSE 长连接，这一观测是整个会话时长而非单次 RTT（已知口径）。
 func (c *Counters) observeUpstreamRTT(seconds float64) {
 	c.ensureHistograms()
-	c.upstreamRTT.observe(seconds)
+	c.upstreamRTT.Observe(seconds)
 }
 
 func (c *Counters) WritePrometheus(w http.ResponseWriter) {
@@ -245,18 +235,15 @@ func (c *Counters) WritePrometheus(w http.ResponseWriter) {
 		_, _ = fmt.Fprintf(w, "firepaas_edge_requests_total{code_class=%q} %d\n", kv.class, kv.v)
 	}
 	c.ensureHistograms()
-	c.routeLookup.writePrometheus(
-		w,
+	writePromHistogram(w, c.routeLookup,
 		"firepaas_edge_route_lookup_seconds",
 		"route catalog lookup latency (cache hits included)",
 	)
-	c.tokenFetch.writePrometheus(
-		w,
+	writePromHistogram(w, c.tokenFetch,
 		"firepaas_edge_token_fetch_seconds",
 		"traffic token fetch latency (cache hits included)",
 	)
-	c.upstreamRTT.writePrometheus(
-		w,
+	writePromHistogram(w, c.upstreamRTT,
 		"firepaas_edge_upstream_rtt_seconds",
 		"upstream agent proxy round-trip (WS/SSE sessions report session duration)",
 	)

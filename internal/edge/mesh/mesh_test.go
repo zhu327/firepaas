@@ -195,8 +195,12 @@ func TestTransportRoutingAndHeaders(t *testing.T) {
 	}
 
 	// 无 DirectInfo → ErrNoDirect（回落信号）。
-	if _, err := tr.RoundTrip(httptest.NewRequest("GET", "http://mesh-direct.invalid/", nil)); err != ErrNoDirect {
-		t.Fatalf("missing direct info err = %v, want ErrNoDirect", err)
+	directResp, directErr := tr.RoundTrip(httptest.NewRequest("GET", "http://mesh-direct.invalid/", nil))
+	if directResp != nil {
+		_ = directResp.Body.Close()
+	}
+	if directErr != ErrNoDirect {
+		t.Fatalf("missing direct info err = %v, want ErrNoDirect", directErr)
 	}
 	// 无入口（endpoint miss）→ ErrNoDirect。
 	tr2 := NewTransport(newEndpointsForTest(time.Minute, time.Minute,
@@ -206,8 +210,12 @@ func TestTransportRoutingAndHeaders(t *testing.T) {
 	req2, _ := http.NewRequestWithContext(
 		WithDirectInfo(context.Background(), DirectInfo{MachineID: "m", ExecutionID: "e"}),
 		"GET", "http://mesh-direct.invalid/", nil)
-	if _, err := tr2.RoundTrip(req2); err != ErrNoDirect {
-		t.Fatalf("endpoint miss err = %v, want ErrNoDirect", err)
+	resp2, err2 := tr2.RoundTrip(req2)
+	if resp2 != nil {
+		_ = resp2.Body.Close()
+	}
+	if err2 != ErrNoDirect {
+		t.Fatalf("endpoint miss err = %v, want ErrNoDirect", err2)
 	}
 }
 

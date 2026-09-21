@@ -30,9 +30,26 @@ func TestEnqueueCreateSameKeyDifferentRequestRejected(t *testing.T) {
 	t.Cleanup(func() { cleanupProject(t, s, project) })
 
 	enqueue := func(body string) (Operation, error) {
-		return s.EnsureAppAndEnqueueCreate(ctx, project, "app-idem", "idem.local", "img:1",
-			1, 512, 1024, 80, "m-idem-"+suffix, "dep-idem", "exec-idem",
-			"op-idem-"+suffix, 1, 0, []byte(body), nil)
+		return s.EnsureAppAndEnqueueCreate(
+			ctx,
+			CreateMachineParams{
+				ProjectID:      project,
+				AppID:          "app-idem",
+				Hostname:       "idem.local",
+				ImageRef:       "img:1",
+				VCPU:           1,
+				MemMIB:         512,
+				DiskMIB:        1024,
+				IngressPort:    80,
+				MachineID:      "m-idem-" + suffix,
+				DeploymentID:   "dep-idem",
+				ExecutionID:    "exec-idem",
+				OperationID:    "op-idem-" + suffix,
+				Generation:     1,
+				ReplicaOrdinal: 0,
+				RequestJSON:    []byte(body),
+			},
+		)
 	}
 
 	first, err := enqueue(`{"generation":"1","note":"a"}`)
@@ -190,9 +207,26 @@ func TestEnqueueCreateConcurrentSameKeyDifferentBodyNeverSilentlyWins(t *testing
 		go func(i int) {
 			defer wg.Done()
 			<-start
-			op, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-idem-conc", "idem-conc.local", "img:1",
-				1, 512, 1024, 80, "m-idem-conc-"+suffix, "dep-idem-conc", "exec-idem-conc",
-				"op-idem-conc-"+suffix, 1, 0, []byte(bodies[i]), nil)
+			op, err := s.EnsureAppAndEnqueueCreate(
+				ctx,
+				CreateMachineParams{
+					ProjectID:      project,
+					AppID:          "app-idem-conc",
+					Hostname:       "idem-conc.local",
+					ImageRef:       "img:1",
+					VCPU:           1,
+					MemMIB:         512,
+					DiskMIB:        1024,
+					IngressPort:    80,
+					MachineID:      "m-idem-conc-" + suffix,
+					DeploymentID:   "dep-idem-conc",
+					ExecutionID:    "exec-idem-conc",
+					OperationID:    "op-idem-conc-" + suffix,
+					Generation:     1,
+					ReplicaOrdinal: 0,
+					RequestJSON:    []byte(bodies[i]),
+				},
+			)
 			results <- result{op: op, err: err, i: i}
 		}(i)
 	}

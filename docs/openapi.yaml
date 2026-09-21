@@ -1,0 +1,1248 @@
+openapi: 3.0.3
+info:
+  title: firepaas Control Plane API
+  version: "v1"
+  description: |
+    firepaas 控制面公开 REST 契约（v1）。
+
+    ## 权威来源与漂移
+    本文件列出控制面公开路由与其请求/响应形状。**路径与方法的唯一权威是**
+    `internal/controlplane/httpapi/api.go` 的 `Register` 路由表（配合
+    `authm5.go` 的 `routeScope`/`projectGated` 授权登记表）；本文件是文档化
+    视图。新增端点必须同时登记路由表、授权表与本文件。路径/方法覆盖由
+    `internal/controlplane/httpapi/openapi_contract_test.go` 对比路由表校验；
+    字段级形状仅在端点行为变化时人工同步。
+
+    ## 认证
+    所有 `/v1/**` 端点需要 `Authorization: Bearer <token>`。token 可以是
+    根 token 或 API key（`POST /v1/apikeys` 创建）。身份带 scope 与项目范围；
+    跨项目访问按 403 拒绝。`GET /v1/health`、`GET /readyz` 不需要认证；
+    `GET /metrics` 需要 metrics token。
+
+    ## 项目范围
+    多数端点的 `project_id` 取自查询参数或请求体；受限身份只能访问自身项目。
+
+    ## 字段命名注意（legacy）
+    部分资源（machine/app/node/operation 等）直接序列化 store 模型，字段为
+    Go 默认的 **PascalCase**（如 `ID`、`AppID`、`Hostname`、`DesiredState`），
+    与请求体的 snake_case 不一致。本文件对这些资源按其真实返回形状记录。
+servers:
+  - url: http://localhost:8080
+    description: 本地/实验室默认
+security:
+  - bearerAuth: []
+tags:
+  - name: health
+  - name: machines
+  - name: apps
+  - name: deployments
+  - name: snapshots
+  - name: volumes
+  - name: secrets
+  - name: images
+  - name: projects
+  - name: apikeys
+  - name: nodes
+  - name: events
+  - name: operations
+  - name: eastwest
+
+paths:
+  /v1/health:
+    get:
+      tags: [health]
+      summary: 存活探针
+      security: []
+      responses:
+        "200": { description: OK }
+  /readyz:
+    get:
+      tags: [health]
+      summary: 就绪探针（探测 PG/Redis 等真实依赖）
+      security: []
+      responses:
+        "200": { description: Ready }
+        "503": { description: 依赖未就绪 }
+  /v1/capabilities:
+    get:
+      tags: [health]
+      summary: 平台能力清单（feature ids）
+      responses:
+        "200": { description: OK }
+  /metrics:
+    get:
+      tags: [health]
+      summary: Prometheus 指标（配置了 metrics token 时用 Authorization 头携带，非普通 Bearer 身份）
+      security: []
+      responses:
+        "200": { description: OK }
+        "401": { description: metrics token 缺失或错误 }
+
+  /v1/machines:
+    get:
+      tags: [machines]
+      summary: 列出机器
+      parameters:
+        - $ref: "#/components/parameters/ProjectQuery"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  machines:
+                    type: array
+                    items: { $ref: "#/components/schemas/Machine" }
+    post:
+      tags: [machines]
+      summary: 创建机器（期望副本）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateMachineRequest" }
+      responses:
+        "202":
+          description: 已登记 create 操作
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OperationAccepted" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /v1/machines/{id}:
+    parameters: [{ $ref: "#/components/parameters/MachineID" }]
+    get:
+      tags: [machines]
+      summary: 获取机器
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Machine" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [machines]
+      summary: 删除机器
+      parameters:
+        - $ref: "#/components/parameters/ExecutionIDQuery"
+        - $ref: "#/components/parameters/OperationIDQuery"
+      responses:
+        "202":
+          description: 已登记 delete 操作
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OperationAccepted" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /v1/machines/{id}/pause:
+    post:
+      tags: [machines]
+      summary: 暂停机器（standby 快照）
+      parameters:
+        - { $ref: "#/components/parameters/MachineID" }
+        - { $ref: "#/components/parameters/ExecutionIDQuery" }
+        - { $ref: "#/components/parameters/OperationIDQuery" }
+      responses:
+        "202": { description: Accepted }
+  /v1/machines/{id}/resume:
+    post:
+      tags: [machines]
+      summary: 恢复机器
+      parameters:
+        - { $ref: "#/components/parameters/MachineID" }
+        - { $ref: "#/components/parameters/ExecutionIDQuery" }
+        - { $ref: "#/components/parameters/OperationIDQuery" }
+      responses:
+        "202": { description: Accepted }
+  /v1/machines/{id}/logs:
+    get:
+      tags: [machines]
+      summary: 流式获取机器日志
+      parameters: [{ $ref: "#/components/parameters/MachineID" }]
+      responses:
+        "200": { description: 日志流 }
+  /v1/machines/{id}/exec:
+    post:
+      tags: [machines]
+      summary: 在机器内执行命令（流式；断线即终止）
+      parameters: [{ $ref: "#/components/parameters/MachineID" }]
+      responses:
+        "200": { description: Exec 流 }
+  /v1/machines/{id}/files:
+    parameters: [{ $ref: "#/components/parameters/MachineID" }]
+    put:
+      tags: [machines]
+      summary: 上传文件到机器
+      responses:
+        "200": { description: OK }
+    get:
+      tags: [machines]
+      summary: 从机器下载文件
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: 文件流 }
+  /v1/machines/{id}/wait:
+    get:
+      tags: [machines]
+      summary: 等待机器达到目标状态
+      parameters:
+        - { $ref: "#/components/parameters/MachineID" }
+        - { $ref: "#/components/parameters/ExecutionIDQuery" }
+        - { $ref: "#/components/parameters/TimeoutMS" }
+      responses:
+        "200": { description: OK }
+        "504": { description: 等待超时 }
+  /v1/machines/{id}/ttl:
+    put:
+      tags: [machines]
+      summary: 更新机器 TTL
+      parameters: [{ $ref: "#/components/parameters/MachineID" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ttl_seconds: { type: integer, format: int64, description: "0 = 关闭" }
+      responses:
+        "200": { description: OK }
+  /v1/machines/{id}/restart-reset:
+    post:
+      tags: [machines]
+      summary: 重置重启退避计数
+      parameters: [{ $ref: "#/components/parameters/MachineID" }]
+      responses:
+        "202": { description: Accepted }
+  /v1/machines/{id}/traffic-token:
+    get:
+      tags: [machines]
+      summary: 获取 execution-bound 流量凭证（内部）
+      parameters: [{ $ref: "#/components/parameters/MachineID" }]
+      responses:
+        "200": { description: OK }
+  /v1/machines/{id}/snapshots:
+    post:
+      tags: [snapshots]
+      summary: 创建机器快照
+      parameters: [{ $ref: "#/components/parameters/MachineID" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateSnapshotRequest" }
+      responses:
+        "202": { description: 已登记快照操作（返回 snapshot_id/machine_id/status） }
+  /v1/machines/{id}/snapshot-schedules:
+    parameters: [{ $ref: "#/components/parameters/MachineID" }]
+    post:
+      tags: [snapshots]
+      summary: 创建/更新快照计划
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SnapshotScheduleRequest" }
+      responses:
+        "202": { description: 已创建/更新快照计划（返回 schedule_id/machine_id） }
+    get:
+      tags: [snapshots]
+      summary: 列出快照计划
+      responses:
+        "200": { description: OK }
+  /v1/machines/{id}/snapshot-schedules/{schedule}:
+    delete:
+      tags: [snapshots]
+      summary: 删除快照计划
+      parameters:
+        - { $ref: "#/components/parameters/MachineID" }
+        - name: schedule
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: OK }
+  /v1/machines/{id}/rescue:
+    post:
+      tags: [snapshots]
+      summary: 从快照 rescue 机器
+      parameters: [{ $ref: "#/components/parameters/MachineID" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [snapshot_id]
+              properties:
+                snapshot_id: { type: string }
+                restore_mode: { type: string, enum: [memory, filesystem, auto], description: "缺省 auto" }
+      responses:
+        "202": { description: Accepted }
+  /v1/machines/{id}/volume-attach:
+    post:
+      tags: [volumes]
+      summary: 挂载卷到机器（volume_id 走查询参数）
+      parameters:
+        - { $ref: "#/components/parameters/MachineID" }
+        - $ref: "#/components/parameters/VolumeIDQuery"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                mount_path: { type: string }
+                readonly: { type: boolean }
+                overlay_size_bytes: { type: integer, format: int64 }
+      responses:
+        "202": { description: Accepted }
+  /v1/machines/{id}/volume-detach:
+    post:
+      tags: [volumes]
+      summary: 从机器卸载卷（volume_id 走查询参数）
+      parameters:
+        - { $ref: "#/components/parameters/MachineID" }
+        - $ref: "#/components/parameters/VolumeIDQuery"
+      responses:
+        "202": { description: Accepted }
+
+  /v1/apps:
+    get:
+      tags: [apps]
+      summary: 列出应用
+      parameters: [{ $ref: "#/components/parameters/ProjectQuery" }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  apps:
+                    type: array
+                    items: { $ref: "#/components/schemas/App" }
+    post:
+      tags: [apps]
+      summary: 创建应用（含初始 deployment）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateAppRequest" }
+      responses:
+        "201": { description: Created }
+  /v1/apps/{id}:
+    parameters: [{ $ref: "#/components/parameters/AppID" }]
+    get:
+      tags: [apps]
+      summary: 获取应用（含副本状态）
+      responses:
+        "200": { description: OK }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [apps]
+      summary: 删除应用
+      responses:
+        "202": { description: Accepted }
+  /v1/apps/{id}/deployments:
+    post:
+      tags: [deployments]
+      summary: 部署新版本（滚动/蓝绿）
+      parameters: [{ $ref: "#/components/parameters/AppID" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DeployRequest" }
+      responses:
+        "202":
+          description: Accepted
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OperationAccepted" }
+  /v1/apps/{id}/scale:
+    post:
+      tags: [apps]
+      summary: 调整期望副本数
+      parameters: [{ $ref: "#/components/parameters/AppID" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [replicas]
+              properties:
+                replicas: { type: integer, minimum: 1, maximum: 100 }
+      responses:
+        "202": { description: 已接管并更新期望副本数 }
+  /v1/apps/{id}/rollback:
+    post:
+      tags: [deployments]
+      summary: 回滚到上一个 deployment
+      parameters: [{ $ref: "#/components/parameters/AppID" }]
+      responses:
+        "202": { description: Accepted }
+  /v1/apps/{id}/autoscale:
+    parameters: [{ $ref: "#/components/parameters/AppID" }]
+    put:
+      tags: [apps]
+      summary: 配置并发弹性策略（ADR-0041）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AutoscalePolicy" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  app_id: { type: string }
+                  autoscale: { $ref: "#/components/schemas/AutoscalePolicy" }
+    get:
+      tags: [apps]
+      summary: 读取弹性策略
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AutoscaleState" }
+  /v1/apps/{id}/secret-refs:
+    put:
+      tags: [apps]
+      summary: 设置应用 secret 引用（值不在此接口）
+      parameters: [{ $ref: "#/components/parameters/AppID" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                secret_refs:
+                  type: object
+                  additionalProperties: { $ref: "#/components/schemas/SecretRef" }
+      responses:
+        "200": { description: OK }
+  /v1/apps/{id}/egress-audit:
+    get:
+      tags: [apps]
+      summary: 应用出向审计汇总
+      parameters: [{ $ref: "#/components/parameters/AppID" }]
+      responses:
+        "200": { description: OK }
+
+  /v1/snapshots:
+    get:
+      tags: [snapshots]
+      summary: 列出快照
+      parameters: [{ $ref: "#/components/parameters/ProjectQuery" }]
+      responses:
+        "200": { description: OK }
+  /v1/snapshots/{id}:
+    parameters: [{ $ref: "#/components/parameters/SnapshotID" }]
+    get:
+      tags: [snapshots]
+      summary: 获取快照
+      responses:
+        "200": { description: OK }
+    delete:
+      tags: [snapshots]
+      summary: 删除快照
+      responses:
+        "202": { description: Accepted }
+  /v1/snapshots/{id}/fork:
+    post:
+      tags: [snapshots]
+      summary: 从快照 fork 新机器（copy-on-write）
+      parameters: [{ $ref: "#/components/parameters/SnapshotID" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [app_id, ttl_seconds]
+              properties:
+                app_id: { type: string, description: "同 project 的既有 app（fork 宿主）" }
+                ttl_seconds: { type: integer, format: int64, description: "必填且 > 0" }
+                env:
+                  type: object
+                  additionalProperties: { type: string }
+                secret_refs: { type: object, additionalProperties: true, description: "暂不支持：非空返回 409" }
+      responses:
+        "202": { description: Accepted }
+  /v1/snapshots/{id}/preflight:
+    post:
+      tags: [snapshots]
+      summary: 快照可移植性预检
+      parameters: [{ $ref: "#/components/parameters/SnapshotID" }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                restore_mode: { type: string, enum: [memory, filesystem, auto], description: "缺省 auto" }
+      responses:
+        "200": { description: OK }
+
+  /v1/volumes:
+    get:
+      tags: [volumes]
+      summary: 列出卷
+      parameters: [{ $ref: "#/components/parameters/ProjectQuery" }]
+      responses:
+        "200": { description: OK }
+    post:
+      tags: [volumes]
+      summary: 创建卷
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateVolumeRequest" }
+      responses:
+        "202": { description: 已登记创建操作（返回 volume_id/status） }
+  /v1/volumes/{id}:
+    parameters: [{ $ref: "#/components/parameters/VolumeID" }]
+    get:
+      tags: [volumes]
+      summary: 获取卷
+      responses:
+        "200": { description: OK }
+    delete:
+      tags: [volumes]
+      summary: 删除卷
+      responses:
+        "202": { description: Accepted }
+
+  /v1/secrets:
+    get:
+      tags: [secrets]
+      summary: 列出 secret 元数据（不含值）
+      parameters: [{ $ref: "#/components/parameters/ProjectQuery" }]
+      responses:
+        "200": { description: OK }
+        "503": { description: secrets 未配置 }
+    post:
+      tags: [secrets]
+      summary: 写入 secret（值只进不出，立即加密）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PutSecretRequest" }
+      responses:
+        "201": { description: 新版本已写入（返回元数据，不含值） }
+        "409": { description: 并发写入同 name 撞版本号，可重试 }
+        "503": { description: secrets 未配置 }
+  /v1/secrets/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [secrets]
+      summary: 获取 secret 元数据（不含值）
+      responses:
+        "200": { description: OK }
+    delete:
+      tags: [secrets]
+      summary: 删除 secret
+      responses:
+        "200": { description: OK }
+
+  /v1/images/prewarm:
+    post:
+      tags: [images]
+      summary: 预热镜像到节点缓存（ADR-0018）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PrewarmRequest" }
+      responses:
+        "202": { description: Accepted }
+        "409": { description: 无可用目标节点 }
+  /v1/images/coverage:
+    get:
+      tags: [images]
+      summary: 镜像缓存覆盖
+      responses:
+        "200": { description: OK }
+  /v1/images/pins:
+    get:
+      tags: [images]
+      summary: 列出镜像 pin
+      responses:
+        "200": { description: OK }
+    post:
+      tags: [images]
+      summary: 创建镜像 pin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ImagePinRequest" }
+      responses:
+        "201": { description: Created }
+  /v1/images/pins/{id}:
+    delete:
+      tags: [images]
+      summary: 删除镜像 pin
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: OK }
+
+  /v1/projects:
+    get:
+      tags: [projects]
+      summary: 列出项目
+      responses:
+        "200": { description: OK }
+    post:
+      tags: [projects]
+      summary: 创建项目（需全局身份）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, name]
+              properties:
+                id: { type: string }
+                name: { type: string }
+      responses:
+        "201": { description: Created }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /v1/projects/{id}:
+    parameters: [{ $ref: "#/components/parameters/ProjectIDPath" }]
+    get:
+      tags: [projects]
+      summary: 获取项目
+      responses:
+        "200": { description: OK }
+    delete:
+      tags: [projects]
+      summary: 删除项目
+      responses:
+        "202": { description: Accepted }
+  /v1/projects/{id}/quota:
+    parameters: [{ $ref: "#/components/parameters/ProjectIDPath" }]
+    get:
+      tags: [projects]
+      summary: 项目配额与用量
+      responses:
+        "200": { description: OK }
+    put:
+      tags: [projects]
+      summary: 设置项目配额
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                vcpu_quota: { type: integer, format: int64, minimum: 1 }
+                mem_mib_quota: { type: integer, format: int64, minimum: 1 }
+                disk_mib_quota: { type: integer, format: int64, minimum: 1 }
+                machine_concurrency: { type: integer, format: int64, minimum: 1 }
+                runtime_session_concurrency: { type: integer, format: int64, minimum: 1 }
+                revision: { type: integer, format: int64, description: "也可经 If-Match: \"rev-N\" 头传入" }
+      responses:
+        "200": { description: OK }
+        "409": { description: 配额 revision 冲突 }
+  /v1/projects/{id}/rate-limits:
+    parameters: [{ $ref: "#/components/parameters/ProjectIDPath" }]
+    get:
+      tags: [projects]
+      summary: 项目限流配置
+      responses:
+        "200": { description: OK }
+    put:
+      tags: [projects]
+      summary: 设置项目限流
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200": { description: OK }
+
+  /v1/apikeys:
+    get:
+      tags: [apikeys]
+      summary: 列出 API key（不含明文）
+      responses:
+        "200": { description: OK }
+    post:
+      tags: [apikeys]
+      summary: 创建 API key（明文仅此一次返回）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateAPIKeyRequest" }
+      responses:
+        "201": { description: Created（含一次性明文 key） }
+  /v1/apikeys/{id}:
+    delete:
+      tags: [apikeys]
+      summary: 吊销 API key
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: OK }
+  /v1/apikeys/{id}/rotate:
+    post:
+      tags: [apikeys]
+      summary: 轮换 API key（旧 key 失效，新明文一次性返回）
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ttl_hours: { type: integer }
+      responses:
+        "201": { description: Created（含一次性明文 key） }
+
+  /v1/nodes:
+    get:
+      tags: [nodes]
+      summary: 列出节点（observed projection）
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  nodes:
+                    type: array
+                    items: { $ref: "#/components/schemas/Node" }
+  /v1/nodes/{id}/drain:
+    post:
+      tags: [nodes]
+      summary: 排水节点（可选 evacuate）
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                evacuate: { type: boolean }
+      responses:
+        "200": { description: OK }
+  /v1/nodes/{id}/ready:
+    post:
+      tags: [nodes]
+      summary: 取消排水，恢复 ready
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: OK }
+
+  /v1/events:
+    get:
+      tags: [events]
+      summary: 租户/user 事件
+      parameters:
+        - { $ref: "#/components/parameters/ProjectQuery" }
+        - name: before
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer }
+      responses:
+        "200": { description: OK }
+  /v1/system/scheduler-events:
+    get:
+      tags: [events]
+      summary: 调度/对账事件（运维）
+      responses:
+        "200": { description: OK }
+  /v1/system/reprojections:
+    post:
+      tags: [events]
+      summary: 显式重建 route/location 投影
+      responses:
+        "202": { description: Accepted }
+
+  /v1/operations:
+    get:
+      tags: [operations]
+      summary: 列出操作
+      parameters: [{ $ref: "#/components/parameters/ProjectQuery" }]
+      responses:
+        "200": { description: OK }
+  /v1/operations/{id}:
+    get:
+      tags: [operations]
+      summary: 获取操作（脱敏）
+      parameters: [{ $ref: "#/components/parameters/OperationID" }]
+      responses:
+        "200": { description: OK }
+  /v1/operations/{id}/wait:
+    get:
+      tags: [operations]
+      summary: 等待操作到达终态
+      parameters:
+        - { $ref: "#/components/parameters/OperationID" }
+        - { $ref: "#/components/parameters/TimeoutMS" }
+      responses:
+        "200": { description: OK }
+        "504": { description: 等待超时 }
+  /v1/rollouts/{id}/wait:
+    get:
+      tags: [operations]
+      summary: 等待 rollout 达到目标 generation
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: generation
+          in: query
+          required: true
+          schema: { type: integer, format: int64 }
+        - { $ref: "#/components/parameters/TimeoutMS" }
+      responses:
+        "200": { description: OK }
+        "504": { description: 等待超时 }
+
+  /v1/eastwest-policies:
+    get:
+      tags: [eastwest]
+      summary: 列出东西向放行策略（ADR-0040，默认 deny）
+      responses:
+        "200": { description: OK }
+    put:
+      tags: [eastwest]
+      summary: 设置东西向放行策略
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EastWestPolicyRule" }
+      responses:
+        "200": { description: OK }
+    delete:
+      tags: [eastwest]
+      summary: 删除东西向策略
+      responses:
+        "200": { description: OK }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: 根 token 或 API key
+
+  parameters:
+    ProjectQuery:
+      name: project_id
+      in: query
+      schema: { type: string }
+      description: 项目 id（受限身份可省略/被强制为自身）
+    MachineID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+    AppID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+    SnapshotID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+    VolumeID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+    VolumeIDQuery:
+      name: volume_id
+      in: query
+      required: true
+      schema: { type: string }
+    OperationID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+    ProjectIDPath:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+    ExecutionIDQuery:
+      name: execution_id
+      in: query
+      required: true
+      schema: { type: string }
+    OperationIDQuery:
+      name: operation_id
+      in: query
+      required: true
+      schema: { type: string }
+    TimeoutMS:
+      name: timeout_ms
+      in: query
+      schema: { type: integer, default: 30000 }
+
+  responses:
+    NotFound:
+      description: 资源不存在
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Conflict:
+      description: 幂等键冲突或 execution/generation 不匹配
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: 身份/scope/项目不允许
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+    OperationAccepted:
+      type: object
+      properties:
+        operation_id: { type: string }
+        status: { type: string }
+        machine_id: { type: string }
+    SecretRef:
+      type: object
+      properties:
+        secret: { type: string, description: "secret 名（非值）" }
+        version: { type: integer, format: int64 }
+    HealthCheck:
+      type: object
+      properties:
+        type: { type: string, enum: [HTTP, TCP, UNSPECIFIED] }
+        target: { type: string }
+        interval_seconds: { type: integer }
+        timeout_seconds: { type: integer }
+        unhealthy_threshold: { type: integer }
+    RestartPolicy:
+      type: object
+      properties:
+        mode: { type: string, enum: [NEVER, ON_FAILURE, ALWAYS] }
+        max_attempts: { type: integer }
+        backoff_seconds: { type: integer }
+        stable_window_seconds: { type: integer }
+    CreateMachineRequest:
+      description: |
+        machine_id/execution_id/generation 由服务端生成，客户端提交会 400。
+        operation_id 是客户端幂等键（必填）。
+      type: object
+      required: [image, hostname, operation_id]
+      properties:
+        project_id: { type: string, description: "缺省 dev；受限身份强制为自身项目" }
+        app_id: { type: string, description: "缺省 app-<hostname>" }
+        hostname: { type: string }
+        image: { type: string, description: "OCI 引用（digest 必填，见镜像准入策略）" }
+        vcpu: { type: integer, format: int64, minimum: 0, description: "0 = 默认 1" }
+        mem_mib: { type: integer, format: int64, minimum: 0, description: "0 = 默认 512" }
+        port: { type: integer, minimum: 0, maximum: 65535, description: "0 = 默认 8080" }
+        deployment_id: { type: string, description: "缺省 dep-<hostname>" }
+        operation_id: { type: string }
+        replica_ordinal: { type: integer }
+        env:
+          type: object
+          additionalProperties: { type: string }
+        node_pool: { type: string }
+        labels:
+          type: object
+          additionalProperties: { type: string }
+        anti_affinity: { type: string, enum: [NONE, DEPLOYMENT] }
+        health_check: { $ref: "#/components/schemas/HealthCheck" }
+        ttl_seconds: { type: integer, format: int64, minimum: 0, description: "0 = 关闭" }
+        restart_policy: { $ref: "#/components/schemas/RestartPolicy" }
+    Machine:
+      description: 直接序列化 store.Machine；字段为 PascalCase（legacy）。
+      type: object
+      properties:
+        ID: { type: string }
+        AppID: { type: string }
+        DeploymentID: { type: string }
+        ReplicaOrdinal: { type: integer }
+        Hostname: { type: string }
+        DesiredState: { type: string }
+        Generation: { type: integer, format: int64 }
+        CurrentExecutionID: { type: string }
+        RequestedVCPU: { type: integer, format: int64 }
+        RequestedMemMIB: { type: integer, format: int64 }
+        RequestedDiskMIB: { type: integer, format: int64 }
+        IngressPort: { type: integer }
+        ImageRef: { type: string }
+        Placement: { type: object, nullable: true, additionalProperties: true }
+        Env: { type: object, additionalProperties: { type: string }, nullable: true }
+        NodeID: { type: string }
+        ObservedState: { type: string }
+        ObservedSlotIP: { type: string }
+        ObservedReadiness: { type: string }
+        LastObservedAt: { type: string, nullable: true }
+        CreatedAt: { type: string }
+        UpdatedAt: { type: string }
+        ExpiresAt: { type: string, nullable: true }
+        RestartMode: { type: string }
+        RestartMaxAttempts: { type: integer }
+        RestartBackoffSeconds: { type: integer }
+        RestartStableWindowSeconds: { type: integer }
+        RestartAttempts: { type: integer }
+        RestartNextAttemptAt: { type: string, nullable: true }
+        RestartStableSince: { type: string, nullable: true }
+        RestartBlocked: { type: boolean }
+    ServiceSpec:
+      type: object
+      properties:
+        name: { type: string }
+        internal_port: { type: integer }
+        mesh_direct: { type: boolean }
+    EgressPolicy:
+      type: object
+      properties:
+        mode: { type: string, enum: [unrestricted, deny_all, allowlist] }
+        allowed_cidrs: { type: array, items: { type: string } }
+        denied_cidrs: { type: array, items: { type: string } }
+        allowed_domains: { type: array, items: { type: string } }
+        max_tcp_connections: { type: integer }
+        audit_all: { type: boolean }
+    CreateAppRequest:
+      type: object
+      required: [hostname, image]
+      properties:
+        app_id: { type: string, description: "缺省 app-<随机 id>" }
+        project_id: { type: string, description: "缺省 dev；受限身份强制为自身项目" }
+        hostname: { type: string }
+        image: { type: string }
+        vcpu: { type: integer, format: int64 }
+        mem_mib: { type: integer, format: int64 }
+        port: { type: integer }
+        replicas: { type: integer }
+        services:
+          type: array
+          items: { $ref: "#/components/schemas/ServiceSpec" }
+        env:
+          type: object
+          additionalProperties: { type: string }
+        node_pool: { type: string }
+        labels:
+          type: object
+          additionalProperties: { type: string }
+        anti_affinity: { type: string, enum: [NONE, DEPLOYMENT] }
+        health_check: { $ref: "#/components/schemas/HealthCheck" }
+        secret_refs:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/SecretRef" }
+        auto_standby: { type: object, additionalProperties: true }
+        egress: { $ref: "#/components/schemas/EgressPolicy" }
+    DeployRequest:
+      type: object
+      required: [image]
+      properties:
+        image: { type: string }
+        vcpu: { type: integer, format: int64 }
+        mem_mib: { type: integer, format: int64 }
+        port: { type: integer }
+        strategy: { type: string, enum: [bluegreen, rolling] }
+        services:
+          type: array
+          items: { $ref: "#/components/schemas/ServiceSpec" }
+        env:
+          type: object
+          additionalProperties: { type: string }
+        node_pool: { type: string }
+        labels:
+          type: object
+          additionalProperties: { type: string }
+        anti_affinity: { type: string, enum: [NONE, DEPLOYMENT] }
+        health_check: { $ref: "#/components/schemas/HealthCheck" }
+        secret_refs:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/SecretRef" }
+        auto_standby: { type: object, additionalProperties: true }
+        egress: { $ref: "#/components/schemas/EgressPolicy" }
+    App:
+      description: 直接序列化 store.App；字段为 PascalCase（legacy）。
+      type: object
+      properties:
+        ID: { type: string }
+        ProjectID: { type: string }
+        Hostname: { type: string }
+        ImageRef: { type: string }
+        VCPU: { type: integer, format: int64 }
+        MemMIB: { type: integer, format: int64 }
+        DesiredReplicas: { type: integer }
+        Generation: { type: integer, format: int64 }
+        Deleted: { type: boolean }
+        AutoscaleEnabled: { type: boolean }
+        MinReplicas: { type: integer }
+        MaxReplicas: { type: integer }
+        TargetConcurrency: { type: integer }
+        ScaleDownDelaySec: { type: integer }
+        PanicThreshold: { type: number }
+        CreatedAt: { type: string }
+        UpdatedAt: { type: string }
+    AutoscalePolicy:
+      type: object
+      properties:
+        enabled: { type: boolean }
+        min_replicas: { type: integer }
+        max_replicas: { type: integer }
+        target_concurrency: { type: integer }
+        scale_down_delay_sec: { type: integer }
+        panic_threshold: { type: number }
+    AutoscaleState:
+      type: object
+      properties:
+        app_id: { type: string }
+        autoscale: { $ref: "#/components/schemas/AutoscalePolicy" }
+        desired_replicas: { type: integer }
+    CreateSnapshotRequest:
+      type: object
+      properties:
+        kind: { type: string, enum: [memory, filesystem], description: "缺省 memory" }
+        name: { type: string }
+        compression: { type: string, enum: [none, zstd, lz4], description: "缺省 none" }
+        compression_level: { type: integer, nullable: true }
+        retention_class: { type: string }
+    SnapshotScheduleRequest:
+      type: object
+      required: [interval_seconds]
+      properties:
+        interval_seconds: { type: integer, minimum: 60 }
+        jitter_seconds: { type: integer }
+        max_count: { type: integer, default: 10, minimum: 1 }
+        max_age_seconds: { type: integer }
+        compression: { type: string, enum: [none, zstd, lz4], description: "缺省 none" }
+        compression_level: { type: integer, nullable: true }
+        enabled: { type: boolean, default: true }
+    CreateVolumeRequest:
+      type: object
+      required: [name, size_gib]
+      properties:
+        project_id: { type: string, description: "缺省 dev；受限身份强制为自身项目" }
+        name: { type: string }
+        mode: { type: string, enum: [LOCAL_RW, DATASET_RO], description: "缺省 LOCAL_RW" }
+        size_gib: { type: integer, minimum: 1, maximum: 1024 }
+        node_id: { type: string, description: "缺省由调度器选节点" }
+        source_url: { type: string, description: "DATASET_RO 必填：无凭证 HTTPS URL" }
+        content_digest: { type: string, description: "DATASET_RO 必填：sha256:<64 hex>" }
+        max_download_bytes: { type: integer, format: int64, description: "DATASET_RO 缺省 = size_gib" }
+        max_files: { type: integer, description: "DATASET_RO 缺省 100000" }
+    PutSecretRequest:
+      type: object
+      required: [project_id, name, value]
+      properties:
+        project_id: { type: string, description: "受限身份强制为自身项目" }
+        name: { type: string }
+        value: { type: string, description: "只在请求内存在，立即加密，绝不回显" }
+        created_by: { type: string }
+    PrewarmRequest:
+      type: object
+      required: [project_id, image_ref]
+      properties:
+        project_id: { type: string }
+        image_ref: { type: string }
+        node_pool: { type: string }
+        node_ids:
+          type: array
+          items: { type: string }
+    ImagePinRequest:
+      description: "image_digest 或 digest-pinned image_ref 至少提供一个；ttl_seconds 必填且 > 0。"
+      type: object
+      required: [ttl_seconds]
+      properties:
+        project_id: { type: string, description: "缺省 dev；受限身份强制为自身项目" }
+        image_digest: { type: string, description: "sha256:<64 hex>" }
+        image_ref: { type: string, description: "digest-pinned 引用（可作为 image_digest 的来源）" }
+        node_pool: { type: string, description: "受限身份只允许 node_pool，不允许 node_ids" }
+        node_ids:
+          type: array
+          items: { type: string }
+        ttl_seconds: { type: integer, minimum: 1 }
+        reason: { type: string }
+    CreateAPIKeyRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        scopes:
+          type: array
+          items: { type: string }
+        role:
+          type: string
+          enum: [viewer, operator, deployer, maintainer, owner]
+        project_id: { type: string }
+        ttl_hours: { type: integer }
+    Node:
+      description: 直接序列化 store.Node；字段为 PascalCase（legacy）。
+      type: object
+      additionalProperties: true
+    EastWestPolicyRule:
+      type: object
+      properties:
+        src_project: { type: string }
+        src_app: { type: string }
+        dst_project: { type: string }
+        dst_app: { type: string }
+        dst_service: { type: string }
+        ports:
+          type: array
+          items: { type: integer }

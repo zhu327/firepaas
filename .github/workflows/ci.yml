@@ -122,7 +122,8 @@ jobs:
         run: GOWORK=off go test -race ./...
 
   lint:
-    # golangci-lint 配置见仓库根 .golangci.yml（保守基线）。
+    # golangci-lint 配置见仓库根 .golangci.yml。版本与本地验证一致（含 gosec
+    # 排除项与 nolint 标注的规则集），避免 lint 工具版本漂移导致门禁结果不一致。
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -132,9 +133,9 @@ jobs:
       - name: golangci-lint
         run: |
           curl -sSfL -o /tmp/golangci-lint.tar.gz \
-            https://github.com/golangci/golangci-lint/releases/download/v2.6.2/golangci-lint-2.6.2-linux-amd64.tar.gz
+            https://github.com/golangci/golangci-lint/releases/download/v2.10.1/golangci-lint-2.10.1-linux-amd64.tar.gz
           tar -xzf /tmp/golangci-lint.tar.gz -C /tmp
-          GOWORK=off /tmp/golangci-lint-2.6.2-linux-amd64/golangci-lint run ./...
+          GOWORK=off /tmp/golangci-lint-2.10.1-linux-amd64/golangci-lint run ./...
 
   security:
     # 依赖漏洞扫描：govulncheck 版本显式钉扎（v1.7.0 要求 go >= 1.25，与仓库/CI

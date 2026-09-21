@@ -290,6 +290,40 @@ func (s *Store) CreateAppAndDeployment(ctx context.Context, projectID string, ap
 	})
 }
 
+// CreateMachineParams 汇聚 app+machine 期望行创建与 create outbox 登记的全部
+// 入参（替代原 ensureAppAndEnqueueCreate 的 22 个位置参数）。execution_id /
+// generation / operation_id 由控制面服务端正生成；requestJSON 是
+// CreateMachineRequest 的 protojson 原始字节，供幂等重放的请求体比对。
+// 三个公开入口按语义设置 Restart*/AllowResurrect 默认值后汇聚到同一私有实现，
+// 因此 ExpiresAt 与 Restart* 只在 EnsureAppAndEnqueueCreateWithLifecycle 生效。
+type CreateMachineParams struct {
+	ProjectID      string
+	AppID          string
+	Hostname       string
+	ImageRef       string
+	VCPU           int64
+	MemMIB         int64
+	DiskMIB        int64
+	IngressPort    int
+	MachineID      string
+	DeploymentID   string
+	ExecutionID    string
+	OperationID    string
+	Generation     int64
+	ReplicaOrdinal int
+	RequestJSON    []byte
+	PlacementJSON  []byte
+	// ExpiresAt：初始 TTL（相对时间由调用方转绝对时间）；nil = 不过期。
+	// 仅 EnsureAppAndEnqueueCreateWithLifecycle 使用。
+	ExpiresAt *time.Time
+	// Restart*：初始重启策略（控制面唯一权威）。仅 WithLifecycle 使用；
+	// 其余入口固定为 NEVER/3/10/300（与旧签名一致）。
+	RestartMode                string
+	RestartMaxAttempts         int
+	RestartBackoffSeconds      int
+	RestartStableWindowSeconds int
+}
+
 // EnsureAppAndEnqueueCreate 在事务中保证 app + machine 期望行存在，并登记 create 操作。
 // 相同 (project_id, idempotency_key) 的操作重复提交：
 //   - 请求体一致 → 返回已有操作（不产生第二个副本）；
@@ -297,17 +331,11 @@ func (s *Store) CreateAppAndDeployment(ctx context.Context, projectID string, ap
 //
 // 并发提交同一幂等键时，先插入者胜出；后到者捕获 23505 后重新读取并比较
 // （M2 验收：同一 replica ordinal 的 1000 次并发重试只生成一个 machine/execution）。
-func (s *Store) EnsureAppAndEnqueueCreate(
-	ctx context.Context,
-	projectID, appID, hostname, imageRef string,
-	vcpu, memMIB, diskMIB int64, ingressPort int,
-	machineID, deploymentID, executionID, operationID string,
-	generation int64, replicaOrdinal int,
-	requestJSON, placementJSON []byte,
-) (Operation, error) {
-	return s.EnsureAppAndEnqueueCreateWithLifecycle(ctx, projectID, appID, hostname, imageRef,
-		vcpu, memMIB, diskMIB, ingressPort, machineID, deploymentID, executionID, operationID,
-		generation, replicaOrdinal, requestJSON, placementJSON, nil, "NEVER", 3, 10, 300)
+func (s *Store) EnsureAppAndEnqueueCreate(ctx context.Context, p CreateMachineParams) (Operation, error) {
+	// TTL 与重启策略只经 WithLifecycle 入口持久化（与旧签名固定 nil/NEVER 一致）。
+	p.ExpiresAt = nil
+	p.RestartMode, p.RestartMaxAttempts, p.RestartBackoffSeconds, p.RestartStableWindowSeconds = "NEVER", 3, 10, 300
+	return s.ensureAppAndEnqueueCreate(ctx, p, false)
 }
 
 // EnsureAppAndEnqueueCreateResurrect 是 app 对账（controller scale up）的显式
@@ -316,47 +344,31 @@ func (s *Store) EnsureAppAndEnqueueCreate(
 // 已判定该 ordinal 属于目标代且有意重建。复活时换新 execution、清 observed
 // 与 node_id，generation 保持 GREATEST 不回退（墓碑可能已换代，降低会让
 // agent 拒绝后续合法 create）。
-func (s *Store) EnsureAppAndEnqueueCreateResurrect(
-	ctx context.Context,
-	projectID, appID, hostname, imageRef string,
-	vcpu, memMIB, diskMIB int64, ingressPort int,
-	machineID, deploymentID, executionID, operationID string,
-	generation int64, replicaOrdinal int,
-	requestJSON, placementJSON []byte,
-) (Operation, error) {
-	return s.ensureAppAndEnqueueCreate(ctx, projectID, appID, hostname, imageRef,
-		vcpu, memMIB, diskMIB, ingressPort, machineID, deploymentID, executionID, operationID,
-		generation, replicaOrdinal, requestJSON, placementJSON, nil, "NEVER", 3, 10, 300, true)
+func (s *Store) EnsureAppAndEnqueueCreateResurrect(ctx context.Context, p CreateMachineParams) (Operation, error) {
+	p.ExpiresAt = nil
+	p.RestartMode, p.RestartMaxAttempts, p.RestartBackoffSeconds, p.RestartStableWindowSeconds = "NEVER", 3, 10, 300
+	return s.ensureAppAndEnqueueCreate(ctx, p, true)
 }
 
 // EnsureAppAndEnqueueCreateWithLifecycle atomically persists the initial TTL and
 // restart policy with the machine and create outbox row. An idempotent replay
 // returns before touching lifecycle fields, so a relative TTL is never extended.
-func (s *Store) EnsureAppAndEnqueueCreateWithLifecycle(
-	ctx context.Context,
-	projectID, appID, hostname, imageRef string,
-	vcpu, memMIB, diskMIB int64, ingressPort int,
-	machineID, deploymentID, executionID, operationID string,
-	generation int64, replicaOrdinal int,
-	requestJSON, placementJSON []byte, expiresAt *time.Time,
-	restartMode string, restartMaxAttempts, restartBackoffSeconds, restartStableWindowSeconds int,
-) (Operation, error) {
-	return s.ensureAppAndEnqueueCreate(ctx, projectID, appID, hostname, imageRef,
-		vcpu, memMIB, diskMIB, ingressPort, machineID, deploymentID, executionID, operationID,
-		generation, replicaOrdinal, requestJSON, placementJSON, expiresAt,
-		restartMode, restartMaxAttempts, restartBackoffSeconds, restartStableWindowSeconds, false)
+func (s *Store) EnsureAppAndEnqueueCreateWithLifecycle(ctx context.Context, p CreateMachineParams) (Operation, error) {
+	return s.ensureAppAndEnqueueCreate(ctx, p, false)
 }
 
 func (s *Store) ensureAppAndEnqueueCreate(
 	ctx context.Context,
-	projectID, appID, hostname, imageRef string,
-	vcpu, memMIB, diskMIB int64, ingressPort int,
-	machineID, deploymentID, executionID, operationID string,
-	generation int64, replicaOrdinal int,
-	requestJSON, placementJSON []byte, expiresAt *time.Time,
-	restartMode string, restartMaxAttempts, restartBackoffSeconds, restartStableWindowSeconds int,
+	p CreateMachineParams,
 	allowResurrect bool,
 ) (Operation, error) {
+	projectID, appID, hostname, imageRef := p.ProjectID, p.AppID, p.Hostname, p.ImageRef
+	vcpu, memMIB, diskMIB, ingressPort := p.VCPU, p.MemMIB, p.DiskMIB, p.IngressPort
+	machineID, deploymentID, executionID, operationID := p.MachineID, p.DeploymentID, p.ExecutionID, p.OperationID
+	generation, replicaOrdinal := p.Generation, p.ReplicaOrdinal
+	requestJSON, placementJSON, expiresAt := p.RequestJSON, p.PlacementJSON, p.ExpiresAt
+	restartMode := p.RestartMode
+	restartMaxAttempts, restartBackoffSeconds, restartStableWindowSeconds := p.RestartMaxAttempts, p.RestartBackoffSeconds, p.RestartStableWindowSeconds
 	var op Operation
 	err := s.inTx(ctx, func(tx pgx.Tx) error {
 		// 所有权检查必须先于幂等短路和任何 upsert。否则重复 operation 或
@@ -997,154 +1009,6 @@ func (s *Store) ListExpiredMachines(ctx context.Context, now time.Time) ([]Machi
 	}
 	defer rows.Close()
 	return scanMachines(rows)
-}
-
-// PrepareRestartBackoff durably binds the delay to the complete failed
-// execution before generation changes. Re-observation is idempotent and cannot
-// extend the deadline.
-func (s *Store) PrepareRestartBackoff(
-	ctx context.Context,
-	id, failedExecution string,
-	generation int64,
-	nextAt time.Time,
-) (bool, error) {
-	tag, err := s.pool.Exec(ctx, `UPDATE machines SET restart_failed_execution_id=$2,
-		restart_next_attempt_at=$4, updated_at=now()
-		WHERE id=$1 AND current_execution_id=$2 AND generation=$3
-		AND desired_state <> 'DELETED' AND lifecycle_delete_phase='ACTIVE'
-		AND (restart_failed_execution_id IS NULL OR restart_failed_execution_id <> $2)`,
-		id, failedExecution, generation, nextAt)
-	if err != nil {
-		return false, fmt.Errorf("prepare restart backoff: %w", err)
-	}
-	return tag.RowsAffected() == 1, nil
-}
-
-// RestartAttemptNumber returns the ordinal reserved by the next restart CAS.
-func (s *Store) RestartAttemptNumber(ctx context.Context, id, failedExecution string, generation int64) (int, error) {
-	var attempt int
-	err := s.pool.QueryRow(ctx, `SELECT restart_attempts+1 FROM machines
-		WHERE id=$1 AND current_execution_id=$2 AND generation=$3
-		AND desired_state <> 'DELETED' AND lifecycle_delete_phase='ACTIVE'`,
-		id, failedExecution, generation).Scan(&attempt)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, ErrMachineLifecycleClosed
-	}
-	return attempt, err
-}
-
-// EnqueueRestartCAS atomically advances attempt/execution/generation and inserts
-// the create outbox row. The failed execution is part of both the CAS and the
-// idempotency key supplied by the caller.
-func (s *Store) EnqueueRestartCAS(ctx context.Context, projectID, machineID,
-	failedExecution, newExecution, operationID string, expectedGeneration int64,
-	requestJSON []byte, nextAt time.Time,
-) (Operation, error) {
-	var op Operation
-	err := s.inTx(ctx, func(tx pgx.Tx) error {
-		var attempt int
-		var actualProject string
-		err := tx.QueryRow(ctx, `UPDATE machines SET
-			current_execution_id=$4, generation=$3+1, desired_state='CREATED',
-			observed_state='', observed_slot_ip='', observed_readiness='UNKNOWN',
-			last_observed_at=NULL, node_id='', restart_attempts=restart_attempts+1,
-			restart_next_attempt_at=$5, restart_stable_since=NULL, updated_at=now()
-			FROM apps a
-			WHERE machines.id=$1 AND machines.current_execution_id=$2 AND machines.generation=$3
-			AND machines.desired_state <> 'DELETED' AND machines.lifecycle_delete_phase='ACTIVE'
-			AND machines.restart_failed_execution_id=$2 AND machines.restart_next_attempt_at <= now()
-			AND a.id=machines.app_id
-			RETURNING machines.restart_attempts, a.project_id`, machineID, failedExecution, expectedGeneration,
-			newExecution, nextAt).Scan(&attempt, &actualProject)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrMachineLifecycleClosed
-		}
-		if err != nil {
-			return fmt.Errorf("restart machine CAS: %w", err)
-		}
-		if projectID != "" && projectID != actualProject {
-			return ownershipConflict("machine", machineID, "project_id", projectID, actualProject)
-		}
-		projectID = actualProject
-		if _, err := tx.Exec(ctx, `INSERT INTO operations(id, project_id, machine_id,
-			execution_id, generation, kind, idempotency_key, status, request)
-			VALUES($1,$2,$3,$4,$5,'create',$1,'PENDING',$6::jsonb)
-			ON CONFLICT (project_id,idempotency_key) DO NOTHING`, operationID, projectID,
-			machineID, newExecution, expectedGeneration+1, string(requestJSON)); err != nil {
-			return fmt.Errorf("enqueue restart create: %w", err)
-		}
-		created, err := selectOperationByKey(ctx, tx, projectID, operationID)
-		if err != nil || created == nil {
-			if err == nil {
-				err = fmt.Errorf("restart operation disappeared")
-			}
-			return err
-		}
-		if !jsonEqual(created.Request, requestJSON) {
-			return ErrRequestConflict
-		}
-		op = *created
-		return nil
-	})
-	return op, err
-}
-
-// RecordRestartAttempt 记录 restart 尝试（attempts 单调递增；next_attempt_at
-// 为固定 backoff 的下一尝试时间）。ADR-0026 §7：stable window 必须从“新
-// execution 的 READY”重新起算——旧 execution 的锚点跨 restart 存活会让
-// attempts 在新 execution 稳定不足窗口时被提前清零（restart storm），因此
-// 每次记账同时清空 restart_stable_since。
-func (s *Store) RecordRestartAttempt(ctx context.Context, id string, attempts int, nextAt time.Time) error {
-	tag, err := s.pool.Exec(ctx, `
-		UPDATE machines SET restart_attempts=$2, restart_next_attempt_at=$3,
-			restart_stable_since=NULL, updated_at=now()
-		WHERE id=$1 AND desired_state <> 'DELETED'`, id, attempts, nextAt)
-	if err != nil {
-		return fmt.Errorf("record restart attempt: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrMachineLifecycleClosed
-	}
-	return nil
-}
-
-// SetRestartStableSince 记录新 execution READY 的稳定窗口起点（NULL 清除）。
-func (s *Store) SetRestartStableSince(ctx context.Context, id string, t *time.Time) error {
-	var arg any
-	if t != nil {
-		arg = *t
-	}
-	_, err := s.pool.Exec(ctx, `
-		UPDATE machines SET restart_stable_since=$2, updated_at=now() WHERE id=$1`, id, arg)
-	if err != nil {
-		return fmt.Errorf("set restart stable since: %w", err)
-	}
-	return nil
-}
-
-// ResetRestartAttempts 清零 attempts（成功运行满 stable window 或管理员 reset）。
-func (s *Store) ResetRestartAttempts(ctx context.Context, id string) error {
-	tag, err := s.pool.Exec(ctx, `
-		UPDATE machines SET restart_attempts=0, restart_next_attempt_at=NULL,
-			restart_stable_since=NULL, restart_blocked=false, updated_at=now()
-		WHERE id=$1`, id)
-	if err != nil {
-		return fmt.Errorf("reset restart attempts: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrMachineNotFound
-	}
-	return nil
-}
-
-// BlockRestart 置/清 RESTART_BLOCKED 终态。
-func (s *Store) BlockRestart(ctx context.Context, id string, blocked bool) error {
-	_, err := s.pool.Exec(ctx, `
-		UPDATE machines SET restart_blocked=$2, updated_at=now() WHERE id=$1`, id, blocked)
-	if err != nil {
-		return fmt.Errorf("block restart: %w", err)
-	}
-	return nil
 }
 
 // MarkStaleNodes 把 last_seen 超阈值的节点置 UNKNOWN（P3-6c）：节点从

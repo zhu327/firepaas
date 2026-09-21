@@ -177,9 +177,7 @@ func TestMachinesCrossGenerationCoexist(t *testing.T) {
 		{"app-coexist-r0-g1", "d1", "exec-1", 1},
 		{"app-coexist-r0-g2", "d2", "exec-2", 2},
 	} {
-		if _, err := s.EnsureAppAndEnqueueCreate(ctx, project, appID, "co.local",
-			"img:v1", 1, 512, 0, 80, m.machineID, m.depID, m.execID,
-			"op-"+m.machineID, m.gen, 0, []byte(`{"machine_id":"`+m.machineID+`"}`), nil); err != nil {
+		if _, err := s.EnsureAppAndEnqueueCreate(ctx, CreateMachineParams{ProjectID: project, AppID: appID, Hostname: "co.local", ImageRef: "img:v1", VCPU: 1, MemMIB: 512, DiskMIB: 0, IngressPort: 80, MachineID: m.machineID, DeploymentID: m.depID, ExecutionID: m.execID, OperationID: "op-" + m.machineID, Generation: m.gen, ReplicaOrdinal: 0, RequestJSON: []byte(`{"machine_id":"` + m.machineID + `"}`)}); err != nil {
 			t.Fatalf("enqueue %s: %v", m.machineID, err)
 		}
 	}

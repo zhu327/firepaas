@@ -155,8 +155,8 @@ func (c *Controller) reconcileVolumeIntegrity(
 			continue
 		}
 		orphanBytes += item.GetSizeBytes()
-		if !c.reportedOrphans["volume:"+n.ID+":"+id] {
-			c.reportedOrphans["volume:"+n.ID+":"+id] = true
+		if !c.st().reportedOrphans["volume:"+n.ID+":"+id] {
+			c.st().reportedOrphans["volume:"+n.ID+":"+id] = true
 			c.recordEvent(ctx, "inventory", "", "", n.ID,
 				fmt.Sprintf("orphan volume artifact %s (%d bytes); report-only", id, item.GetSizeBytes()), nil)
 		}

@@ -2,6 +2,7 @@ package state
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -139,5 +140,25 @@ func TestFencesPruneBeforeUnlessLive(t *testing.T) {
 	// 已删 machine：照常过期，旧代重新放行。
 	if err := f.Check("m-gone", 1); err != nil {
 		t.Fatalf("deleted machine fence should be age-GC'd: %v", err)
+	}
+}
+
+// persistLocked 新建的目录必须是 0700（而非 0755）：fence 高水位属于本机
+// 敏感运行态，不应允许同机其他用户读写。
+func TestFencesPersistDirMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent", "fences.json")
+	f, err := OpenFences(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Advance("m", 1, "e1"); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("fences dir mode = %o, want 700", got)
 	}
 }

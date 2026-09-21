@@ -139,7 +139,14 @@ func (s *Server) acquireMachineSlot(machineID string) (release func(), ok bool) 
 // 事件类型名 runtime.exec.allow / runtime.exec.deny 预留给控制面 user_events
 // 投影消费——agent 无 PG 句柄，controller 侧落库为设计项（Phase1 不写码，
 // 需改 internal/controlplane，本波次 allowlist 之外）。
-func (s *Server) auditExec(machineID, executionID string, argv []string, env map[string]string, decision, reason string, bytes int64, took time.Duration) {
+func (s *Server) auditExec(
+	machineID, executionID string,
+	argv []string,
+	env map[string]string,
+	decision, reason string,
+	bytes int64,
+	took time.Duration,
+) {
 	argv0 := ""
 	if len(argv) > 0 {
 		argv0 = argv[0]

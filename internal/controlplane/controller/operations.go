@@ -137,23 +137,23 @@ type machineDispatchLock struct {
 // lockMachine 获取该 machine 的派发互斥（进程内；不同机互不阻塞）。
 // 返回的 unlock 同时归还引用并在无人使用时回收条目。
 func (c *Controller) lockMachine(machineID string) func() {
-	c.machineLocksMu.Lock()
-	m, ok := c.machineLocks[machineID]
+	c.st().machineLocksMu.Lock()
+	m, ok := c.st().machineLocks[machineID]
 	if !ok {
 		m = &machineDispatchLock{}
-		c.machineLocks[machineID] = m
+		c.st().machineLocks[machineID] = m
 	}
 	m.refs++
-	c.machineLocksMu.Unlock()
+	c.st().machineLocksMu.Unlock()
 	m.mu.Lock()
 	return func() {
 		m.mu.Unlock()
-		c.machineLocksMu.Lock()
+		c.st().machineLocksMu.Lock()
 		m.refs--
-		if m.refs == 0 && c.machineLocks[machineID] == m {
-			delete(c.machineLocks, machineID)
+		if m.refs == 0 && c.st().machineLocks[machineID] == m {
+			delete(c.st().machineLocks, machineID)
 		}
-		c.machineLocksMu.Unlock()
+		c.st().machineLocksMu.Unlock()
 	}
 }
 

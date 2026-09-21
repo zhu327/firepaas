@@ -132,12 +132,10 @@ func decodeFlowEvent(raw []byte) (FlowEvent, bool) {
 func (b *Backend) correlate(ev FlowEvent, resolve IdentityResolver) FlowRecord {
 	rec := FlowRecord{FlowEvent: ev}
 	if src, ok := resolve.Resolve(ev.SrcID); ok {
-		rec.SrcProject, rec.SrcApp, rec.SrcMachine, rec.SrcExecution =
-			src.ProjectID, src.AppID, src.MachineID, src.ExecutionID
+		rec.SrcProject, rec.SrcApp, rec.SrcMachine, rec.SrcExecution = src.ProjectID, src.AppID, src.MachineID, src.ExecutionID
 	}
 	if dst, ok := resolve.Resolve(ev.DstID); ok {
-		rec.DstProject, rec.DstApp, rec.DstMachine, rec.DstExecution =
-			dst.ProjectID, dst.AppID, dst.MachineID, dst.ExecutionID
+		rec.DstProject, rec.DstApp, rec.DstMachine, rec.DstExecution = dst.ProjectID, dst.AppID, dst.MachineID, dst.ExecutionID
 	}
 	return rec
 }

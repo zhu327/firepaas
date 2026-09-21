@@ -46,15 +46,15 @@ func (c *Controller) reconcileEvacuateNode(ctx context.Context, node *store.Node
 		return err
 	}
 	if len(machines) == 0 {
-		if !c.evacuatedNodes[node.ID] {
-			c.evacuatedNodes[node.ID] = true
+		if !c.st().evacuatedNodes[node.ID] {
+			c.st().evacuatedNodes[node.ID] = true
 			c.recordEvent(ctx, "evacuate_complete", "", "", node.ID,
 				"node evacuated: zero machines remain, safe for maintenance/upgrade", nil)
 			c.metrics.Inc("firepaas_evacuate_total", map[string]string{"result": "complete"}, 1)
 		}
 		return nil
 	}
-	c.evacuatedNodes[node.ID] = false
+	c.st().evacuatedNodes[node.ID] = false
 	sort.Slice(machines, func(i, j int) bool {
 		if machines[i].AppID != machines[j].AppID {
 			return machines[i].AppID < machines[j].AppID

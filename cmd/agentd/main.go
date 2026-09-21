@@ -66,6 +66,9 @@ import (
 	"github.com/zhu327/firepaas/shared/pkg/logging"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	grpchealth "google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/keepalive"
 )
 
 // serviceVersion 由 -ldflags "-X main.serviceVersion=..." 注入发布版本。
@@ -83,6 +86,58 @@ func main() {
 		slog.Error("agentd terminated", "error", err)
 		os.Exit(1)
 	}
+}
+
+// openAgentState 打开 agent 的全部崩溃安全持久状态（operation ledger、
+// generation fence 高水位、fabric 快照）并解析 ledger/fence 的年龄 GC 保留
+// 窗口。三者路径均可经 env 覆盖，默认落在 dataDir/agent/ 下；缺文件即新建。
+// 抽成独立函数使其可单测（默认路径、坏 retention 报错、缺文件新建语义）。
+func openAgentState(dataDir string) (*state.Ledger, *state.Fences, *state.Fabric, time.Duration, error) {
+	ledger, err := state.Open(env.Get("FIREPAAS_AGENT_LEDGER_PATH", filepath.Join(dataDir, "agent", "ledger.json")))
+	if err != nil {
+		return nil, nil, nil, 0, err
+	}
+	// generation fence（P0-2）：machine → 已知最高 generation 高水位，
+	// 拒绝早于高水位的变更请求（重启保留；machine 删除后仍拒绝旧 re-create）。
+	fences, err := state.OpenFences(
+		env.Get("FIREPAAS_AGENT_FENCES_PATH", filepath.Join(dataDir, "agent", "fences.json")),
+	)
+	if err != nil {
+		return nil, nil, nil, 0, err
+	}
+	// 节点级 fabric 快照与高水位（ADR-0040 §18，T3）：ApplyFabric 全量替换
+	// 后崩溃安全落盘；重启后旧代请求继续被拒。
+	fabric, err := state.OpenFabric(
+		env.Get("FIREPAAS_AGENT_FABRIC_PATH", filepath.Join(dataDir, "agent", "fabric.json")),
+	)
+	if err != nil {
+		return nil, nil, nil, 0, err
+	}
+	rawRetention := env.Get("FIREPAAS_AGENT_LEDGER_RETENTION", "24h")
+	retention, err := time.ParseDuration(rawRetention)
+	if err != nil {
+		return nil, nil, nil, 0, fmt.Errorf("invalid FIREPAAS_AGENT_LEDGER_RETENTION %q: %w", rawRetention, err)
+	}
+	if retention <= 0 {
+		return nil, nil, nil, 0, fmt.Errorf("invalid FIREPAAS_AGENT_LEDGER_RETENTION %q: must be > 0", rawRetention)
+	}
+	return ledger, fences, fabric, retention, nil
+}
+
+// registerAgentHealth 在 agentd gRPC server 上注册标准 health 服务并置 SERVING。
+// 与业务服务同在 mTLS 身份门禁下：仅持证（默认 control-plane CN）调用方可查，
+// grpc_health_probe 类探针需配置客户端证书。
+func registerAgentHealth(grpcServer *grpc.Server) *grpchealth.Server {
+	srv := grpchealth.NewServer()
+	healthpb.RegisterHealthServer(grpcServer, srv)
+	srv.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
+	return srv
+}
+
+// markAgentHealthDraining 在优雅停机前置 NOT_SERVING，避免探针/客户端在
+// 排空窗口继续把新工作引向正在退出的 agent。
+func markAgentHealthDraining(srv *grpchealth.Server) {
+	srv.SetServingStatus("", healthpb.HealthCheckResponse_NOT_SERVING)
 }
 
 func run() error {
@@ -126,22 +181,7 @@ func run() error {
 		return fmt.Errorf("ensure system files: %w", err)
 	}
 
-	ledgerPath := env.Get("FIREPAAS_AGENT_LEDGER_PATH", filepath.Join(cfg.DataDir, "agent", "ledger.json"))
-	ledger, err := state.Open(ledgerPath)
-	if err != nil {
-		return err
-	}
-	// generation fence（P0-2）：machine → 已知最高 generation 高水位，
-	// 拒绝早于高水位的变更请求（重启保留；machine 删除后仍拒绝旧 re-create）。
-	fencesPath := env.Get("FIREPAAS_AGENT_FENCES_PATH", filepath.Join(cfg.DataDir, "agent", "fences.json"))
-	fences, err := state.OpenFences(fencesPath)
-	if err != nil {
-		return err
-	}
-	// 节点级 fabric 快照与高水位（ADR-0040 §18，T3）：ApplyFabric 全量替换
-	// 后崩溃安全落盘；重启后旧代请求继续被拒。
-	fabricPath := env.Get("FIREPAAS_AGENT_FABRIC_PATH", filepath.Join(cfg.DataDir, "agent", "fabric.json"))
-	fabric, err := state.OpenFabric(fabricPath)
+	ledger, fences, fabric, retention, err := openAgentState(cfg.DataDir)
 	if err != nil {
 		return err
 	}
@@ -150,10 +190,6 @@ func run() error {
 	// 启动时清理一次，之后每小时一次。fence 侧额外绑定 machine 存活（R2-6）：
 	// 活 machine 的高水位必须随 machine 存活，年龄窗口不适用；实例清单
 	// 不可得时跳过本轮 fence GC（不清单≠已死，误回收会让过期请求复活）。
-	retention, err := time.ParseDuration(env.Get("FIREPAAS_AGENT_LEDGER_RETENTION", "24h"))
-	if err != nil || retention <= 0 {
-		return fmt.Errorf("invalid FIREPAAS_AGENT_LEDGER_RETENTION: %v", err)
-	}
 	pruneGC := func() {
 		cutoff := time.Now().Add(-retention)
 		if n, err := ledger.PruneBefore(cutoff); err != nil {
@@ -688,7 +724,18 @@ func run() error {
 		slog.Info("agentd mTLS enabled (hot-reload certs, ADR-0006 degradation)",
 			"grpc_clients", grpcAllowed, "proxy_clients", proxyAllowed)
 	}
+	// R2 加固：keepalive enforcement。控制面客户端以 30s 心跳探测半开连接
+	//（agentclient.Dial）；默认 MinTime=5m 会把这样频繁的客户端判为
+	// too_many_pings 并 GOAWAY。此处放宽到 10s（仍防滥用）并允许无活跃
+	// stream 时心跳。缺此配置时，新控制面 + 旧 agentd 会在升级窗口内被断开。
+	grpcOpts = append(grpcOpts, grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+		MinTime:             10 * time.Second,
+		PermitWithoutStream: true,
+	}))
 	grpcServer := grpc.NewServer(grpcOpts...)
+	// 标准 gRPC health 服务：便于持证的 grpc_health_probe / 编排探活与后续
+	// 客户端 health checking。
+	healthSrv := registerAgentHealth(grpcServer)
 	pb.RegisterInfoServiceServer(grpcServer, srv)
 	pb.RegisterMachineServiceServer(grpcServer, srv)
 	pb.RegisterImageServiceServer(grpcServer, srv)    // v1.1（ADR-0018）：部署预取
@@ -733,6 +780,7 @@ func run() error {
 	select {
 	case <-ctx.Done():
 		slog.Info("agentd shutting down")
+		markAgentHealthDraining(healthSrv)
 		// R2-5：GracefulStop 带 deadline（FIREPAAS_AGENT_GRACEFUL_STOP_TIMEOUT，
 		// 默认 30s）。GracefulStop 会等在途流结束——Exec/logs/cp 流长可达 15
 		// 分钟（runtimeLimits），不绑死节点重启/升级窗口；超时后强制 Stop()

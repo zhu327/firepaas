@@ -112,7 +112,7 @@ func TestTokenDifferentKeysDiffer(t *testing.T) {
 // edge→agent proxy 的 credential 请求头是 wire 契约，改名即断链。
 func TestHeaderCredentialContract(t *testing.T) {
 	t.Parallel()
-	if HeaderCredential != "X-Firepaas-Credential" {
+	if HeaderCredential != "X-Firepaas-Credential" { //nolint:gosec // G101：断言头名常量，非凭证
 		t.Fatalf("HeaderCredential=%q", HeaderCredential)
 	}
 }

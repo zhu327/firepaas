@@ -90,7 +90,15 @@ func runImagesUnpin(args []string) error {
 	fs := flag.NewFlagSet("images unpin", flag.ExitOnError)
 	idem := idemKeyFlag(fs)
 	_ = fs.Parse(args[1:])
-	return doRequest(apiClient, "DELETE", "/v1/images/pins/"+url.PathEscape(pinID), nil, nil, resolveIdemKey(*idem), true)
+	return doRequest(
+		apiClient,
+		"DELETE",
+		"/v1/images/pins/"+url.PathEscape(pinID),
+		nil,
+		nil,
+		resolveIdemKey(*idem),
+		true,
+	)
 }
 
 func runImagesPin(args []string) error {

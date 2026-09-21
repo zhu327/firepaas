@@ -168,7 +168,11 @@ func egressTableScript(ref SlotRef, snap *api.PolicySnapshot) (string, error) {
 		fmt.Fprintf(&b, "add rule ip fp-slot egress-pre %s\n", proxyDNATRule(vethGuest, hostAddr, 80, snap.ProxyPort80))
 	}
 	if snap.ProxyPort443 > 0 {
-		fmt.Fprintf(&b, "add rule ip fp-slot egress-pre %s\n", proxyDNATRule(vethGuest, hostAddr, 443, snap.ProxyPort443))
+		fmt.Fprintf(
+			&b,
+			"add rule ip fp-slot egress-pre %s\n",
+			proxyDNATRule(vethGuest, hostAddr, 443, snap.ProxyPort443),
+		)
 	}
 	b.WriteString("add rule ip fp-slot egress-fwd ct state established,related accept\n")
 	// The limit precedes every new-connection accept, including allowed CIDRs and

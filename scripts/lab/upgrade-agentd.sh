@@ -7,6 +7,10 @@
 # 单节点实验室：驱离后重建仍落回本节点（重启后 ready 恢复放置）；
 # 多节点形态下重建自然落其它节点（本脚本不做假设）。
 # 失败时严格退出；节点只会在重启成功且对账通过后 ready。
+#
+# 顺序约束：含 keepalive enforcement 的版本必须先升级 agentd、再升级控制面
+#（控制面客户端 30s 心跳需要 agentd 的 MinTime<=10s）；回滚反向。
+# 详见 docs/runbook-upgrade-control-plane.md 的“升级顺序约束”。
 set -euo pipefail
 
 TS() { date '+%H:%M:%S'; }

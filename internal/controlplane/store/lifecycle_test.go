@@ -115,8 +115,26 @@ func TestEnsureCreateRejectsDeletedMachine(t *testing.T) {
 	}
 
 	raw := ensureCreateRequest(t, machineID, "dep-delrace", "exec-new", "op-del-race-1")
-	_, err := s.EnsureAppAndEnqueueCreate(ctx, project, "app-delrace", machineID+".test", "img",
-		1, 512, 0, 8080, machineID, "dep-delrace", "exec-new", "op-del-race-1", 2, 0, raw, nil)
+	_, err := s.EnsureAppAndEnqueueCreate(
+		ctx,
+		CreateMachineParams{
+			ProjectID:      project,
+			AppID:          "app-delrace",
+			Hostname:       machineID + ".test",
+			ImageRef:       "img",
+			VCPU:           1,
+			MemMIB:         512,
+			DiskMIB:        0,
+			IngressPort:    8080,
+			MachineID:      machineID,
+			DeploymentID:   "dep-delrace",
+			ExecutionID:    "exec-new",
+			OperationID:    "op-del-race-1",
+			Generation:     2,
+			ReplicaOrdinal: 0,
+			RequestJSON:    raw,
+		},
+	)
 	if err == nil {
 		t.Fatal("EnsureAppAndEnqueueCreate must reject DELETED machine (revive guard)")
 	}
@@ -146,17 +164,23 @@ func TestCreateLifecycleIsAtomicAndReplayDoesNotExtendTTL(t *testing.T) {
 	}
 	expires := time.Now().Add(time.Hour).Truncate(time.Microsecond)
 	raw := ensureCreateRequest(t, machineID, "dep-create-lifecycle", "exec-create-lifecycle", opID)
-	if _, err := s.EnsureAppAndEnqueueCreateWithLifecycle(ctx, project, appID,
-		machineID+".test", "img", 1, 512, 0, 8080, machineID,
-		"dep-create-lifecycle", "exec-create-lifecycle", opID, 2, 0, raw, nil,
-		&expires, "ON_FAILURE", 7, 13, 29); err != nil {
+	if _, err := s.EnsureAppAndEnqueueCreateWithLifecycle(ctx, CreateMachineParams{
+		ProjectID: project, AppID: appID, Hostname: machineID + ".test", ImageRef: "img",
+		VCPU: 1, MemMIB: 512, DiskMIB: 0, IngressPort: 8080, MachineID: machineID,
+		DeploymentID: "dep-create-lifecycle", ExecutionID: "exec-create-lifecycle", OperationID: opID,
+		Generation: 2, ReplicaOrdinal: 0, RequestJSON: raw,
+		ExpiresAt: &expires, RestartMode: "ON_FAILURE", RestartMaxAttempts: 7, RestartBackoffSeconds: 13, RestartStableWindowSeconds: 29,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	later := expires.Add(time.Hour)
-	if _, err := s.EnsureAppAndEnqueueCreateWithLifecycle(ctx, project, appID,
-		machineID+".test", "img", 1, 512, 0, 8080, machineID,
-		"dep-create-lifecycle", "exec-create-lifecycle", opID, 2, 0, raw, nil,
-		&later, "ALWAYS", 99, 99, 99); err != nil {
+	if _, err := s.EnsureAppAndEnqueueCreateWithLifecycle(ctx, CreateMachineParams{
+		ProjectID: project, AppID: appID, Hostname: machineID + ".test", ImageRef: "img",
+		VCPU: 1, MemMIB: 512, DiskMIB: 0, IngressPort: 8080, MachineID: machineID,
+		DeploymentID: "dep-create-lifecycle", ExecutionID: "exec-create-lifecycle", OperationID: opID,
+		Generation: 2, ReplicaOrdinal: 0, RequestJSON: raw,
+		ExpiresAt: &later, RestartMode: "ALWAYS", RestartMaxAttempts: 99, RestartBackoffSeconds: 99, RestartStableWindowSeconds: 99,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	m, err := s.GetMachine(ctx, machineID)

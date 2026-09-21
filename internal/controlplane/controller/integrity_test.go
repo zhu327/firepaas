@@ -59,7 +59,7 @@ func seedIntegritySnapshot(t *testing.T, s *store.Store, project, snapID, nodeID
 // v1.4-B：完整 inventory + 产物不存在 → MISSING + UNAVAILABLE；存在 →\n// METADATA_VERIFIED；旧 agent（complete=false）不推导任何结论。
 func TestReconcileSnapshotIntegrity(t *testing.T) {
 	s := testStoreController(t)
-	c := &Controller{store: s, metrics: metrics.New(), reportedOrphans: map[string]bool{}}
+	c := &Controller{store: s, metrics: metrics.New(), state: newReconcileState()}
 	ctx := context.Background()
 	project := fmt.Sprintf("p-int-snap-%d", os.Getpid())
 	if err := s.EnsureProject(ctx, project, "int-test"); err != nil {
@@ -124,7 +124,7 @@ func TestReconcileSnapshotIntegrity(t *testing.T) {
 // 完整列表缺席 → MISSING + UNAVAILABLE；orphan 只报告。
 func TestAuthoritativeInventoryOrderingAndCorruptStickiness(t *testing.T) {
 	s := testStoreController(t)
-	c := &Controller{store: s, metrics: metrics.New(), reportedOrphans: map[string]bool{}}
+	c := &Controller{store: s, metrics: metrics.New(), state: newReconcileState()}
 	ctx := context.Background()
 	project := fmt.Sprintf("p-int-order-%d", os.Getpid())
 	if err := s.EnsureProject(ctx, project, "int-order-test"); err != nil {
@@ -187,7 +187,7 @@ func TestAuthoritativeInventoryOrderingAndCorruptStickiness(t *testing.T) {
 
 func TestReconcileVolumeIntegrity(t *testing.T) {
 	s := testStoreController(t)
-	c := &Controller{store: s, metrics: metrics.New(), reportedOrphans: map[string]bool{}}
+	c := &Controller{store: s, metrics: metrics.New(), state: newReconcileState()}
 	ctx := context.Background()
 	project := fmt.Sprintf("p-int-vol-%d", os.Getpid())
 	if err := s.EnsureProject(ctx, project, "int-test"); err != nil {

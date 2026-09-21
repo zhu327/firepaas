@@ -134,10 +134,10 @@ func (c *Controller) syncObserved(ctx context.Context) error {
 		v := o.view
 		if o.noClient {
 			// M5 诊断：之前静默跳过掩盖了 node client 未建立的问题。
-			c.nodeListFailures[v.agentID]++
-			if c.nodeListFailures[v.agentID]%5 == 1 {
+			c.st().nodeListFailures[v.agentID]++
+			if c.st().nodeListFailures[v.agentID]%5 == 1 {
 				slog.Warn("no agent client for node view", "node", v.agentID,
-					"nomad_id", v.nomadID, "status", v.status, "consecutive", c.nodeListFailures[v.agentID])
+					"nomad_id", v.nomadID, "status", v.status, "consecutive", c.st().nodeListFailures[v.agentID])
 			}
 			continue
 		}
@@ -147,10 +147,10 @@ func (c *Controller) syncObserved(ctx context.Context) error {
 			// NodeMissingThreshold 次失败才把节点上的 machine 摘路由，避免
 			// backend 随抖动来回抖。真正失联时 nodemanager 会在 20s 内把
 			// 节点置 UNKNOWN，R4 路径兑底。
-			c.nodeListFailures[v.agentID]++
-			if c.nodeListFailures[v.agentID] < c.cfg.NodeMissingThreshold {
+			c.st().nodeListFailures[v.agentID]++
+			if c.st().nodeListFailures[v.agentID] < c.cfg.NodeMissingThreshold {
 				slog.Warn("agent list failed (transient)", "node", v.agentID,
-					"consecutive", c.nodeListFailures[v.agentID], "error", o.err)
+					"consecutive", c.st().nodeListFailures[v.agentID], "error", o.err)
 				continue
 			}
 			// 节点持续失联：把该节点上的 machine 保守置 UNKNOWN（摘路由）。
@@ -170,7 +170,7 @@ func (c *Controller) syncObserved(ctx context.Context) error {
 			}
 			continue
 		}
-		delete(c.nodeListFailures, v.agentID)
+		delete(c.st().nodeListFailures, v.agentID)
 		for _, m := range o.machines {
 			if copies[m.MachineId] == nil {
 				copies[m.MachineId] = map[string]*pb.Machine{}
@@ -867,10 +867,24 @@ func (c *Controller) recreateMachine(ctx context.Context, m store.Machine, bump 
 		slog.Error("marshal recreate request", "machine_id", m.ID, "error", err)
 		return
 	}
-	_, err = c.store.EnsureAppAndEnqueueCreate(ctx, project, m.AppID, m.Hostname, m.ImageRef,
-		m.RequestedVCPU, m.RequestedMemMIB,
-		int64(agentv1.EffectiveDiskMib(req.Spec.GetDiskMib())), m.IngressPort,
-		m.ID, m.DeploymentID, exec, opID, gen, m.ReplicaOrdinal, raw, []byte(m.Placement))
+	_, err = c.store.EnsureAppAndEnqueueCreate(ctx, store.CreateMachineParams{
+		ProjectID:      project,
+		AppID:          m.AppID,
+		Hostname:       m.Hostname,
+		ImageRef:       m.ImageRef,
+		VCPU:           m.RequestedVCPU,
+		MemMIB:         m.RequestedMemMIB,
+		DiskMIB:        int64(agentv1.EffectiveDiskMib(req.Spec.GetDiskMib())),
+		IngressPort:    m.IngressPort,
+		MachineID:      m.ID,
+		DeploymentID:   m.DeploymentID,
+		ExecutionID:    exec,
+		OperationID:    opID,
+		Generation:     gen,
+		ReplicaOrdinal: m.ReplicaOrdinal,
+		RequestJSON:    raw,
+		PlacementJSON:  []byte(m.Placement),
+	})
 	if err != nil {
 		slog.Error("enqueue recreate", "machine_id", m.ID, "error", err)
 		return

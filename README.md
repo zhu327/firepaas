@@ -14,6 +14,7 @@
 | 文档 | 说明 |
 |---|---|
 | [docs/architecture.md](docs/architecture.md) | 目标架构、状态权威、路由与 fencing 契约 |
+| [docs/openapi.yaml](docs/openapi.yaml) | 控制面公开 REST API 的 OpenAPI 3.0 规范（路径权威为 httpapi 路由表） |
 | [docs/adr/](docs/adr/) | 关键设计决策（Nomad 边界、调度、状态分层、网络、route catalog、内部身份、secret 路径、edge 入口、网络 fabric 等 41 篇；ADR-0040 为网络 fabric G1–G3 契约，ADR-0041 为基于并发的自动弹性） |
 | [docs/releases/README.md](docs/releases/README.md) | MVP–v1.5 的范围、实现记录与证据状态索引 |
 | [docs/mvp-plan.md](docs/mvp-plan.md) | MVP 范围、实现记录、出口和降级策略 |

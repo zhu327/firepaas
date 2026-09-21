@@ -260,7 +260,7 @@ const (
 const (
 	// secretDir：guest 内接收 secret 文件的 tmpfs 挂载点（init 在 guest
 	// agent 启动前挂载，mode 0700）。
-	secretDir = "/run/firepaas/secrets"
+	secretDir = "/run/firepaas/secrets" //nolint:gosec // G101：常量名含 secret，是 guest 内路径而非凭证
 	// secretMarkerFile：release marker（最后写入，原子放行 entrypoint gate）。
 	secretMarkerFile = secretDir + "/.delivered"
 	// secretGateTimeoutSeconds：guest init 等待 marker 的上限；覆盖 agent

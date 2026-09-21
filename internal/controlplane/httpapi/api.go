@@ -113,8 +113,6 @@ type API struct {
 	limits PrewarmLimits
 }
 
-// routeKicker 把 leader 实例 controller 的 KickRouteRebuild 递给 API 层
-// （controller 在 leader 回调内构造，无法重排到 API 之前）。
 // RouteKicker 把 leader 实例 controller 的 KickRouteRebuild 递给 HTTP 层
 // （controller 在 leader 回调内构造，无法重排到 API 之前）。
 type RouteKicker struct {
@@ -148,8 +146,6 @@ func (k *RouteKicker) Kick() (time.Duration, error, bool) {
 	return d, err, true
 }
 
-// runtimeGW 把本 API 副本的只读 agent 客户端解析递给 HTTP 层。
-// resolver 生命周期独立于 leader 任期，handover 时不会出现 follower 503 窗口。
 // RuntimeGateway 把本 API 副本的只读 agent 客户端解析递给 HTTP 层。
 // resolver 生命周期独立于 leader 任期，handover 时不会出现 follower 503 窗口。
 type RuntimeGateway struct {
@@ -378,12 +374,29 @@ func (a *API) createMachine(w http.ResponseWriter, r *http.Request) {
 			stable = body.RestartPolicy.StableWindowSeconds
 		}
 	}
-	op, err := a.store.EnsureAppAndEnqueueCreateWithLifecycle(r.Context(),
-		body.ProjectID, body.AppID, body.Hostname, body.Image, body.VCPU, body.MemMIB,
-		int64(agentv1.EffectiveDiskMib(req.Spec.GetDiskMib())),
-		body.Port, body.MachineID, body.DeploymentID, body.ExecutionID, body.OperationID,
-		body.Generation, int(body.ReplicaOrdinal), raw, placementJSON(req.Spec.Placement),
-		expiresAt, mode, maxAttempts, backoff, stable)
+	op, err := a.store.EnsureAppAndEnqueueCreateWithLifecycle(r.Context(), store.CreateMachineParams{
+		ProjectID:                  body.ProjectID,
+		AppID:                      body.AppID,
+		Hostname:                   body.Hostname,
+		ImageRef:                   body.Image,
+		VCPU:                       body.VCPU,
+		MemMIB:                     body.MemMIB,
+		DiskMIB:                    int64(agentv1.EffectiveDiskMib(req.Spec.GetDiskMib())),
+		IngressPort:                body.Port,
+		MachineID:                  body.MachineID,
+		DeploymentID:               body.DeploymentID,
+		ExecutionID:                body.ExecutionID,
+		OperationID:                body.OperationID,
+		Generation:                 body.Generation,
+		ReplicaOrdinal:             int(body.ReplicaOrdinal),
+		RequestJSON:                raw,
+		PlacementJSON:              placementJSON(req.Spec.Placement),
+		ExpiresAt:                  expiresAt,
+		RestartMode:                mode,
+		RestartMaxAttempts:         maxAttempts,
+		RestartBackoffSeconds:      backoff,
+		RestartStableWindowSeconds: stable,
+	})
 	if err != nil {
 		if errors.Is(err, store.ErrRequestConflict) {
 			writeErr(w, 409, err.Error())
@@ -642,7 +655,7 @@ func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any, maxBytes in
 // 进程环境（可变的准入参数在 cmd/api 装配期解析后传入）。
 type Config struct {
 	Store         *store.Store
-	APIToken      string
+	APIToken      string //nolint:gosec // G117：进程内配置字段，不序列化
 	AuthDisabled  bool
 	Images        *imagepolicy.Policy
 	AppCommands   *appcommand.Command

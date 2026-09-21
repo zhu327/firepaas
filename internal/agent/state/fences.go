@@ -160,7 +160,7 @@ func (f *Fences) persistLocked() error {
 	if err != nil {
 		return fmt.Errorf("marshal fences: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(f.path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(f.path), 0o700); err != nil {
 		return fmt.Errorf("create fences dir: %w", err)
 	}
 	dir := filepath.Dir(f.path)

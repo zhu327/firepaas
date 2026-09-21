@@ -48,7 +48,15 @@ func runSnapshot(args []string) error {
 		put(body, "name", *name)
 		put(body, "retention_class", *retention)
 		putAny(body, "compression_level", *level, *level >= 0)
-		return doRequest(apiClient, "POST", "/v1/machines/"+url.PathEscape(machineID)+"/snapshots", body, nil, resolveIdemKey(*idem), true)
+		return doRequest(
+			apiClient,
+			"POST",
+			"/v1/machines/"+url.PathEscape(machineID)+"/snapshots",
+			body,
+			nil,
+			resolveIdemKey(*idem),
+			true,
+		)
 	case "ls":
 		fs := flag.NewFlagSet("snapshot ls", flag.ExitOnError)
 		project := projectFlag(fs, "")
@@ -110,7 +118,15 @@ func runSnapshot(args []string) error {
 			return errors.New("usage: fpctl snapshot fork <snapshot_id> --app <app_id> --ttl <sec>")
 		}
 		body := map[string]any{"app_id": *app, "ttl_seconds": *ttl, "restore_mode": *mode}
-		return doRequest(apiClient, "POST", "/v1/snapshots/"+url.PathEscape(snapID)+"/fork", body, nil, resolveIdemKey(*idem), true)
+		return doRequest(
+			apiClient,
+			"POST",
+			"/v1/snapshots/"+url.PathEscape(snapID)+"/fork",
+			body,
+			nil,
+			resolveIdemKey(*idem),
+			true,
+		)
 	case "preflight":
 		snapID, err := oneArg(args[1:], "usage: fpctl snapshot preflight <snapshot_id> [--restore-mode M]")
 		if err != nil {
@@ -135,7 +151,15 @@ func runSnapshot(args []string) error {
 			return errors.New("usage: fpctl snapshot rescue <machine_id> --snapshot <snap_id>")
 		}
 		body := map[string]any{"snapshot_id": *snap, "restore_mode": *mode}
-		return doRequest(apiClient, "POST", "/v1/machines/"+url.PathEscape(machineID)+"/rescue", body, nil, resolveIdemKey(*idem), true)
+		return doRequest(
+			apiClient,
+			"POST",
+			"/v1/machines/"+url.PathEscape(machineID)+"/rescue",
+			body,
+			nil,
+			resolveIdemKey(*idem),
+			true,
+		)
 	default:
 		return fmt.Errorf("unknown snapshot command %q", args[0])
 	}
