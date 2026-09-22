@@ -652,3 +652,112 @@ func TestNewNormalizesDiskR(t *testing.T) {
 		t.Fatalf("placed on %s", pl.NodeID)
 	}
 }
+
+// P1 带宽硬过滤：需求超已知容量 → NoCandidates + bandwidth 审计事件；
+// 容量未知（0）→ 跳过（混合版本安全）。
+func TestBandwidthHardFilter(t *testing.T) {
+	nodes := []Node{
+		func() Node { n := healthyNode("thin", "compute", 64, 65536); n.BandwidthMbps = 100; return n }(),
+		func() Node { n := healthyNode("fat", "compute", 64, 65536); n.BandwidthMbps = 10000; return n }(),
+	}
+	p := New(DefaultBestOfKConfig(), Options{})
+	if _, err := p.Place(Request{VCPU: 1, MemMib: 512, BandwidthMbps: 50000},
+		nodes, rand.New(rand.NewSource(1))); err == nil {
+		t.Fatal("want ErrNoCandidates when demand exceeds all known capacity")
+	} else {
+		var nce ErrNoCandidates
+		if !errors.As(err, &nce) {
+			t.Fatalf("want ErrNoCandidates, got %T (%v)", err, err)
+		}
+	}
+	pl, err := p.Place(Request{VCPU: 1, MemMib: 512, BandwidthMbps: 500},
+		nodes, rand.New(rand.NewSource(1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pl.NodeID != "fat" {
+		t.Fatalf("want fat pipe, got %s", pl.NodeID)
+	}
+	var sawBW bool
+	for _, ev := range pl.Events {
+		if ev.Kind == "filter_rejection" && ev.NodeID == "thin" && strings.Contains(ev.Reason, "bandwidth:") {
+			sawBW = true
+		}
+	}
+	if !sawBW {
+		t.Fatalf("want bandwidth filter rejection event, got %+v", pl.Events)
+	}
+	// 容量未知节点永不因带宽被过滤。
+	unknown := []Node{healthyNode("legacy", "compute", 64, 65536)}
+	if _, err := p.Place(Request{VCPU: 1, MemMib: 512, BandwidthMbps: 50000},
+		unknown, rand.New(rand.NewSource(1))); err != nil {
+		t.Fatalf("unknown capacity must skip bandwidth filter, got %v", err)
+	}
+}
+
+// P1 带宽打分：同等 CPU/内存下，大管道节点排名靠前（PrefetchTopK 按分排序，确定性）。
+func TestBandwidthScoringPrefersFatPipe(t *testing.T) {
+	nodes := []Node{
+		func() Node { n := healthyNode("thin", "compute", 64, 65536); n.BandwidthMbps = 1000; return n }(),
+		func() Node { n := healthyNode("fat", "compute", 64, 65536); n.BandwidthMbps = 10000; return n }(),
+	}
+	p := New(DefaultBestOfKConfig(), Options{})
+	top := p.PrefetchTopK(Request{VCPU: 1, MemMib: 512, BandwidthMbps: 500}, nodes, 2)
+	if len(top) != 2 || top[0].ID != "fat" {
+		t.Fatalf("want fat pipe ranked first, got %+v", top)
+	}
+	// 无带宽需求时带宽项恒 0：同分按 ID 确定性排序（零回归）。
+	top = p.PrefetchTopK(Request{VCPU: 1, MemMib: 512}, nodes, 2)
+	if len(top) != 2 || top[0].ID != "fat" || top[1].ID != "thin" {
+		t.Fatalf("no-demand ranking changed: %+v", top)
+	}
+}
+
+// P1 topology 反亲和：同 deployment 已占机架的节点被罚分，新机架优先；
+// 未知机架不罚；永不触发 NoCandidates（纯打分层）。
+func TestRackAntiAffinityScoring(t *testing.T) {
+	nodes := []Node{
+		func() Node { n := healthyNode("r1n1", "compute", 64, 65536); n.Rack = "r1"; return n }(),
+		func() Node { n := healthyNode("r2n1", "compute", 64, 65536); n.Rack = "r2"; return n }(),
+		func() Node { n := healthyNode("norack", "compute", 64, 65536); return n }(),
+	}
+	p := New(DefaultBestOfKConfig(), Options{})
+	req := Request{
+		VCPU: 1, MemMib: 512, DeploymentID: "dep",
+		AntiAffinity: true,
+		// 机架 r1 被同 deployment 的其它节点占据（本候选集外）：r1n1 只吃
+		// 打分罚项，不吃节点级硬过滤（ExistingDeploymentNodes 为空）。
+		ExistingDeploymentRacks: map[string]bool{"r1": true},
+	}
+	top := p.PrefetchTopK(req, nodes, 3)
+	if len(top) != 3 {
+		t.Fatalf("topk = %+v, want 3 (soft penalty must not filter)", top)
+	}
+	if top[2].ID != "r1n1" {
+		t.Fatalf("occupied rack must rank last: %+v", top)
+	}
+	// 显式关闭：负值哨兵归一为 0，占机架不再被罚。
+	off := New(BestOfKConfig{WeightRack: -1}, Options{})
+	topOff := off.PrefetchTopK(req, nodes, 3)
+	if topOff[0].ID != "norack" && topOff[0].ID != "r1n1" {
+		// 全等分（除 ID 外）→ 按 ID 排序，r1n1 首位可接受；关键不断言罚分存在。
+		t.Logf("disabled rack ranking: %+v", topOff)
+	}
+	if got := off.Config().WeightRack; got != 0 {
+		t.Fatalf("WeightRack sentinel not normalized to 0, got %v", got)
+	}
+}
+
+// P1 权重哨兵：负值 = 显式关闭（配置面 0 翻译而来），0 = 未配置 → 默认。
+func TestWeightSentinelNormalization(t *testing.T) {
+	off := New(BestOfKConfig{WeightBandwidth: -1, WeightRack: -1, WeightZone: -1}, Options{})
+	cfg := off.Config()
+	if cfg.WeightBandwidth != 0 || cfg.WeightRack != 0 || cfg.WeightZone != 0 {
+		t.Fatalf("sentinels not disabled: %+v", cfg)
+	}
+	def := New(BestOfKConfig{}, Options{})
+	dcfg := def.Config()
+	if dcfg.WeightBandwidth != 0.25 || dcfg.WeightRack != 0.25 || dcfg.WeightZone != 0.25 {
+		t.Fatalf("defaults not applied: %+v", dcfg)
+	}
+}

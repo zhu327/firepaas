@@ -63,6 +63,7 @@ import (
 	"github.com/zhu327/firepaas/internal/security/mtls"
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 	"github.com/zhu327/firepaas/shared/pkg/env"
+	"github.com/zhu327/firepaas/shared/pkg/h2transport"
 	"github.com/zhu327/firepaas/shared/pkg/logging"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -763,6 +764,9 @@ func run() error {
 		TLSConfig:         proxyTLS,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       90 * time.Second, // 与 cmd/edge-proxy 同值
+		// P1（gRPC workload）：明文开发模式启用服务端 h2c（标准库 Protocols
+		// 原生同端口双协议）；mTLS 路径 nil（ALPN 默认协商 H2）。
+		Protocols: h2transport.ServerProtocols(proxyTLS),
 	}
 	go func() {
 		slog.Info("agentd workload proxy listening", "addr", proxyServer.Addr, "mtls", proxyTLS != nil)

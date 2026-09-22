@@ -25,6 +25,7 @@ import (
 	"github.com/zhu327/firepaas/internal/controlplane/catalog"
 	"github.com/zhu327/firepaas/internal/controlplane/traffic"
 	"github.com/zhu327/firepaas/internal/edge/mesh"
+	"github.com/zhu327/firepaas/shared/pkg/h2transport"
 )
 
 const (
@@ -308,34 +309,106 @@ func (t *inflightTracker) snapshot() map[string]int64 {
 	return out
 }
 
+// effectiveWeight 归一 backend 权重：<=0 视为 1。旧投影缺 weight 字段时
+// 反序列化为 0，仍须参与均分（全零即等权）；下线用 Draining 标志表达，
+// 不复用 weight=0（publisher 侧永不写 0，避免“缺字段”与“摘流”歧义）。
+func effectiveWeight(b catalog.Backend) int {
+	if b.Weight <= 0 {
+		return 1
+	}
+	return b.Weight
+}
+
+// inflightCandidate 是加权选择的行视图（selectAndAcquire 内部使用）。
+type inflightCandidate struct {
+	backend  catalog.Backend
+	inflight int64
+	weight   int
+}
+
+// selectAndAcquire 在 hard 限内选择一个 backend 并占用一个 inflight 名额。
+//
+// 两条路径：
+//   - 候选权重全等（典型全 100，含旧投影缺字段归一为 1）：在“inflight 最小”
+//     的集合内均匀抽样，即 ADR-0020 的 least-inflight 语义，逐字节不变；
+//   - 权重分化（灰度，canary 权重由 publisher 写入投影）：先排除达 hard 的
+//     backend，再按 weight/(1+inflight) 归一化抽样（ADR-0043 §3）——期望
+//     流量比≈代权重比，且更闲的副本在同代内多拿流量；不做 min-inflight
+//     过滤（min 集会收敛到 inflight 均等、冲掉权重比例），突发偏斜由 hard
+//     及后续本地队列兜底。
 func (t *inflightTracker) selectAndAcquire(bs []catalog.Backend, hard int64) (catalog.Backend, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	min := int64(-1)
-	candidates := make([]catalog.Backend, 0, len(bs))
+	eligible := make([]inflightCandidate, 0, len(bs))
 	for _, b := range bs {
-		n := int64(0)
+		var n int64
 		if e := t.entries[b.MachineID]; e != nil {
 			n = e.count.Load()
 		}
-		if min < 0 || n < min {
-			min = n
-			candidates = append(candidates[:0], b)
-		} else if n == min {
-			candidates = append(candidates, b)
+		if n >= hard {
+			continue
 		}
+		eligible = append(eligible, inflightCandidate{backend: b, inflight: n, weight: effectiveWeight(b)})
 	}
-	if min >= hard {
+	if len(eligible) == 0 {
 		return catalog.Backend{}, true
 	}
-	chosen := candidates[rand.Intn(len(candidates))]
-	e := t.entries[chosen.MachineID]
+	if allEqualWeights(eligible) {
+		min := eligible[0].inflight
+		for _, c := range eligible[1:] {
+			if c.inflight < min {
+				min = c.inflight
+			}
+		}
+		pool := eligible[:0]
+		for _, c := range eligible {
+			if c.inflight == min {
+				pool = append(pool, c)
+			}
+		}
+		return t.acquireLocked(pool[rand.Intn(len(pool))].backend), false
+	}
+	// 加权 + inflight 阻尼：权重除以 (1+inflight) 后归一化抽取。
+	total := 0.0
+	for _, c := range eligible {
+		total += dampedWeight(c)
+	}
+	pick := rand.Float64() * total
+	for _, c := range eligible {
+		pick -= dampedWeight(c)
+		if pick < 0 {
+			return t.acquireLocked(c.backend), false
+		}
+	}
+	// 防御：浮点区间划分不可能落到此处；万一落到取末位，绝不返回零值 backend。
+	return t.acquireLocked(eligible[len(eligible)-1].backend), false
+}
+
+// dampedWeight 是加权路径的单 backend 抽样权重：weight/(1+inflight)。
+// 权重≥1、inflight≥0，分母恒 >0。
+func dampedWeight(c inflightCandidate) float64 {
+	return float64(c.weight) / float64(1+c.inflight)
+}
+
+// allEqualWeights 判定候选权重是否全等（等权即沿用历史最小 inflight 语义）。
+func allEqualWeights(cs []inflightCandidate) bool {
+	for _, c := range cs[1:] {
+		if c.weight != cs[0].weight {
+			return false
+		}
+	}
+	return true
+}
+
+// acquireLocked 在持有 t.mu 时为 backend 累加 inflight（调用方持有锁）。
+func (t *inflightTracker) acquireLocked(b catalog.Backend) catalog.Backend {
+	e := t.entries[b.MachineID]
 	if e == nil {
 		e = &inflightEntry{}
-		t.entries[chosen.MachineID] = e
+		t.entries[b.MachineID] = e
 	}
 	e.count.Add(1)
-	return chosen, false
+	return b
 }
 
 // Config provides the complete edge HTTP lifecycle dependencies.
@@ -397,6 +470,28 @@ var (
 	errPinMiss         = errors.New("pinned machine is not eligible")
 	errHardLimit       = errors.New("backend hard concurrency limit")
 )
+
+// newAgentRoundTripper 构造 edge→agent 的转发 Transport：
+//   - base：标准 Transport（拨号 3s + 首字节 30s，与 mesh.Transport 同口径；
+//     ForceAttemptHTTP2=true：自定义 Dialer/TLSConfig 下仍经 ALPN 协商 H2，
+//     否则 gRPC over mTLS 退化为 HTTP/1.1）；
+//   - gRPC 明文（h2c，mTLS 未启用/开发联调）经 h2transport 分流到
+//     prior-knowledge H2，其余走 base（见 shared/pkg/h2transport 的协商说明）。
+func newAgentRoundTripper(tlsCfg *tls.Config) http.RoundTripper {
+	base := &http.Transport{
+		TLSClientConfig:     tlsCfg,
+		MaxIdleConns:        64,
+		MaxIdleConnsPerHost: 64,
+		IdleConnTimeout:     30 * time.Second,
+		// W2-6：与 mesh.Transport 同口径——拨号 3s（节点失联/WG 断链时
+		// SYN 无 RST，OS 默认重试会吞掉请求预算）+ 首字节 30s（半开连接
+		// 兜底）。不改 retry/header 语义。
+		DialContext:           (&net.Dialer{Timeout: 3 * time.Second}).DialContext,
+		ResponseHeaderTimeout: 30 * time.Second,
+		ForceAttemptHTTP2:     true,
+	}
+	return h2transport.New(base)
+}
 
 func NewHandler(cfg Config) *Handler {
 	if cfg.Counters == nil {
@@ -542,17 +637,7 @@ func NewHandler(cfg Config) *Handler {
 			return nil
 		},
 		ErrorHandler: h.handleProxyError,
-		Transport: &http.Transport{
-			TLSClientConfig:     cfg.AgentTLS,
-			MaxIdleConns:        64,
-			MaxIdleConnsPerHost: 64,
-			IdleConnTimeout:     30 * time.Second,
-			// W2-6：与 mesh.Transport 同口径——拨号 3s（节点失联/WG 断链时
-			// SYN 无 RST，OS 默认重试会吞掉请求预算）+ 首字节 30s（半开连接
-			// 兜底）。不改 retry/header 语义；ForceAttemptHTTP2 保持默认。
-			DialContext:           (&net.Dialer{Timeout: 3 * time.Second}).DialContext,
-			ResponseHeaderTimeout: 30 * time.Second,
-		},
+		Transport:    newAgentRoundTripper(cfg.AgentTLS),
 	}
 	return h
 }

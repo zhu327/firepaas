@@ -38,19 +38,33 @@ type BestOfKConfig struct {
 	// WeightImage（v1.1，ADR-0018）：镜像缓存亲和罚项权重，默认 0.5。
 	// 只在打分层生效（任何节点都不因镜像未缓存被过滤）。
 	WeightImage float64
+	// WeightBandwidth（P1）：带宽项权重，默认 0.25。demand/capacity 形态
+	// （req.BandwidthMbps/node.BandwidthMbps，越小越好）；无带宽需求或节点
+	// 容量未知时该项恒 0（需求门控；混合版本安全）。显式关闭传负值哨兵
+	// （配置面 =0 即按此处理），0 = 未配置 → 默认。
+	WeightBandwidth float64
+	// WeightRack/WeightZone（P1）：topology 反亲和软罚项权重，默认 0.25。
+	// 同 deployment 已占机架/可用区的节点各 +1 罚项；未知机架（空）不罚。
+	// 只在打分层生效（永不触发 NoCandidates）。显式关闭传负值哨兵（见 New；
+	// 配置面 FIREPAAS_SCHED_WEIGHT_RACK=0 即按此处理），0 = 未配置 → 默认。
+	WeightRack float64
+	WeightZone float64
 }
 
 // DefaultBestOfKConfig 返回默认参数（对齐 e2b）。
 func DefaultBestOfKConfig() BestOfKConfig {
 	return BestOfKConfig{
-		R:           4,
-		MemR:        1.0,
-		DiskR:       1.0,
-		K:           3,
-		Alpha:       0.5,
-		WeightCPU:   0.5,
-		WeightMem:   0.5,
-		WeightImage: 0.5,
+		R:               4,
+		MemR:            1.0,
+		DiskR:           1.0,
+		K:               3,
+		Alpha:           0.5,
+		WeightCPU:       0.5,
+		WeightMem:       0.5,
+		WeightImage:     0.5,
+		WeightBandwidth: 0.25,
+		WeightRack:      0.25,
+		WeightZone:      0.25,
 	}
 }
 
@@ -96,6 +110,14 @@ type Node struct {
 	// FeatureIDs（v1.2-A，ADR-0023）：节点上报的 runtime capability 集合。
 	// nil = 未上报/无能力（任何 required feature 都不满足）。
 	FeatureIDs map[string]bool
+	// BandwidthMbps（P1）：节点出网带宽容量（Mbps，labels bandwidth_mbps）。
+	// 0 = 未知（未设标签/旧 agent）：未知容量永不因带宽被过滤（与
+	// DiskTotalMib==0 的混合版本策略一致）。
+	BandwidthMbps uint64
+	// Rack/Zone（P1）：topology 标签（labels rack/zone）。空 = 未知（不罚，
+	// 也不作为反亲和依据）。
+	Rack string
+	Zone string
 }
 
 // Request 是一次放置请求（来自 MachineSpec.placement + 资源需求）。
@@ -119,6 +141,17 @@ type Request struct {
 	// ImageDigest（v1.1，ADR-0018）：目标镜像 digest（image_ref 的 @ 后缀）。
 	// 空 = 不启用镜像亲和罚项。
 	ImageDigest string
+	// BandwidthMbps（P1）：本次放置的带宽需求（Mbps）。0 = 无需求（当前控制面
+	// 未采集需求恒 0；agent NodeCapacity 带宽上报 + MachineSpec 需求字段是后续
+	// proto 扩展，见 capacity-model 缺口记录）。有需求时：已知容量不足的节点被
+	// 硬过滤，未知容量节点跳过（混合版本安全）。
+	BandwidthMbps uint64
+	// ExistingDeploymentRacks/Zones（P1）：同 deployment 已占机架/可用区
+	// （控制面从 PG 推导）。topology 反亲和只做打分层软罚项（永不触发
+	// NoCandidates），nil/空 = 不启用。
+	ExistingDeploymentRacks map[string]bool
+	// ExistingDeploymentZones 同上（可用区维度）。
+	ExistingDeploymentZones map[string]bool
 	// RequiredFeatures（v1.2-A，ADR-0023）：启动正确性能力硬过滤。控制面从
 	// deployment 语义推导（客户端不得直接声明内部 feature）。空 = 无要求。
 	RequiredFeatures []string
@@ -183,6 +216,23 @@ func New(cfg BestOfKConfig, opts Options) *Placer {
 	}
 	if cfg.WeightImage == 0 && !opts.ImageAffinityDisabled {
 		cfg.WeightImage = DefaultBestOfKConfig().WeightImage
+	}
+	// 带宽/topology 权重：负值 = 显式关闭（配置面 0 翻译而来），0 = 未配置 → 默认。
+	if cfg.WeightBandwidth < 0 {
+		cfg.WeightBandwidth = 0
+	} else if cfg.WeightBandwidth == 0 {
+		cfg.WeightBandwidth = DefaultBestOfKConfig().WeightBandwidth
+	}
+	// topology 权重：负值 = 显式关闭（配置面 0 翻译而来），0 = 未配置 → 默认。
+	if cfg.WeightRack < 0 {
+		cfg.WeightRack = 0
+	} else if cfg.WeightRack == 0 {
+		cfg.WeightRack = DefaultBestOfKConfig().WeightRack
+	}
+	if cfg.WeightZone < 0 {
+		cfg.WeightZone = 0
+	} else if cfg.WeightZone == 0 {
+		cfg.WeightZone = DefaultBestOfKConfig().WeightZone
 	}
 	return &Placer{cfg: cfg, opts: opts}
 }
@@ -287,6 +337,14 @@ func (p *Placer) evaluateCandidates(req Request, nodes []Node, opts candidateEva
 		}
 		return ""
 	})
+	// P1 带宽硬过滤（独立审计原因）：有需求且容量已知且需求超容量。
+	// 未知容量（BandwidthMbps==0）跳过——混合版本安全。
+	candidates = filter(candidates, func(n Node) string {
+		if bandwidthExceeded(n, req) {
+			return fmt.Sprintf("bandwidth: need %dMbps exceeds node %dMbps", req.BandwidthMbps, n.BandwidthMbps)
+		}
+		return ""
+	})
 	candidates = filter(candidates, func(n Node) string {
 		if req.RequiredNodeID != "" && n.ID != req.RequiredNodeID {
 			return "volume locality mismatch"
@@ -367,24 +425,36 @@ func (p *Placer) Place(req Request, nodes []Node, rnd *rand.Rand) (Placement, er
 // v1.1（ADR-0018）：增加镜像缓存亲和软罚项 WeightImage·imageMiss——目标镜像
 // digest 在节点缓存内 = 0，不在 = 1；节点缓存未知（nil）不罚。亲和只出现在
 // 打分层，任何节点都不因镜像未缓存被过滤（否则新镜像永远无候选）。
+// P1：增加带宽项 WeightBandwidth·(req/node)（无需求或容量未知时为 0）与
+// topology 反亲和软罚项（同 deployment 已占机架/可用区各 +1 权重；未知机架不罚）。
+// 三者都只在打分层生效，永不触发 NoCandidates。
 func (p *Placer) score(n Node, req Request) float64 {
 	cpuCap := float64(n.CPUTotal) * p.cfg.R
 	memCap := float64(n.MemTotalMib) * p.cfg.MemR
 	usageCPU := n.CPUPercent / 100 * float64(n.CPUTotal) // 折算为“占用 vcpu 数”
 	cpu := (float64(req.VCPU+uint64(n.CPUAllocated)+uint64(n.CPUPending)) + p.cfg.Alpha*usageCPU) / cpuCap
 	mem := (float64(req.MemMib+n.MemAllocated+n.MemPending) + p.cfg.Alpha*float64(n.MemUsedMib)) / memCap
-	base := p.cfg.WeightCPU*cpu + p.cfg.WeightMem*mem
-	if req.ImageDigest == "" || p.cfg.WeightImage == 0 {
-		return base
+	s := p.cfg.WeightCPU*cpu + p.cfg.WeightMem*mem
+	if req.ImageDigest != "" && p.cfg.WeightImage != 0 {
+		// 注：nil（未上报）与空集合同罚——proto3 repeated 无法区分“未知”与
+		// “空”，且节点视图均来自已上报 ServiceInfo 的 agent（20s 内必有缓存
+		// 视图）；不罚会让未上报者永远战胜已缓存节点，亲和失效。
+		miss := 1.0
+		if n.CachedImageDigests[req.ImageDigest] {
+			miss = 0
+		}
+		s += p.cfg.WeightImage * miss
 	}
-	// 注：nil（未上报）与空集合同罚——proto3 repeated 无法区分“未知”与
-	// “空”，且节点视图均来自已上报 ServiceInfo 的 agent（20s 内必有缓存
-	// 视图）；不罚会让未上报者永远战胜已缓存节点，亲和失效。
-	miss := 1.0
-	if n.CachedImageDigests[req.ImageDigest] {
-		miss = 0
+	if req.BandwidthMbps > 0 && n.BandwidthMbps > 0 && p.cfg.WeightBandwidth != 0 {
+		s += p.cfg.WeightBandwidth * float64(req.BandwidthMbps) / float64(n.BandwidthMbps)
 	}
-	return base + p.cfg.WeightImage*miss
+	if p.cfg.WeightRack != 0 && n.Rack != "" && req.ExistingDeploymentRacks[n.Rack] {
+		s += p.cfg.WeightRack
+	}
+	if p.cfg.WeightZone != 0 && n.Zone != "" && req.ExistingDeploymentZones[n.Zone] {
+		s += p.cfg.WeightZone
+	}
+	return s
 }
 
 // canFit 硬准入：allocated+pending+req ≤ R·capacity（内存 R=MemR）。
@@ -409,6 +479,12 @@ func canFit(n Node, req Request, cfg BestOfKConfig) bool {
 		}
 	}
 	return true
+}
+
+// bandwidthExceeded 判定带宽硬过滤：有需求（req>0）且容量已知（node>0）
+// 且需求超容量。任一为 0 即未知/无需求 → 不过滤。
+func bandwidthExceeded(n Node, req Request) bool {
+	return req.BandwidthMbps > 0 && n.BandwidthMbps > 0 && req.BandwidthMbps > n.BandwidthMbps
 }
 
 func labelsMatch(nodeLabels, want map[string]string) bool {

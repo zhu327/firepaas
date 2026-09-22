@@ -26,6 +26,15 @@ info:
     部分资源（machine/app/node/operation 等）直接序列化 store 模型，字段为
     Go 默认的 **PascalCase**（如 `ID`、`AppID`、`Hostname`、`DesiredState`），
     与请求体的 snake_case 不一致。本文件对这些资源按其真实返回形状记录。
+
+    ## 弃用政策
+    弃用 ≠ 删除：弃用端点保持全功能至少两个 minor 版本；删除前先公告 Sunset
+    日期。机器信号：`Deprecation` 头（RFC 8594，弃用生效时间）+ `Sunset` 头
+    （计划删除日期）+ `Link: <successor>; rel="successor-version"`。响应体不加
+    弃用字段（避免破坏严格客户端）。登记点唯一：
+    `internal/controlplane/httpapi/deprecation.go`（handler 入口调 markDeprecated）。
+    当前弃用：`POST /v1/machines`（M2 单机直建；替代为 `POST /v1/apps` +
+    `POST /v1/apps/{id}/deployments`）。
 servers:
   - url: http://localhost:8080
     description: 本地/实验室默认
@@ -81,9 +90,16 @@ paths:
   /v1/machines:
     get:
       tags: [machines]
-      summary: 列出机器
+      summary: 列出机器（keyset 分页）
       parameters:
         - $ref: "#/components/parameters/ProjectQuery"
+        - name: limit
+          in: query
+          schema: { type: integer, default: 200, maximum: 1000 }
+        - name: cursor
+          in: query
+          schema: { type: string }
+          description: 上一页的 next_cursor（本页从其之后开始）
       responses:
         "200":
           description: OK
@@ -95,9 +111,16 @@ paths:
                   machines:
                     type: array
                     items: { $ref: "#/components/schemas/Machine" }
+                  next_cursor:
+                    type: string
+                    description: 下一页 cursor（空 = 末页）
     post:
       tags: [machines]
-      summary: 创建机器（期望副本）
+      summary: 创建机器（期望副本）[已弃用：用 POST /v1/apps + deploy]
+      deprecated: true
+      description: |
+        M2 单机直建（自动派生 app/deployment，绕过 rollout 状态机）仍全功能，
+        但新调用方请用 app 模型。响应带 Deprecation + Link rel="successor-version" 头。
       requestBody:
         required: true
         content:
@@ -371,7 +394,12 @@ paths:
     post:
       tags: [apps]
       summary: 调整期望副本数
-      parameters: [{ $ref: "#/components/parameters/AppID" }]
+      parameters:
+        - $ref: "#/components/parameters/AppID"
+        - name: If-Match
+          in: header
+          schema: { type: string }
+          description: 可选乐观并发。前提 `"replicas-N-<ts>"`（N/ts=GET app ETag 所见 desired 与更新时间戳，ts 为 RFC 3339 形态，如 `2026-09-22T10:00:00+00`）仅当两者仍匹配时接管；`*`/缺省 = 无条件。失配 412；解析失败 400。
       requestBody:
         required: true
         content:
@@ -382,7 +410,13 @@ paths:
               properties:
                 replicas: { type: integer, minimum: 1, maximum: 100 }
       responses:
-        "202": { description: 已接管并更新期望副本数 }
+        "202":
+          description: 已接管并更新期望副本数
+          headers:
+            ETag:
+              schema: { type: string }
+              description: 写后新值 ETag（`"replicas-N-<ts>"`），供下次 scale 做 If-Match（免一次 GET）
+        "412": { description: desired/时间戳已被他人修改（前提失配，含 ABA 回绕），重读后重试 }
   /v1/apps/{id}/rollback:
     post:
       tags: [deployments]
@@ -1112,6 +1146,17 @@ components:
           type: object
           additionalProperties: { type: string }
         anti_affinity: { type: string, enum: [NONE, DEPLOYMENT] }
+        canary_weight:
+          type: integer
+          minimum: 0
+          maximum: 99
+          description: |
+            按权重灰度（显式 opt-in）：to 代在 PREPARING 混合代窗口内的流量
+            份额（1-99）；0/缺省 = 不启用（全部 backend 权重 100，历史行为）。
+            仅 strategy=rolling 允许非 0（bluegreen 的 PREPARING 只发布旧代，
+            传非 0 会 400）；份额按代内可发布 backend 均分，实际代间比例 =
+            两代可服务 backend 数之比 × 权重之比，随 rolling 按 ordinal 切流
+            逐步变化（不是窗口内恒定百分比）。
         health_check: { $ref: "#/components/schemas/HealthCheck" }
         secret_refs:
           type: object

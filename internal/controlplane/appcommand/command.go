@@ -90,6 +90,10 @@ type Intent struct {
 	InheritAll bool
 	// ReadActiveFirst preserves the secret-ref endpoint's historical lookup order.
 	ReadActiveFirst bool
+	// CanaryWeight（P1 按权重灰度，显式 opt-in）：to-generation 在 PREPARING
+	// 混合代窗口内的流量份额（1..99）；0 = 未启用（历史行为）。非法值由
+	// Execute 拒绝（400）。
+	CanaryWeight int
 }
 
 type Result struct {
@@ -167,8 +171,30 @@ func (c *Command) Execute(ctx context.Context, in Intent) (Result, error) {
 	deployment.ID = fmt.Sprintf("dep-%s-%d", app.ID, generation)
 	deployment.AppID = app.ID
 	deployment.Status = "PREPARING"
+	// P1 按权重灰度（显式 opt-in）：非法值 fail-closed 拒绝，不写库；
+	// 0 = 不启用，行为与加权前一致。权重只在 PREPARING 同时发布新旧两代
+	// 的混合代窗口生效（rolling 按 ordinal 切流）；bluegreen 的 PREPARING
+	// 只发布旧代，带上该参数是静默无效果，故直接拒绝。
+	if in.CanaryWeight < 0 || in.CanaryWeight > 99 {
+		return Result{}, invalid(
+			errors.New("canary_weight must be in [0,99] (0 = canary weighting disabled)"),
+		)
+	}
+	if in.CanaryWeight > 0 && deployment.Strategy != "rolling" {
+		return Result{}, invalid(
+			errors.New(
+				"canary_weight requires strategy=rolling (only rolling serves both generations during PREPARING)",
+			),
+		)
+	}
 	rolloutID := "rollout-" + c.newID()
-	rollout := store.Rollout{ID: rolloutID, AppID: app.ID, FromGeneration: active.Generation, ToGeneration: generation}
+	rollout := store.Rollout{
+		ID:             rolloutID,
+		AppID:          app.ID,
+		FromGeneration: active.Generation,
+		ToGeneration:   generation,
+		CanaryWeight:   store.NormalizeCanaryWeight(in.CanaryWeight),
+	}
 	if err := c.store.DeployApp(ctx, deployment, rollout, generation); err != nil {
 		if errors.Is(err, store.ErrRolloutBusy) {
 			return Result{}, ErrRolloutBusy

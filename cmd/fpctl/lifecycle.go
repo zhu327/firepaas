@@ -13,6 +13,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -28,8 +29,9 @@ func runMachines(args []string) error {
 	case "ls":
 		fs := flag.NewFlagSet("machines ls", flag.ExitOnError)
 		project := projectFlag(fs, "")
+		limit := fs.Int("limit", 200, "page size for each request (max 1000)")
 		_ = fs.Parse(args[1:])
-		return do("GET", withQuery("/v1/machines", map[string]string{"project_id": *project}), nil, nil)
+		return listAllMachines(*project, *limit)
 	case "show":
 		return getByID(args[1:], "usage: fpctl machines show <machine_id>", "/v1/machines")
 	case "rm":
@@ -41,6 +43,40 @@ func runMachines(args []string) error {
 	default:
 		return fmt.Errorf("unknown machines command %q", args[0])
 	}
+}
+
+// listAllMachines 跟随 next_cursor 拉全量（服务端 keyset 分页；旧服务端无
+// next_cursor 时单次返回）。输出合并后的 {"machines": [...]}（与分页前同形）。
+func listAllMachines(project string, limit int) error {
+	var all []json.RawMessage
+	cursor := ""
+	for {
+		q := map[string]string{"project_id": project, "limit": strconv.Itoa(limit)}
+		if cursor != "" {
+			q["cursor"] = cursor
+		}
+		var env struct {
+			Machines   []json.RawMessage `json:"machines"`
+			NextCursor string            `json:"next_cursor"`
+		}
+		if err := doRequest(apiClient, "GET", withQuery("/v1/machines", q), nil, &env, "", false); err != nil {
+			return err
+		}
+		all = append(all, env.Machines...)
+		if env.NextCursor == "" {
+			break
+		}
+		cursor = env.NextCursor
+	}
+	if all == nil {
+		all = []json.RawMessage{}
+	}
+	raw, err := json.Marshal(map[string]any{"machines": all})
+	if err != nil {
+		return err
+	}
+	printJSON(raw)
+	return nil
 }
 
 func runWait(args []string) error {

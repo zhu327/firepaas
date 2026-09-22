@@ -101,6 +101,140 @@ func TestSelectAndAcquireHonorsHardLimitAtomically(t *testing.T) {
 	}
 }
 
+// 等权时沿用历史最小 inflight 语义：忙 backend 不被选中（least-conn 零回归）。
+func TestSelectAndAcquireEqualWeightLeastConn(t *testing.T) {
+	h := testHandler(nil, 100000)
+	busy := testBackend("busy", "s")
+	busy.Weight = 50
+	idle := testBackend("idle", "s")
+	idle.Weight = 50
+	for i := 0; i < 10; i++ {
+		h.inflight.acquire("busy")
+	}
+	for i := 0; i < 20; i++ {
+		chosen, over := h.inflight.selectAndAcquire([]catalog.Backend{busy, idle}, 100000)
+		if over {
+			t.Fatal("unexpected hard-limit over")
+		}
+		if chosen.MachineID != "idle" {
+			t.Fatalf("equal weights must prefer least inflight, chose %s", chosen.MachineID)
+		}
+		h.inflight.release(chosen.MachineID)
+	}
+}
+
+// 按权重灰度：90/10 权重下 canary backend 的选中占比应落在统计区间内
+// （二项分布 2000 次采样，p=0.1，±3σ≈±2%，取宽松 ±5% 避免 flake）。
+func TestSelectAndAcquireWeightedDistribution(t *testing.T) {
+	h := testHandler(nil, 100000)
+	stable := testBackend("stable", "s")
+	stable.Weight = 90
+	canary := testBackend("canary", "c")
+	canary.Weight = 10
+	const n = 2000
+	canaryHits := 0
+	for i := 0; i < n; i++ {
+		chosen, over := h.inflight.selectAndAcquire([]catalog.Backend{stable, canary}, 100000)
+		if over {
+			t.Fatal("unexpected hard-limit over")
+		}
+		if chosen.MachineID == "canary" {
+			canaryHits++
+		}
+		h.inflight.release(chosen.MachineID)
+	}
+	ratio := float64(canaryHits) / n
+	if ratio < 0.05 || ratio > 0.15 {
+		t.Fatalf("canary ratio=%.3f want in [0.05,0.15]", ratio)
+	}
+}
+
+// 加权路径带 inflight 阻尼（ADR-0043 §3）：慢 canary（高 inflight）即使权重
+// 相同也几乎不再被选中——不会先堆到 hard 上限才摘流。
+func TestSelectAndAcquireWeightedDampsSlowBackend(t *testing.T) {
+	h := testHandler(nil, 1_000_000)
+	stable := testBackend("stable", "s")
+	stable.Weight = 50
+	slow := testBackend("slow", "s")
+	slow.Weight = 50
+	h.inflight.mu.Lock()
+	slowEntry := &inflightEntry{}
+	slowEntry.count.Add(1_000_000)
+	h.inflight.entries["slow"] = slowEntry
+	h.inflight.mu.Unlock()
+	// 阻尼后 slow 的抽样权重 = 50/(1+1e6) ≈ 5e-5，1000 次采样命中概率 <1e-4。
+	for i := 0; i < 1000; i++ {
+		chosen, over := h.inflight.selectAndAcquire([]catalog.Backend{stable, slow}, 1_000_000)
+		if over {
+			t.Fatal("unexpected hard-limit over")
+		}
+		if chosen.MachineID != "stable" {
+			t.Fatalf("damped slow backend selected (%s): weight/(1+inflight) not applied", chosen.MachineID)
+		}
+		h.inflight.release(chosen.MachineID)
+	}
+}
+
+// dampedWeight 是抽样权重：inflight 越高越小（软 least-inflight），权重线性。
+func TestDampedWeight(t *testing.T) {
+	if got := dampedWeight(inflightCandidate{weight: 100}); got != 100 {
+		t.Fatalf("idle damped weight = %v, want 100", got)
+	}
+	if got := dampedWeight(inflightCandidate{weight: 100, inflight: 9}); got != 10 {
+		t.Fatalf("damped weight = %v, want 10", got)
+	}
+	if low, high := dampedWeight(inflightCandidate{weight: 50, inflight: 3}), dampedWeight(inflightCandidate{weight: 50, inflight: 1}); low >= high {
+		t.Fatalf("damping not monotonic: %v >= %v", low, high)
+	}
+}
+
+// 权重缺失（旧投影反序列化为 0）视为 1 参与均分，不饿死。
+func TestSelectAndAcquireZeroWeightNotStarved(t *testing.T) {
+	h := testHandler(nil, 100000)
+	a := testBackend("a", "s")
+	a.Weight = 0
+	b := testBackend("b", "s")
+	b.Weight = 0
+	seen := map[string]int{}
+	for i := 0; i < 200; i++ {
+		chosen, over := h.inflight.selectAndAcquire([]catalog.Backend{a, b}, 100000)
+		if over {
+			t.Fatal("unexpected hard-limit over")
+		}
+		seen[chosen.MachineID]++
+		h.inflight.release(chosen.MachineID)
+	}
+	if seen["a"] == 0 || seen["b"] == 0 {
+		t.Fatalf("zero-weight backends starved: %v", seen)
+	}
+}
+
+// 已达硬限的 backend 被排除在加权之外；全部达限才报 over（与旧 min>=hard 同条件）。
+func TestSelectAndAcquireExcludesHardLimited(t *testing.T) {
+	h := testHandler(nil, 2)
+	full := testBackend("full", "s")
+	full.Weight = 90
+	free := testBackend("free", "s")
+	free.Weight = 10
+	h.inflight.acquire("full")
+	h.inflight.acquire("full") // 2/2 达限
+	for i := 0; i < 20; i++ {
+		chosen, over := h.inflight.selectAndAcquire([]catalog.Backend{full, free}, 2)
+		if over {
+			t.Fatal("free backend available but reported over")
+		}
+		if chosen.MachineID != "free" {
+			t.Fatalf("chose hard-limited backend: %s", chosen.MachineID)
+		}
+		h.inflight.release(chosen.MachineID)
+	}
+	h.inflight.acquire("free")
+	h.inflight.acquire("free") // 全部达限
+	if _, over := h.inflight.selectAndAcquire([]catalog.Backend{full, free}, 2); !over {
+		t.Fatal("all backends at hard limit must report over")
+	}
+}
+
 func TestInflightLifecycle(t *testing.T) {
 	h := testHandler(nil, 8)
 	h.inflight.acquire("m1")
@@ -114,15 +248,24 @@ func TestInflightLifecycle(t *testing.T) {
 // 30s），避免节点失联/WG 断链时 OS 默认 SYN 重试吞掉整个请求预算。
 func TestLegacyTransportTimeouts(t *testing.T) {
 	h := testHandler(nil, 8)
-	tr, ok := h.proxy.Transport.(*http.Transport)
+	// P1（H2 端到端）：proxy Transport 是 h2transport 包装（gRPC 明文分流 h2c）；
+	// 超时/拨号口径在被包装的 base 上断言，H2 开关单独断言。
+	wrapped, ok := h.proxy.Transport.(interface{ Base() http.RoundTripper })
 	if !ok {
-		t.Fatalf("legacy proxy transport = %T", h.proxy.Transport)
+		t.Fatalf("legacy proxy transport = %T, want h2分流包装", h.proxy.Transport)
+	}
+	tr, ok := wrapped.Base().(*http.Transport)
+	if !ok {
+		t.Fatalf("legacy proxy base transport = %T", wrapped.Base())
 	}
 	if tr.DialContext == nil {
 		t.Fatal("legacy transport must set a bounded DialContext")
 	}
 	if tr.ResponseHeaderTimeout != 30*time.Second {
 		t.Fatalf("ResponseHeaderTimeout = %v, want 30s", tr.ResponseHeaderTimeout)
+	}
+	if !tr.ForceAttemptHTTP2 {
+		t.Fatal("legacy transport must enable HTTP/2 (ForceAttemptHTTP2) for gRPC over mTLS/ALPN")
 	}
 }
 

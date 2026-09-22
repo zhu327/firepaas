@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -134,6 +135,45 @@ func (s *Service) SchedulerNodes(ctx context.Context) ([]scheduler.Node, error) 
 	return assembleSchedulerNodes(live, allocated, pendingMap(pending), stored), nil
 }
 
+// topologyOf 从 agent labels 提取调度 topology 视图。缺失/非法 → 零值
+// （未知），调用方（scheduler）对未知容量/机架跳过相关过滤与罚项。
+func topologyOf(labels map[string]string) (rack, zone string, bandwidthMbps uint64) {
+	if len(labels) == 0 {
+		return "", "", 0
+	}
+	rack = strings.TrimSpace(labels["rack"])
+	zone = strings.TrimSpace(labels["zone"])
+	if raw := strings.TrimSpace(labels["bandwidth_mbps"]); raw != "" {
+		if v, err := strconv.ParseUint(raw, 10, 64); err == nil {
+			bandwidthMbps = v
+		}
+	}
+	return rack, zone, bandwidthMbps
+}
+
+// occupiedTopo 返回同 deployment 成员节点已占的机架/可用区集合（P1 topology
+// 反亲和输入）。未知机架（空）不计入；空结果返回 nil（= 不启用罚项）。
+func occupiedTopo(nodes []scheduler.Node, members map[string]bool) (racks, zones map[string]bool) {
+	for _, n := range nodes {
+		if !members[n.ID] {
+			continue
+		}
+		if n.Rack != "" {
+			if racks == nil {
+				racks = map[string]bool{}
+			}
+			racks[n.Rack] = true
+		}
+		if n.Zone != "" {
+			if zones == nil {
+				zones = map[string]bool{}
+			}
+			zones[n.Zone] = true
+		}
+	}
+	return racks, zones
+}
+
 func pendingMap(rows []store.PendingUsage) map[string]store.PendingUsage {
 	out := make(map[string]store.PendingUsage, len(rows))
 	for _, row := range rows {
@@ -176,6 +216,9 @@ func assembleSchedulerNodes(live []liveNode, allocated map[string]store.Allocate
 				n.FeatureIDs = capabilities.SetOf(info.FeatureIds)
 			}
 			n.Labels = info.Labels
+			// P1 调度 topology 视图：rack/zone/bandwidth_mbps 标签（空/非法 =
+			// 未知，不过滤不罚分；见 scheduler.Node 字段注释）。
+			n.Rack, n.Zone, n.BandwidthMbps = topologyOf(info.Labels)
 			if n.Pool == "" {
 				n.Pool = info.Labels["node_pool"]
 			}
@@ -289,8 +332,18 @@ func (s *Service) Place(ctx context.Context, op store.Operation, req *pb.CreateM
 		ExistingDeploymentNodes: deployNodes[spec.GetDeploymentId()], ExcludedNodes: excluded,
 		ImageDigest: ImageDigest(spec.GetImageRef()), RequiredFeatures: required, RequiredNodeID: localNode,
 		PinnedNodeID: pin,
+		// BandwidthMbps 需求暂无采集来源（恒 0 = 不启用带宽过滤/打分；
+		// agent NodeCapacity 带宽上报 + MachineSpec 需求字段是后续 proto 扩展）。
 	}
 	schedNodes := assembleSchedulerNodes(live, allocated, pendingMap(pending), stored)
+	// P1 topology 反亲和：与节点级反亲和同一门控（AntiAffinity 显式声明才启用），
+	// 打分层软罚项（永不触发 NoCandidates）。
+	if antiAffinity && spec.GetDeploymentId() != "" {
+		schedReq.ExistingDeploymentRacks, schedReq.ExistingDeploymentZones = occupiedTopo(
+			schedNodes,
+			deployNodes[spec.GetDeploymentId()],
+		)
+	}
 	result, err := s.placer.Place(schedReq, schedNodes, nil)
 	if err != nil && pin != "" {
 		// 先记录 pinned 尝试的拒绝原因（否则 pin 失败的可见性全部丢失）。

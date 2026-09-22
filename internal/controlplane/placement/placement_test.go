@@ -317,3 +317,53 @@ func TestPinnedRejectionReasonClassification(t *testing.T) {
 		t.Fatalf("unfiltered node reason = %q, want empty", got)
 	}
 }
+
+// P1 调度 topology 视图：labels rack/zone/bandwidth_mbps → scheduler.Node；
+// 非法带宽按未知处理（不过滤）。
+func TestTopologyOfLabels(t *testing.T) {
+	rack, zone, bw := topologyOf(map[string]string{"rack": " r1 ", "zone": "az-a", "bandwidth_mbps": "10000"})
+	if rack != "r1" || zone != "az-a" || bw != 10000 {
+		t.Fatalf("topo = %q %q %d", rack, zone, bw)
+	}
+	if r, z, b := topologyOf(nil); r != "" || z != "" || b != 0 {
+		t.Fatalf("nil labels = %q %q %d, want zeros", r, z, b)
+	}
+	if _, _, b := topologyOf(map[string]string{"bandwidth_mbps": "ten-gig"}); b != 0 {
+		t.Fatalf("invalid bandwidth = %d, want 0 (unknown)", b)
+	}
+}
+
+func TestOccupiedTopo(t *testing.T) {
+	nodes := []scheduler.Node{
+		{ID: "n1", Rack: "r1", Zone: "z1"},
+		{ID: "n2", Rack: "r2", Zone: "z1"},
+		{ID: "n3"}, // 未知机架不计入
+	}
+	racks, zones := occupiedTopo(nodes, map[string]bool{"n1": true, "n3": true})
+	if !racks["r1"] || len(racks) != 1 {
+		t.Fatalf("racks = %v", racks)
+	}
+	if !zones["z1"] || len(zones) != 1 {
+		t.Fatalf("zones = %v", zones)
+	}
+	if r, z := occupiedTopo(nodes, nil); r != nil || z != nil {
+		t.Fatalf("empty members = %v %v, want nils", r, z)
+	}
+}
+
+func TestAssembleSchedulerNodesPopulatesTopoView(t *testing.T) {
+	live := []liveNode{{
+		NodeID: "agent-1", NomadID: "nomad-1", Status: scheduler.StatusHealthy,
+		Node: nodemanager.Node{Info: &pb.ServiceInfoResponse{
+			Labels:   map[string]string{"rack": "r1", "zone": "z1", "bandwidth_mbps": "25000"},
+			Capacity: &pb.NodeCapacity{VcpuTotal: 8, MemTotalMib: 16384},
+		}},
+	}}
+	got := assembleSchedulerNodes(live, nil, nil, nil)
+	if len(got) != 1 {
+		t.Fatalf("nodes = %d", len(got))
+	}
+	if got[0].Rack != "r1" || got[0].Zone != "z1" || got[0].BandwidthMbps != 25000 {
+		t.Fatalf("topo view = %+v", got[0])
+	}
+}

@@ -158,3 +158,49 @@ func TestPrepareRejectsNegativeResources(t *testing.T) {
 		}
 	}
 }
+
+// P1 按权重灰度（显式 opt-in）：deploy 可带 canary_weight；非法值拒绝，
+// 未指定 = 0 = 不启用（历史行为）。
+func TestExecuteCanaryWeight(t *testing.T) {
+	newCmd := func() (*Command, *fakeStore) {
+		active := &store.Deployment{Generation: 1, ImageRef: "old", VCPU: 1, MemMIB: 512, Port: 8080}
+		st := &fakeStore{app: &store.App{ID: "app-1", Generation: 1}, active: active}
+		cmd := New(st, fakeImages{})
+		cmd.newID = func() string { return "fixed" }
+		return cmd, st
+	}
+	// 显式权重透传到 rollout 行（仅在 rolling 的混合代窗口生效）。
+	cmd, st := newCmd()
+	if _, err := cmd.Execute(context.Background(), Intent{AppID: "app-1", ProjectID: "dev", Strategy: "rolling", CanaryWeight: 25}); err != nil {
+		t.Fatal(err)
+	}
+	if st.rollout == nil || st.rollout.CanaryWeight != 25 {
+		t.Fatalf("rollout = %+v, want canary 25", st.rollout)
+	}
+	// bluegreen 不经过混合代窗口：带权重直接 400，避免“设置了但无效果”的静默落差。
+	cmd, _ = newCmd()
+	if _, err := cmd.Execute(context.Background(), Intent{AppID: "app-1", ProjectID: "dev", CanaryWeight: 25}); !errors.Is(
+		err,
+		ErrInvalidIntent,
+	) {
+		t.Fatalf("bluegreen canary_weight err=%v, want ErrInvalidIntent", err)
+	}
+	// 未指定 → 0 = 不启用（publisher 全部 100，与加权前一致）。
+	cmd, st = newCmd()
+	if _, err := cmd.Execute(context.Background(), Intent{AppID: "app-1", ProjectID: "dev"}); err != nil {
+		t.Fatal(err)
+	}
+	if st.rollout == nil || st.rollout.CanaryWeight != 0 {
+		t.Fatalf("rollout = %+v, want canary disabled (0)", st.rollout)
+	}
+	// 非法值 fail-closed（400 映射由 writeDeploymentCommandError 经 ErrInvalidIntent 完成）。
+	for _, w := range []int{-5, -1, 100, 101} {
+		cmd, _ = newCmd()
+		if _, err := cmd.Execute(context.Background(), Intent{AppID: "app-1", ProjectID: "dev", CanaryWeight: w}); !errors.Is(
+			err,
+			ErrInvalidIntent,
+		) {
+			t.Fatalf("canary_weight=%d err=%v, want ErrInvalidIntent", w, err)
+		}
+	}
+}

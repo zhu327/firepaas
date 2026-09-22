@@ -219,6 +219,9 @@ type healthCheckBody struct {
 }
 
 func (a *API) createMachine(w http.ResponseWriter, r *http.Request) {
+	// P1 弃用政策（见 deprecation.go）：M2 单机直建仍全功能，但调用方应迁移
+	// 到 app 模型（POST /v1/apps + deploy）；机器可读头先行，删除另行公告。
+	markDeprecated(w, r.Pattern)
 	var body createMachineBody
 	if err := decodeJSONBody(w, r, &body, 1<<20, false); err != nil {
 		writeErr(w, 400, "bad request: "+err.Error())
@@ -414,12 +417,21 @@ func (a *API) createMachine(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) listMachines(w http.ResponseWriter, r *http.Request) {
 	project := effectiveProjectID(r, "")
-	machines, err := a.store.ListMachines(r.Context(), project)
+	limit, cursor := parseListParams(r)
+	machines, err := a.store.ListMachinesPaged(r.Context(), project, limit, cursor)
 	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, 400, "unknown cursor")
+			return
+		}
 		writeInternalErr(w, r, err)
 		return
 	}
-	writeJSON(w, 200, map[string]any{"machines": machines})
+	next := ""
+	if len(machines) == limit && len(machines) > 0 {
+		next = machines[len(machines)-1].ID
+	}
+	writeJSON(w, 200, map[string]any{"machines": machines, "next_cursor": next})
 }
 
 func (a *API) getMachine(w http.ResponseWriter, r *http.Request) {

@@ -193,6 +193,40 @@ func run() error {
 			slog.Warn("invalid FIREPAAS_SCHED_WEIGHT_IMAGE, keeping default", "value", raw)
 		}
 	}
+	// P1 调度维度（带宽需求门控 + topology 反亲和门控，无需求/无声明时恒 0，
+	// 零回归；单维度 =0 即显式关闭该维度，按哨兵处理）。
+	if raw := os.Getenv("FIREPAAS_SCHED_WEIGHT_BANDWIDTH"); raw != "" {
+		if v, err := strconv.ParseFloat(raw, 64); err == nil && v >= 0 {
+			if v == 0 {
+				placerCfg.WeightBandwidth = -1
+			} else {
+				placerCfg.WeightBandwidth = v
+			}
+		} else {
+			slog.Warn("invalid FIREPAAS_SCHED_WEIGHT_BANDWIDTH, keeping default", "value", raw)
+		}
+	}
+	// topology 单维度关闭：env 0 → 负值哨兵（New 归一为 0 = 关闭），
+	// 与“未设置 → 默认”区分。
+	for _, kv := range []struct {
+		env string
+		set func(float64)
+	}{
+		{"FIREPAAS_SCHED_WEIGHT_RACK", func(v float64) { placerCfg.WeightRack = v }},
+		{"FIREPAAS_SCHED_WEIGHT_ZONE", func(v float64) { placerCfg.WeightZone = v }},
+	} {
+		if raw := os.Getenv(kv.env); raw != "" {
+			if v, err := strconv.ParseFloat(raw, 64); err == nil && v >= 0 {
+				if v == 0 {
+					kv.set(-1)
+				} else {
+					kv.set(v)
+				}
+			} else {
+				slog.Warn("invalid weight, keeping default", "env", kv.env, "value", raw)
+			}
+		}
+	}
 	placer := scheduler.New(placerCfg, placerOpts)
 
 	// 每个 API 副本都维护只读 Nomad discovery + agent 连接池，使 follower 可
@@ -298,8 +332,13 @@ func run() error {
 				MaxPlacementAttempts:  3,
 				RolloutTimeout:        env.Dur("FIREPAAS_ROLLOUT_TIMEOUT", 300*time.Second),
 				RolloutDrainGrace:     env.Dur("FIREPAAS_ROLLOUT_DRAIN", 30*time.Second),
-				Secrets:               secretsMgr,
-				Traffic:               trafficSigner,
+				// P1 指标驱动回滚（CUTOVER 观察窗；Argo analysis 类比）：
+				// Window<=0 → 观察窗即 drain grace（历史行为）；MinServingRatio<=0 → 1.0。
+				CutoverAnalysisWindow:   env.Dur("FIREPAAS_ROLLOUT_ANALYSIS_WINDOW", 0),
+				CutoverMinServingRatio:  rolloutMinServingRatio(),
+				CutoverZeroServingGrace: env.Dur("FIREPAAS_ROLLOUT_ZERO_SERVING_GRACE", 30*time.Second),
+				Secrets:                 secretsMgr,
+				Traffic:                 trafficSigner,
 				// ADR-0040 T4c：与 fabric reconciler 同开关/同 cell 前缀；
 				// mesh 未启用时派发跳过身份/ULA 分配（legacy 零回归）。
 				FabricMesh: controller.FabricMeshConfig{
@@ -451,4 +490,17 @@ func envFraction(key string, def float64) float64 {
 		return def
 	}
 	return f
+}
+
+// rolloutMinServingRatio 解析 CUTOVER 可服务比例下限（(0,1]；缺省/非法 → 1.0
+// = 与完成门控一致）。envFraction 只接受 (0,1) 开区间，1.0 在此合法，故单列。
+func rolloutMinServingRatio() float64 {
+	const key = "FIREPAAS_ROLLOUT_MIN_SERVING_RATIO"
+	if raw := os.Getenv(key); raw != "" {
+		if v, err := strconv.ParseFloat(raw, 64); err == nil && v > 0 && v <= 1 {
+			return v
+		}
+		slog.Warn("invalid env value; using default", "key", key, "value", raw, "default", 1.0)
+	}
+	return 1.0
 }

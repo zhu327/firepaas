@@ -486,6 +486,11 @@ func (c *Controller) processCreate(ctx context.Context, op store.Operation) erro
 			}
 			// ADR-0041 §4.5：连续 resources 拒绝 → 冻结扩容（配额同语义）。
 			c.notePlacementFailure(ctx, op, req.Spec.GetAppId())
+			// P1：无候选 → 节点扩容信号（durable 事件 + 指标 + 可选外部通知），
+			// 而不是仅记事件后静默重入列。app 级冻结保留（防不可放置副本热循环）。
+			if isNoCandidates(err) {
+				c.signalNodeScaleUp(ctx, op, &req, err)
+			}
 			lastErr = err
 			break
 		}

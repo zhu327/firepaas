@@ -37,24 +37,39 @@ type Config struct {
 	// DNSStaleWindow（G2c，P1 独立评审）：dns:internal 投影 TTL = serve-stale
 	// 预算，与 edge FIREPAAS_EDGE_STALE_WINDOW 同源（默认 120s）；0 = 默认。
 	DNSStaleWindow                 time.Duration
-	OpPollInterval                 time.Duration    // 默认 1s
-	SyncInterval                   time.Duration    // 默认 5s
-	RebuildInterval                time.Duration    // 预约/投影重建，默认 30s
-	NodeStaleAfter                 time.Duration    // 节点 observed 投影过期阈值，默认 3×SyncInterval
-	ReservationCompensationTimeout time.Duration    // PG 派发提交失败后的 Redis 释放上限，默认 5s
-	ReconcileGrace                 time.Duration    // ACK 丢失判定宽限，默认 30s
-	MaxPlacementAttempts           int              // ResourceExhausted 换节点上限，默认 3
-	AgentRPCTimeout                time.Duration    // 默认 2m（未缓存镜像 pull 可达 60s）
-	CreateRetryBase                time.Duration    // create FAILED 首次重派退避（P1-3），默认 10s
-	CreateRetryMax                 time.Duration    // create FAILED 退避封顶，默认 5m
-	MaxCreateRetryAttempts         int              // 同 machine 连续 create FAILED 上限，默认 8；0 取默认
-	ClaimStaleAfter                time.Duration    // CLAIMED 滞留回收阈值（P1-1），默认 2×AgentRPCTimeout+60s
-	NodeMissingThreshold           int              // 节点连续 List 失败次数才摘路由（P3-9），默认 3
-	NodeLossRecreateAfter          time.Duration    // 节点持续失联后换代重建，默认 60s
-	RolloutTimeout                 time.Duration    // M3 PREPARING 超时→自动回滚（S3），默认 300s
-	RolloutDrainGrace              time.Duration    // M3 CUTOVER 后旧代 drain 期限，默认 30s
-	Secrets                        *secrets.Manager // M4：信封加密（nil = secret 引用不可用）
-	Traffic                        *traffic.Signer  // M4：execution-bound proxy credential（nil = 不下发）
+	OpPollInterval                 time.Duration // 默认 1s
+	SyncInterval                   time.Duration // 默认 5s
+	RebuildInterval                time.Duration // 预约/投影重建，默认 30s
+	NodeStaleAfter                 time.Duration // 节点 observed 投影过期阈值，默认 3×SyncInterval
+	ReservationCompensationTimeout time.Duration // PG 派发提交失败后的 Redis 释放上限，默认 5s
+	ReconcileGrace                 time.Duration // ACK 丢失判定宽限，默认 30s
+	MaxPlacementAttempts           int           // ResourceExhausted 换节点上限，默认 3
+	AgentRPCTimeout                time.Duration // 默认 2m（未缓存镜像 pull 可达 60s）
+	CreateRetryBase                time.Duration // create FAILED 首次重派退避（P1-3），默认 10s
+	CreateRetryMax                 time.Duration // create FAILED 退避封顶，默认 5m
+	MaxCreateRetryAttempts         int           // 同 machine 连续 create FAILED 上限，默认 8；0 取默认
+	ClaimStaleAfter                time.Duration // CLAIMED 滞留回收阈值（P1-1），默认 2×AgentRPCTimeout+60s
+	NodeMissingThreshold           int           // 节点连续 List 失败次数才摘路由（P3-9），默认 3
+	NodeLossRecreateAfter          time.Duration // 节点持续失联后换代重建，默认 60s
+	RolloutTimeout                 time.Duration // M3 PREPARING 超时→自动回滚（S3），默认 300s
+	RolloutDrainGrace              time.Duration // M3 CUTOVER 后旧代 drain 期限，默认 30s
+	// CutoverAnalysisWindow（P1 指标驱动回滚）：CUTOVER 观察窗（cutover 起）。
+	// <=0 → 观察窗即 drain grace（历史行为：drain 到期即决策）。窗内旧代保留可回退。
+	CutoverAnalysisWindow time.Duration
+	// CutoverMinServingRatio：观察窗到期时新代可服务比例下限 [0,1]；
+	// <=0 → 1.0（与既有完成门控一致）。
+	CutoverMinServingRatio float64
+	// CutoverZeroServingGrace：cutover 后允许零可服务的宽限（切流传播抖动）；
+	// <=0 → 30s。超宽限仍零可服务 → 灾难信号提前回退。
+	CutoverZeroServingGrace time.Duration
+	// CutoverAnalysis：可插拔 CUTOVER 评估（nil = 内建 serving-ratio 实现；
+	// Argo AnalysisTemplate 类比，错误率/延迟 Provider 实现同一接口接入）。
+	CutoverAnalysis AnalysisProvider
+	// ScaleUpNotifier：节点扩容外部通知（Nomad scaling API 等；nil = 仅
+	// durable 事件 + 指标 + 日志，外部 autoscaler 按事件/指标消费）。
+	ScaleUpNotifier NodeScaleUpNotifier
+	Secrets         *secrets.Manager // M4：信封加密（nil = secret 引用不可用）
+	Traffic         *traffic.Signer  // M4：execution-bound proxy credential（nil = 不下发）
 	// FabricMesh（ADR-0040 T4c）：mesh 启用时的身份/ULA 生命周期接线。
 	// Enabled=false（默认）时派发跳过分配，legacy 路径零回归。
 	FabricMesh FabricMeshConfig
@@ -171,6 +186,9 @@ type Controller struct {
 	userEventsRetention time.Duration
 	// schedulerEventsRetention 同上。
 	schedulerEventsRetention time.Duration
+	// scaleUpThrottle 按 pool 节流扩容信号（零值可用；leader 切换后重置，
+	// 最多提前一次提醒，无害）。
+	scaleUpThrottle scaleUpThrottle
 	// gc（v1.2-F）：引用感知镜像 GC 配置。
 	gc    GCConfig
 	scrub ScrubConfig

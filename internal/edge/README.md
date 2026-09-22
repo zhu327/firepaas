@@ -9,7 +9,8 @@ internal/edge/autoscale.go # ADR-0041 per-hostname 并发信号记账 + 5s 上�
 ```
 
 `internal/edge.Handler` 是数据面行为所有者。命令包不参与 backend eligibility、
-pinning、least-inflight/hard limit、凭证、header 清理或 retry 状态机；每次转发的
+pinning、least-inflight（权重全等时的原路径）/按权重抽样（灰度，`weight/(1+inflight)`，
+权重由 route publisher 按 rollout 写入）/hard limit、凭证、header 清理或 retry 状态机；每次转发的
 retry 结果保存在 attempt-local state，不使用 package-global 请求映射。
 `catalog.Catalog` 直接实现 edge 的窄只读接口，Redis JSON/key 格式不经包装或转换。
 

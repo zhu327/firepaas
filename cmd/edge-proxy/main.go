@@ -27,6 +27,7 @@ import (
 	edgemesh "github.com/zhu327/firepaas/internal/edge/mesh"
 	"github.com/zhu327/firepaas/internal/security/mtls"
 	"github.com/zhu327/firepaas/shared/pkg/env"
+	"github.com/zhu327/firepaas/shared/pkg/h2transport"
 	"github.com/zhu327/firepaas/shared/pkg/logging"
 )
 
@@ -179,15 +180,20 @@ func run() error {
 	handler := withVersionedHealthz(dataHandler)
 	plainHandler := http.Handler(handler)
 	tlsEnabled := tlsPort != "" && serverCertMgr != nil
+	// P1（gRPC workload）：明文数据面监听启用服务端 h2c（标准库 Protocols
+	// 原生同端口双协议）；TLS 路径与 80 跳转保持默认（ALPN/HTTP-1）。
+	var plainProtocols *http.Protocols
 	if tlsEnabled {
 		plainHandler = redirectHandler(tlsPort)
+	} else {
+		plainProtocols = h2transport.ServerProtocols(nil)
 	}
 
 	mainListener, err := net.Listen("tcp", ":"+port)
 	if err != nil {
 		return fmt.Errorf("listen :%s: %w", port, err)
 	}
-	server := newEdgeServer(plainHandler)
+	server := newEdgeServer(plainHandler, plainProtocols)
 	serve(server, mainListener, "edge serve")
 
 	var extraServers []*http.Server
@@ -203,7 +209,7 @@ func run() error {
 		p := p
 		srv := newEdgeServer(http.HandlerFunc(
 			func(w http.ResponseWriter, r *http.Request) { handler.ServeHTTP(w, edgesvc.WithListenPort(r, p)) },
-		))
+		), h2transport.ServerProtocols(nil))
 		extraServers = append(extraServers, srv)
 		serve(srv, listener, fmt.Sprintf("edge extra serve port=%d", p))
 	}
@@ -219,7 +225,7 @@ func run() error {
 		if listenErr != nil {
 			return fmt.Errorf("listen %s: %w", tlsPort, listenErr)
 		}
-		tlsServer = newEdgeServer(handler)
+		tlsServer = newEdgeServer(handler, nil)
 		tlsServer.TLSConfig = tlsCfg
 		serve(tlsServer, tls.NewListener(listener, tlsCfg), "edge tls serve")
 	}
@@ -382,7 +388,7 @@ func startMetrics(counters *edgesvc.Counters, handler *edgesvc.Handler, gauges *
 	if err != nil {
 		return fmt.Errorf("listen metrics %s:%s: %w", bind, port, err)
 	}
-	serve(newEdgeServer(mux), listener, "edge metrics serve")
+	serve(newEdgeServer(mux, nil), listener, "edge metrics serve")
 	return nil
 }
 
@@ -420,10 +426,12 @@ func writeInflightAggregated(w io.Writer, handler *edgesvc.Handler) {
 
 // newEdgeServer 统一 edge 全部 http.Server 的超时口径：仅 ReadHeaderTimeout
 // 与 IdleTimeout。不设 WriteTimeout/ReadTimeout 的原因见顶部常量注释
-// （WS/SSE 长连接不得被整体超时切断）。
-func newEdgeServer(handler http.Handler) *http.Server {
+// （WS/SSE 长连接不得被整体超时切断）。protocols 为明文数据面传 h2c 配置
+// （TLS/跳转/metrics 传 nil 走默认）。
+func newEdgeServer(handler http.Handler, protocols *http.Protocols) *http.Server {
 	return &http.Server{
 		Handler:           handler,
+		Protocols:         protocols,
 		ReadHeaderTimeout: readHeaderTimeout,
 		IdleTimeout:       idleTimeout,
 	}

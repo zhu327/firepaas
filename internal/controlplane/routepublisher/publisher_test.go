@@ -826,3 +826,120 @@ func TestDeriveExcludesSupersededGenerationAfterRolloutComplete(t *testing.T) {
 		t.Fatalf("failed generation must not serve: %+v", projection.Routes)
 	}
 }
+
+// P1 按权重灰度（显式 opt-in）：PREPARING 且 canary_weight>0 时按代写权重
+// （份额按代内均分，余数按 machine_id 升序确定性分配）；未指定（0）/其它
+// 状态/无 rollout 恒 100（历史行为，零回归）。
+func TestDeriveCanaryWeights(t *testing.T) {
+	machine := func(id, depID string, ordinal int) store.Machine {
+		return store.Machine{
+			ID: id, AppID: "app", DeploymentID: depID, Hostname: "app.test",
+			CurrentExecutionID: "exec-" + id, NodeID: "node",
+			ObservedState: "RUNNING", ObservedReadiness: "READY", ReplicaOrdinal: ordinal,
+		}
+	}
+	deployments := []store.Deployment{
+		{ID: "dep-old", AppID: "app", Generation: 1, Port: 8080, Strategy: "rolling"},
+		{ID: "dep-new", AppID: "app", Generation: 2, Port: 8080, Strategy: "rolling"},
+	}
+	weights := func(p Projection) map[string]int {
+		if len(p.Routes) != 1 {
+			t.Fatalf("routes = %+v, want 1", p.Routes)
+		}
+		out := map[string]int{}
+		for _, b := range p.Routes[0].Backends {
+			out[b.MachineID] = b.Weight
+		}
+		return out
+	}
+	// rolling PREPARING：新代 ordinal0 已切（serving），旧代 ordinal0 被 drain，
+	// 旧代 ordinal1 仍 serving——可服务集横跨两代，权重 20/80。
+	machines := []store.Machine{
+		machine("new-0", "dep-new", 0),
+		machine("old-0", "dep-old", 0),
+		machine("old-1", "dep-old", 1),
+	}
+	p := Derive(Input{
+		Machines: machines, Deployments: deployments,
+		Rollouts: []store.Rollout{
+			{AppID: "app", FromGeneration: 1, ToGeneration: 2, Status: "PREPARING", CanaryWeight: 20},
+		},
+		ProxyByNode:    map[string]string{"node": "proxy"},
+		DefaultAppPort: 8080,
+	})
+	if got := weights(p); got["new-0"] != 20 || got["old-1"] != 80 || len(got) != 2 {
+		t.Fatalf("preparing weights = %v, want {new-0:20 old-1:80}", got)
+	}
+	// canary 未指定（0）→ 不启用：全部 100（与加权前逐字节一致）。
+	p = Derive(Input{
+		Machines: machines, Deployments: deployments,
+		Rollouts:       []store.Rollout{{AppID: "app", FromGeneration: 1, ToGeneration: 2, Status: "PREPARING"}},
+		ProxyByNode:    map[string]string{"node": "proxy"},
+		DefaultAppPort: 8080,
+	})
+	if got := weights(p); got["new-0"] != 100 || got["old-1"] != 100 || len(got) != 2 {
+		t.Fatalf("disabled canary weights = %v, want {new-0:100 old-1:100}", got)
+	}
+	// 副本数不等：份额按“代内均分”（floor + 余数），比例按代而不是按副本数。
+	// 1 新（ordinal2 已切）+ 2 旧（ordinal0/1 未切）canary=30 → 30 vs 35+35。
+	unequal := []store.Machine{
+		machine("new-2", "dep-new", 2),
+		machine("old-0", "dep-old", 0),
+		machine("old-1", "dep-old", 1),
+	}
+	p = Derive(Input{
+		Machines: unequal, Deployments: deployments,
+		Rollouts: []store.Rollout{
+			{AppID: "app", FromGeneration: 1, ToGeneration: 2, Status: "PREPARING", CanaryWeight: 30},
+		},
+		ProxyByNode:    map[string]string{"node": "proxy"},
+		DefaultAppPort: 8080,
+	})
+	if got := weights(p); got["new-2"] != 30 || got["old-0"] != 35 || got["old-1"] != 35 {
+		t.Fatalf("unequal replica weights = %v, want {new-2:30 old-0:35 old-1:35}", got)
+	}
+	// 余数按 machine_id 升序确定性分配：3 台新代 canary=10 → 4,3,3（合计 10）。
+	remainderMachines := []store.Machine{
+		machine("new-b", "dep-new", 4),
+		machine("new-a", "dep-new", 5),
+		machine("new-c", "dep-new", 6),
+		machine("old-9", "dep-old", 9),
+	}
+	p = Derive(Input{
+		Machines: remainderMachines, Deployments: deployments,
+		Rollouts: []store.Rollout{
+			{AppID: "app", FromGeneration: 1, ToGeneration: 2, Status: "PREPARING", CanaryWeight: 10},
+		},
+		ProxyByNode:    map[string]string{"node": "proxy"},
+		DefaultAppPort: 8080,
+	})
+	if got := weights(p); got["new-a"] != 4 || got["new-b"] != 3 || got["new-c"] != 3 || got["old-9"] != 90 {
+		t.Fatalf("remainder weights = %v, want {new-a:4 new-b:3 new-c:3 old-9:90}", got)
+	}
+	// CUTOVER：可服务集只剩 to 代，权重恒 100。
+	p = Derive(Input{
+		Machines: machines, Deployments: deployments,
+		Rollouts: []store.Rollout{
+			{AppID: "app", FromGeneration: 1, ToGeneration: 2, Status: "CUTOVER", CanaryWeight: 20},
+		},
+		ProxyByNode:    map[string]string{"node": "proxy"},
+		DefaultAppPort: 8080,
+	})
+	for _, b := range p.Routes[0].Backends {
+		if b.Weight != 100 {
+			t.Fatalf("cutover backend %s weight=%d want 100", b.MachineID, b.Weight)
+		}
+	}
+	// 无 rollout：恒 100（历史行为）。
+	p = Derive(Input{
+		Machines:       machines,
+		Deployments:    deployments,
+		ProxyByNode:    map[string]string{"node": "proxy"},
+		DefaultAppPort: 8080,
+	})
+	for _, b := range p.Routes[0].Backends {
+		if b.Weight != 100 {
+			t.Fatalf("no-rollout backend %s weight=%d want 100", b.MachineID, b.Weight)
+		}
+	}
+}

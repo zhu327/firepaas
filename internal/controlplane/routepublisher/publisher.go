@@ -199,6 +199,55 @@ func Derive(in Input) Projection {
 		}
 	}
 
+	// drainingOf 是单台 machine 的摘流判定（rollout 状态机 + 终态代 + rolling
+	// 按 ordinal 切流）。权重派生与 route 组装共用，避免两处逻辑发散。
+	// review 2026-09-10：rollout 完成（或回滚失败）后旧代 deployment 已
+	// SUPERSEDED/FAILED，但它的 machine 在 delete 操作收敛前仍是
+	// desired_state=CREATED/RUNNING。旧实现只在“有活跃 rollout”时计算
+	// draining，COMPLETE 后旧代 backend 会被重新发布上线。终态的非活跃代
+	// 永远不能 serving，与是否有活跃 rollout 无关。
+	drainingOf := func(m store.Machine) bool {
+		if s := depStatus[m.DeploymentID]; s == "SUPERSEDED" || s == "FAILED" {
+			return true
+		}
+		rollout := rolloutByApp[m.AppID]
+		if rollout == nil {
+			return false
+		}
+		generation := depGen[m.DeploymentID]
+		switch rollout.Status {
+		case "PREPARING":
+			if depStrategy[toDepByApp[m.AppID]] == "rolling" {
+				cut := cutOrdinals[appOrdinal{m.AppID, m.ReplicaOrdinal}]
+				if generation == rollout.ToGeneration {
+					return !cut
+				}
+				return cut
+			}
+			return generation != rollout.FromGeneration
+		case "CUTOVER":
+			return generation != rollout.ToGeneration
+		case "ROLLING_BACK":
+			return generation != rollout.FromGeneration
+		}
+		return false
+	}
+	proxyOf := func(m store.Machine) string {
+		if p := in.ProxyByNode[m.NodeID]; p != "" {
+			return p
+		}
+		return in.LegacyProxyAddr
+	}
+	// 每代“可发布 machine”集合（用于灰度权重按代均分；见 deriveCanaryWeights）。
+	publishableByDep := make(map[string][]string)
+	for _, m := range in.Machines {
+		if !machineServing(m) || drainingOf(m) || proxyOf(m) == "" {
+			continue
+		}
+		publishableByDep[m.DeploymentID] = append(publishableByDep[m.DeploymentID], m.ID)
+	}
+	weightByMachine := deriveCanaryWeights(in.Deployments, rolloutByApp, toDepByApp, publishableByDep)
+
 	type routeKey struct {
 		hostname string
 		port     int
@@ -217,44 +266,12 @@ func Derive(in Input) Projection {
 		if len(services) == 0 {
 			services = []store.ServiceSpec{{Name: "default", InternalPort: port}}
 		}
-		proxy := in.ProxyByNode[m.NodeID]
-		if proxy == "" {
-			proxy = in.LegacyProxyAddr
-		}
+		proxy := proxyOf(m)
 		generation := depGen[m.DeploymentID]
-		// review 2026-09-10：rollout 完成（或回滚失败）后旧代 deployment 已
-		// SUPERSEDED/FAILED，但它的 machine 在 delete 操作收敛前仍是
-		// desired_state=CREATED/RUNNING。旧实现只在“有活跃 rollout”时计算
-		// draining，COMPLETE 后旧代 backend 会被重新发布上线。终态的
-		// 非活跃代永远不能 serving，与是否有活跃 rollout 无关。
-		draining := false
-		if s := depStatus[m.DeploymentID]; s == "SUPERSEDED" || s == "FAILED" {
-			draining = true
-		}
-		if rollout := rolloutByApp[m.AppID]; rollout != nil {
-			rolling := depStrategy[toDepByApp[m.AppID]] == "rolling" && rollout.Status == "PREPARING"
-			switch rollout.Status {
-			case "PREPARING":
-				if rolling {
-					cut := cutOrdinals[appOrdinal{m.AppID, m.ReplicaOrdinal}]
-					if generation == rollout.ToGeneration {
-						draining = !cut
-					} else {
-						draining = cut
-					}
-				} else {
-					draining = generation != rollout.FromGeneration
-				}
-			case "CUTOVER":
-				draining = generation != rollout.ToGeneration
-			case "ROLLING_BACK":
-				draining = generation != rollout.FromGeneration
-			}
-		}
 		// Rollout cut decisions are derived from the complete machine snapshot
 		// above, but neither authoritative route rows nor Redis may contain an
 		// execution that is unready or draining.
-		if !machineServing(m) || draining || proxy == "" {
+		if !machineServing(m) || drainingOf(m) || proxy == "" {
 			continue
 		}
 		for serviceIndex, service := range services {
@@ -269,7 +286,8 @@ func Derive(in Input) Projection {
 			}
 			backend := store.RouteBackendRow{
 				MachineID: m.ID, ExecutionID: m.CurrentExecutionID,
-				NodeProxyEndpoint: proxy, AppPort: service.InternalPort, Weight: 100,
+				NodeProxyEndpoint: proxy, AppPort: service.InternalPort,
+				Weight:    weightOrDefault(weightByMachine, m.ID),
 				Readiness: m.ObservedReadiness,
 			}
 			// G2b/G2c（ADR-0040 §16）：mesh_direct 服务才发布 ULA 提示与
@@ -386,6 +404,68 @@ func appendUniqueAAA(list []string, ula string) []string {
 		}
 	}
 	return append(list, ula)
+}
+
+// deriveCanaryWeights 计算显式启用灰度的 rollout 的每 backend 权重（P1，
+// 迁移 0040/0042：canary_weight 1..99 = to 代份额，0/缺失 = 不启用）。
+//
+// 份额按“代内可发布 backend 数”均分（floor），余数按 machine_id 升序确定性地
+// 分给前 N 台，单台下限 1——每代总权重恒等于目标份额，副本数不等时比例仍按
+// 代而不是按副本数（ADR-0043 §2）。draining/非 serving 的 machine 先被调用方
+// 过滤，不参与计数。未启用时返回空表（全部 backend 走 weightOrDefault=100，
+// 与加权前逐字节一致）。
+func deriveCanaryWeights(
+	deployments []store.Deployment,
+	rolloutByApp map[string]*store.Rollout,
+	toDepByApp map[string]string,
+	publishableByDep map[string][]string,
+) map[string]int {
+	out := make(map[string]int)
+	for i := range deployments {
+		dep := &deployments[i]
+		rollout := rolloutByApp[dep.AppID]
+		if rollout == nil || rollout.Status != "PREPARING" {
+			continue
+		}
+		weight := store.NormalizeCanaryWeight(rollout.CanaryWeight)
+		if weight == 0 {
+			continue // 未启用：历史行为
+		}
+		var share int
+		switch {
+		case dep.ID == toDepByApp[dep.AppID]:
+			share = weight
+		case dep.Generation == rollout.FromGeneration:
+			share = 100 - weight
+		default:
+			continue // 非本次发布的代：保持 100
+		}
+		ids := append([]string(nil), publishableByDep[dep.ID]...)
+		if len(ids) == 0 {
+			continue
+		}
+		sort.Strings(ids)
+		base, remainder := share/len(ids), share%len(ids)
+		for j, id := range ids {
+			w := base
+			if j < remainder {
+				w++
+			}
+			if w < 1 {
+				w = 1
+			}
+			out[id] = w
+		}
+	}
+	return out
+}
+
+// weightOrDefault 取 machine 的发布权重（未参与灰度 → 100：历史行为）。
+func weightOrDefault(weights map[string]int, machineID string) int {
+	if w := weights[machineID]; w > 0 {
+		return w
+	}
+	return 100
 }
 
 func machineServing(m store.Machine) bool {

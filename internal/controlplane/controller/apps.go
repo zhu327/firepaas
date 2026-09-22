@@ -135,12 +135,36 @@ func (c *Controller) reconcileRollout(ctx context.Context, app *store.App, r *st
 	case "CUTOVER":
 		// S4：旧代死亡不重建（drain 期限后统一回收）；S5：新代死亡由
 		// machine reconcile（M2 R1-R8）按目标代重建。
+		// P1 指标驱动回滚（Argo analysis 类比）：CUTOVER 观察窗评估——窗内仅
+		// 灾难信号（新代零可服务超宽限）提前回退；窗到期时未达标自动回退上一代
+		//（from 代在线 serving，不断流），替代此前“到期未全 READY 则无限等待”。
 		if r.DrainDeadline == nil {
 			return nil
 		}
-		if time.Now().Before(*r.DrainDeadline) {
+		now := time.Now()
+		windowEnd := cutoverAnalysisEnd(r, c.cfg.CutoverAnalysisWindow, *r.DrainDeadline)
+		decisionAt := *r.DrainDeadline
+		if windowEnd.After(decisionAt) {
+			decisionAt = windowEnd
+		}
+		atEnd := !now.Before(decisionAt)
+		verdict, reason := c.cutoverAssessment(app, r, toMachines, atEnd, now)
+		if verdict == VerdictRollback {
+			c.recordEvent(ctx, "rollout", "", r.ID, "", "cutover analysis: "+reason, nil)
+			c.rolloutUserEvent(ctx, r, "auto_rollback", map[string]any{"reason": reason})
+			c.metrics.Inc(
+				"firepaas_rollout_auto_rollback_total",
+				map[string]string{"stage": "cutover"},
+				1,
+			)
+			return c.startRollback(ctx, r)
+		}
+		if !atEnd {
 			return nil
 		}
+		// 到期点必须终结：AnalysisProvider 契约要求到期只报 Proceed/Rollback，
+		// Wait 在此按 Proceed 处理（否则旧代无限滞留）；下面的完成路径仍有
+		// allReady 守卫，不会因误判删掉未就绪的新代。
 		// 防御性重检：即使 rollout 已进入 CUTOVER，也不能因新代随后掉出
 		// route-serving 就删除旧代。这样 edge 只能在新代已可用、且 drain
 		// grace 已覆盖 route/token cache 后失去旧 execution。
@@ -199,6 +223,25 @@ func (c *Controller) reconcileRollout(ctx context.Context, app *store.App, r *st
 		}
 	}
 	return nil
+}
+
+// cutoverAssessment 取 CUTOVER 评估器（cfg 可插拔，nil = 内建 serving-ratio）
+// 并评估当前 tick。窗长度只用于观察窗终点计算（见 CUTOVER 分支）。
+func (c *Controller) cutoverAssessment(
+	app *store.App,
+	r *store.Rollout,
+	toMachines []store.Machine,
+	atEnd bool,
+	now time.Time,
+) (CutoverVerdict, string) {
+	p := c.cfg.CutoverAnalysis
+	if p == nil {
+		p = NewServingRatioAnalysis(CutoverAnalysisConfig{
+			MinServingRatio:  c.cfg.CutoverMinServingRatio,
+			ZeroServingGrace: c.cfg.CutoverZeroServingGrace,
+		})
+	}
+	return p.AssessCutover(app, r, toMachines, atEnd, now)
 }
 
 func (c *Controller) startRollback(ctx context.Context, r *store.Rollout) error {

@@ -23,6 +23,7 @@ import (
 
 	"github.com/zhu327/firepaas/internal/agent/machine"
 	"github.com/zhu327/firepaas/internal/controlplane/traffic"
+	"github.com/zhu327/firepaas/shared/pkg/h2transport"
 )
 
 const (
@@ -245,6 +246,21 @@ func (p *Proxy) takeCredentialMiss() bool {
 	return true
 }
 
+// newWorkloadRoundTripper 构造 agent→workload 的转发 Transport：base 与既有
+// 口径一致（连接池复用）并显式启用 H2（ForceAttemptHTTP2，mTLS/ALPN 路径）；
+// gRPC 明文经 h2transport 分流到 h2c prior-knowledge（见
+// shared/pkg/h2transport）。ReverseProxy 与 Transport 仍在构造时创建一次复用。
+func newWorkloadRoundTripper() http.RoundTripper {
+	base := &http.Transport{
+		MaxIdleConns:        64,
+		IdleConnTimeout:     30 * time.Second,
+		DisableCompression:  true,
+		MaxIdleConnsPerHost: 64,
+		ForceAttemptHTTP2:   true,
+	}
+	return h2transport.New(base)
+}
+
 func newReverseProxy() *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
@@ -281,12 +297,7 @@ func newReverseProxy() *httputil.ReverseProxy {
 			w.Header().Set(HeaderRetryable, retryableValue)
 			http.Error(w, "workload upstream unreachable", http.StatusBadGateway)
 		},
-		Transport: &http.Transport{
-			MaxIdleConns:        64,
-			IdleConnTimeout:     30 * time.Second,
-			DisableCompression:  true,
-			MaxIdleConnsPerHost: 64,
-		},
+		Transport: newWorkloadRoundTripper(),
 	}
 }
 

@@ -96,6 +96,24 @@ type Rollout struct {
 	DrainDeadline  *time.Time
 	StartedAt      time.Time
 	CompletedAt    *time.Time
+	// CanaryWeight（迁移 0040/0042，P1 按权重灰度）：显式启用时 to-generation
+	// 在 PREPARING 混合代窗口内的流量份额（1..99）；0 = 未启用（历史行/未指定，
+	// 全部 backend 权重 100）。publisher 据此写 route_backends.weight，edge
+	// 加权选择；未启用时发布路径与加权前逐字节一致。
+	CanaryWeight int
+}
+
+// NormalizeCanaryWeight 归一 canary 权重到 [0,99]（0 = 不启用；>99 → 99，
+// from 代保底 1%）。调用方（API/command 层）仍须显式校验拒绝非法输入（400）；
+// 本函数只保证内存/历史行永不产出越界权重（fail-safe）。
+func NormalizeCanaryWeight(w int) int {
+	if w < 0 {
+		return 0
+	}
+	if w > 99 {
+		return 99
+	}
+	return w
 }
 
 // EnsureApp upsert app 行（apps 表，mvp-plan §5.4 最小模型）。
@@ -383,9 +401,9 @@ func (s *Store) SetDeploymentStatus(ctx context.Context, depID, status string) e
 // （唯一部分索引的 23505 冲突）。
 func (s *Store) CreateRollout(ctx context.Context, r Rollout) error {
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO rollouts(id, app_id, from_generation, to_generation, status)
-		VALUES($1,$2,$3,$4,'PREPARING')`,
-		r.ID, r.AppID, r.FromGeneration, r.ToGeneration)
+		INSERT INTO rollouts(id, app_id, from_generation, to_generation, status, canary_weight)
+		VALUES($1,$2,$3,$4,'PREPARING',$5)`,
+		r.ID, r.AppID, r.FromGeneration, r.ToGeneration, NormalizeCanaryWeight(r.CanaryWeight))
 	if err != nil {
 		if isUniqueViolation(err) {
 			return ErrRolloutBusy
@@ -399,11 +417,11 @@ func (s *Store) CreateRollout(ctx context.Context, r Rollout) error {
 func (s *Store) GetRollout(ctx context.Context, id string) (*Rollout, error) {
 	row := s.pool.QueryRow(ctx, `
 		SELECT id, app_id, from_generation, to_generation, status, failed,
-			cutover_at, drain_deadline, started_at, completed_at
+			cutover_at, drain_deadline, started_at, completed_at, canary_weight
 		FROM rollouts WHERE id=$1`, id)
 	var r Rollout
 	err := row.Scan(&r.ID, &r.AppID, &r.FromGeneration, &r.ToGeneration, &r.Status,
-		&r.Failed, &r.CutoverAt, &r.DrainDeadline, &r.StartedAt, &r.CompletedAt)
+		&r.Failed, &r.CutoverAt, &r.DrainDeadline, &r.StartedAt, &r.CompletedAt, &r.CanaryWeight)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -417,12 +435,12 @@ func (s *Store) GetRollout(ctx context.Context, id string) (*Rollout, error) {
 func (s *Store) ActiveRolloutForApp(ctx context.Context, appID string) (*Rollout, error) {
 	row := s.pool.QueryRow(ctx, `
 		SELECT id, app_id, from_generation, to_generation, status, failed,
-			cutover_at, drain_deadline, started_at, completed_at
+			cutover_at, drain_deadline, started_at, completed_at, canary_weight
 		FROM rollouts WHERE app_id=$1 AND status IN ('PREPARING','CUTOVER','ROLLING_BACK')`,
 		appID)
 	var r Rollout
 	err := row.Scan(&r.ID, &r.AppID, &r.FromGeneration, &r.ToGeneration, &r.Status,
-		&r.Failed, &r.CutoverAt, &r.DrainDeadline, &r.StartedAt, &r.CompletedAt)
+		&r.Failed, &r.CutoverAt, &r.DrainDeadline, &r.StartedAt, &r.CompletedAt, &r.CanaryWeight)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -436,7 +454,7 @@ func (s *Store) ActiveRolloutForApp(ctx context.Context, appID string) (*Rollout
 func (s *Store) ListActiveRollouts(ctx context.Context) ([]Rollout, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, app_id, from_generation, to_generation, status, failed,
-			cutover_at, drain_deadline, started_at, completed_at
+			cutover_at, drain_deadline, started_at, completed_at, canary_weight
 		FROM rollouts WHERE status IN ('PREPARING','CUTOVER','ROLLING_BACK') ORDER BY started_at`)
 	if err != nil {
 		return nil, fmt.Errorf("list active rollouts: %w", err)
@@ -446,7 +464,7 @@ func (s *Store) ListActiveRollouts(ctx context.Context) ([]Rollout, error) {
 	for rows.Next() {
 		var r Rollout
 		if err := rows.Scan(&r.ID, &r.AppID, &r.FromGeneration, &r.ToGeneration, &r.Status,
-			&r.Failed, &r.CutoverAt, &r.DrainDeadline, &r.StartedAt, &r.CompletedAt); err != nil {
+			&r.Failed, &r.CutoverAt, &r.DrainDeadline, &r.StartedAt, &r.CompletedAt, &r.CanaryWeight); err != nil {
 			return nil, fmt.Errorf("scan rollout: %w", err)
 		}
 		out = append(out, r)
@@ -588,9 +606,9 @@ func (s *Store) DeployApp(ctx context.Context, d Deployment, r Rollout, appGener
 			return fmt.Errorf("create deployment: %w", err)
 		}
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO rollouts(id, app_id, from_generation, to_generation, status)
-			VALUES($1,$2,$3,$4,'PREPARING')`,
-			r.ID, r.AppID, r.FromGeneration, r.ToGeneration); err != nil {
+			INSERT INTO rollouts(id, app_id, from_generation, to_generation, status, canary_weight)
+			VALUES($1,$2,$3,$4,'PREPARING',$5)`,
+			r.ID, r.AppID, r.FromGeneration, r.ToGeneration, NormalizeCanaryWeight(r.CanaryWeight)); err != nil {
 			if isUniqueViolation(err) {
 				return ErrRolloutBusy
 			}

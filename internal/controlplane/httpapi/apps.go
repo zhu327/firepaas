@@ -18,7 +18,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/zhu327/firepaas/internal/capabilities"
 	agentv1 "github.com/zhu327/firepaas/internal/contracts/agentv1"
@@ -268,6 +270,8 @@ func (a *API) getApp(w http.ResponseWriter, r *http.Request) {
 		writeInternalErr(w, r, err)
 		return
 	}
+	// P1 并发控制（quota 之外）：scale-CAS 的 ETag 底座（If-Match 见 scaleApp）。
+	w.Header().Set("ETag", scaleETag(app.DesiredReplicas, app.UpdatedAt))
 	writeJSON(w, 200, map[string]any{
 		"app": app, "deployments": deps, "machines": machines, "active_rollout": rollout,
 	})
@@ -285,9 +289,10 @@ type deployBody struct {
 	Labels       map[string]string          `json:"labels"`
 	AntiAffinity string                     `json:"anti_affinity"`
 	HealthCheck  *healthCheckBody           `json:"health_check"`
-	SecretRefs   map[string]store.SecretRef `json:"secret_refs"`  // M4（ADR-0010）
-	AutoStandby  *autoStandbyBody           `json:"auto_standby"` // v1.1（ADR-0017）；nil = 继承
-	Egress       *egressPolicyBody          `json:"egress"`       // v1.3-A（ADR-0027）；nil = 继承
+	SecretRefs   map[string]store.SecretRef `json:"secret_refs"`   // M4（ADR-0010）
+	AutoStandby  *autoStandbyBody           `json:"auto_standby"`  // v1.1（ADR-0017）；nil = 继承
+	Egress       *egressPolicyBody          `json:"egress"`        // v1.3-A（ADR-0027）；nil = 继承
+	CanaryWeight int                        `json:"canary_weight"` // P1 按权重灰度（显式 opt-in）：to 代 PREPARING 份额 [1,99]；0/缺省 = 不启用
 }
 
 func (a *API) deployApp(w http.ResponseWriter, r *http.Request) {
@@ -354,7 +359,7 @@ func deploymentIntent(appID, projectID string, body deployBody, inheritAll bool)
 		MemMIB: body.MemMIB, Port: body.Port, Services: services, Strategy: body.Strategy, Env: body.Env,
 		NodePool: body.NodePool, Labels: body.Labels, AntiAffinity: body.AntiAffinity, HealthCheck: healthCheck,
 		SecretRefs: body.SecretRefs, AutoStandby: standby, Egress: egress, InheritAll: inheritAll,
-		ReadActiveFirst: inheritAll,
+		ReadActiveFirst: inheritAll, CanaryWeight: body.CanaryWeight,
 	}, nil
 }
 
@@ -376,6 +381,70 @@ func writeDeploymentResult(w http.ResponseWriter, result appcommand.Result) {
 		AppID: result.AppID, Deployment: result.DeploymentID,
 		Generation: result.Generation, RolloutID: result.RolloutID, Status: result.Status,
 	})
+}
+
+// scaleETag 返回 app 的 scale-CAS ETag：desired 版本 + 行更新时间戳
+// （双条件防 ABA：3→5→3 后旧 ETag 因时间戳不同而失效；quota 用 revision，
+// 格式域不同不混用）。updatedAt 取自 GetApp.UpdatedAt（PG timestamptz::text，
+// 形如 `2026-09-22 10:00:00+00`）：RFC 7232 的 etagc 不允许空格，这里只把
+// 日期与时间的分隔空格换成 'T'（RFC 3339 形态），语义与 CAS 的
+// ::timestamptz 解析不变；旧空格形态仍可解析（向后兼容，见 parseScaleIfMatch）。
+func scaleETag(replicas int, updatedAt string) string {
+	return fmt.Sprintf(`"replicas-%d-%s"`, replicas, strings.Replace(updatedAt, " ", "T", 1))
+}
+
+// parseScaleIfMatch 解析 scale 的 If-Match："*"/空由调用方先行处理（无条件）；
+// `"replicas-N-<ts>"` → (N, ts)。时间戳须为 PG timestamptz 文本可解析格式
+// （服务端签发的是 RFC 3339 `T` 分隔形态；旧的空格分隔形态仍接受，
+// 非法 → error，调用方 400）。
+func parseScaleIfMatch(v string) (expect int, expectUpdated string, err error) {
+	fail := func() (int, string, error) {
+		return 0, "", fmt.Errorf("must be * or \"replicas-N-<updated_at>\" (see GET app ETag)")
+	}
+	t := strings.TrimSpace(v)
+	if len(t) < 2 || t[0] != '"' || t[len(t)-1] != '"' {
+		return fail()
+	}
+	rest, ok := strings.CutPrefix(t[1:len(t)-1], "replicas-")
+	if !ok {
+		return fail()
+	}
+	head, tail, ok := strings.Cut(rest, "-")
+	if !ok || tail == "" {
+		return fail()
+	}
+	n, cerr := strconv.Atoi(head)
+	if cerr != nil || n < 0 {
+		return fail()
+	}
+	if !validScaleTimestamp(tail) {
+		return fail()
+	}
+	return n, tail, nil
+}
+
+// validScaleTimestamp 校验 ETag 时间戳可被 PG 解析（服务端签发格式恒过；
+// 含 PG 短时区 +00 形态，Go Z07:00 不接受裸 ±hh，单列 -07 系列；
+// 同时接受 RFC 3339 "T" 分隔与 PG 原生的空格分隔，两者 PG 均可 cast）。
+func validScaleTimestamp(ts string) bool {
+	for _, layout := range []string{
+		// 服务端签发形态（RFC 3339 'T' 分隔；PG 整点偏移输出裸 ±hh，
+		// 非整点时区输出 ±hh:mm）。
+		"2006-01-02T15:04:05.999999999Z07:00",
+		"2006-01-02T15:04:05Z07:00",
+		"2006-01-02T15:04:05.999999999-07",
+		"2006-01-02T15:04:05-07",
+		// 兼容旧 ETag（空格分隔的 PG 文本形态）。
+		"2006-01-02 15:04:05.999999999Z07:00",
+		"2006-01-02 15:04:05Z07:00",
+		"2006-01-02 15:04:05.999999999-07",
+		"2006-01-02 15:04:05-07",
+	} {
+		if _, err := time.Parse(layout, ts); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *API) scaleApp(w http.ResponseWriter, r *http.Request) {
@@ -406,7 +475,36 @@ func (a *API) scaleApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !app.Deleted {
-		if err := a.store.TakeoverScale(r.Context(), appID, body.Replicas); err != nil {
+		// P1 并发控制：If-Match `"replicas-N-<ts>"` 仅当 desired 与更新时间戳
+		// 仍匹配时接管（原子 CAS，消除双 scale 读-改-写丢失与 ABA 回绕）；
+		// 缺省/* = 无条件（历史行为）。
+		if match := r.Header.Get("If-Match"); match != "" && match != "*" {
+			expect, expectUpdated, perr := parseScaleIfMatch(match)
+			if perr != nil {
+				writeErr(w, 400, "invalid If-Match: "+perr.Error())
+				return
+			}
+			ok, err := a.store.TakeoverScaleCAS(r.Context(), appID, body.Replicas, expect, expectUpdated)
+			if err != nil {
+				writeInternalErr(w, r, err)
+				return
+			}
+			if !ok {
+				cur, cerr := a.store.GetApp(r.Context(), appID)
+				if cerr != nil {
+					writeInternalErr(w, r, cerr)
+					return
+				}
+				if cur == nil || cur.Deleted {
+					writeErr(w, 404, "app not found")
+					return
+				}
+				writeErr(w, 412, fmt.Sprintf(
+					"scale precondition failed: desired_replicas is %d (updated %s); re-read and retry",
+					cur.DesiredReplicas, cur.UpdatedAt))
+				return
+			}
+		} else if err := a.store.TakeoverScale(r.Context(), appID, body.Replicas); err != nil {
 			if errors.Is(err, store.ErrNotFound) {
 				writeErr(w, 404, "app not found")
 				return
@@ -419,6 +517,10 @@ func (a *API) scaleApp(w http.ResponseWriter, r *http.Request) {
 			"prev_desired":           app.DesiredReplicas,
 			"autoscale_prev_enabled": app.AutoscaleEnabled,
 		})
+		// 新值 ETag：重读行取写后时间戳（免客户端再 GET 即可连锁下一次 CAS）。
+		if cur, cerr := a.store.GetApp(r.Context(), appID); cerr == nil && cur != nil {
+			w.Header().Set("ETag", scaleETag(cur.DesiredReplicas, cur.UpdatedAt))
+		}
 		writeJSON(w, 202, map[string]any{
 			"app_id": appID, "desired_replicas": body.Replicas,
 			"autoscale_enabled": false,

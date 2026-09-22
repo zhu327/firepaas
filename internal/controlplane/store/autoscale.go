@@ -184,3 +184,24 @@ func (s *Store) TakeoverScale(ctx context.Context, appID string, replicas int) e
 	}
 	return nil
 }
+
+// TakeoverScaleCAS 是 TakeoverScale 的乐观并发变体：仅当 desired 与行更新时间戳
+// 仍匹配时接管（HTTP If-Match 的原子底座；读-改-写竞态与 ABA 回绕由本条 UPDATE
+// 一次消除——时间戳比较绝对时刻，与会话时区无关）。
+// 返回 false = 前提失效（他人已改；调用方 412），不区分墓碑/缺失——
+// 调用方在 false 时按既有语义补查 GetApp 即可。
+func (s *Store) TakeoverScaleCAS(
+	ctx context.Context,
+	appID string,
+	replicas, expect int,
+	expectUpdated string,
+) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `UPDATE apps SET desired_replicas=$2, autoscale_enabled=false,
+		updated_at=now() WHERE id=$1 AND deleted_at IS NULL
+		AND desired_replicas=$3 AND updated_at=$4::timestamptz`,
+		appID, replicas, expect, expectUpdated)
+	if err != nil {
+		return false, fmt.Errorf("takeover scale cas: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}

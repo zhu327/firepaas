@@ -829,6 +829,7 @@ func (s *Store) EnqueueOperation(ctx context.Context, p EnqueueOperationParams) 
 }
 
 // ListMachines 返回所有（或按 project）machine。
+// 大租户全量扫描昂贵：HTTP 层必须用 ListMachinesPaged；本函数仅内部对账用。
 func (s *Store) ListMachines(ctx context.Context, projectID string) ([]Machine, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT m.id, m.app_id, m.deployment_id, m.replica_ordinal, m.hostname,
@@ -848,6 +849,62 @@ func (s *Store) ListMachines(ctx context.Context, projectID string) ([]Machine, 
 		ORDER BY m.created_at`, projectID)
 	if err != nil {
 		return nil, fmt.Errorf("list machines: %w", err)
+	}
+	defer rows.Close()
+	return scanMachines(rows)
+}
+
+// machinePageLimit bounds ListMachinesPaged (HTTP 默认 200，上限 1000，
+// 与 listEvents 同口径）。
+const machinePageLimit = 1000
+
+// ListMachinesPaged 以 (created_at, id) keyset 分页返回 machine（升序稳定）。
+// cursorID 为空 = 首页；否则从该 machine 之后开始。limit<=0 → 200，>1000 → 1000。
+// cursor 不存在 → ErrNotFound（调用方 400）。
+func (s *Store) ListMachinesPaged(
+	ctx context.Context,
+	projectID string,
+	limit int,
+	cursorID string,
+) ([]Machine, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	if limit > machinePageLimit {
+		limit = machinePageLimit
+	}
+	var curCreated any
+	var curID string
+	if cursorID != "" {
+		cur, err := s.GetMachine(ctx, cursorID)
+		if err != nil {
+			return nil, err
+		}
+		if cur == nil {
+			return nil, fmt.Errorf("unknown machines cursor: %w", ErrNotFound)
+		}
+		curCreated, curID = cur.CreatedAt, cur.ID
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT m.id, m.app_id, m.deployment_id, m.replica_ordinal, m.hostname,
+			m.desired_state, m.generation, m.current_execution_id,
+			m.requested_vcpu, m.requested_mem_mib, m.requested_disk_mib, m.ingress_port, m.image_ref,
+			coalesce(m.env::text,'{}'), coalesce(m.placement::text,'{}'),
+			coalesce(m.node_id,''),
+			coalesce(m.observed_state,''), coalesce(m.observed_slot_ip,''),
+			coalesce(m.observed_readiness,''), m.last_observed_at,
+			m.created_at, m.updated_at, m.expires_at, m.restart_mode,
+			m.restart_max_attempts, m.restart_backoff_seconds,
+			m.restart_stable_window_seconds, m.restart_attempts,
+			m.restart_next_attempt_at, m.restart_stable_since, m.restart_blocked
+		FROM machines m
+		JOIN apps a ON a.id = m.app_id
+		WHERE ($1='' OR a.project_id=$1)
+			AND ($2='' OR (m.created_at, m.id) > ($3, $2))
+		ORDER BY m.created_at, m.id
+		LIMIT $4`, projectID, curID, curCreated, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list machines paged: %w", err)
 	}
 	defer rows.Close()
 	return scanMachines(rows)
