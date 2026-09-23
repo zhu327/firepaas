@@ -25,6 +25,12 @@ func TestValidateAutoscalePolicy(t *testing.T) {
 		{"delay high", func(p *AutoscalePolicy) { p.ScaleDownDelaySec = 601 }},
 		{"panic low", func(p *AutoscalePolicy) { p.PanicThreshold = 1.4 }},
 		{"panic high", func(p *AutoscalePolicy) { p.PanicThreshold = 5.1 }},
+		{"rps negative", func(p *AutoscalePolicy) { p.TargetRPS = -1 }},
+		{"rps too big", func(p *AutoscalePolicy) { p.TargetRPS = 100001 }},
+		{"cpu negative", func(p *AutoscalePolicy) { p.TargetCPURatio = -0.1 }},
+		{"cpu >1", func(p *AutoscalePolicy) { p.TargetCPURatio = 1.5 }},
+		{"custom target w/o query", func(p *AutoscalePolicy) { p.CustomTarget = 2 }},
+		{"custom bad mode", func(p *AutoscalePolicy) { p.CustomMode = "median" }},
 	}
 	for _, tc := range cases {
 		p := DefaultAutoscalePolicy()
@@ -115,10 +121,11 @@ func TestAutoscalePolicyCRUD(t *testing.T) {
 	if err := s.SetAutoscalePolicy(ctx, appID, bad); err == nil {
 		t.Fatal("expected validation error for min>max")
 	}
-	// 合法全量替换。
+	// 合法全量替换（CustomMode 缺省 "" 读时归一 per_replica，故直接写期望值）。
 	want := AutoscalePolicy{
 		Enabled: true, MinReplicas: 0, MaxReplicas: 5,
 		TargetConcurrency: 20, ScaleDownDelaySec: 60, PanicThreshold: 2.0,
+		CustomMode: "per_replica",
 	}
 	if err := s.SetAutoscalePolicy(ctx, appID, want); err != nil {
 		t.Fatal(err)

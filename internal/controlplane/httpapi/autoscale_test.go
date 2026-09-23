@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
@@ -169,5 +170,57 @@ func TestScaleTakeoverDisablesAutoscale(t *testing.T) {
 	}
 	if pol, _ := st.GetAutoscalePolicy(ctx, appID); pol.Enabled {
 		t.Fatal("repeat manual scale must keep autoscale disabled (P1-2)")
+	}
+}
+
+// custom 查询需 admin：匿名调用方设置即 403（任意 PromQL 跨租户可见，
+// 需 admin scope；关闭 custom 仍允许 deploy scope）。
+func TestPutAutoscaleCustomRequiresAdmin(t *testing.T) {
+	a := &API{}
+	anon := func(body string) int {
+		req := httptest.NewRequest("PUT", "/v1/apps/x/autoscale", strings.NewReader(body))
+		req.SetPathValue("id", "x")
+		rec := httptest.NewRecorder()
+		a.putAutoscale(rec, req)
+		return rec.Code
+	}
+	custom := `{"enabled":true,"min_replicas":1,"max_replicas":5,"target_concurrency":20,"scale_down_delay_sec":60,"panic_threshold":2.0,"custom_prom_query":"up","custom_target":1}`
+	if code := anon(custom); code != 403 {
+		t.Fatalf("custom without admin = %d, want 403", code)
+	}
+	// 只设 target 不设 query 同样 403（Validate 先于 store，不会误 400）。
+	targetOnly := `{"enabled":true,"min_replicas":1,"max_replicas":5,"target_concurrency":20,"scale_down_delay_sec":60,"panic_threshold":2.0,"custom_target":1}`
+	if code := anon(targetOnly); code != 403 {
+		t.Fatalf("custom target without admin = %d, want 403", code)
+	}
+}
+
+// admin 身份的 custom 全链路（PG）：PUT 200 + GET 回显。
+func TestPutAutoscaleCustomAdminRoundTrip(t *testing.T) {
+	a := newAutoscaleAPI(t)
+	ctx := context.Background()
+	st := a.store
+	project, appID := "test-autoscale-api", "app-as-api-custom"
+	if err := st.EnsureApp(ctx, project, appID, "as-custom.local", "img:v1", 1, 512, 80, 2); err != nil {
+		t.Fatal(err)
+	}
+	adminCtx := func(r *http.Request) *http.Request {
+		return r.WithContext(withIdentity(r.Context(), identity{Kind: "key", Scopes: []string{"admin"}}))
+	}
+	put := func(body string) int {
+		req := httptest.NewRequest("PUT", "/v1/apps/"+appID+"/autoscale", strings.NewReader(body))
+		req = adminCtx(req)
+		req.SetPathValue("id", appID)
+		rec := httptest.NewRecorder()
+		a.putAutoscale(rec, req)
+		return rec.Code
+	}
+	custom := `{"enabled":true,"min_replicas":1,"max_replicas":5,"target_concurrency":20,"scale_down_delay_sec":60,"panic_threshold":2.0,"custom_prom_query":"up{app=\"x\"}","custom_target":1,"custom_mode":"absolute"}`
+	if code := put(custom); code != 200 {
+		t.Fatalf("admin custom PUT = %d, want 200", code)
+	}
+	pol, err := st.GetAutoscalePolicy(ctx, appID)
+	if err != nil || pol.CustomPromQuery != `up{app="x"}` || pol.CustomTarget != 1 || pol.CustomMode != "absolute" {
+		t.Fatalf("policy = %+v err=%v", pol, err)
 	}
 }

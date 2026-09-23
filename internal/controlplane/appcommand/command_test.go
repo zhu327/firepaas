@@ -204,3 +204,29 @@ func TestExecuteCanaryWeight(t *testing.T) {
 		}
 	}
 }
+
+// Wave3 Stage B：approval_required 透传到 rollout 行（bluegreen/rolling 均可，
+// 与 canary_weight 的 strategy 门限正交——审批 gate 不依赖混合代窗口）。
+func TestExecuteApprovalRequired(t *testing.T) {
+	newCmd := func() (*Command, *fakeStore) {
+		active := &store.Deployment{Generation: 1, ImageRef: "old", VCPU: 1, MemMIB: 512, Port: 8080}
+		st := &fakeStore{app: &store.App{ID: "app-1", Generation: 1}, active: active}
+		cmd := New(st, fakeImages{})
+		cmd.newID = func() string { return "fixed" }
+		return cmd, st
+	}
+	cmd, st := newCmd()
+	if _, err := cmd.Execute(context.Background(), Intent{AppID: "app-1", ProjectID: "dev", ApprovalRequired: true}); err != nil {
+		t.Fatal(err)
+	}
+	if st.rollout == nil || !st.rollout.ApprovalRequired {
+		t.Fatalf("rollout = %+v, want approval required", st.rollout)
+	}
+	cmd, st = newCmd()
+	if _, err := cmd.Execute(context.Background(), Intent{AppID: "app-1", ProjectID: "dev"}); err != nil {
+		t.Fatal(err)
+	}
+	if st.rollout == nil || st.rollout.ApprovalRequired {
+		t.Fatalf("rollout = %+v, want approval off by default", st.rollout)
+	}
+}

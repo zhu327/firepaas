@@ -65,6 +65,13 @@ type Config struct {
 	// CutoverAnalysis：可插拔 CUTOVER 评估（nil = 内建 serving-ratio 实现；
 	// Argo AnalysisTemplate 类比，错误率/延迟 Provider 实现同一接口接入）。
 	CutoverAnalysis AnalysisProvider
+	// PrometheusAddr：controller 查询 Prometheus 的基地址（Wave3 Stage A；
+	// 空 = 不启用外部指标，零回归）。启用还需至少一个阈值 >0。
+	PrometheusAddr string
+	// CutoverMaxErrorRate：CUTOVER 新代错误率上限 [0,1]；<=0 = 不启用该门。
+	CutoverMaxErrorRate float64
+	// CutoverP99LatencySec：CUTOVER 新代 p99 上限（秒）；<=0 = 不启用该门。
+	CutoverP99LatencySec float64
 	// ScaleUpNotifier：节点扩容外部通知（Nomad scaling API 等；nil = 仅
 	// durable 事件 + 指标 + 日志，外部 autoscaler 按事件/指标消费）。
 	ScaleUpNotifier NodeScaleUpNotifier

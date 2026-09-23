@@ -116,10 +116,14 @@ func (c *Controller) signalNodeScaleUp(
 	slog.Warn("placement has no candidates; node scale-up signaled",
 		"pool", sig.Pool, "app_id", sig.AppID, "machine_id", sig.MachineID,
 		"operation_id", sig.OperationID, "reason", sig.Reason)
+	// 外部通知异步投递：webhook 最长 10s 超时，不能占派发 worker
+	// （durable 事件已落库，通知丢了也可由事件重放）。
 	if n := c.cfg.ScaleUpNotifier; n != nil {
-		if nerr := n.NotifyScaleUp(ctx, sig); nerr != nil {
-			slog.Warn("node scale-up notify failed (signal already journaled as event)",
-				"pool", sig.Pool, "error", nerr)
-		}
+		go func() {
+			if nerr := n.NotifyScaleUp(context.WithoutCancel(ctx), sig); nerr != nil {
+				slog.Warn("node scale-up notify failed (signal already journaled as event)",
+					"pool", sig.Pool, "error", nerr)
+			}
+		}()
 	}
 }

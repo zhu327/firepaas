@@ -1,0 +1,52 @@
+# OTel Collector 配置（Wave6 tracing，optional；默认不启动）。
+#
+# 拓扑：三进程（api/agentd/edge-proxy）经 OTLP gRPC 直推中心 gateway
+#（FIREPAAS_TRACING_ENABLED=true + OTEL_EXPORTER_OTLP_ENDPOINT）。
+# per-node 不放 sidecar（节点是容量层，保持精简；与 Prometheus 中央
+# 抓取拓扑一致）。后端示例为 Tempo（Grafana 栈现成可接）；换 Jaeger/
+# OTLP 兼容后端只改 exporters 段。
+#
+# 启动（与 observability profile 同纪律，只读观测、不参与数据面）：
+#   docker compose -f iac/dev/docker-compose.yaml --profile observability up -d otel-collector
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch: {}
+  # 脱敏兜底：span 属性 allowlist 之外的一律丢弃（SDK 侧已只记业务字段，
+  # 此处是第二道门；凭证头在 edge/agent 入口即剥离，正常到不了这里）。
+  attributes/allowlist:
+    actions:
+      - key: host
+        action: keep
+      - key: request.id
+        action: keep
+      - key: machine.id
+        action: keep
+      - key: execution.id
+        action: keep
+      - key: operation.id
+        action: keep
+      - key: generation
+        action: keep
+      - key: http.status
+        action: keep
+
+exporters:
+  # 本地验证：先 file，确认链路后再切 tempo。
+  file:
+    path: /tmp/firepaas-spans.json
+  # tempo:
+  #   endpoint: tempo:4317
+  #   tls:
+  #     insecure: true
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [attributes/allowlist, batch]
+      exporters: [file]

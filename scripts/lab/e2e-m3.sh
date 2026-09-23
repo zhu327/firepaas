@@ -7,6 +7,9 @@
 #   4) U2 失败发布：坏镜像 → 自动回滚 → 旧代继续服务
 #   5) U3：杀一个 VM → 仅重建缺失 ordinal（其余 execution 不变）
 #   6) slot 泄漏：1000 次 attach/release + agent 重启 reconcile 无残留
+#   6.5) Wave3 审批 gate：approval_required → PAUSED（旧代继续服务）→ approve → CUTOVER
+#        （含未知 rollout 404 / 重复放行 409 / approved_by 落库 / 旧代回收）
+#   6.6) edge 代级指标 exposition：le 引号 + 直方图桶单调（Wave3 分析源回归）
 #   7) 终态：无 VM/netns/veth/route/lease/在途 op 残留
 # 用法: sudo bash scripts/lab/e2e-m3.sh
 set -euo pipefail
@@ -21,6 +24,8 @@ TRAFFIC_KEY="$(openssl rand -base64 32)"   # M4：proxy credential 密钥（与 
 # edge 明文入口端口。默认 8081；宿主已有进程占用时用 FIREPAAS_LAB_EDGE_PORT 覆盖
 # （M4 API 默认也用 8081，两者时序不重叠，但本机常驻进程可能先占）。
 EDGE_HTTP_PORT="${FIREPAAS_LAB_EDGE_PORT:-8081}"
+# edge 代级指标端点（6.6 校验 exposition；只绑 loopback，无鉴权，测试期端口）。
+EDGE_METRICS_PORT="${FIREPAAS_LAB_EDGE_METRICS_PORT:-19465}"
 PG="docker exec dev-postgres-1 psql -U firepaas -d firepaas -tAc"
 
 export PATH="$LAB_BIN:$HOME/.local/firepaas-lab/go/bin:$PATH"
@@ -79,6 +84,7 @@ nohup env FIREPAAS_POSTGRES_URL='postgres://firepaas:firepaas@127.0.0.1:5432/fir
 nohup env FIREPAAS_EDGE_PORT=$EDGE_HTTP_PORT FIREPAAS_API_ADDR=http://127.0.0.1:8080 FIREPAAS_API_TOKEN="$API_TOKEN" \
   FIREPAAS_EDGE_TLS_CERT="$CERT_DIR/edge.crt" FIREPAAS_EDGE_TLS_KEY="$CERT_DIR/edge.key" \
   FIREPAAS_REDIS_ADDR=127.0.0.1:6379 FIREPAAS_EDGE_TLS_CA="$CERT_DIR/ca.crt" \
+  FIREPAAS_EDGE_METRICS_PORT="$EDGE_METRICS_PORT" \
   "$LAB_BIN/edge-proxy" > "$RUN_DIR/edge.log" 2>&1 &
 for _ in $(seq 1 30); do
   authed_curl http://127.0.0.1:8080/v1/health >/dev/null 2>&1 && break
@@ -195,11 +201,78 @@ code=$(curl -s -m 8 -o /dev/null -w '%{http_code}' -H "Host: $HN" http://127.0.0
 wait_app "$APP" "rl is None and len([m for m in ms if m['ObservedState']=='RUNNING'])==3" 480 \
   || fail "rollout 未完成"
 sleep 15  # 旧代回收
-old_left=$(pg "SELECT count(*) FROM machines WHERE app_id='$APP' AND deployment_id LIKE '%-g1' AND desired_state!='DELETED'")
+# 断言必须钉住实际 deployment id（曾用 LIKE '%-g1'：deployment id 是
+# dep-<app>-<ts>-N，永不命中 → 断言空转）。
+old_dep=$(pg "SELECT id FROM deployments WHERE app_id='$APP' AND generation=1")
+[[ -n "$old_dep" ]] || fail "旧代 deployment（generation=1）不存在"
+old_left=$(pg "SELECT count(*) FROM machines WHERE app_id='$APP' AND deployment_id='$old_dep' AND desired_state!='DELETED'")
 [[ "$old_left" -eq 0 ]] || fail "旧代机器未回收（剩余 $old_left）"
 code=$(curl -s -m 8 -o /dev/null -w '%{http_code}' -H "Host: $HN" http://127.0.0.1:$EDGE_HTTP_PORT/ || true)
 [[ "$code" == "200" ]] || fail "发布完成后 edge != 200"
 log "    新代全部 READY 切流、旧代 drain 回收、edge 200 OK"
+
+log "6.5) Wave3 审批 gate：approval_required → PAUSED → approve → CUTOVER"
+resp=$(curl -fsS -m 10 -X POST -H "Authorization: Bearer $API_TOKEN" -H 'Content-Type: application/json' \
+  "http://127.0.0.1:8080/v1/apps/$APP/deployments" -d '{
+  "image":"docker.io/library/nginx:1.27-alpine",
+  "approval_required":true,
+  "health_check":{"type":"http","target":"http://127.0.0.1:80/","interval_seconds":2,"timeout_seconds":1,"unhealthy_threshold":3}
+}') || fail "approval_required deploy 失败"
+rollout_id=$(echo "$resp" | python3 -c 'import json,sys; print(json.load(sys.stdin)["rollout_id"])') \
+  || fail "deploy 响应缺 rollout_id"
+# 新代全部 READY 后停在 PAUSED_FOR_APPROVAL，不切流（蓝绿：旧代继续服务）。
+wait_app "$APP" "rl is not None and rl['Status']=='PAUSED_FOR_APPROVAL'" 480 \
+  || fail "rollout 未进入 PAUSED_FOR_APPROVAL"
+code=$(curl -s -m 8 -o /dev/null -w '%{http_code}' -H "Host: $HN" http://127.0.0.1:$EDGE_HTTP_PORT/ || true)
+[[ "$code" == "200" ]] || fail "PAUSED 期间旧代应继续服务（got $code）"
+st=$(curl -s -m 10 -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer $API_TOKEN" \
+  "http://127.0.0.1:8080/v1/rollouts/no-such-rollout/approve" || true)
+[[ "$st" == "404" ]] || fail "未知 rollout approve 应 404（got $st）"
+# 放行 → 202；重复放行 → 409（非等待态 CAS）。
+st=$(curl -s -m 10 -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer $API_TOKEN" \
+  "http://127.0.0.1:8080/v1/rollouts/$rollout_id/approve") || fail "approve 请求失败"
+[[ "$st" == "202" ]] || fail "approve 期望 202（got $st）"
+st=$(curl -s -m 10 -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer $API_TOKEN" \
+  "http://127.0.0.1:8080/v1/rollouts/$rollout_id/approve" || true)
+[[ "$st" == "409" ]] || fail "重复 approve 期望 409（got $st）"
+pg "SELECT count(*) FROM rollouts WHERE id='$rollout_id' AND approved_by <> '' AND approved_at IS NOT NULL" \
+  | grep -qx 1 || fail "approve 未记录 approved_by/approved_at"
+wait_app "$APP" "rl is None and len([m for m in ms if m['ObservedState']=='RUNNING'])==3" 480 \
+  || fail "approve 后 rollout 未完成"
+sleep 15  # 旧代回收
+old_dep=$(pg "SELECT id FROM deployments WHERE app_id='$APP' AND generation=2")
+[[ -n "$old_dep" ]] || fail "旧代 deployment（generation=2）不存在"
+old_left=$(pg "SELECT count(*) FROM machines WHERE app_id='$APP' AND deployment_id='$old_dep' AND desired_state!='DELETED'")
+[[ "$old_left" -eq 0 ]] || fail "approve 后旧代未回收（剩余 $old_left）"
+code=$(curl -s -m 8 -o /dev/null -w '%{http_code}' -H "Host: $HN" http://127.0.0.1:$EDGE_HTTP_PORT/ || true)
+[[ "$code" == "200" ]] || fail "审批发布后 edge != 200"
+log "    PAUSED 不切流、approve 202/重复 409、审批审计落库、旧代回收"
+
+log "6.6) edge 代级指标 exposition（le 引号 + 桶单调回归）"
+metrics=$(curl -fsS -m 5 "http://127.0.0.1:$EDGE_METRICS_PORT/metrics") || fail "edge metrics 不可达"
+M3_METRICS="$metrics" python3 - <<'PY' || fail "代级指标 exposition 不合法"
+import os, re
+
+text = os.environ["M3_METRICS"]
+assert 'firepaas_edge_gen_responses_total{host="' in text, "缺代级响应计数"
+assert re.search(r'le=[0-9]', text) is None, "le 存在未加引号的数值（exposition 非法）"
+pat = re.compile(
+    r'firepaas_edge_gen_latency_seconds_bucket\{host="([^"]+)",generation="([^"]+)",le="([^"]+)"\} (\d+)')
+groups = {}
+for line in text.splitlines():
+    m = pat.match(line)
+    if not m:
+        continue
+    host, gen, le, val = m.group(1), m.group(2), m.group(3), int(m.group(4))
+    groups.setdefault((host, gen), []).append((le, val))
+assert groups, "无代级直方图数据（未被任何代服务过？）"
+for (host, gen), buckets in groups.items():
+    buckets.sort(key=lambda kv: float("inf") if kv[0] == "+Inf" else float(kv[0]))
+    vals = [v for _, v in buckets]
+    assert all(a <= b for a, b in zip(vals, vals[1:])), f"{host}/g{gen} 桶非单调: {buckets}"
+    assert buckets[-1][0] == "+Inf", f"{host}/g{gen} 缺 +Inf"
+print("gen metrics OK:", len(groups), "series")
+PY
 
 log "7) U2 失败发布：坏镜像 → 自动回滚 → 旧代持续服务"
 curl -fsS -m 10 -X POST -H "Authorization: Bearer $API_TOKEN" -H 'Content-Type: application/json' \
@@ -276,11 +349,17 @@ code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' \
 log "    stale execution 请求被拒（$code）OK"
 
 log "8) U3：杀一个 VM → 仅重建缺失 ordinal"
-M1="$APP-r1-g2"
+# active 代从 DB 取：Wave3 审批 gate 会在 g2 之后再多推进一代，不能写死。
+ACTIVE_GEN=$(pg "SELECT generation FROM deployments WHERE app_id='$APP' AND status='ACTIVE'")
+[[ -n "$ACTIVE_GEN" ]] || fail "找不到 ACTIVE deployment（app=$APP）"
+M1="$APP-r1-g$ACTIVE_GEN"
 BEFORE=$(pg "SELECT id||'='||current_execution_id FROM machines WHERE app_id='$APP' AND desired_state!='DELETED' ORDER BY id" | tr '\n' ' ')
-OLD_R1_EXEC=$(echo "$BEFORE" | grep -o "$M1=[^ ]*" | cut -d= -f2)
-OLD_R0_EXEC=$(echo "$BEFORE" | grep -o "$APP-r0-g2=[^ ]*" | cut -d= -f2)
-OLD_R2_EXEC=$(echo "$BEFORE" | grep -o "$APP-r2-g2=[^ ]*" | cut -d= -f2)
+# grep 无匹配时 pipefail 会让赋值语句直接终止脚本，必须 || true + 显式校验。
+OLD_R1_EXEC=$(echo "$BEFORE" | grep -o "$M1=[^ ]*" | cut -d= -f2 || true)
+OLD_R0_EXEC=$(echo "$BEFORE" | grep -o "$APP-r0-g$ACTIVE_GEN=[^ ]*" | cut -d= -f2 || true)
+OLD_R2_EXEC=$(echo "$BEFORE" | grep -o "$APP-r2-g$ACTIVE_GEN=[^ ]*" | cut -d= -f2 || true)
+[[ -n "$OLD_R0_EXEC" && -n "$OLD_R1_EXEC" && -n "$OLD_R2_EXEC" ]] \
+  || fail "active 代（g$ACTIVE_GEN）机器不齐：r0=$OLD_R0_EXEC r1=$OLD_R1_EXEC r2=$OLD_R2_EXEC"
 GUEST_DIR=$(grep -l "\"$M1\"" /var/lib/firepaas-p0/hypeman/guests/*/metadata.json 2>/dev/null | head -1 | xargs -r dirname)
 [[ -n "$GUEST_DIR" ]] || fail "找不到 $M1 的 guest 目录"
 pkill -9 -f "$(basename "$GUEST_DIR")" || true
@@ -294,8 +373,8 @@ done
 wait_app "$APP" "len([m for m in ms if m['ObservedState']=='RUNNING'])==3" 480 || fail "缺失 ordinal 未重建"
 AFTER=$(pg "SELECT id||'='||current_execution_id FROM machines WHERE app_id='$APP' AND desired_state!='DELETED' ORDER BY id" | tr '\n' ' ')
 echo "$AFTER" | grep -q "$M1=$OLD_R1_EXEC" && fail "r1 execution 未换代（未重建）"
-echo "$AFTER" | grep -q "$APP-r0-g2=$OLD_R0_EXEC" || fail "r0 execution 被意外改动"
-echo "$AFTER" | grep -q "$APP-r2-g2=$OLD_R2_EXEC" || fail "r2 execution 被意外改动"
+echo "$AFTER" | grep -q "$APP-r0-g$ACTIVE_GEN=$OLD_R0_EXEC" || fail "r0 execution 被意外改动"
+echo "$AFTER" | grep -q "$APP-r2-g$ACTIVE_GEN=$OLD_R2_EXEC" || fail "r2 execution 被意外改动"
 log "    仅缺失 ordinal 换代重建，其余 execution 不变 OK"
 
 log "10) agent 重启 reconcile：VM 重建收敛 + slot 一致 + 数据面恢复"

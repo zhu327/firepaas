@@ -156,3 +156,45 @@ func TestVersionedHealthz(t *testing.T) {
 func newTestAggregateHandler() *edgesvc.Handler {
 	return edgesvc.NewHandler(edgesvc.Config{})
 }
+
+// G710：HTTP→HTTPS 跳转沿用请求 Host 时必须拒绝可改变 URL 结构的 Host；
+// 合法 Host 保持原跳转行为（含非 443 端口后缀与 RequestURI 透传）。
+func TestRedirectHandlerHostValidation(t *testing.T) {
+	serve := func(h http.Handler, host, target string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		req.Host = host
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	h := redirectHandler(":443")
+	rec := serve(h, "app.example.com", "/a?b=1")
+	if rec.Code != http.StatusPermanentRedirect {
+		t.Fatalf("valid host status=%d", rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); loc != "https://app.example.com/a?b=1" {
+		t.Fatalf("valid host location=%q", loc)
+	}
+
+	rec = serve(h, "app.example.com:8080", "/a")
+	if loc := rec.Header().Get("Location"); loc != "https://app.example.com/a" {
+		t.Fatalf("host with port location=%q", loc)
+	}
+
+	h8443 := redirectHandler(":8443")
+	rec = serve(h8443, "app.example.com", "/")
+	if loc := rec.Header().Get("Location"); loc != "https://app.example.com:8443/" {
+		t.Fatalf("non-443 suffix location=%q", loc)
+	}
+
+	for _, bad := range []string{"", "evil.com@good.com", "a/b", `a\b`, "a?b", "a#b", "a b", "a\tb"} {
+		if rec := serve(h, bad, "/"); rec.Code != http.StatusBadRequest {
+			t.Fatalf("host %q must be rejected with 400, got %d", bad, rec.Code)
+		}
+	}
+
+	if rec := serve(h, "app.example.com", "/healthz"); rec.Code != http.StatusOK {
+		t.Fatalf("healthz status=%d", rec.Code)
+	}
+}

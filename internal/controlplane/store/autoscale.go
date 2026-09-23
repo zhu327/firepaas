@@ -14,6 +14,8 @@ import (
 //   - 手动 scale 经 TakeoverScale 单条 UPDATE（desired + enabled=false 原子接管）。
 
 // AutoscalePolicy 是 apps 行上的弹性策略（与 App 内联字段一一对应）。
+// Wave4 多信号：TargetRPS/TargetCPURatio/Custom* 全系可选维度，0/空 = 关闭
+// （不参与 max-of-wants）。关闭语义是零回归的关键：既有策略逐字保持并发行为。
 type AutoscalePolicy struct {
 	Enabled           bool
 	MinReplicas       int
@@ -21,6 +23,17 @@ type AutoscalePolicy struct {
 	TargetConcurrency int
 	ScaleDownDelaySec int
 	PanicThreshold    float64
+	// TargetRPS：单副本目标速率（rps，~10s 滚动口径）；<=0 = 关闭。
+	TargetRPS int
+	// TargetCPURatio：单副本目标平均利用率 (0,1]；<=0 = 关闭。
+	TargetCPURatio float64
+	// CustomPromQuery：自定义 PromQL（{hostname}/{app_id} 模板变量）；空 = 关闭。
+	CustomPromQuery string
+	// CustomTarget：自定义指标目标值；<=0 = 关闭。
+	CustomTarget float64
+	// CustomMode：per_replica（HPA 式 want=ceil(ready*value/target)）或
+	// absolute（want=ceil(value/target)）。其它值写入前拒绝。
+	CustomMode string
 }
 
 // DefaultAutoscalePolicy 返回列默认值对应的策略（= 当前手动行为，零回归）。
@@ -32,6 +45,7 @@ func DefaultAutoscalePolicy() AutoscalePolicy {
 		TargetConcurrency: 20,
 		ScaleDownDelaySec: 120,
 		PanicThreshold:    2.0,
+		CustomMode:        "per_replica",
 	}
 }
 
@@ -89,7 +103,29 @@ func ValidateAutoscalePolicy(p AutoscalePolicy) error {
 	if p.PanicThreshold < autoscaleBounds.panicThreshold[0] || p.PanicThreshold > autoscaleBounds.panicThreshold[1] {
 		return fmt.Errorf("panic_threshold must be in [1.5,5.0]")
 	}
+	if p.TargetRPS < 0 || p.TargetRPS > 100000 {
+		return fmt.Errorf("target_rps must be in [0,100000] (0 = disabled)")
+	}
+	if p.TargetCPURatio < 0 || p.TargetCPURatio > 1 {
+		return fmt.Errorf("target_cpu_ratio must be in [0,1] (0 = disabled)")
+	}
+	if p.CustomTarget < 0 {
+		return fmt.Errorf("custom_target must be >= 0 (0 = disabled)")
+	}
+	if p.CustomMode != "" && p.CustomMode != "per_replica" && p.CustomMode != "absolute" {
+		return fmt.Errorf("custom_mode must be per_replica|absolute")
+	}
+	if p.CustomTarget > 0 && p.CustomPromQuery == "" {
+		return fmt.Errorf("custom_target requires custom_prom_query")
+	}
 	return nil
+}
+
+// NormalizeAutoscalePolicy 是 clampAutoscalePolicy 的导出形态：写入前归一
+// （"" 与 per_replica 同语义统一写法）与读时钳制共用，保证库内单写法、
+// policyHash 不因同语义异写误判变更。
+func NormalizeAutoscalePolicy(p AutoscalePolicy) AutoscalePolicy {
+	return clampAutoscalePolicy(p)
 }
 
 // clampAutoscalePolicy 防脏行：读时钳制到合法域（DB 无 CHECK 约束，
@@ -115,6 +151,24 @@ func clampAutoscalePolicy(p AutoscalePolicy) AutoscalePolicy {
 		autoscaleBounds.panicThreshold[0],
 		autoscaleBounds.panicThreshold[1],
 	)
+	if p.TargetRPS < 0 {
+		p.TargetRPS = 0
+	}
+	if p.TargetRPS > 100000 {
+		p.TargetRPS = 100000
+	}
+	if p.TargetCPURatio < 0 || p.TargetCPURatio > 1 {
+		p.TargetCPURatio = 0
+	}
+	if p.CustomTarget < 0 {
+		p.CustomTarget = 0
+	}
+	if p.CustomTarget == 0 {
+		p.CustomPromQuery = ""
+	}
+	if p.CustomMode != "absolute" {
+		p.CustomMode = "per_replica"
+	}
 	return p
 }
 
@@ -136,12 +190,17 @@ func (s *Store) SetAutoscalePolicy(ctx context.Context, appID string, p Autoscal
 	if err := ValidateAutoscalePolicy(p); err != nil {
 		return err
 	}
+	// 归一后入库："" 与 per_replica 同语义，统一写法避免 policyHash 误判
+	// 策略变更（稳定窗无谓重置一次）。
+	p = clampAutoscalePolicy(p)
 	tag, err := s.pool.Exec(ctx, `UPDATE apps SET autoscale_enabled=$2, min_replicas=$3,
 		max_replicas=$4, target_concurrency=$5, scale_down_delay_sec=$6,
-		panic_threshold=$7, updated_at=now()
+		panic_threshold=$7, target_rps=$8, target_cpu_ratio=$9,
+		custom_prom_query=$10, custom_target=$11, custom_mode=$12, updated_at=now()
 		WHERE id=$1 AND deleted_at IS NULL`,
 		appID, p.Enabled, p.MinReplicas, p.MaxReplicas, p.TargetConcurrency,
-		p.ScaleDownDelaySec, p.PanicThreshold)
+		p.ScaleDownDelaySec, p.PanicThreshold, p.TargetRPS, p.TargetCPURatio,
+		p.CustomPromQuery, p.CustomTarget, p.CustomMode)
 	if err != nil {
 		return fmt.Errorf("set autoscale policy: %w", err)
 	}

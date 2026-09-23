@@ -22,7 +22,9 @@ import (
 	"github.com/zhu327/firepaas/internal/agent/network/api"
 	"github.com/zhu327/firepaas/internal/agent/state"
 	contracts "github.com/zhu327/firepaas/internal/contracts/agentv1"
+	"github.com/zhu327/firepaas/internal/observability/tracing"
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
+	"go.opentelemetry.io/otel/attribute"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -202,8 +204,14 @@ func (s *Server) ServiceInfo(context.Context, *emptypb.Empty) (*pb.ServiceInfoRe
 	return s.info.Response(), nil
 }
 
-// CreateMachine 实现带 fencing/幂等的创建。
+// CreateMachine 实现带 fencing/幂等的创建（Wave6：续接派发 trace）。
 func (s *Server) CreateMachine(ctx context.Context, req *pb.CreateMachineRequest) (*pb.CreateMachineResponse, error) {
+	ctx = tracing.ExtractFromMetadata(ctx)
+	ctx, span := tracing.StartServerSpan(ctx, "firepaas-agent", "agent.create",
+		attribute.String("machine.id", req.GetMachineId()),
+		attribute.String("operation.id", req.GetOperationId()),
+		attribute.Int64("generation", int64(req.GetGeneration())))
+	defer span.End()
 	if err := contracts.ValidateCreateRequest(req); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}

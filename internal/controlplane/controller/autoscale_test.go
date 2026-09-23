@@ -594,3 +594,14 @@ func TestNotePlacementFailureFreezesAfterStreak(t *testing.T) {
 		t.Fatal("freeze must clear")
 	}
 }
+
+// Wave4：WindowSec 只取 fresh 样本窗口——stale 大窗口样本不得稀释 RPS 速率。
+func TestAggregateWindowSecFreshOnly(t *testing.T) {
+	now := time.Now()
+	fresh, _ := json.Marshal(autoscaleSample{EWMA: 1, RPS: 100, TsMs: now.UnixMilli(), WinMs: 10000})
+	stale, _ := json.Marshal(autoscaleSample{EWMA: 0, RPS: 0, TsMs: now.Add(-time.Hour).UnixMilli(), WinMs: 60000})
+	sig := aggregateAutoscaleSignal([]map[string]string{{"e1": string(fresh), "e2": string(stale)}}, 20, now)
+	if sig.WindowSec != 10 {
+		t.Fatalf("WindowSec=%v, want 10 (stale 60s window must not count)", sig.WindowSec)
+	}
+}

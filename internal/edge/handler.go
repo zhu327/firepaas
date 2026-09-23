@@ -25,7 +25,11 @@ import (
 	"github.com/zhu327/firepaas/internal/controlplane/catalog"
 	"github.com/zhu327/firepaas/internal/controlplane/traffic"
 	"github.com/zhu327/firepaas/internal/edge/mesh"
+	"github.com/zhu327/firepaas/internal/observability/tracing"
 	"github.com/zhu327/firepaas/shared/pkg/h2transport"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
 )
 
 const (
@@ -68,6 +72,13 @@ type Counters struct {
 	backendIneligibleEmpty, backendIneligibleNotReady, backendIneligibleUnknown atomic.Uint64
 	// 每客户端请求一次的状态码分母（2xx/4xx/5xx；1xx 升级不计）。
 	req2xx, req4xx, req5xx atomic.Uint64
+	// 按 (host, generation) 的代级观测（Wave3 rollout 分析源：canary 错误率/
+	// p99 必须按代归因；全局计数给不出代维度）。RLock 快路径 + 条目内原子
+	// 计数；建表项才持写锁。键空间以 maxGenEntries 为界 LRU 逐出——generation
+	// 随发布单调涨，不封顶会泄漏；逐出只丢 Prometheus 可见性，不影响转发。
+	genMu    sync.RWMutex
+	genTable map[string]*genEntry
+	genOrder []string
 
 	histOnce                             sync.Once
 	routeLookup, tokenFetch, upstreamRTT prometheus.Histogram
@@ -248,6 +259,7 @@ func (c *Counters) WritePrometheus(w http.ResponseWriter) {
 		"firepaas_edge_upstream_rtt_seconds",
 		"upstream agent proxy round-trip (WS/SSE sessions report session duration)",
 	)
+	c.writeGenMetrics(w)
 }
 
 // statusRecorder 记录最终响应码用于结构化访问日志。实现 Unwrap 供
@@ -533,6 +545,8 @@ func NewHandler(cfg Config) *Handler {
 					req.Header.Set(HeaderRequestID, id)
 					req.Header.Set(HeaderClientRequestID, id)
 				}
+				// Wave6：mesh 直达路径同样透传 trace 上下文。
+				otel.GetTextMapPropagator().Inject(req.Context(), propagation.HeaderCarrier(req.Header))
 			},
 			ModifyResponse: func(resp *http.Response) error {
 				retryable := resp.StatusCode == http.StatusBadGateway &&
@@ -615,6 +629,8 @@ func NewHandler(cfg Config) *Handler {
 			if cred, _ := req.Context().Value(credKey{}).(string); cred != "" {
 				req.Header.Set(traffic.HeaderCredential, cred)
 			}
+			// Wave6：trace 上下文随内部头下行（agent 侧续接，guest 前剥离）。
+			otel.GetTextMapPropagator().Inject(req.Context(), propagation.HeaderCarrier(req.Header))
 		},
 		ModifyResponse: func(resp *http.Response) error {
 			retryable := resp.StatusCode == http.StatusBadGateway &&
@@ -762,6 +778,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// agent 日志与 workload 应用日志关联。
 	reqID := newRequestID()
 	r = r.WithContext(context.WithValue(r.Context(), edgeRequestIDKey{}, reqID))
+	// Wave6 tracing：续接上游 traceparent（无则按采样起根）；与 request-id
+	// 并存（span 属性记 request.id 互跳）。关闭时 span 为 noop（不采样不导出）。
+	r = r.WithContext(otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header)))
+	edgeCtx, edgeSpan := tracing.StartServerSpan(r.Context(), "firepaas-edge", "edge.http",
+		attribute.String("host", host),
+		attribute.String("request.id", reqID))
+	defer edgeSpan.End()
+	r = r.WithContext(edgeCtx)
 	w.Header().Set(HeaderClientRequestID, reqID)
 	// 结构化访问日志：request_id/host/port/backend/execution/generation/
 	// outcome/duration。凭证、token、Authorization 等敏感材料绝不进日志
@@ -771,8 +795,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	backendID := ""
 	executionID := ""
 	var routeGeneration int64
+	var backendDeploymentGen int64
 	defer func() {
 		h.cnt.observeRequest(rec.status)
+		h.cnt.observeGenResponse(host, backendDeploymentGen, rec.status, time.Since(start).Seconds())
+		edgeSpan.SetAttributes(attribute.Int("http.status", rec.status))
 		slog.Info("edge request",
 			"request_id", reqID,
 			"host", host,
@@ -828,6 +855,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	backendID = backend.MachineID
 	executionID = backend.ExecutionID
+	backendDeploymentGen = backend.DeploymentGeneration
 	if r.Header.Get(HeaderPinMachine) != "" {
 		h.cnt.pinHits.Add(1) // 每个请求只计一次；重试路径不重复计数
 	}
@@ -889,6 +917,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	backendID = retryBackend.MachineID
 	executionID = retryBackend.ExecutionID
+	backendDeploymentGen = retryBackend.DeploymentGeneration
 	routeGeneration = retryRoute.RouteGeneration
 	retryCred, retryTokenStale, err := h.getToken(r.Context(), retryBackend)
 	if err != nil {

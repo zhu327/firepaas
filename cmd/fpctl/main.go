@@ -209,6 +209,8 @@ func run(args []string) error {
 		return runMachines(rest[1:])
 	case "wait":
 		return runWait(rest[1:])
+	case "rollout":
+		return runRollout(rest[1:])
 	case "ttl":
 		return runTTL(rest[1:])
 	case "snapshot":
@@ -248,6 +250,7 @@ func printUsage(w io.Writer) {
   events ls|scheduler
   machines ls|show|rm|pause|resume
   wait machine|operation|rollout
+  rollout approve
   ttl set|reset-restart
   snapshot create|ls|show|rm|schedule-set|schedule-ls|schedule-rm|fork|preflight|rescue
   volume create|ls|show|rm|attach|detach
@@ -494,6 +497,11 @@ func runApp(args []string) error {
 		fs.Var(&secretSpecs, "secret", "secret binding VAR=NAME[@VERSION] (repeatable)")
 		fs.Int64Var(&port, "port", 0, "ingress port (0 = inherit)")
 		fs.StringVar(&strategy, "strategy", "", "rollout strategy: bluegreen (default) | rolling")
+		approvalRequired := fs.Bool(
+			"approval-required",
+			false,
+			"pause for manual approval when the new generation is ready (Wave3 promotion gate)",
+		)
 		fs.Int64Var(
 			&standbyIdle,
 			"auto-standby-idle",
@@ -514,6 +522,9 @@ func runApp(args []string) error {
 		putAny(body, "port", port, port != 0)
 		putAny(body, "services", []serviceBody(services), len(services) > 0)
 		put(body, "strategy", strategy)
+		if *approvalRequired {
+			body["approval_required"] = true
+		}
 		if standbyIdle >= 0 {
 			if standbyIdle == 0 {
 				body["auto_standby"] = map[string]any{"enabled": false}

@@ -25,6 +25,7 @@ import (
 	"github.com/zhu327/firepaas/internal/controlplane/catalog"
 	edgesvc "github.com/zhu327/firepaas/internal/edge"
 	edgemesh "github.com/zhu327/firepaas/internal/edge/mesh"
+	"github.com/zhu327/firepaas/internal/observability/tracing"
 	"github.com/zhu327/firepaas/internal/security/mtls"
 	"github.com/zhu327/firepaas/shared/pkg/env"
 	"github.com/zhu327/firepaas/shared/pkg/h2transport"
@@ -48,10 +49,15 @@ var version = "dev"
 
 func main() {
 	logging.Setup()
+	// Wave6 tracing：默认关闭（FIREPAAS_TRACING_ENABLED=true 开启）。
+	shutdownTracing := tracing.Init(context.Background(), "firepaas-edge-proxy")
+	code := 0
 	if err := run(); err != nil {
 		slog.Error("edge-proxy terminated", "error", err)
-		os.Exit(1)
+		code = 1
 	}
+	_ = shutdownTracing(context.Background())
+	os.Exit(code)
 }
 
 func run() error {
@@ -455,7 +461,13 @@ func redirectHandler(tlsPort string) http.Handler {
 			writeHealthz(w)
 			return
 		}
-		http.Redirect(w, r, "https://"+stripPort(r.Host)+suffix+r.URL.RequestURI(), http.StatusPermanentRedirect)
+		host := stripPort(r.Host)
+		if !validRedirectHost(host) {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		//nolint:gosec // G710：同 host HTTP→HTTPS 升级，Host 已过 validRedirectHost 校验（多租户动态 hostname，无静态 allowlist）
+		http.Redirect(w, r, "https://"+host+suffix+r.URL.RequestURI(), http.StatusPermanentRedirect)
 	})
 }
 
@@ -529,6 +541,26 @@ func stripPort(hostport string) string {
 		return hostport
 	}
 	return host
+}
+
+// validRedirectHost 校验 HTTP→HTTPS 跳转拼 Location 用的 Host。跳转目标
+// 沿用请求 Host（多租户 hostname 动态，edge 层无静态 allowlist），仅拒绝
+// 空值与可改变 URL 结构的字符（userinfo/路径/查询/片段分隔符、空白及控制
+// 字符），避免不可信 Host 污染 Location。
+func validRedirectHost(host string) bool {
+	if host == "" {
+		return false
+	}
+	for _, c := range host {
+		switch c {
+		case '@', '/', '\\', '?', '#', ' ', '\t', '\r', '\n':
+			return false
+		}
+		if c < 0x21 || c == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 // resolveAutoscaleEdgeID 解析 autoscale reporter 的 edge 身份

@@ -216,7 +216,8 @@ func Derive(in Input) Projection {
 		}
 		generation := depGen[m.DeploymentID]
 		switch rollout.Status {
-		case "PREPARING":
+		// PAUSED_FOR_APPROVAL 延续 PREPARING 的混合代窗口（等人看，不切流）。
+		case "PREPARING", "PAUSED_FOR_APPROVAL":
 			if depStrategy[toDepByApp[m.AppID]] == "rolling" {
 				cut := cutOrdinals[appOrdinal{m.AppID, m.ReplicaOrdinal}]
 				if generation == rollout.ToGeneration {
@@ -289,6 +290,9 @@ func Derive(in Input) Projection {
 				NodeProxyEndpoint: proxy, AppPort: service.InternalPort,
 				Weight:    weightOrDefault(weightByMachine, m.ID),
 				Readiness: m.ObservedReadiness,
+				// DeploymentGeneration 是 deployment 发布代（rollout 轴）：
+				// edge 代级指标/错误率归因按它打标签（Wave3 Stage A）。
+				DeploymentGeneration: generation,
 			}
 			// G2b/G2c（ADR-0040 §16）：mesh_direct 服务才发布 ULA 提示与
 			// .internal AAAA，且仅 READY 非 draining（严格于 route backend 的
@@ -361,8 +365,10 @@ func (p *Publisher) publishRedis(ctx context.Context, projection Projection, rev
 				NodeProxyEndpoint: backend.NodeProxyEndpoint, AppPort: backend.AppPort,
 				Readiness: backend.Readiness, Weight: backend.Weight, Draining: backend.Draining,
 				// G2b（ADR-0040 §16）：mesh 直连提示（mesh_direct ∧ READY 才填；
-				// 零值 = 无提示，旧 edge 忽略未知字段）。
+				// 零值 = 无提示，旧 edge 忽略未知字段）。DeploymentGeneration
+				// 是 rollout 轴，所有 backend 都填（edge 代级指标归因）。
 				ULA: backend.ULA, IdentityID: backend.IdentityID, Generation: backend.Generation,
+				DeploymentGeneration: backend.DeploymentGeneration,
 			})
 		}
 		hostRoutes[route.Hostname] = append(
@@ -424,7 +430,8 @@ func deriveCanaryWeights(
 	for i := range deployments {
 		dep := &deployments[i]
 		rollout := rolloutByApp[dep.AppID]
-		if rollout == nil || rollout.Status != "PREPARING" {
+		// PAUSED_FOR_APPROVAL 延续 PREPARING 的权重份额（等人看，不切流）。
+		if rollout == nil || (rollout.Status != "PREPARING" && rollout.Status != "PAUSED_FOR_APPROVAL") {
 			continue
 		}
 		weight := store.NormalizeCanaryWeight(rollout.CanaryWeight)

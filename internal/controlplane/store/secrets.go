@@ -243,7 +243,7 @@ func secretRefsJSON(refs map[string]SecretRef) string {
 	if len(refs) == 0 {
 		return "{}"
 	}
-	b, err := json.Marshal(refs)
+	b, err := json.Marshal(refs) //nolint:gosec // G117：存的是 name 引用，非明文值
 	if err != nil {
 		return "{}"
 	}

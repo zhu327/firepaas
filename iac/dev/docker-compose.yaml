@@ -52,6 +52,16 @@ services:
       - ../observability/prometheus-alerts.yml:/etc/prometheus/alerts.yml:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
+  # Wave6 tracing（默认不启动）：三进程 OTLP gRPC 直推本 gateway
+  # （FIREPAAS_TRACING_ENABLED=true + OTEL_EXPORTER_OTLP_ENDPOINT）；
+  # 部署决策与脱敏 allowlist 见 iac/observability/otel-collector.yaml。
+  otel-collector:
+    image: docker.m.daocloud.io/otel/opentelemetry-collector-contrib:latest
+    profiles: ["observability"]
+    ports:
+      - "4317:4317"
+    volumes:
+      - ../observability/otel-collector.yaml:/etc/otelcol/config.yaml:ro
   grafana:
     image: docker.m.daocloud.io/grafana/grafana:latest
     profiles: ["observability"]

@@ -34,7 +34,8 @@ func (c *Controller) rolloutHoldsRecreate(ctx context.Context, m store.Machine) 
 // create retry（S2/S3 超时、回滚），不消耗 restart attempts。
 func rolloutHoldDecision(status string, depGen, fromGen, toGen int64) bool {
 	switch status {
-	case "PREPARING":
+	// PAUSED_FOR_APPROVAL 同 PREPARING：目标代死亡走 rollout 重建，不耗 restart。
+	case "PREPARING", "PAUSED_FOR_APPROVAL":
 		return depGen == toGen
 	case "CUTOVER":
 		return depGen != toGen
@@ -50,7 +51,7 @@ func rolloutHoldDecision(status string, depGen, fromGen, toGen int64) bool {
 // rolloutHoldDecision, which also covers generations being drained/removed.
 func rolloutOwnsReplacement(status string, depGen, fromGen, toGen int64) bool {
 	switch status {
-	case "PREPARING", "CUTOVER":
+	case "PREPARING", "CUTOVER", "PAUSED_FOR_APPROVAL":
 		return depGen == toGen
 	case "ROLLING_BACK":
 		return depGen == fromGen

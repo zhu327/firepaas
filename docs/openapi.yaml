@@ -868,6 +868,19 @@ paths:
       responses:
         "200": { description: OK }
         "504": { description: 等待超时 }
+  /v1/rollouts/{id}/approve:
+    post:
+      tags: [operations]
+      summary: 放行等待人工审批的 rollout（PAUSED_FOR_APPROVAL → CUTOVER）
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "202": { description: 已放行，进入 CUTOVER }
+        "404": { description: rollout 不存在 }
+        "409": { description: 不在审批等待态（已放行/并发推进） }
   /v1/rollouts/{id}/wait:
     get:
       tags: [operations]
@@ -1157,6 +1170,12 @@ components:
             传非 0 会 400）；份额按代内可发布 backend 均分，实际代间比例 =
             两代可服务 backend 数之比 × 权重之比，随 rolling 按 ordinal 切流
             逐步变化（不是窗口内恒定百分比）。
+        approval_required:
+          type: boolean
+          description: |
+            人工审批 gate（显式 opt-in）：新代全 READY 后先进入
+            PAUSED_FOR_APPROVAL 等人工放行（POST /v1/rollouts/{id}/approve），
+            不直接 CUTOVER。rolling canary 显式启用时隐含生效。
         health_check: { $ref: "#/components/schemas/HealthCheck" }
         secret_refs:
           type: object
@@ -1193,6 +1212,11 @@ components:
         target_concurrency: { type: integer }
         scale_down_delay_sec: { type: integer }
         panic_threshold: { type: number }
+        target_rps: { type: integer }
+        target_cpu_ratio: { type: number }
+        custom_prom_query: { type: string }
+        custom_target: { type: number }
+        custom_mode: { type: string }
     AutoscaleState:
       type: object
       properties:

@@ -28,7 +28,8 @@ type autoscaleSample = catalog.SignalSample
 type AutoscaleSignal struct {
 	Served      float64 // fresh ewma 之和
 	Unserved    float64 // ceil(fresh unserved 滚动和 / target)
-	TotalRPS    float64 // fresh rps 之和
+	TotalRPS    float64 // fresh rps 之和（~2×上报窗滚动计数，见 WindowSec）
+	WindowSec   float64 // rps 滚动和对应的窗口秒数（样本 WinMs 最大值；<=0 防御取 10）
 	PanicReject bool    // 任一 fresh field hard_rejected>0
 	HasFresh    bool    // 存在至少一个 fresh field（含全零——合法 idle 信号）
 	// HasStaleNonzero：存在过期且非零 field → 禁止缩容（fail-closed：
@@ -64,6 +65,7 @@ func aggregateAutoscaleSignal(fieldSets []map[string]string, target int, now tim
 		target = 1
 	}
 	var unservedSum int64
+	var winMsMax int64
 	for _, fields := range fieldSets {
 		for _, raw := range fields {
 			var s autoscaleSample
@@ -76,6 +78,10 @@ func aggregateAutoscaleSignal(fieldSets []map[string]string, target int, now tim
 				}
 				continue // 过期全零 field 视为缺席
 			}
+			// 窗口只取 fresh 样本的最大值：stale 大窗口样本会稀释 RPS 速率。
+			if s.WinMs > winMsMax {
+				winMsMax = s.WinMs
+			}
 			sig.HasFresh = true
 			sig.Served += s.EWMA
 			sig.TotalRPS += s.RPS
@@ -86,6 +92,12 @@ func aggregateAutoscaleSignal(fieldSets []map[string]string, target int, now tim
 		}
 	}
 	sig.Unserved = math.Ceil(float64(unservedSum) / float64(target))
+	// RPS 速率归一（Wave4）：TotalRPS 是滚动窗口内的计数和，target_rps 是
+	// 速率口径；窗口取样本 WinMs 最大值（同 reporter 的 2×上报窗），缺失防御 10s。
+	sig.WindowSec = float64(winMsMax) / 1000.0
+	if sig.WindowSec <= 0 {
+		sig.WindowSec = 10
+	}
 	return sig
 }
 
@@ -532,10 +544,25 @@ func (c *Controller) reconcileAutoscaleApp(ctx context.Context, app *store.App,
 			warming++
 		}
 	}
-	want, panicTriggered := computeAutoscaleWant(policy, sig, ready, warming)
+	// Wave4 多信号：可选维度缺信号且有有效容量时整体 hold（盲目扩缩都不安全）。
+	extra, holdReason, hold := c.fetchExtraSignals(ctx, app, policy, sig, ready+warming)
+	if hold {
+		st.deleteScaleDown(app.ID)
+		c.autoscaleHold(autoscaleResultHoldSignal, app, holdReason)
+		// 静态配置缺失（开了 CPU/custom 维度却没配 PrometheusAddr）是运维
+		// 错误而非信号抖动：Warn 让它在日志里可见，否则 app 被永久 hold
+		// 且无任何报错（B4）。
+		if strings.Contains(holdReason, "not configured") {
+			slog.Warn("autoscale holds: external signal dimension enabled but prometheus not configured",
+				"app_id", app.ID, "hostname", app.Hostname, "detail", holdReason)
+		}
+		return
+	}
+	want, panicTriggered, byDim := computeAutoscaleWantMulti(policy, sig, ready, warming, extra)
 	sigDetail := map[string]any{
 		"served": sig.Served, "unserved": sig.Unserved, "rps": sig.TotalRPS,
 		"hard_rejected": sig.PanicReject, "ready": ready, "warming": warming,
+		"want_by_dimension": byDim,
 	}
 	// 配额/资源冻结：只冻扩不冻缩（缩是自愈方向）。
 	if _, frozen := st.frozen(app.ID, now); frozen {
@@ -609,9 +636,10 @@ func (c *Controller) reconcileAutoscaleApp(ctx context.Context, app *store.App,
 
 // autoscalePolicyHash 是策略变更感知用的指纹（浮点用 %v，跨拍稳定）。
 func autoscalePolicyHash(p store.AutoscalePolicy) string {
-	return fmt.Sprintf("%v|%d|%d|%d|%d|%v",
+	return fmt.Sprintf("%v|%d|%d|%d|%d|%v|%d|%v|%s|%v|%s",
 		p.Enabled, p.MinReplicas, p.MaxReplicas, p.TargetConcurrency,
-		p.ScaleDownDelaySec, p.PanicThreshold)
+		p.ScaleDownDelaySec, p.PanicThreshold, p.TargetRPS, p.TargetCPURatio,
+		p.CustomPromQuery, p.CustomTarget, p.CustomMode)
 }
 
 // autoscaleEvent 写状态变化事件（扩/缩/冻结/解冻；hold 只进指标与 debug 日志）。

@@ -90,7 +90,7 @@ type Rollout struct {
 	AppID          string
 	FromGeneration int64
 	ToGeneration   int64
-	Status         string // PREPARING|CUTOVER|ROLLING_BACK|COMPLETE
+	Status         string // PREPARING|PAUSED_FOR_APPROVAL|CUTOVER|ROLLING_BACK|COMPLETE
 	Failed         bool
 	CutoverAt      *time.Time
 	DrainDeadline  *time.Time
@@ -101,6 +101,11 @@ type Rollout struct {
 	// 全部 backend 权重 100）。publisher 据此写 route_backends.weight，edge
 	// 加权选择；未启用时发布路径与加权前逐字节一致。
 	CanaryWeight int
+	// ApprovalRequired（迁移 0043，Wave3 Stage B）：人工审批 gate 是否生效。
+	// ApprovedBy/ApprovedAt 在放行时写入（空 = 未放行）。
+	ApprovalRequired bool
+	ApprovedBy       string
+	ApprovedAt       *time.Time
 }
 
 // NormalizeCanaryWeight 归一 canary 权重到 [0,99]（0 = 不启用；>99 → 99，
@@ -152,6 +157,11 @@ type App struct {
 	TargetConcurrency int
 	ScaleDownDelaySec int
 	PanicThreshold    float64
+	TargetRPS         int
+	TargetCPURatio    float64
+	CustomPromQuery   string
+	CustomTarget      float64
+	CustomMode        string
 	CreatedAt         string
 	UpdatedAt         string
 }
@@ -165,6 +175,11 @@ func (a App) Autoscale() AutoscalePolicy {
 		TargetConcurrency: a.TargetConcurrency,
 		ScaleDownDelaySec: a.ScaleDownDelaySec,
 		PanicThreshold:    a.PanicThreshold,
+		TargetRPS:         a.TargetRPS,
+		TargetCPURatio:    a.TargetCPURatio,
+		CustomPromQuery:   a.CustomPromQuery,
+		CustomTarget:      a.CustomTarget,
+		CustomMode:        a.CustomMode,
 	})
 }
 
@@ -172,6 +187,7 @@ func (a App) Autoscale() AutoscalePolicy {
 const appColumns = `id, project_id, hostname, image_ref, vcpu, mem_mib, desired_replicas,
 	generation, (deleted_at IS NOT NULL), autoscale_enabled, min_replicas, max_replicas,
 	target_concurrency, scale_down_delay_sec, panic_threshold,
+	target_rps, target_cpu_ratio, custom_prom_query, custom_target, custom_mode,
 	created_at::text, updated_at::text`
 
 // scanApp 按列序扫描 app 行。
@@ -181,6 +197,7 @@ func scanApp(row scanner) (*App, error) {
 		&a.DesiredReplicas, &a.Generation, &a.Deleted,
 		&a.AutoscaleEnabled, &a.MinReplicas, &a.MaxReplicas, &a.TargetConcurrency,
 		&a.ScaleDownDelaySec, &a.PanicThreshold,
+		&a.TargetRPS, &a.TargetCPURatio, &a.CustomPromQuery, &a.CustomTarget, &a.CustomMode,
 		&a.CreatedAt, &a.UpdatedAt); err != nil {
 		return nil, err
 	}
@@ -401,9 +418,9 @@ func (s *Store) SetDeploymentStatus(ctx context.Context, depID, status string) e
 // （唯一部分索引的 23505 冲突）。
 func (s *Store) CreateRollout(ctx context.Context, r Rollout) error {
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO rollouts(id, app_id, from_generation, to_generation, status, canary_weight)
-		VALUES($1,$2,$3,$4,'PREPARING',$5)`,
-		r.ID, r.AppID, r.FromGeneration, r.ToGeneration, NormalizeCanaryWeight(r.CanaryWeight))
+		INSERT INTO rollouts(id, app_id, from_generation, to_generation, status, canary_weight, approval_required)
+		VALUES($1,$2,$3,$4,'PREPARING',$5,$6)`,
+		r.ID, r.AppID, r.FromGeneration, r.ToGeneration, NormalizeCanaryWeight(r.CanaryWeight), r.ApprovalRequired)
 	if err != nil {
 		if isUniqueViolation(err) {
 			return ErrRolloutBusy
@@ -417,11 +434,13 @@ func (s *Store) CreateRollout(ctx context.Context, r Rollout) error {
 func (s *Store) GetRollout(ctx context.Context, id string) (*Rollout, error) {
 	row := s.pool.QueryRow(ctx, `
 		SELECT id, app_id, from_generation, to_generation, status, failed,
-			cutover_at, drain_deadline, started_at, completed_at, canary_weight
+			cutover_at, drain_deadline, started_at, completed_at, canary_weight,
+			approval_required, approved_by, approved_at
 		FROM rollouts WHERE id=$1`, id)
 	var r Rollout
 	err := row.Scan(&r.ID, &r.AppID, &r.FromGeneration, &r.ToGeneration, &r.Status,
-		&r.Failed, &r.CutoverAt, &r.DrainDeadline, &r.StartedAt, &r.CompletedAt, &r.CanaryWeight)
+		&r.Failed, &r.CutoverAt, &r.DrainDeadline, &r.StartedAt, &r.CompletedAt, &r.CanaryWeight,
+		&r.ApprovalRequired, &r.ApprovedBy, &r.ApprovedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -435,12 +454,14 @@ func (s *Store) GetRollout(ctx context.Context, id string) (*Rollout, error) {
 func (s *Store) ActiveRolloutForApp(ctx context.Context, appID string) (*Rollout, error) {
 	row := s.pool.QueryRow(ctx, `
 		SELECT id, app_id, from_generation, to_generation, status, failed,
-			cutover_at, drain_deadline, started_at, completed_at, canary_weight
-		FROM rollouts WHERE app_id=$1 AND status IN ('PREPARING','CUTOVER','ROLLING_BACK')`,
+			cutover_at, drain_deadline, started_at, completed_at, canary_weight,
+			approval_required, approved_by, approved_at
+		FROM rollouts WHERE app_id=$1 AND status IN ('PREPARING','CUTOVER','ROLLING_BACK','PAUSED_FOR_APPROVAL')`,
 		appID)
 	var r Rollout
 	err := row.Scan(&r.ID, &r.AppID, &r.FromGeneration, &r.ToGeneration, &r.Status,
-		&r.Failed, &r.CutoverAt, &r.DrainDeadline, &r.StartedAt, &r.CompletedAt, &r.CanaryWeight)
+		&r.Failed, &r.CutoverAt, &r.DrainDeadline, &r.StartedAt, &r.CompletedAt, &r.CanaryWeight,
+		&r.ApprovalRequired, &r.ApprovedBy, &r.ApprovedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -454,8 +475,9 @@ func (s *Store) ActiveRolloutForApp(ctx context.Context, appID string) (*Rollout
 func (s *Store) ListActiveRollouts(ctx context.Context) ([]Rollout, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, app_id, from_generation, to_generation, status, failed,
-			cutover_at, drain_deadline, started_at, completed_at, canary_weight
-		FROM rollouts WHERE status IN ('PREPARING','CUTOVER','ROLLING_BACK') ORDER BY started_at`)
+			cutover_at, drain_deadline, started_at, completed_at, canary_weight,
+			approval_required, approved_by, approved_at
+		FROM rollouts WHERE status IN ('PREPARING','CUTOVER','ROLLING_BACK','PAUSED_FOR_APPROVAL') ORDER BY started_at`)
 	if err != nil {
 		return nil, fmt.Errorf("list active rollouts: %w", err)
 	}
@@ -464,7 +486,8 @@ func (s *Store) ListActiveRollouts(ctx context.Context) ([]Rollout, error) {
 	for rows.Next() {
 		var r Rollout
 		if err := rows.Scan(&r.ID, &r.AppID, &r.FromGeneration, &r.ToGeneration, &r.Status,
-			&r.Failed, &r.CutoverAt, &r.DrainDeadline, &r.StartedAt, &r.CompletedAt, &r.CanaryWeight); err != nil {
+			&r.Failed, &r.CutoverAt, &r.DrainDeadline, &r.StartedAt, &r.CompletedAt, &r.CanaryWeight,
+			&r.ApprovalRequired, &r.ApprovedBy, &r.ApprovedAt); err != nil {
 			return nil, fmt.Errorf("scan rollout: %w", err)
 		}
 		out = append(out, r)
@@ -478,7 +501,7 @@ func (s *Store) RolloutToCutover(ctx context.Context, appID string, deadline tim
 		var cur string
 		if err := tx.QueryRow(ctx,
 			`SELECT status FROM rollouts WHERE app_id=$1
-			 AND status IN ('PREPARING','CUTOVER','ROLLING_BACK') FOR UPDATE`,
+			 AND status IN ('PREPARING','CUTOVER','ROLLING_BACK','PAUSED_FOR_APPROVAL') FOR UPDATE`,
 			appID).Scan(&cur); err != nil {
 			return err
 		}
@@ -492,21 +515,79 @@ func (s *Store) RolloutToCutover(ctx context.Context, appID string, deadline tim
 	})
 }
 
+// RolloutToPaused 推进 PREPARING→PAUSED_FOR_APPROVAL（Wave3 Stage B 人工审批卡点）。
+// 仅 PREPARING 可进入；其它状态与无活跃行一律 no-op（并发推进幂等，与
+// ApproveRollout 同语义）。
+func (s *Store) RolloutToPaused(ctx context.Context, appID string) error {
+	return s.inTx(ctx, func(tx pgx.Tx) error {
+		var cur string
+		if err := tx.QueryRow(ctx,
+			`SELECT status FROM rollouts WHERE app_id=$1
+			 AND status IN ('PREPARING','CUTOVER','ROLLING_BACK','PAUSED_FOR_APPROVAL') FOR UPDATE`,
+			appID).Scan(&cur); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil
+			}
+			return err
+		}
+		if cur != "PREPARING" {
+			return nil
+		}
+		_, err := tx.Exec(ctx, `UPDATE rollouts SET status='PAUSED_FOR_APPROVAL', updated_at=now()
+			WHERE app_id=$1 AND status='PREPARING'`, appID)
+		return err
+	})
+}
+
+// ApproveRollout 人工放行：PAUSED_FOR_APPROVAL→CUTOVER 并写 cutover/drain
+// deadline 与审批人。返回 approved=false 表示当时不在 PAUSED（已被放行或
+// 并发推进），调用方按 409 处理。by 为空时记 unknown（审计不断档）。
+func (s *Store) ApproveRollout(ctx context.Context, appID, by string, deadline time.Time) (bool, error) {
+	if by == "" {
+		by = "unknown"
+	}
+	approved := false
+	err := s.inTx(ctx, func(tx pgx.Tx) error {
+		var cur string
+		if err := tx.QueryRow(ctx,
+			`SELECT status FROM rollouts WHERE app_id=$1
+			 AND status IN ('PREPARING','CUTOVER','ROLLING_BACK','PAUSED_FOR_APPROVAL') FOR UPDATE`,
+			appID).Scan(&cur); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil // 无活跃 rollout
+			}
+			return err
+		}
+		if cur != "PAUSED_FOR_APPROVAL" {
+			return nil
+		}
+		tag, err := tx.Exec(ctx, `UPDATE rollouts SET status='CUTOVER',
+			cutover_at=now(), drain_deadline=$2, approved_by=$3, approved_at=now(), updated_at=now()
+			WHERE app_id=$1 AND status='PAUSED_FOR_APPROVAL'`, appID, deadline, by)
+		if err != nil {
+			return err
+		}
+		approved = tag.RowsAffected() == 1
+		return nil
+	})
+	return approved, err
+}
+
 // RolloutToRollback 推进 →ROLLING_BACK。
 func (s *Store) RolloutToRollback(ctx context.Context, appID string) error {
 	return s.inTx(ctx, func(tx pgx.Tx) error {
 		var cur string
 		if err := tx.QueryRow(ctx,
 			`SELECT status FROM rollouts WHERE app_id=$1
-			 AND status IN ('PREPARING','CUTOVER','ROLLING_BACK') FOR UPDATE`,
+			 AND status IN ('PREPARING','CUTOVER','ROLLING_BACK','PAUSED_FOR_APPROVAL') FOR UPDATE`,
 			appID).Scan(&cur); err != nil {
 			return err
 		}
-		if cur != "PREPARING" && cur != "CUTOVER" {
+		if cur != "PREPARING" && cur != "CUTOVER" && cur != "PAUSED_FOR_APPROVAL" {
 			return nil
 		}
 		_, err := tx.Exec(ctx, `UPDATE rollouts SET status='ROLLING_BACK', updated_at=now()
-			WHERE app_id=$1 AND status IN ('PREPARING','CUTOVER')`, appID)
+			WHERE app_id=$1 AND status IN ('PREPARING','CUTOVER','PAUSED_FOR_APPROVAL')`, appID)
 		return err
 	})
 }
@@ -517,13 +598,13 @@ func (s *Store) CompleteRollout(ctx context.Context, appID string, failed bool) 
 		var cur string
 		if err := tx.QueryRow(ctx,
 			`SELECT status FROM rollouts WHERE app_id=$1
-			 AND status IN ('PREPARING','CUTOVER','ROLLING_BACK') FOR UPDATE`,
+			 AND status IN ('PREPARING','CUTOVER','ROLLING_BACK','PAUSED_FOR_APPROVAL') FOR UPDATE`,
 			appID).Scan(&cur); err != nil {
 			return err
 		}
 		_, err := tx.Exec(ctx, `UPDATE rollouts SET status='COMPLETE', failed=$2,
 			completed_at=now(), updated_at=now()
-			WHERE app_id=$1 AND status IN ('PREPARING','CUTOVER','ROLLING_BACK')`,
+			WHERE app_id=$1 AND status IN ('PREPARING','CUTOVER','ROLLING_BACK','PAUSED_FOR_APPROVAL')`,
 			appID, failed)
 		return err
 	})
@@ -539,7 +620,7 @@ func (s *Store) CompleteRolloutWithStatus(ctx context.Context, appID string, fai
 		var cur string
 		if err := tx.QueryRow(ctx,
 			`SELECT status FROM rollouts WHERE app_id=$1
-			 AND status IN ('PREPARING','CUTOVER','ROLLING_BACK') FOR UPDATE`,
+			 AND status IN ('PREPARING','CUTOVER','ROLLING_BACK','PAUSED_FOR_APPROVAL') FOR UPDATE`,
 			appID).Scan(&cur); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return nil // 已被并发推进（幂等）
@@ -548,7 +629,7 @@ func (s *Store) CompleteRolloutWithStatus(ctx context.Context, appID string, fai
 		}
 		if _, err := tx.Exec(ctx, `UPDATE rollouts SET status='COMPLETE', failed=$2,
 			completed_at=now(), updated_at=now()
-			WHERE app_id=$1 AND status IN ('PREPARING','CUTOVER','ROLLING_BACK')`,
+			WHERE app_id=$1 AND status IN ('PREPARING','CUTOVER','ROLLING_BACK','PAUSED_FOR_APPROVAL')`,
 			appID, failed); err != nil {
 			return err
 		}
@@ -587,7 +668,7 @@ func (s *Store) DeployApp(ctx context.Context, d Deployment, r Rollout, appGener
 		}
 		var n int
 		if err := tx.QueryRow(ctx, `SELECT count(*) FROM rollouts
-			WHERE app_id=$1 AND status IN ('PREPARING','CUTOVER','ROLLING_BACK')`, r.AppID).Scan(&n); err != nil {
+			WHERE app_id=$1 AND status IN ('PREPARING','CUTOVER','ROLLING_BACK','PAUSED_FOR_APPROVAL')`, r.AppID).Scan(&n); err != nil {
 			return err
 		}
 		if n > 0 {
@@ -606,9 +687,9 @@ func (s *Store) DeployApp(ctx context.Context, d Deployment, r Rollout, appGener
 			return fmt.Errorf("create deployment: %w", err)
 		}
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO rollouts(id, app_id, from_generation, to_generation, status, canary_weight)
-			VALUES($1,$2,$3,$4,'PREPARING',$5)`,
-			r.ID, r.AppID, r.FromGeneration, r.ToGeneration, NormalizeCanaryWeight(r.CanaryWeight)); err != nil {
+			INSERT INTO rollouts(id, app_id, from_generation, to_generation, status, canary_weight, approval_required)
+			VALUES($1,$2,$3,$4,'PREPARING',$5,$6)`,
+			r.ID, r.AppID, r.FromGeneration, r.ToGeneration, NormalizeCanaryWeight(r.CanaryWeight), r.ApprovalRequired); err != nil {
 			if isUniqueViolation(err) {
 				return ErrRolloutBusy
 			}
@@ -649,7 +730,7 @@ func (s *Store) SoftDeleteApp(ctx context.Context, appID string) error {
 		}
 		if _, err := tx.Exec(ctx, `UPDATE rollouts SET status='COMPLETE', failed=true,
 			completed_at=now(), updated_at=now()
-			WHERE app_id=$1 AND status IN ('PREPARING','CUTOVER','ROLLING_BACK')`, appID); err != nil {
+			WHERE app_id=$1 AND status IN ('PREPARING','CUTOVER','ROLLING_BACK','PAUSED_FOR_APPROVAL')`, appID); err != nil {
 			return fmt.Errorf("complete active rollouts: %w", err)
 		}
 		if _, err := tx.Exec(ctx, `UPDATE deployments SET status='SUPERSEDED', updated_at=now()
@@ -712,7 +793,7 @@ func (s *Store) SoftDeleteAppAndEnqueueDeletes(
 			}
 			if _, err := tx.Exec(ctx, `UPDATE rollouts SET status='COMPLETE', failed=true,
 				completed_at=now(), updated_at=now()
-				WHERE app_id=$1 AND status IN ('PREPARING','CUTOVER','ROLLING_BACK')`, appID); err != nil {
+				WHERE app_id=$1 AND status IN ('PREPARING','CUTOVER','ROLLING_BACK','PAUSED_FOR_APPROVAL')`, appID); err != nil {
 				return fmt.Errorf("complete active rollouts: %w", err)
 			}
 			if _, err := tx.Exec(ctx, `UPDATE deployments SET status='SUPERSEDED', updated_at=now()

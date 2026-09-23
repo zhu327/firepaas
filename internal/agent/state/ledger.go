@@ -234,6 +234,23 @@ func (l *Ledger) PruneMachineExcept(machineID, keepOperationID string) (int, err
 	return removed, nil
 }
 
+// Stats 返回 ledger 规模（内存条数 + 磁盘文件字节数），供 agent metrics
+// 抓取与存储形态触发线评估。磁盘文件缺失/不可读时 bytes=0，不报错。
+//
+// 存储形态说明：当前每次变更全量 Marshal + 全量重写（O(N)/op + 一次 fsync）。
+// 单节点在役 machine 有界时足够；当 Stats 持续满足 entries>10000 或
+// persist p99>100ms 时，迁移到 append-only JSONL + snapshot 压实（零新依赖；
+// bbolt/SQLite 是备选，见 docs/plans/2026-09-23-items-9-14.md 的 ledger 决策）。
+func (l *Ledger) Stats() (entries int, bytes int64) {
+	l.mu.Lock()
+	entries = len(l.records)
+	l.mu.Unlock()
+	if st, err := os.Stat(l.path); err == nil {
+		bytes = st.Size()
+	}
+	return entries, bytes
+}
+
 // persistLocked uses the crash-safe sequence (see writeFileDurable /
 // durablewrite.WriteFileAtomic): write temp, fsync temp, rename, fsync parent.
 // A successful return means both data and directory entry are durable.

@@ -581,8 +581,14 @@ func TestDeriveMeshDirectULAHints(t *testing.T) {
 		t.Fatalf("direct backends = %+v", direct.Backends)
 	}
 	b := direct.Backends[0]
-	if b.ULA != "fd7a:9a55:0:1::7" || b.IdentityID != 42 || b.Generation != 3 {
-		t.Fatalf("mesh_direct hint missing: ula=%q id=%d gen=%d", b.ULA, b.IdentityID, b.Generation)
+	if b.ULA != "fd7a:9a55:0:1::7" || b.IdentityID != 42 || b.Generation != 3 || b.DeploymentGeneration != 1 {
+		t.Fatalf(
+			"mesh_direct hint missing: ula=%q id=%d gen=%d depgen=%d",
+			b.ULA,
+			b.IdentityID,
+			b.Generation,
+			b.DeploymentGeneration,
+		)
 	}
 	proxyOnly := byPort[9090]
 	if len(proxyOnly.Backends) != 1 {
@@ -759,7 +765,7 @@ func TestRebuildPublishesBackendHints(t *testing.T) {
 		t.Fatalf("replaced = %+v", cat.replaced)
 	}
 	b := cat.replaced[0].Route.Backends[0]
-	if b.ULA != "fd7a:9a55:0:1::7" || b.IdentityID != 42 || b.Generation != 5 {
+	if b.ULA != "fd7a:9a55:0:1::7" || b.IdentityID != 42 || b.Generation != 5 || b.DeploymentGeneration != 1 {
 		t.Fatalf("published backend hint missing: %+v", b)
 	}
 }
@@ -941,5 +947,95 @@ func TestDeriveCanaryWeights(t *testing.T) {
 		if b.Weight != 100 {
 			t.Fatalf("no-rollout backend %s weight=%d want 100", b.MachineID, b.Weight)
 		}
+	}
+}
+
+// Wave3 Stage B：PAUSED_FOR_APPROVAL 延续 PREPARING 的混合代窗口——同输入下
+// 权重与 draining 与 PREPARING 逐字一致（等人看，不切流）。
+func TestPausedApprovalMirrorsPreparing(t *testing.T) {
+	machine := func(id, depID string, ordinal int) store.Machine {
+		return store.Machine{
+			ID: id, AppID: "app", DeploymentID: depID, Hostname: "app.test",
+			CurrentExecutionID: "exec-" + id, NodeID: "node",
+			ObservedState: "RUNNING", ObservedReadiness: "READY", ReplicaOrdinal: ordinal,
+		}
+	}
+	deployments := []store.Deployment{
+		{ID: "dep-old", AppID: "app", Generation: 1, Port: 8080, Strategy: "rolling"},
+		{ID: "dep-new", AppID: "app", Generation: 2, Port: 8080, Strategy: "rolling"},
+	}
+	machines := []store.Machine{
+		machine("new-0", "dep-new", 0),
+		machine("old-0", "dep-old", 0),
+		machine("old-1", "dep-old", 1),
+	}
+	derive := func(status string) Projection {
+		return Derive(Input{
+			Machines: machines, Deployments: deployments,
+			Rollouts: []store.Rollout{
+				{AppID: "app", FromGeneration: 1, ToGeneration: 2, Status: status, CanaryWeight: 20},
+			},
+			ProxyByNode:    map[string]string{"node": "proxy"},
+			DefaultAppPort: 8080,
+		})
+	}
+	preparing, paused := derive("PREPARING"), derive("PAUSED_FOR_APPROVAL")
+	weights := func(p Projection) map[string]int {
+		out := map[string]int{}
+		for _, b := range p.Routes[0].Backends {
+			out[b.MachineID] = b.Weight
+		}
+		return out
+	}
+	if len(preparing.Routes) != 1 || len(paused.Routes) != 1 {
+		t.Fatalf("routes preparing=%d paused=%d, want 1/1", len(preparing.Routes), len(paused.Routes))
+	}
+	pw, zw := weights(preparing), weights(paused)
+	if len(pw) != len(zw) {
+		t.Fatalf("backend sets differ: %v vs %v", pw, zw)
+	}
+	for id, w := range pw {
+		if zw[id] != w {
+			t.Fatalf("machine %s weight preparing=%d paused=%d", id, w, zw[id])
+		}
+	}
+}
+
+// Wave3 Stage A 回归（真机 e2e 抓到）：backend 必须带 deployment 发布代，
+// 不依赖 fabric/mesh hint——否则 legacy 路径 edge 代级指标恒为空，错误率/
+// p99 门永远无数据。
+func TestDeriveBackendDeploymentGeneration(t *testing.T) {
+	machine := func(id, depID string, ordinal int) store.Machine {
+		return store.Machine{
+			ID: id, AppID: "app", DeploymentID: depID, Hostname: "app.test",
+			CurrentExecutionID: "exec-" + id, NodeID: "node",
+			ObservedState: "RUNNING", ObservedReadiness: "READY", ReplicaOrdinal: ordinal,
+		}
+	}
+	proj := Derive(Input{
+		Machines: []store.Machine{
+			machine("new-0", "dep-new", 0),
+			machine("old-0", "dep-old", 0),
+			machine("old-1", "dep-old", 1),
+		},
+		Deployments: []store.Deployment{
+			{ID: "dep-old", AppID: "app", Generation: 1, Port: 8080, Strategy: "rolling"},
+			{ID: "dep-new", AppID: "app", Generation: 2, Port: 8080, Strategy: "rolling"},
+		},
+		Rollouts: []store.Rollout{
+			{AppID: "app", FromGeneration: 1, ToGeneration: 2, Status: "PREPARING", CanaryWeight: 20},
+		},
+		ProxyByNode:    map[string]string{"node": "proxy"},
+		DefaultAppPort: 8080,
+	})
+	if len(proj.Routes) != 1 {
+		t.Fatalf("routes = %+v, want 1 route", proj.Routes)
+	}
+	got := map[string]int64{}
+	for _, b := range proj.Routes[0].Backends {
+		got[b.MachineID] = b.DeploymentGeneration
+	}
+	if got["old-1"] != 1 || got["new-0"] != 2 {
+		t.Fatalf("backend deployment generations = %v, want old-1=1 new-0=2", got)
 	}
 }

@@ -7570,7 +7570,9 @@ var (
 
 func file_agent_v1_agent_proto_rawDescGZIP() []byte {
 	file_agent_v1_agent_proto_rawDescOnce.Do(func() {
-		file_agent_v1_agent_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_agent_v1_agent_proto_rawDesc), len(file_agent_v1_agent_proto_rawDesc)))
+		file_agent_v1_agent_proto_rawDescData = protoimpl.X.CompressGZIP(
+			unsafe.Slice(unsafe.StringData(file_agent_v1_agent_proto_rawDesc), len(file_agent_v1_agent_proto_rawDesc)),
+		)
 	})
 	return file_agent_v1_agent_proto_rawDescData
 }
@@ -7864,7 +7866,10 @@ func file_agent_v1_agent_proto_init() {
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_agent_v1_agent_proto_rawDesc), len(file_agent_v1_agent_proto_rawDesc)),
+			RawDescriptor: unsafe.Slice(
+				unsafe.StringData(file_agent_v1_agent_proto_rawDesc),
+				len(file_agent_v1_agent_proto_rawDesc),
+			),
 			NumEnums:      10,
 			NumMessages:   92,
 			NumExtensions: 0,

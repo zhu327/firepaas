@@ -196,7 +196,7 @@ func (s *Store) GCRootImages(ctx context.Context) ([]string, error) {
 			SELECT d.image_ref AS ref FROM rollouts r
 				CROSS JOIN LATERAL (VALUES (r.from_generation), (r.to_generation)) AS g(generation)
 				LEFT JOIN deployments d ON d.app_id = r.app_id AND d.generation = g.generation
-				WHERE r.status IN ('PREPARING','CUTOVER','ROLLING_BACK')
+				WHERE r.status IN ('PREPARING','CUTOVER','ROLLING_BACK','PAUSED_FOR_APPROVAL')
 			UNION ALL
 			SELECT o.request->'spec'->>'image_ref' AS ref FROM operations o
 				WHERE o.kind='create' AND o.status IN ('PENDING','CLAIMED')

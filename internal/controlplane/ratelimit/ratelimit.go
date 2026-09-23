@@ -222,7 +222,7 @@ func (l *Limiter) AcquireSession(
 	}
 	active, countErr := l.rdb.ZCard(ctx, key).Result()
 	if countErr != nil {
-		_ = sessionRelease.Run(context.Background(), l.rdb, []string{key}, token).Err()
+		_ = sessionRelease.Run(ctx, l.rdb, []string{key}, token).Err()
 		return nil, 0, fmt.Errorf("runtime session count %s: %w", project, countErr)
 	}
 	if ok == 0 {
@@ -237,7 +237,8 @@ func (l *Limiter) AcquireSession(
 			select {
 			case <-ticker.C:
 				now := time.Now()
-				renewCtx, cancel := context.WithTimeout(context.Background(), ttl/3)
+				// 续租是 detached 后台清理：请求取消后仍须执行，解绑取消但保留 values。
+				renewCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ttl/3)
 				renewed, renewErr := sessionRenew.Run(renewCtx, l.rdb, []string{key}, token,
 					now.Add(ttl).UnixMilli(), ttl.Milliseconds()).Int()
 				cancel()
@@ -255,7 +256,8 @@ func (l *Limiter) AcquireSession(
 	return func() {
 		once.Do(func() {
 			close(stop)
-			releaseCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+			// 释放同续租：release 常在请求结束后调用，不可绑定请求取消。
+			releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
 			defer cancel()
 			_ = sessionRelease.Run(releaseCtx, l.rdb, []string{key}, token).Err()
 		})

@@ -94,6 +94,11 @@ type Intent struct {
 	// 混合代窗口内的流量份额（1..99）；0 = 未启用（历史行为）。非法值由
 	// Execute 拒绝（400）。
 	CanaryWeight int
+	// ApprovalRequired（Wave3 Stage B 人工审批 gate，显式 opt-in）：为 true
+	// 时 canary/新代全 READY 后先进入 PAUSED_FOR_APPROVAL 等人工放行，不直接
+	// CUTOVER。rolling canary 显式启用时即使 false 也进 PAUSED（见 controller
+	// approvalGateApplies）。
+	ApprovalRequired bool
 }
 
 type Result struct {
@@ -189,11 +194,12 @@ func (c *Command) Execute(ctx context.Context, in Intent) (Result, error) {
 	}
 	rolloutID := "rollout-" + c.newID()
 	rollout := store.Rollout{
-		ID:             rolloutID,
-		AppID:          app.ID,
-		FromGeneration: active.Generation,
-		ToGeneration:   generation,
-		CanaryWeight:   store.NormalizeCanaryWeight(in.CanaryWeight),
+		ID:               rolloutID,
+		AppID:            app.ID,
+		FromGeneration:   active.Generation,
+		ToGeneration:     generation,
+		CanaryWeight:     store.NormalizeCanaryWeight(in.CanaryWeight),
+		ApprovalRequired: in.ApprovalRequired,
 	}
 	if err := c.store.DeployApp(ctx, deployment, rollout, generation); err != nil {
 		if errors.Is(err, store.ErrRolloutBusy) {

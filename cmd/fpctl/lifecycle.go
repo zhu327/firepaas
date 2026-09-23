@@ -8,6 +8,7 @@
 //	fpctl wait machine <machine_id> --execution <exec_id> [--timeout-ms N]
 //	fpctl wait operation <operation_id> [--timeout-ms N]
 //	fpctl wait rollout <rollout_id> --generation G [--timeout-ms N]
+//	fpctl rollout approve <rollout_id>   (Wave3 Stage B：放行审批卡点 → CUTOVER)
 //	fpctl ttl set <machine_id> <seconds>   (0 = 关闭 TTL)
 //	fpctl ttl reset-restart <machine_id>   (清零 restart attempts，需 admin)
 package main
@@ -148,6 +149,25 @@ func runWait(args []string) error {
 		)
 	default:
 		return fmt.Errorf("unknown wait command %q", args[0])
+	}
+}
+
+// runRollout 是 rollout 运维组（Wave3 Stage B）：
+//
+//	fpctl rollout approve <rollout_id>
+func runRollout(args []string) error {
+	if len(args) < 1 {
+		return errors.New("usage: fpctl rollout <approve>")
+	}
+	switch args[0] {
+	case "approve":
+		rolloutID, err := oneArg(args[1:], "usage: fpctl rollout approve <rollout_id>")
+		if err != nil {
+			return err
+		}
+		return do("POST", "/v1/rollouts/"+url.PathEscape(rolloutID)+"/approve", map[string]any{}, nil)
+	default:
+		return fmt.Errorf("unknown rollout command %q", args[0])
 	}
 }
 

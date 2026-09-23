@@ -39,6 +39,7 @@ import (
 	"github.com/zhu327/firepaas/internal/controlplane/store"
 	"github.com/zhu327/firepaas/internal/controlplane/traffic"
 	"github.com/zhu327/firepaas/internal/observability/metrics"
+	"github.com/zhu327/firepaas/internal/observability/tracing"
 	"github.com/zhu327/firepaas/internal/scheduler"
 	"github.com/zhu327/firepaas/shared/pkg/env"
 	"github.com/zhu327/firepaas/shared/pkg/logging"
@@ -49,10 +50,16 @@ var buildVersion = "dev"
 
 func main() {
 	logging.Setup()
+	// Wave6 tracing：默认关闭（FIREPAAS_TRACING_ENABLED=true 开启）。
+	shutdownTracing := tracing.Init(context.Background(), "firepaas-api")
+	// shutdown 在 os.Exit 前显式执行（defer 会被 Exit 跳过，span 不 flush）。
+	code := 0
 	if err := run(); err != nil {
 		slog.Error("api terminated", "error", err)
-		os.Exit(1)
+		code = 1
 	}
+	_ = shutdownTracing(context.Background())
+	os.Exit(code)
 }
 
 func run() error {
@@ -337,8 +344,15 @@ func run() error {
 				CutoverAnalysisWindow:   env.Dur("FIREPAAS_ROLLOUT_ANALYSIS_WINDOW", 0),
 				CutoverMinServingRatio:  rolloutMinServingRatio(),
 				CutoverZeroServingGrace: env.Dur("FIREPAAS_ROLLOUT_ZERO_SERVING_GRACE", 30*time.Second),
-				Secrets:                 secretsMgr,
-				Traffic:                 trafficSigner,
+				// Wave3 Stage A 外部指标门（显式 opt-in：地址 + 至少一个阈值；
+				// 缺省全关 = 纯 serving-ratio，零回归）。
+				PrometheusAddr:       env.Get("FIREPAAS_PROMETHEUS_ADDR", ""),
+				CutoverMaxErrorRate:  env.Float("FIREPAAS_CUTOVER_MAX_ERROR_RATE", 0),
+				CutoverP99LatencySec: env.Float("FIREPAAS_CUTOVER_P99_LATENCY_SEC", 0),
+				// Wave5 节点扩容 webhook（URL 空 = 仅事件/指标/日志，不外调）。
+				ScaleUpNotifier: scaleUpNotifierFromEnv(),
+				Secrets:         secretsMgr,
+				Traffic:         trafficSigner,
 				// ADR-0040 T4c：与 fabric reconciler 同开关/同 cell 前缀；
 				// mesh 未启用时派发跳过身份/ULA 分配（legacy 零回归）。
 				FabricMesh: controller.FabricMeshConfig{
@@ -410,6 +424,8 @@ func run() error {
 		MetricsToken:  env.Get("FIREPAAS_METRICS_TOKEN", ""),
 		Version:       buildVersion,
 		PrewarmLimits: prewarmLimitsFromEnv(),
+		// 放行 drain 与 controller 同源（FIREPAAS_ROLLOUT_DRAIN，缺省 30s）。
+		RolloutDrainGrace: env.Dur("FIREPAAS_ROLLOUT_DRAIN", 30*time.Second),
 	})
 	mux := http.NewServeMux()
 	httpapi.Register(mux, api)
@@ -494,6 +510,19 @@ func envFraction(key string, def float64) float64 {
 
 // rolloutMinServingRatio 解析 CUTOVER 可服务比例下限（(0,1]；缺省/非法 → 1.0
 // = 与完成门控一致）。envFraction 只接受 (0,1) 开区间，1.0 在此合法，故单列。
+// scaleUpNotifierFromEnv 装配 Wave5 节点扩容 webhook：URL 空 = 不外调
+// （nil 接口，信号止于 durable 事件 + 指标 + 日志）。
+func scaleUpNotifierFromEnv() controller.NodeScaleUpNotifier {
+	url := env.Get("FIREPAAS_SCALEUP_WEBHOOK_URL", "")
+	if url == "" {
+		return nil
+	}
+	return &controller.WebhookScaleUpNotifier{
+		URL:   url,
+		Token: os.Getenv("FIREPAAS_SCALEUP_WEBHOOK_TOKEN"),
+	}
+}
+
 func rolloutMinServingRatio() float64 {
 	const key = "FIREPAAS_ROLLOUT_MIN_SERVING_RATIO"
 	if raw := os.Getenv(key); raw != "" {

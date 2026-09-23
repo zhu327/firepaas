@@ -23,7 +23,11 @@ import (
 
 	"github.com/zhu327/firepaas/internal/agent/machine"
 	"github.com/zhu327/firepaas/internal/controlplane/traffic"
+	"github.com/zhu327/firepaas/internal/observability/tracing"
 	"github.com/zhu327/firepaas/shared/pkg/h2transport"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
 )
 
 const (
@@ -278,6 +282,9 @@ func newReverseProxy() *httputil.ReverseProxy {
 			req.Header.Del(traffic.HeaderCredential)
 			req.Header.Del(HeaderAppPort)
 			req.Header.Del(HeaderRetryable)
+			// Wave6：trace 上下文同步剥离（guest 是用户镜像不可信）。
+			req.Header.Del(tracing.HeaderTraceparent)
+			req.Header.Del(tracing.HeaderTracestate)
 		},
 		// A workload must not be able to forge the agent→edge retry signal.
 		ModifyResponse: func(resp *http.Response) error {
@@ -334,6 +341,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // serveTarget 是两条入口共享的转发路径（legacy :5107 头路由与 G2d
 // fabric ingress 凭证路由）：endpoint 解析 → 反向代理到 guest。
 func (p *Proxy) serveTarget(w http.ResponseWriter, r *http.Request, machineID, executionID string, wantPort int) {
+	// Wave6 tracing：续接 edge 的 trace（guest 前已剥离，本 span 止于 guest 响应）。
+	r = r.WithContext(otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header)))
+	proxyCtx, proxySpan := tracing.StartServerSpan(r.Context(), "firepaas-agent", "agent.proxy",
+		attribute.String("machine.id", machineID),
+		attribute.String("execution.id", executionID),
+		attribute.String("request.id", r.Header.Get(HeaderRequestID)))
+	defer proxySpan.End()
+	r = r.WithContext(proxyCtx)
 	// 关联字段进 context：Director 会剥离内部头，ErrorHandler 只能从
 	// context 取 request_id 与路由归属。
 	r = r.WithContext(context.WithValue(r.Context(), logFieldsKey{}, logFields{

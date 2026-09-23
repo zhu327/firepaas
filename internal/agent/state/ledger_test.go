@@ -243,3 +243,24 @@ func TestPruneBefore(t *testing.T) {
 		t.Fatal("record within retention window must be kept")
 	}
 }
+
+// Stats 返回内存条数与磁盘字节数；缺失文件时 bytes=0 不报错（Wave2 触发线评估用）。
+func TestLedgerStats(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ledger.json")
+	l, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, b := l.Stats(); n != 0 || b != 0 {
+		t.Fatalf("empty stats = (%d,%d)", n, b)
+	}
+	if err := l.Put("op-1", "m-1", "hash-1", []byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Put("op-2", "m-1", "hash-2", []byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if n, b := l.Stats(); n != 2 || b <= 0 {
+		t.Fatalf("stats = (%d,%d), want (2,>0)", n, b)
+	}
+}

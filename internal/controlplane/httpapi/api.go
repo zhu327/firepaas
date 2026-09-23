@@ -111,6 +111,8 @@ type API struct {
 	version      string
 	// limits 是 v1.4-C 准入上限（cmd/api 装配期解析 env 后传入）。
 	limits PrewarmLimits
+	// drainGrace 是放行写入的 drain 期限（见 Config.RolloutDrainGrace）。
+	drainGrace time.Duration
 }
 
 // RouteKicker 把 leader 实例 controller 的 KickRouteRebuild 递给 HTTP 层
@@ -685,6 +687,9 @@ type Config struct {
 	MetricsToken  string
 	Version       string
 	PrewarmLimits PrewarmLimits
+	// RolloutDrainGrace 是放行写入的 drain 期限（与 controller 同 env 源；
+	// <=0 → 30s 默认，保证双源不漂移）。
+	RolloutDrainGrace time.Duration
 }
 
 // New 构造 API。可能为 nil 的依赖由各 handler 按既有语义 fail-closed。
@@ -710,6 +715,7 @@ func New(cfg Config) *API {
 		metricsToken: cfg.MetricsToken,
 		version:      cfg.Version,
 		limits:       cfg.PrewarmLimits,
+		drainGrace:   cfg.RolloutDrainGrace,
 	}
 }
 
@@ -796,6 +802,8 @@ func Register(mux *http.ServeMux, api *API) {
 	mux.HandleFunc("GET /v1/machines/{id}/wait", api.auth(api.waitMachine))
 	mux.HandleFunc("GET /v1/operations/{id}/wait", api.auth(api.waitOperation))
 	mux.HandleFunc("GET /v1/rollouts/{id}/wait", api.auth(api.waitRollout))
+	// Wave3 Stage B：人工审批放行（deploy scope，与 deploy/rollback 同级）。
+	mux.HandleFunc("POST /v1/rollouts/{id}/approve", api.auth(api.approveRollout))
 	mux.HandleFunc("PUT /v1/machines/{id}/ttl", api.auth(api.updateMachineTTL))
 	mux.HandleFunc("POST /v1/machines/{id}/restart-reset", api.auth(api.resetRestart))
 	// v1.2-E（ADR-0035）：项目配额与限流配置（配额写 = admin；读 = read）。

@@ -124,6 +124,9 @@ type RouteBackendRow struct {
 	ULA        string
 	IdentityID uint32
 	Generation int64
+	// DeploymentGeneration 是 deployment 发布代（rollout 轴）：edge 代级
+	// 指标按它归因；与 fabric 分配代（Generation）不同轴，所有 backend 都填。
+	DeploymentGeneration int64
 }
 
 // RouteRow 是 controller 计算出的一个活跃 route（hostname+port 及其 backend set）。

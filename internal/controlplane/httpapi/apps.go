@@ -278,21 +278,22 @@ func (a *API) getApp(w http.ResponseWriter, r *http.Request) {
 }
 
 type deployBody struct {
-	Image        string                     `json:"image"`
-	VCPU         int64                      `json:"vcpu"`
-	MemMIB       int64                      `json:"mem_mib"`
-	Port         int                        `json:"port"`
-	Services     []serviceBody              `json:"services"` // v1.1（ADR-0022）；nil = 继承/单端口
-	Strategy     string                     `json:"strategy"` // v1.1-F：bluegreen（默认）| rolling
-	Env          map[string]string          `json:"env"`
-	NodePool     string                     `json:"node_pool"`
-	Labels       map[string]string          `json:"labels"`
-	AntiAffinity string                     `json:"anti_affinity"`
-	HealthCheck  *healthCheckBody           `json:"health_check"`
-	SecretRefs   map[string]store.SecretRef `json:"secret_refs"`   // M4（ADR-0010）
-	AutoStandby  *autoStandbyBody           `json:"auto_standby"`  // v1.1（ADR-0017）；nil = 继承
-	Egress       *egressPolicyBody          `json:"egress"`        // v1.3-A（ADR-0027）；nil = 继承
-	CanaryWeight int                        `json:"canary_weight"` // P1 按权重灰度（显式 opt-in）：to 代 PREPARING 份额 [1,99]；0/缺省 = 不启用
+	Image            string                     `json:"image"`
+	VCPU             int64                      `json:"vcpu"`
+	MemMIB           int64                      `json:"mem_mib"`
+	Port             int                        `json:"port"`
+	Services         []serviceBody              `json:"services"` // v1.1（ADR-0022）；nil = 继承/单端口
+	Strategy         string                     `json:"strategy"` // v1.1-F：bluegreen（默认）| rolling
+	Env              map[string]string          `json:"env"`
+	NodePool         string                     `json:"node_pool"`
+	Labels           map[string]string          `json:"labels"`
+	AntiAffinity     string                     `json:"anti_affinity"`
+	HealthCheck      *healthCheckBody           `json:"health_check"`
+	SecretRefs       map[string]store.SecretRef `json:"secret_refs"`       // M4（ADR-0010）
+	AutoStandby      *autoStandbyBody           `json:"auto_standby"`      // v1.1（ADR-0017）；nil = 继承
+	Egress           *egressPolicyBody          `json:"egress"`            // v1.3-A（ADR-0027）；nil = 继承
+	CanaryWeight     int                        `json:"canary_weight"`     // P1 按权重灰度（显式 opt-in）：to 代 PREPARING 份额 [1,99]；0/缺省 = 不启用
+	ApprovalRequired bool                       `json:"approval_required"` // Wave3 Stage B：人工审批 gate opt-in；rolling canary 启用时隐含生效
 }
 
 func (a *API) deployApp(w http.ResponseWriter, r *http.Request) {
@@ -360,6 +361,7 @@ func deploymentIntent(appID, projectID string, body deployBody, inheritAll bool)
 		NodePool: body.NodePool, Labels: body.Labels, AntiAffinity: body.AntiAffinity, HealthCheck: healthCheck,
 		SecretRefs: body.SecretRefs, AutoStandby: standby, Egress: egress, InheritAll: inheritAll,
 		ReadActiveFirst: inheritAll, CanaryWeight: body.CanaryWeight,
+		ApprovalRequired: body.ApprovalRequired,
 	}, nil
 }
 

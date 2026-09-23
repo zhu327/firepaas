@@ -60,6 +60,7 @@ import (
 	"github.com/zhu327/firepaas/internal/agent/standby"
 	"github.com/zhu327/firepaas/internal/agent/state"
 	"github.com/zhu327/firepaas/internal/capabilities"
+	"github.com/zhu327/firepaas/internal/observability/tracing"
 	"github.com/zhu327/firepaas/internal/security/mtls"
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
 	"github.com/zhu327/firepaas/shared/pkg/env"
@@ -83,10 +84,15 @@ const (
 
 func main() {
 	logging.Setup()
+	// Wave6 tracing：默认关闭（FIREPAAS_TRACING_ENABLED=true 开启）。
+	shutdownTracing := tracing.Init(context.Background(), "firepaas-agentd")
+	code := 0
 	if err := run(); err != nil {
 		slog.Error("agentd terminated", "error", err)
-		os.Exit(1)
+		code = 1
 	}
+	_ = shutdownTracing(context.Background())
+	os.Exit(code)
 }
 
 // openAgentState 打开 agent 的全部崩溃安全持久状态（operation ledger、
@@ -186,6 +192,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	observeAgentLedger(meter, ledger)
 
 	// ledger/fences 年龄 GC（mvp-plan §5.5 可配置去重窗口，评审 P2-5）：
 	// 启动时清理一次，之后每小时一次。fence 侧额外绑定 machine 存活（R2-6）：
@@ -1184,6 +1191,30 @@ func startAutoStandby(
 	return nil
 }
 
+// observeAgentLedger 注册 ledger 规模 gauge（Wave2 触发线评估：条数/字节；
+// meter 为 nil（metrics 未启用）时跳过）。
+func observeAgentLedger(meter otelmetric.Meter, ledger *state.Ledger) {
+	if meter == nil || ledger == nil {
+		return
+	}
+	entries, err := meter.Int64ObservableGauge("firepaas_agent_ledger_entries",
+		otelmetric.WithDescription("agent operation ledger records in memory"))
+	if err != nil {
+		return
+	}
+	bytesGauge, err := meter.Int64ObservableGauge("firepaas_agent_ledger_bytes",
+		otelmetric.WithDescription("agent operation ledger file size in bytes"))
+	if err != nil {
+		return
+	}
+	_, _ = meter.RegisterCallback(func(_ context.Context, o otelmetric.Observer) error {
+		n, b := ledger.Stats()
+		o.ObserveInt64(entries, int64(n))
+		o.ObserveInt64(bytesGauge, b)
+		return nil
+	}, entries, bytesGauge)
+}
+
 // mustNoopHistogram 返回 noop 直方图（meter 构造失败的兜底）。
 func mustNoopHistogram() otelmetric.Float64Histogram {
 	h, _ := noop.Meter{}.Float64Histogram("firepaas_agent_autostandby_wake_seconds")
@@ -1364,7 +1395,8 @@ func initAgentMetrics(ctx context.Context, metricsPort, metricsBind string) otel
 	otel.SetMeterProvider(mp)
 	go func() {
 		<-ctx.Done()
-		_ = mp.Shutdown(context.Background())
+		// Shutdown 在 ctx 取消后仍须执行：解绑取消但保留 values。
+		_ = mp.Shutdown(context.WithoutCancel(ctx))
 	}()
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(promReg, promhttp.HandlerOpts{}))

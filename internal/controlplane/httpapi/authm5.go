@@ -151,6 +151,7 @@ var routeScope = map[string]string{
 	"GET /v1/machines/{id}/wait":           "read",
 	"GET /v1/operations/{id}/wait":         "read",
 	"GET /v1/rollouts/{id}/wait":           "read",
+	"POST /v1/rollouts/{id}/approve":       "deploy",
 	"PUT /v1/machines/{id}/ttl":            "write",
 	"POST /v1/machines/{id}/restart-reset": "admin",
 	// v1.3：egress audit、snapshot/checkpoint/fork/rescue 与 LOCAL_RW volume。
@@ -230,6 +231,7 @@ var projectGated = map[string]bool{
 	"GET /v1/operations/{id}":                                true,
 	"GET /v1/operations/{id}/wait":                           true,
 	"GET /v1/rollouts/{id}/wait":                             true,
+	"POST /v1/rollouts/{id}/approve":                         true,
 	"DELETE /v1/machines/{id}":                               true,
 	"POST /v1/machines/{id}/pause":                           true,
 	"POST /v1/machines/{id}/resume":                          true,

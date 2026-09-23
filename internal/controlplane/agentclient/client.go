@@ -9,8 +9,13 @@ import (
 	"os"
 	"time"
 
+	"github.com/zhu327/firepaas/internal/observability/tracing"
 	"github.com/zhu327/firepaas/internal/security/mtls"
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
@@ -132,10 +137,20 @@ func certReloadInterval() time.Duration {
 	return d
 }
 
-// Create 调用 CreateMachine。
+// Create 调用 CreateMachine（Wave6：client span + trace 经 metadata 下行）。
 func (c *Client) Create(ctx context.Context, req *pb.CreateMachineRequest) (*pb.Machine, error) {
-	resp, err := c.Machines.CreateMachine(ctx, req)
+	ctx, span := otel.Tracer("firepaas-controller").Start(ctx, "controller.dispatch",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			attribute.String("machine.id", req.GetMachineId()),
+			attribute.String("operation.id", req.GetOperationId()),
+			attribute.Int64("generation", int64(req.GetGeneration())),
+		))
+	defer span.End()
+	resp, err := c.Machines.CreateMachine(tracing.InjectToMetadata(ctx), req)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
 	return resp.Machine, nil

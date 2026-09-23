@@ -609,13 +609,13 @@ func dumpEbpfDebug(t *testing.T, ctx context.Context, ns, guestNS string, b *Bac
 	out, _ = exec.Command("tc", "filter", "show", "dev", "v-ebpf-h", "ingress").CombinedOutput()
 	t.Logf("host tc filters:\n%s", out)
 	// 抓包看 SYN 是否被重写并送到 host 侧（重试一次真实拨号，边拨边抓）。
-	go runHelper(t, context.Background(), guestNS, dialSpec{
+	go runHelper(t, ctx, guestNS, dialSpec{
 		target: "203.0.113.10:80", src: guestIP, timeout: 2500 * time.Millisecond,
 	})
 	time.Sleep(400 * time.Millisecond)
 	out, _ = exec.Command("timeout", "2", "tcpdump", "-vv", "-i", "v-ebpf-h", "-n", "-c", "3").CombinedOutput()
 	t.Logf("host any tcpdump:\n%s", out)
-	go runHelper(t, context.Background(), guestNS, dialSpec{
+	go runHelper(t, ctx, guestNS, dialSpec{
 		target: "203.0.113.10:80", src: guestIP, timeout: 2500 * time.Millisecond,
 	})
 	time.Sleep(400 * time.Millisecond)

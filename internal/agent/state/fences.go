@@ -15,7 +15,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 )
@@ -108,17 +107,33 @@ func (f *Fences) Advance(machineID string, generation uint64, executionID string
 	}
 	if ok && generation == e.MaxGeneration {
 		// 同代新操作（如 create 后的同代 delete）：只刷新调试字段。
+		// 落盘失败回滚内存（与 ledger Begin/Complete 同纪律：内存与磁盘
+		// 不长期分叉，重启后以磁盘为准）。
+		old := e
 		e.LastExecutionID = executionID
 		e.UpdatedAt = time.Now().UTC()
 		f.entries[machineID] = e
-		return f.persistLocked()
+		if err := f.persistLocked(); err != nil {
+			f.entries[machineID] = old
+			return err
+		}
+		return nil
 	}
+	old, hadOld := f.entries[machineID]
 	f.entries[machineID] = FenceEntry{
 		MaxGeneration:   generation,
 		LastExecutionID: executionID,
 		UpdatedAt:       time.Now().UTC(),
 	}
-	return f.persistLocked()
+	if err := f.persistLocked(); err != nil {
+		if hadOld {
+			f.entries[machineID] = old
+		} else {
+			delete(f.entries, machineID)
+		}
+		return err
+	}
+	return nil
 }
 
 // PruneBefore 删除 UpdatedAt 早于 cutoff 的条目（与 ledger 共享 GC 窗口），
@@ -160,38 +175,7 @@ func (f *Fences) persistLocked() error {
 	if err != nil {
 		return fmt.Errorf("marshal fences: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(f.path), 0o700); err != nil {
-		return fmt.Errorf("create fences dir: %w", err)
-	}
-	dir := filepath.Dir(f.path)
-	tmp, err := os.OpenFile(f.path+".tmp", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
-		return fmt.Errorf("open fences tmp: %w", err)
-	}
-	cleanup := func() { _ = tmp.Close(); _ = os.Remove(tmp.Name()) }
-	if _, err := tmp.Write(data); err != nil {
-		cleanup()
-		return fmt.Errorf("write fences tmp: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		cleanup()
-		return fmt.Errorf("fsync fences tmp: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmp.Name())
-		return fmt.Errorf("close fences tmp: %w", err)
-	}
-	if err := os.Rename(tmp.Name(), f.path); err != nil {
-		_ = os.Remove(tmp.Name())
-		return fmt.Errorf("rename fences: %w", err)
-	}
-	d, err := os.Open(dir)
-	if err != nil {
-		return fmt.Errorf("open fences dir: %w", err)
-	}
-	defer func() { _ = d.Close() }()
-	if err := d.Sync(); err != nil {
-		return fmt.Errorf("fsync fences dir: %w", err)
-	}
-	return nil
+	// 与 ledger/creds/fabric 同纪律：实现收敛在 writeFileDurable
+	//（= shared/pkg/durablewrite.WriteFileAtomic），此处不保留副本。
+	return writeFileDurable(f.path, "fences", data)
 }

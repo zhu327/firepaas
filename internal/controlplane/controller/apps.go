@@ -25,6 +25,7 @@ import (
 	"github.com/zhu327/firepaas/internal/capabilities"
 	agentv1 "github.com/zhu327/firepaas/internal/contracts/agentv1"
 	"github.com/zhu327/firepaas/internal/controlplane/agentclient"
+	"github.com/zhu327/firepaas/internal/controlplane/promquery"
 	"github.com/zhu327/firepaas/internal/controlplane/store"
 	"github.com/zhu327/firepaas/internal/scheduler"
 	pb "github.com/zhu327/firepaas/shared/gen/agent/v1"
@@ -58,6 +59,15 @@ func (c *Controller) reconcileRollouts(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// Wave3 Stage B 护栏：PAUSED 无自动超时、无限期等人看——至少让卡住
+	// 多少个可观测（stuck 告警看本 gauge 持续大于 0）。
+	var paused uint64
+	for i := range rollouts {
+		if rollouts[i].Status == "PAUSED_FOR_APPROVAL" {
+			paused++
+		}
+	}
+	c.metrics.Set("firepaas_rollouts_paused_for_approval", nil, paused)
 	for i := range rollouts {
 		r := &rollouts[i]
 		app, err := c.store.GetApp(ctx, r.AppID)
@@ -119,6 +129,28 @@ func (c *Controller) reconcileRollout(ctx context.Context, app *store.App, r *st
 		// 使用旧 route/token。旧代必须保留至全部新代已 READY、CUTOVER 的
 		// drain grace 到期后再删除，避免 route/token 的短暂空窗。
 		if allReady(toMachines, app.DesiredReplicas) {
+			// Wave3 Stage B 人工审批卡点：gate 生效时先 PAUSED 等人工放行。
+			if approvalGateApplies(r, toDep) {
+				if err := c.store.RolloutToPaused(ctx, app.ID); err != nil {
+					return err
+				}
+				c.recordEvent(
+					ctx,
+					"rollout",
+					"",
+					r.ID,
+					"",
+					"paused for approval: new generation ready, awaiting promotion",
+					nil,
+				)
+				c.rolloutUserEvent(ctx, r, "approval_pending", nil)
+				c.metrics.Inc(
+					"firepaas_rollout_transitions_total",
+					map[string]string{"from": "PREPARING", "to": "PAUSED_FOR_APPROVAL"},
+					1,
+				)
+				return nil
+			}
 			deadline := time.Now().Add(c.rolloutDrainGrace())
 			if err := c.store.RolloutToCutover(ctx, app.ID, deadline); err != nil {
 				return err
@@ -131,6 +163,11 @@ func (c *Controller) reconcileRollout(ctx context.Context, app *store.App, r *st
 				1,
 			)
 		}
+
+	// PAUSED_FOR_APPROVAL：等人工放行（approve→CUTOVER）或手动回滚；
+	// 无自动超时（Argo pause step 语义），本分支只做存活不断言。
+	case "PAUSED_FOR_APPROVAL":
+		return nil
 
 	case "CUTOVER":
 		// S4：旧代死亡不重建（drain 期限后统一回收）；S5：新代死亡由
@@ -240,8 +277,42 @@ func (c *Controller) cutoverAssessment(
 			MinServingRatio:  c.cfg.CutoverMinServingRatio,
 			ZeroServingGrace: c.cfg.CutoverZeroServingGrace,
 		})
+		// 外部指标门（显式 opt-in）：与 serving-ratio AND 组合。
+		if ext := c.prometheusAnalysis(); ext != nil {
+			p = NewCompositeAnalysis(p, ext)
+		}
 	}
 	return p.AssessCutover(app, r, toMachines, atEnd, now)
+}
+
+// approvalGateApplies 报告新代全 READY 后是否进 PAUSED 等人工放行：
+// deploy 显式 approval_required，或 rolling canary 显式启用（权重只在
+// PREPARING 混合窗口生效，PAUSED 延续该份额等人看——纯函数，可单测）。
+func approvalGateApplies(r *store.Rollout, toDep *store.Deployment) bool {
+	if r == nil {
+		return false
+	}
+	if r.ApprovalRequired {
+		return true
+	}
+	if store.NormalizeCanaryWeight(r.CanaryWeight) == 0 {
+		return false
+	}
+	return toDep != nil && toDep.EffectiveStrategy() == "rolling"
+}
+
+// prometheusAnalysis 按 cfg 构造外部指标 Provider（未启用返回 nil）。
+// Client 构造廉价（无状态），每次评估现建，避免 controller 持有长连接。
+func (c *Controller) prometheusAnalysis() *PrometheusAnalysis {
+	if c.cfg.PrometheusAddr == "" ||
+		(c.cfg.CutoverMaxErrorRate <= 0 && c.cfg.CutoverP99LatencySec <= 0) {
+		return nil
+	}
+	return NewPrometheusAnalysis(PrometheusAnalysisConfig{
+		Querier:       &promquery.Client{BaseURL: c.cfg.PrometheusAddr},
+		MaxErrorRate:  c.cfg.CutoverMaxErrorRate,
+		P99LatencySec: c.cfg.CutoverP99LatencySec,
+	})
 }
 
 func (c *Controller) startRollback(ctx context.Context, r *store.Rollout) error {
@@ -322,8 +393,9 @@ func (c *Controller) reconcileApp(ctx context.Context, app *store.App) error {
 	if err != nil {
 		return fmt.Errorf("get active rollout for rolling scale: %w", err)
 	}
-	if rl != nil && rl.Status == "PREPARING" && rl.ToGeneration == target.Generation &&
-		target.EffectiveStrategy() == "rolling" {
+	// PAUSED_FOR_APPROVAL 同 PREPARING：审批等待期间不建下一批。
+	if rl != nil && (rl.Status == "PREPARING" || rl.Status == "PAUSED_FOR_APPROVAL") &&
+		rl.ToGeneration == target.Generation && target.EffectiveStrategy() == "rolling" {
 		// A recreate/retry can temporarily leave more than one row for an
 		// ordinal. Batch exposure is defined by distinct ordinals, not rows.
 		cutOrdinals := map[int]bool{}

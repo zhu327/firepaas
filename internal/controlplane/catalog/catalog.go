@@ -36,11 +36,15 @@ type Backend struct {
 	// G2b（ADR-0040 §16）：mesh 直连提示。仅当服务声明 mesh_direct 且
 	// execution 在役时由发布器填充；omitempty 保证旧发布器写出的字节形态
 	// 可逆（旧 edge 反序列化忽略未知字段，新旧共存）。ULA 是裸地址；
-	// identity_id/generation 随 fabric 快照同源（观测/诊断用，edge 选路
-	// 不读——G2d 前唯一路径仍是 node_proxy_endpoint）。
+	// identity_id 随 fabric 快照同源（观测/诊断用，edge 选路不读——G2d 前
+	// 唯一路径仍是 node_proxy_endpoint）。
 	ULA        string `json:"ula,omitempty"`
 	IdentityID uint32 `json:"identity_id,omitempty"`
 	Generation int64  `json:"generation,omitempty"`
+	// DeploymentGeneration 是 deployment 发布代（rollout 轴）：edge 代级
+	// 指标（firepaas_edge_gen_*）按它归因，供 rollout 错误率/p99 分析；
+	// 与 fabric 分配代不同轴。
+	DeploymentGeneration int64 `json:"deployment_generation,omitempty"`
 }
 
 // Route 是 hostname+port 对应的版本化 backend set。
