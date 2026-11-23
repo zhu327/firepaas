@@ -87,6 +87,10 @@ type Config struct {
 	// VethCIDR：root↔netns 点对点链路地址池（默认 10.12.0.0/16，必须
 	// IPv4 /16）。同主机多 agent 时必须互异（避免 root ns 路由冲突）。
 	VethCIDR string
+	// ExternalStateLock 为 true 时表示调用方（如 cmd/cni-firepaas）已在外部
+	// 持有 WithStateFileLock(StatePath)，Load/persistLocked 不再二次 flock，
+	// 避免同进程在不同 fd 上重入 flock 导致自死锁。
+	ExternalStateLock bool
 }
 
 // Slot 是一个已分配的 slot。
@@ -261,11 +265,18 @@ func WithStateFileLock(statePath string, fn func() error) error {
 	return fn()
 }
 
+func (m *Manager) withStateLock(fn func() error) error {
+	if m.cfg.ExternalStateLock {
+		return fn()
+	}
+	return WithStateFileLock(m.cfg.StatePath, fn)
+}
+
 // Load 从状态文件恢复内存视图（Reconcile 前调用）。
 func (m *Manager) Load() error {
 	// 文件读经跨进程锁（CNI×agentd 串行），解析与内存交换在 mu 下。
 	var raw []byte
-	if err := WithStateFileLock(m.cfg.StatePath, func() error {
+	if err := m.withStateLock(func() error {
 		var err error
 		raw, err = os.ReadFile(m.cfg.StatePath)
 		if err != nil && os.IsNotExist(err) {
@@ -681,7 +692,7 @@ func (m *Manager) persistLocked() error {
 		return fmt.Errorf("slot: marshal state: %w", err)
 	}
 	// 文件写经跨进程锁（与 Load/CNI 同锁，防交错写）。
-	return WithStateFileLock(m.cfg.StatePath, func() error {
+	return m.withStateLock(func() error {
 		return durablewrite.WriteFileAtomic(m.cfg.StatePath, "slot state", raw)
 	})
 }

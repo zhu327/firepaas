@@ -10,8 +10,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
+	"strconv"
 	"time"
 )
 
@@ -83,16 +85,21 @@ func (c *Client) Query(ctx context.Context, expr string) (float64, error) {
 		return 0, ErrNoData
 	}
 	raw := qr.Data.Result[0].Value[1]
+	var f float64
 	switch v := raw.(type) {
 	case string:
-		var f float64
-		if _, err := fmt.Sscanf(v, "%g", &f); err != nil {
+		var err error
+		f, err = strconv.ParseFloat(v, 64)
+		if err != nil {
 			return 0, fmt.Errorf("prometheus sample %q: %w", v, err)
 		}
-		return f, nil
 	case float64:
-		return v, nil
+		f = v
 	default:
 		return 0, fmt.Errorf("prometheus sample of unexpected type %T", raw)
 	}
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, fmt.Errorf("prometheus sample non-finite (%v): %w", f, ErrNoData)
+	}
+	return f, nil
 }

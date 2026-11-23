@@ -50,7 +50,7 @@ func Elect(ctx context.Context, dsn string, key string, onLeader func(ctx contex
 	for ctx.Err() == nil {
 		// 每次抢锁用独立 leaseCtx：onLeader 返回/进程退出/心跳失败时都释放锁。
 		leaseCtx, cancel := context.WithCancel(ctx)
-		acquired, err := tryAcquire(leaseCtx, cancel, cfg, key)
+		acquired, done, err := tryAcquire(leaseCtx, cancel, cfg, key)
 		if err != nil {
 			cancel()
 			slog.Error("leader acquire", "error", err)
@@ -59,6 +59,7 @@ func Elect(ctx context.Context, dsn string, key string, onLeader func(ctx contex
 			slog.Info("leader acquired", "key", key)
 			err := runGuarded(leaseCtx, onLeader)
 			cancel() // 触发后台解锁
+			<-done   // 等待解锁与连接关闭收敛，避免自竞争或泄漏
 			slog.Warn("leader lease ended", "key", key, "error", err)
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -84,33 +85,46 @@ func runGuarded(ctx context.Context, onLeader func(ctx context.Context) error) (
 	return onLeader(ctx)
 }
 
-// tryAcquire 在专用连接上抢锁；成功后立即返回 true。cancel 是 leaseCtx 的
-// 取消函数：持锁 goroutine 心跳失败时调用它辞任（P2-4），锁由该 goroutine
-// 持有到辞任/退出，连接断开自动释放。
-func tryAcquire(ctx context.Context, cancel context.CancelFunc, cfg *pgx.ConnConfig, key string) (bool, error) {
+// tryAcquire 在专用连接上抢锁；成功后立即返回 true 和解锁完成通知 done。
+// cancel 是 leaseCtx 的取消函数：持锁 goroutine 心跳失败时调用它辞任（P2-4），
+// 锁由该 goroutine 持有到辞任/退出，连接断开自动释放。
+func tryAcquire(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	cfg *pgx.ConnConfig,
+	key string,
+) (bool, <-chan struct{}, error) {
 	conn, err := pgx.ConnectConfig(ctx, cfg)
 	if err != nil {
-		return false, fmt.Errorf("dial leader conn: %w", err)
+		return false, nil, fmt.Errorf("dial leader conn: %w", err)
+	}
+
+	closeBounded := func() {
+		cCtx, cCancel := context.WithTimeout(context.Background(), heartbeatTimeout)
+		_ = conn.Close(cCtx)
+		cCancel()
 	}
 
 	var got bool
 	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtext($1))`, key).Scan(&got); err != nil {
-		_ = conn.Close(context.Background())
-		return false, fmt.Errorf("pg_try_advisory_lock: %w", err)
+		closeBounded()
+		return false, nil, fmt.Errorf("pg_try_advisory_lock: %w", err)
 	}
 	if !got {
-		_ = conn.Close(context.Background())
-		return false, nil
+		closeBounded()
+		return false, nil, nil
 	}
 
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		defer func() {
-			// 解锁加时限：连接所在会话可能已僵死，无限期阻塞会泄漏专用连接
-			// 与 goroutine；超时后由 Close 收尾（服务端会话销毁即放锁）。
+			// 解锁与关闭均加时限：连接所在会话可能已僵死，无限期阻塞会泄漏专用连接
+			// 与 goroutine；超时后由连接断开收尾（服务端会话销毁即放锁）。
 			uCtx, uCancel := context.WithTimeout(context.WithoutCancel(ctx), heartbeatTimeout)
 			_, _ = conn.Exec(uCtx, `SELECT pg_advisory_unlock(hashtext($1))`, key)
 			uCancel()
-			_ = conn.Close(context.Background())
+			closeBounded()
 		}()
 		ticker := time.NewTicker(HeartbeatEvery)
 		defer ticker.Stop()
@@ -120,7 +134,7 @@ func tryAcquire(ctx context.Context, cancel context.CancelFunc, cfg *pgx.ConnCon
 				return // 正常卸任：解锁由 defer 完成
 			case <-ticker.C:
 				// P2-4 心跳：连接在服务端已死时 Exec 立即报错（TCP RST），
-				// 半开连接由心跳时限免底。失败即辞任，消除静默双主。
+				// 半开连接由心跳时限兜底。失败即辞任，消除静默双主。
 				hbCtx, hbCancel := context.WithTimeout(context.WithoutCancel(ctx), heartbeatTimeout)
 				_, err := conn.Exec(hbCtx, `SELECT 1`)
 				hbCancel()
@@ -132,5 +146,5 @@ func tryAcquire(ctx context.Context, cancel context.CancelFunc, cfg *pgx.ConnCon
 			}
 		}
 	}()
-	return true, nil
+	return true, done, nil
 }

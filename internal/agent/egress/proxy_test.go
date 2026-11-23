@@ -283,3 +283,21 @@ func TestRelayReplaysPrefix(t *testing.T) {
 		t.Fatal("relay did not return")
 	}
 }
+
+// 回归测试：recordDeny 超过 32 分桶上限时不得泄漏互斥锁导致后续 Stats/recordDeny 死锁。
+func TestRecordDenyOverBucketLimitDoesNotDeadlock(t *testing.T) {
+	p := NewProxy(0, 0, nil, nil, nil)
+	if err := p.Register("m1", "e1", "10.0.0.2", "", &Policy{Mode: ModeDenyAll, Generation: 1}); err != nil {
+		t.Fatal(err)
+	}
+	p.mu.RLock()
+	e := p.byMach["m1"]
+	p.mu.RUnlock()
+	for i := uint32(1); i <= 40; i++ {
+		e.recordDeny("tcp", i)
+	}
+	stats := p.Stats("m1")
+	if stats == nil || stats.DeniedConnections != 40 || len(stats.DenyBuckets) != 32 {
+		t.Fatalf("stats = %+v, want denied=40 buckets=32", stats)
+	}
+}

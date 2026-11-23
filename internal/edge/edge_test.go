@@ -714,3 +714,56 @@ func TestInflightTotal(t *testing.T) {
 		t.Fatalf("total=%d backends=%d, want 3/2", total, backends)
 	}
 }
+
+func TestTokenClientSingleflightSurvivesFirstCallerCancel(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		select {
+		case <-release:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"token":"tok-ok","execution_id":"exec-1"}`))
+		case <-r.Context().Done():
+			w.WriteHeader(http.StatusRequestTimeout)
+		}
+	}))
+	defer srv.Close()
+	tc := NewTokenClient(srv.URL, "bearer", time.Minute)
+	tc.SetStaleWindow(time.Minute)
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	done1 := make(chan error, 1)
+	go func() {
+		_, _, err := tc.Get(ctx1, "m1", "exec-1")
+		done1 <- err
+	}()
+	<-started
+
+	done2 := make(chan string, 1)
+	err2 := make(chan error, 1)
+	go func() {
+		tok, _, err := tc.Get(context.Background(), "m1", "exec-1")
+		if err != nil {
+			err2 <- err
+			return
+		}
+		done2 <- tok
+	}()
+	// 给第二个调用方进入 flights 等待窗口，然后取消第一个调用方。
+	time.Sleep(20 * time.Millisecond)
+	cancel1()
+	close(release)
+
+	select {
+	case err := <-err2:
+		t.Fatalf("second coalesced caller failed due to first caller cancel: %v", err)
+	case tok := <-done2:
+		if tok != "tok-ok" {
+			t.Fatalf("tok = %q, want tok-ok", tok)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second caller timed out")
+	}
+	<-done1
+}

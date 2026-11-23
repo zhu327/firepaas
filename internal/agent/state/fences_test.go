@@ -162,3 +162,20 @@ func TestFencesPersistDirMode(t *testing.T) {
 		t.Fatalf("fences dir mode = %o, want 700", got)
 	}
 }
+
+func TestFencesLockMachineCleansUpEntries(t *testing.T) {
+	f, err := OpenFences(filepath.Join(t.TempDir(), "fences.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 10; i++ {
+		unlock := f.LockMachine("m-ephemeral-" + string(rune('a'+i)))
+		unlock()
+	}
+	f.mu.Lock()
+	n := len(f.machineLocks)
+	f.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("machineLocks leaked %d entries after unlock", n)
+	}
+}

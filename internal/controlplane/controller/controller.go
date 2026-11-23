@@ -316,12 +316,6 @@ func New(st *store.Store, cat *catalog.Catalog, nm *nodemanager.Manager,
 // evacuatedNodes→evacuation、reportedOrphans→node-resources、
 // autoscale 状态→autoscale），machineLocks 自带互斥。
 func (c *Controller) Run(ctx context.Context) error {
-	// 有界去重表：超限重置（孤儿事件可重复上报，但不会无限增长）。
-	// 进程内对账状态经 st() 惰性初始化（New 已预置），此处不再逐字段防御。
-	if len(c.st().reportedOrphans) > 4096 {
-		c.st().reportedOrphans = map[string]bool{}
-	}
-
 	// P1-1（启动回收）：单写者不变量——刚获得 leader 锁时，任何 CLAIMED
 	// 操作都是前任（已死）留下的孤儿；立即回退为 PENDING，收敛窗口从
 	// ClaimStaleAfter（分钟级）降到秒级。重复派发由 agent operation ledger
@@ -332,7 +326,13 @@ func (c *Controller) Run(ctx context.Context) error {
 		c.metrics.Inc("firepaas_operation_stale_claims_recovered_total", nil, uint64(n))
 		slog.Warn("recovered orphaned CLAIMED operations on leader start", "count", n)
 	}
-	go c.runPrewarmWorker(ctx)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		c.runPrewarmWorker(ctx)
+	}()
 
 	// M3：app scale + rollout 状态机首轮立即跑一次，再交给独立环。
 	if err := c.reconcileApps(ctx); err != nil {
@@ -340,7 +340,6 @@ func (c *Controller) Run(ctx context.Context) error {
 	}
 
 	loops := c.reconcileLoops()
-	var wg sync.WaitGroup
 	for _, loop := range loops {
 		wg.Add(1)
 		go func(loop reconcileLoop) {
@@ -415,6 +414,10 @@ func (c *Controller) runLoopOnce(ctx context.Context, loop reconcileLoop) {
 // reconcileNodeResources 推进 node-local snapshot/volume 投影。同环串行，
 // reportedOrphans 去重表由该环独占；单步失败只记日志，不阻塞其余步骤。
 func (c *Controller) reconcileNodeResources(ctx context.Context) error {
+	// 有界去重表：周期性在所属单写环内检查上限，防止长期运行无限增长。
+	if len(c.st().reportedOrphans) > 4096 {
+		c.st().reportedOrphans = map[string]bool{}
+	}
 	if err := c.reconcileSnapshotSchedules(ctx); err != nil {
 		slog.Error("reconcile snapshot schedules", "error", err)
 	}

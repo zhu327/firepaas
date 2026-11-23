@@ -12,11 +12,16 @@ import (
 )
 
 // sensitive 片段表：任一片段命中即视为敏感。
+// 同时保留带下划线与无分隔符形态：IsSensitive 在 normalize 后匹配无分隔符形态，
+// RedactJSONBytes 的非法 JSON 正则兜底路径直接匹配原始键名。
 var sensitive = []string{
-	"secret_env", "secret_value", "secretenv", "ciphertext", "cipher_text",
-	"wrapped_dek", "wrappeddek", "wrapped", "proxy_credential",
-	"proxycredential", "traffic_token", "traffictoken", "authorization",
-	"password", "api_key", "bearer",
+	"secret_env", "secretenv", "secret_value", "secretvalue",
+	"ciphertext", "cipher_text",
+	"wrapped_dek", "wrappeddek", "wrapped",
+	"proxy_credential", "proxycredential",
+	"traffic_token", "traffictoken",
+	"authorization", "password",
+	"api_key", "apikey", "bearer",
 	// v1.4（ADR-0030）：dataset 来源 URL 原文不得进入响应/日志/事件；
 	// 摘要（source_url_digest）不受影响。
 	"source_url", "sourceurl",
@@ -110,7 +115,10 @@ func redactValue(v any) any {
 func RedactHeaders(h map[string][]string) map[string]any {
 	m := make(map[string]any, len(h))
 	for k, vs := range h {
-		if IsSensitive(k) || k == "Authorization" || k == "Cookie" {
+		if IsSensitive(k) ||
+			strings.EqualFold(k, "Authorization") ||
+			strings.EqualFold(k, "Cookie") ||
+			strings.EqualFold(k, "Set-Cookie") {
 			m[k] = "[REDACTED]"
 			continue
 		}

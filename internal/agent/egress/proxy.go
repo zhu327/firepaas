@@ -317,6 +317,7 @@ func (e *Entry) recordDeny(protocol string, port uint32) {
 	e.denied.Add(1)
 	key := protocol + ":" + strconv.FormatUint(uint64(port), 10)
 	e.mu.Lock()
+	defer e.mu.Unlock()
 	if e.bucket == nil {
 		e.bucket = map[string]*bucketStat{}
 	}
@@ -331,7 +332,6 @@ func (e *Entry) recordDeny(protocol string, port uint32) {
 		e.bucket[key] = b
 	}
 	b.denied++
-	e.mu.Unlock()
 }
 
 // Stats 返回当前 execution 的审计聚合（Machine.EgressAudit 用）。
@@ -499,7 +499,9 @@ func (p *Proxy) dialFor(policy *Policy, host string, port uint32, _ []byte) (net
 		decision := policy.DecideForProxied("", nil)
 		return nil, decision
 	}
-	addrs, err := p.resolver.Resolve(context.Background(), host)
+	resolveCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	addrs, err := p.resolver.Resolve(resolveCtx, host)
+	cancel()
 	if err != nil {
 		return nil, Decision{
 			Allow: false, MatchType: "resolution_failed",
@@ -603,5 +605,10 @@ func relay(upstream, downstream net.Conn, br *bufio.Reader, prefix []byte) error
 		}
 		errc <- err
 	}()
-	return <-errc
+	err1 := <-errc
+	err2 := <-errc
+	if err1 != nil {
+		return err1
+	}
+	return err2
 }

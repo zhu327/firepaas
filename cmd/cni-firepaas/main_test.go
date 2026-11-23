@@ -152,3 +152,16 @@ func TestBundleBackendRejectsUnknown(t *testing.T) {
 		t.Fatalf("expected backend rejection, got %v", err)
 	}
 }
+
+// TestDelCommandReadsStdinBundle：CNI DEL 必须读取 stdin 中的 slotBundle JSON，
+// 否则 JSON 解析直接失败（无法释放 slot）。
+func TestDelCommandReadsStdinBundle(t *testing.T) {
+	fence := writeFence(t, "op-cni-del-1")
+	statePath := filepath.Join(t.TempDir(), "slots.json")
+	bundle := `{"machine_id":"m-missing","state_path":` + `"` + statePath + `"` + `,"subnet_cidr":"10.100.0.0/16"}`
+	if _, err := runShim(t, map[string]string{
+		"CNI_COMMAND": "DEL", "CNI_CONTAINERID": "m-missing", "FIREPAAS_CNI_FENCE_FILE": fence,
+	}, bundle); err != nil {
+		t.Fatalf("DEL with valid stdin bundle should succeed idempotently, got %v", err)
+	}
+}

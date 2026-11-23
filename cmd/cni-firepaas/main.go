@@ -110,9 +110,9 @@ func readInput() (cniInput, error) {
 		NetNS:     os.Getenv("CNI_NETNS"),
 		Args:      os.Getenv("CNI_ARGS"),
 	}
-	// prevResult：stdin 上随 ADD/CHECK 传入（runtime 序列化的上次 Result）。
+	// prevResult：stdin 上随 ADD/CHECK/DEL 传入（bundle 配置或上次 Result）。
 	// 从 os.Stdin 读取（而非 /dev/stdin 路径，保证重定向/管道语义）。
-	if in.Command == "ADD" || in.Command == "CHECK" {
+	if in.Command == "ADD" || in.Command == "CHECK" || in.Command == "DEL" {
 		raw, err := io.ReadAll(os.Stdin)
 		if err == nil && len(strings.TrimSpace(string(raw))) > 0 {
 			in.PrevResult = raw
@@ -227,6 +227,7 @@ func run() error {
 		Backend:            backend,
 		EgressProxyPort80:  bundle.ProxyPort80,
 		EgressProxyPort443: bundle.ProxyPort443,
+		ExternalStateLock:  true,
 	})
 	if err != nil {
 		return err

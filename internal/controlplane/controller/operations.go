@@ -211,7 +211,7 @@ func (c *Controller) processLifecycle(ctx context.Context, op store.Operation) e
 		return nil
 	}
 
-	client := c.nodes.ClientFor(m.NodeID)
+	client := c.clientForNodeID(m.NodeID)
 	if client == nil {
 		return fmt.Errorf("no agent client for machine %s", op.MachineID)
 	}

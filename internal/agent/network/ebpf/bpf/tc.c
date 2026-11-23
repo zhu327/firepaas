@@ -448,6 +448,8 @@ int tc_ingress(struct __sk_buff *skb)
 		// ACK））；跨 slot 目标不在 host_addrs4，落 private4 drop。代理
 		// 端口特判保留 host-bound 条件，等价 nft INPUT 链。
 		if (ip->protocol == IPPROTO_TCP) {
+			if (ip->ihl < 5)
+				return TC_ACT_SHOT;
 			struct tcphdr *tcp = (void *)ip + ip->ihl * 4;
 			if (CTX_BOUND(skb, tcp + 1)) {
 				__u16 dport = bpf_ntohs(tcp->dest);
@@ -499,11 +501,29 @@ int tc_ingress(struct __sk_buff *skb)
 			emit_flow(skb, 0, 0, 0, ip6->nexthdr, FLOW_DENY_SRC);
 			return TC_ACT_SHOT;
 		}
-		// dst = 本节点自身 ULA（平台流量：探活/DNS/健康检查）→ 放行。
+		// dst = 本节点自身 ULA：仅放行节点本机 .internal DNS（UDP/TCP 53）与
+		// ICMPv6；禁止租户 VM 直接访问宿主其它 ULA 端口（尤其是明文
+		// fabricingress :5109 或双栈监听的宿主服务）。
 		{
 			__u8 *self = node_ula_lookup(set, &ip6->daddr);
-			if (self)
-				return TC_ACT_OK;
+			if (self) {
+				__u8 nproto = ip6->nexthdr;
+				if (nproto == 58) /* ICMPv6 */
+					return TC_ACT_OK;
+				if (nproto == 17) { /* UDP */
+					struct udphdr *udp = (void *)(ip6 + 1);
+					if ((void *)udp + 8 <= (void *)(long)skb->data_end &&
+					    bpf_ntohs(udp->dest) == 53)
+						return TC_ACT_OK;
+				} else if (nproto == 6) { /* TCP */
+					struct tcphdr *tcp = (void *)(ip6 + 1);
+					if ((void *)tcp + 20 <= (void *)(long)skb->data_end &&
+					    bpf_ntohs(tcp->dest) == 53)
+						return TC_ACT_OK;
+				}
+				emit_flow(skb, *src_id, 0, 0, nproto, FLOW_DENY_PORT);
+				return TC_ACT_SHOT;
+			}
 		}
 		// 东西向：dst 也必须是已知 ULA 且 policy 有放行条目（默认 deny）
 		__u32 *dst_id = ipcache_lookup(set, &ip6->daddr);
@@ -658,6 +678,8 @@ int tc_egress(struct __sk_buff *skb)
 		// 与 nft 同条件：只在快照声明了代理端口时 bypass（无声明时 80/443
 		// 走正常 deny/allow/mode 裁决，见 egress_mode）。
 		if (ip->protocol == IPPROTO_TCP && host && *host != 0 && daddr != *host) {
+			if (ip->ihl < 5)
+				return TC_ACT_SHOT;
 			struct egress_mode_val *mode = egress_mode_of(guest_key);
 			struct tcphdr *t2 = (void *)ip + ip->ihl * 4;
 			if ((void *)t2 + 4 <= (void *)(long)skb->data_end) {

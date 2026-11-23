@@ -62,6 +62,7 @@ func PeekHTTPHost(r *bufio.Reader) (*PeekResult, error) {
 			host = h
 		}
 	}
+	seenHostHeader := false
 	for {
 		line, err = readCRLFLine(r, &buf, maxHTTPHeaderBytes)
 		if err != nil {
@@ -74,7 +75,13 @@ func PeekHTTPHost(r *bufio.Reader) (*PeekResult, error) {
 		if i := strings.IndexByte(trimmed, ':'); i > 0 {
 			name := strings.ToLower(strings.TrimSpace(trimmed[:i]))
 			if name == "host" {
-				host = NormalizeHost(trimmed[i+1:])
+				h := NormalizeHost(trimmed[i+1:])
+				if seenHostHeader && h != host {
+					// RFC 9112 §3.2：多个冲突 Host 头属于请求走私特征，拒绝提取。
+					return &PeekResult{Host: "", Prefix: append([]byte(nil), buf.Bytes()...)}, ErrNoHostInfo
+				}
+				seenHostHeader = true
+				host = h
 			}
 		}
 	}

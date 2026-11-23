@@ -57,3 +57,15 @@ func TestQueryFailureModes(t *testing.T) {
 		t.Fatal("error status must fail")
 	}
 }
+
+func TestQueryRejectsNonFiniteSamples(t *testing.T) {
+	for _, sample := range []string{"NaN", "+Inf", "-Inf", "Inf"} {
+		srv := fakeProm(t, fmt.Sprintf(`{"status":"success","data":{"result":[{"value":[123,%q]}]}}`, sample), 200)
+		c := &Client{BaseURL: srv.URL}
+		_, err := c.Query(context.Background(), `0/0`)
+		srv.Close()
+		if !errors.Is(err, ErrNoData) {
+			t.Fatalf("sample %q: err=%v, want ErrNoData", sample, err)
+		}
+	}
+}

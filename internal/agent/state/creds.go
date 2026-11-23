@@ -58,38 +58,63 @@ func Digest(raw string) string {
 
 // Ensure 仅在本机缺少该 (machine, execution, digest) 材料时写入；已存同值
 // 摘要时不重写（重放路径每次都会调用，避免无意义 fsync）；已有不同值
-// （execution 换代）时覆盖。
+// （execution 换代）时覆盖。落盘失败回滚内存，保持内存与磁盘一致。
 func (c *Creds) Ensure(machineID, executionID, digest string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if e, ok := c.entries[machineID]; ok && e.ExecutionID == executionID && e.Digest == digest {
+	prev, hadPrev := c.entries[machineID]
+	if hadPrev && prev.ExecutionID == executionID && prev.Digest == digest {
 		return nil
 	}
 	c.entries[machineID] = CredEntry{
 		ExecutionID: executionID, Digest: digest, UpdatedAt: time.Now().UTC(),
 	}
-	return c.persistLocked()
+	if err := c.persistLocked(); err != nil {
+		if hadPrev {
+			c.entries[machineID] = prev
+		} else {
+			delete(c.entries, machineID)
+		}
+		return err
+	}
+	return nil
 }
 
 // Set 记录/替换 machine 的验证材料（create 成功或换代重发时调用）。
+// 落盘失败回滚内存，保持内存与磁盘一致。
 func (c *Creds) Set(machineID, executionID, digest string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	prev, hadPrev := c.entries[machineID]
 	c.entries[machineID] = CredEntry{
 		ExecutionID: executionID, Digest: digest, UpdatedAt: time.Now().UTC(),
 	}
-	return c.persistLocked()
+	if err := c.persistLocked(); err != nil {
+		if hadPrev {
+			c.entries[machineID] = prev
+		} else {
+			delete(c.entries, machineID)
+		}
+		return err
+	}
+	return nil
 }
 
 // Drop 撤销验证材料（delete / execution 替换）。不存在时为 no-op。
+// 落盘失败回滚内存，保持内存与磁盘一致。
 func (c *Creds) Drop(machineID string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if _, ok := c.entries[machineID]; !ok {
+	prev, ok := c.entries[machineID]
+	if !ok {
 		return nil
 	}
 	delete(c.entries, machineID)
-	return c.persistLocked()
+	if err := c.persistLocked(); err != nil {
+		c.entries[machineID] = prev
+		return err
+	}
+	return nil
 }
 
 // Verify 校验请求携带的原始凭证。执行绑定必须完全一致（execution 替换后旧

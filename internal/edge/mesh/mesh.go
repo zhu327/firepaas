@@ -358,7 +358,9 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	out := req.Clone(req.Context())
 	out.URL.Scheme = "http"
 	out.URL.Host = net.JoinHostPort(rec.NodeULA, fmt.Sprintf("%d", rec.IngressPort))
-	out.Host = out.URL.Host
+	if out.Host == "" || out.Host == "mesh-direct.invalid" {
+		out.Host = out.URL.Host
+	}
 	// 凭证是唯一路由依据：剥离全部 edge→agent 路由头，只留凭证与端口参数。
 	for _, h := range []string{"X-Firepaas-Machine-ID", "X-Firepaas-Execution-ID", "X-Firepaas-Pin-Machine"} {
 		out.Header.Del(h)

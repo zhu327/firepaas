@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 
@@ -131,4 +132,25 @@ func TestFetchExtraSignalsQueryError(t *testing.T) {
 		t.Fatalf("hold=%v reason=%q", hold, reason)
 	}
 	_ = errors.New
+}
+
+func TestComputeAutoscaleWantMultiIgnoresNonFinite(t *testing.T) {
+	p := multiPolicy()
+	p.TargetRPS = 100
+	p.TargetCPURatio = 0.7
+	p.CustomPromQuery = "q"
+	p.CustomTarget = 1
+	sig := AutoscaleSignal{Served: 20, WindowSec: 10, HasFresh: true}
+	extra := extraSignals{
+		rpsRate:     math.NaN(),
+		rpsOK:       true,
+		cpuUtil:     math.Inf(1),
+		cpuOK:       true,
+		customValue: math.Inf(-1),
+		customOK:    true,
+	}
+	want, _, byDim := computeAutoscaleWantMulti(p, sig, 2, 0, extra)
+	if want != 1 {
+		t.Fatalf("non-finite extra signals must not corrupt want: got %d byDim=%v", want, byDim)
+	}
 }

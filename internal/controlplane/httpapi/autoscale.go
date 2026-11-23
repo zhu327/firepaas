@@ -92,10 +92,11 @@ func (a *API) putAutoscale(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// custom_prom_query 是任意 PromQL（可读中心 Prometheus 全量指标，跨租户
-	// 可见）：设置/保持需要 admin scope；deploy scope 只允许关闭（清空）。
+	// 可见）：设置/保持需要全局 admin 身份（项目级 owner key 仅限本项目，
+	// 不得读全集群 Prometheus）；deploy scope 只允许关闭（清空）。
 	if (body.CustomPromQuery != "" || body.CustomTarget != 0) &&
-		!scopeAllows(identFrom(r).Scopes, "admin") {
-		writeErr(w, 403, "custom_prom_query requires admin scope (arbitrary PromQL can read cross-tenant metrics)")
+		(!identityIsGlobal(identFrom(r)) || !scopeAllows(identFrom(r).Scopes, "admin")) {
+		writeErr(w, 403, "custom_prom_query requires global admin identity (arbitrary PromQL can read cross-tenant metrics)")
 		return
 	}
 	policy := autoscalePolicyFromBody(body)

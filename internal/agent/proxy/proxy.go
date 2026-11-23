@@ -274,7 +274,10 @@ func newReverseProxy() *httputil.ReverseProxy {
 			}
 			req.URL.Scheme = target.Scheme
 			req.URL.Host = target.Host
-			req.Host = target.Host
+			// 保留客户端原始 Host（虚拟主机/CSRF/重定向构造依赖它）；仅在缺失时回退到目标地址。
+			if req.Host == "" {
+				req.Host = target.Host
+			}
 			// 内部转发头不进入 guest（request id 同步剥离；关联只到 agent 日志）。
 			req.Header.Del(HeaderMachineID)
 			req.Header.Del(HeaderExecutionID)
@@ -361,8 +364,15 @@ func (p *Proxy) serveTarget(w http.ResponseWriter, r *http.Request, machineID, e
 		// Endpoint lookup failure means this agent cannot serve the catalogued
 		// backend (for example a stale rolling route), rather than a workload
 		// response. Tell edge that this particular 502 is safe to retry.
+		// 错误细节只进本机日志，响应体返回固定文案，避免泄露内部拓扑或实例错误细节。
+		slog.Warn("workload endpoint lookup failed",
+			"request_id", r.Header.Get(HeaderRequestID),
+			"machine_id", machineID,
+			"execution_id", executionID,
+			"want_port", wantPort,
+			"error", err)
 		w.Header().Set(HeaderRetryable, retryableValue)
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		http.Error(w, "workload endpoint unavailable", http.StatusBadGateway)
 		return
 	}
 

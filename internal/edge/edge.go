@@ -168,7 +168,10 @@ func (t *TokenClient) Get(ctx context.Context, machineID, executionID string) (s
 	t.mu.Unlock()
 
 	// 回源在锁外执行（P2-5：不阻塞其它 machine 的取 token）。
-	tok, err := t.fetch(ctx, machineID, executionID)
+	// 与单飞首调用方 ctx 脱钩并设上限，避免首调用方提前取消把全部合并等待者打成 503。
+	fetchCtx, fetchCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	tok, err := t.fetch(fetchCtx, machineID, executionID)
+	fetchCancel()
 	if err == nil && tok == "" {
 		// 防御：fetch 契约不允许 (空, nil)。若显式放行，上层会拿着空凭证
 		// 转发 → agent 403 → Invalidate 后原地重试空转；此处收敛为显式错误。
@@ -437,6 +440,7 @@ func (c *RouteCache) Get(ctx context.Context, key string, load Load) (any, bool,
 		rerr   error
 	)
 	c.mu.Lock()
+	fetchedAt := c.nowFn()
 	switch {
 	case err == nil:
 		rev := snapshotRevision(v)
@@ -451,7 +455,7 @@ func (c *RouteCache) Get(ctx context.Context, key string, load Load) (any, bool,
 			c.cache.touch(key)
 			rv, rstale, rerr = cur.Value, true, nil
 		} else {
-			c.cache.set(key, CachedRoute{Value: v, FetchedAt: now, Revision: rev})
+			c.cache.set(key, CachedRoute{Value: v, FetchedAt: fetchedAt, Revision: rev})
 			c.cache.evict(c.maxEntries())
 			rv, rstale, rerr = v, false, nil
 		}
@@ -463,13 +467,13 @@ func (c *RouteCache) Get(ctx context.Context, key string, load Load) (any, bool,
 		if cur, has := c.cache.get(key); has {
 			rev = cur.Revision
 		}
-		c.cache.set(key, CachedRoute{Value: nil, FetchedAt: now, Revision: rev})
+		c.cache.set(key, CachedRoute{Value: nil, FetchedAt: fetchedAt, Revision: rev})
 		c.cache.evict(c.maxEntries())
 		rv, rstale, rerr = nil, false, ErrNotFound
 	default:
 		// 回源失败：stale 窗口内允许 last-known-good（仅此路径 servedStale=true）。
 		switch {
-		case ok && e.Value != nil && now.Sub(e.FetchedAt) < c.StaleWindow:
+		case ok && e.Value != nil && fetchedAt.Sub(e.FetchedAt) < c.StaleWindow:
 			c.cache.touch(key)
 			rv, rstale, rerr = e.Value, true, nil
 		case ok && e.Value != nil:

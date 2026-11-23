@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -535,9 +536,12 @@ func NewHandler(cfg Config) *Handler {
 		h.direct = &httputil.ReverseProxy{
 			Director: func(req *http.Request) {
 				// 占位：mesh.Transport.RoundTrip 按 DirectInfo 改写目标。
+				// 保留客户端原始 Host 头，使下游 workload 仍可看到业务域名。
 				req.URL.Scheme = "http"
 				req.URL.Host = "mesh-direct.invalid"
-				req.Host = "mesh-direct.invalid"
+				if req.Host == "" {
+					req.Host = "mesh-direct.invalid"
+				}
 				// 关联 ID 与 legacy 同口径：覆盖客户端入站值后下行。
 				req.Header.Del(HeaderRequestID)
 				req.Header.Del(HeaderClientRequestID)
@@ -771,7 +775,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	start := time.Now()
-	host := stripPort(r.Host)
+	host := strings.ToLower(stripPort(r.Host))
 	port := h.requestRoutePort(r)
 	// 关联 ID：handler 入口生成（不采信客户端入站值），响应回显给客户端并
 	// 注入 context；转发时作为内部头/标准 X-Request-Id 下行，供 edge 日志、

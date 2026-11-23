@@ -18,6 +18,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -269,11 +270,12 @@ func run() error {
 	rgw := &httpapi.RuntimeGateway{}
 	rgw.Set(nm.AgentRuntimeForMachine)
 	go func() {
-		// goroutine 入口 recover：进程仍持 HTTP 服务，panic 否则会造成无人
-		// 感知的静默吃栈退出；与错误路径同语义（log 后退出）。
+		// goroutine 入口 recover：leader 选主环崩溃或致命退出时触发进程停机，
+		// 避免进程只留 HTTP 壳而无人调度/对账。
 		defer func() {
 			if p := recover(); p != nil {
 				slog.Error("leader goroutine panic", "panic", p)
+				stop()
 			}
 		}()
 		err := leader.Elect(ctx, pgURL, leader.Key, func(lctx context.Context) error {
@@ -282,8 +284,19 @@ func run() error {
 			if err != nil {
 				return err
 			}
+			// 任期子后台任务（RunServiceInfo / fabric reconciler）绑定到独立子
+			// context + WaitGroup，在释放 advisory lock 前全部收敛，避免跨任期残留双写。
+			subCtx, subCancel := context.WithCancel(lctx)
+			var subWG sync.WaitGroup
+			defer func() {
+				subCancel()
+				subWG.Wait()
+			}()
+
+			subWG.Add(1)
 			go func() {
-				if err := nm.RunServiceInfo(lctx); err != nil && lctx.Err() == nil {
+				defer subWG.Done()
+				if err := nm.RunServiceInfo(subCtx); err != nil && subCtx.Err() == nil {
 					slog.Error("node service info sync exited", "error", err)
 				}
 			}()
@@ -313,8 +326,10 @@ func run() error {
 				if err != nil {
 					return fmt.Errorf("fabric reconciler: %w", err)
 				}
+				subWG.Add(1)
 				go func() {
-					if err := fr.Run(lctx); err != nil && lctx.Err() == nil {
+					defer subWG.Done()
+					if err := fr.Run(subCtx); err != nil && subCtx.Err() == nil {
 						slog.Error("fabric reconciler exited", "error", err)
 					}
 				}()
@@ -391,6 +406,7 @@ func run() error {
 		})
 		if err != nil && ctx.Err() == nil {
 			slog.Error("leader loop exited", "error", err)
+			stop()
 		}
 	}()
 

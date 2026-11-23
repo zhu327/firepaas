@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -126,5 +127,26 @@ func TestPromQLLabelQuoting(t *testing.T) {
 	p99 := p99Query("app.test", 7, 5*time.Minute)
 	if !strings.Contains(p99, `generation="7"`) {
 		t.Fatalf("p99Query = %s, missing quoted generation", p99)
+	}
+	// promLabelEscape 必须先转义反斜杠再转义双引号，避免引号逃逸。
+	if got := promLabelEscape(`a\"b`); got != `a\\\"b` {
+		t.Fatalf("promLabelEscape = %q, want %q", got, `a\\\"b`)
+	}
+}
+
+func TestPrometheusAnalysisNonFiniteFailClosed(t *testing.T) {
+	app, r := rolloutFixture()
+	now := time.Now()
+	for _, sample := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		a := NewPrometheusAnalysis(PrometheusAnalysisConfig{
+			Querier:      &fakeQuerier{values: map[string]float64{"code_class": sample}},
+			MaxErrorRate: 0.05,
+		})
+		if v, _ := a.AssessCutover(app, r, nil, false, now); v != VerdictWait {
+			t.Fatalf("sample %v mid-window = %v, want Wait", sample, v)
+		}
+		if v, _ := a.AssessCutover(app, r, nil, true, now); v != VerdictRollback {
+			t.Fatalf("sample %v at-end = %v, want Rollback (fail-closed)", sample, v)
+		}
 	}
 }

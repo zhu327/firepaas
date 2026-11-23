@@ -441,6 +441,36 @@ func proxyDNATRule(vethGuest, hostAddr string, dport, proxyPort int) string {
 		vethGuest, dport, hostAddr, hostAddr, proxyPort)
 }
 
+// EnsureNetnsProxyDNAT 原子更新 slot netns 内 fp-slot 表的 pre 透明代理 DNAT 链
+// （供 eBPF 后端按 PolicySnapshot 动态开关 80/443 代理重定向，避免未配置 egress
+// 策略的 unrestricted VM 被无条件 DNAT 进 egress proxy 后丢弃）。
+func EnsureNetnsProxyDNAT(ctx context.Context, ref SlotRef, proxyPort80, proxyPort443 int) error {
+	if err := EnsureNetnsNAT(ctx, ref, 0, 0); err != nil {
+		return err
+	}
+	if err := exec.CommandContext(
+		ctx, "ip", "netns", "exec", ref.Netns, "nft", "list", "chain", "ip", "fp-slot", "pre",
+	).Run(); err != nil {
+		if err := execCmd(ctx, "ip", "netns", "exec", ref.Netns,
+			"nft", "add", "chain", "ip", "fp-slot", "pre",
+			"{", "type", "nat", "hook", "prerouting", "priority", "dstnat;", "}"); err != nil {
+			return fmt.Errorf("slot: add pre nat chain: %w", err)
+		}
+	}
+	var b strings.Builder
+	fmt.Fprintln(&b, "flush chain ip fp-slot pre")
+	if proxyPort80 > 0 {
+		fmt.Fprintf(&b, "add rule ip fp-slot pre %s\n", proxyDNATRule(ref.VethGuest, ref.HostAddr, 80, proxyPort80))
+	}
+	if proxyPort443 > 0 {
+		fmt.Fprintf(&b, "add rule ip fp-slot pre %s\n", proxyDNATRule(ref.VethGuest, ref.HostAddr, 443, proxyPort443))
+	}
+	if err := runNftBatch(ctx, ref.Netns, b.String()); err != nil {
+		return fmt.Errorf("slot: apply proxy dnat: %w", err)
+	}
+	return nil
+}
+
 // EnsureNetnsNAT 幂等创建 slot 内一级 NAT：出口 masquerade +（port>0 时）
 // prerouting DNAT（tcp 80/443 → hostAddr:port，conntrack 反向 NAT——代理回流
 // 不改写）。proxyPort 传 0 = 只建 masquerade（nft 后端在 ApplyEgress 的

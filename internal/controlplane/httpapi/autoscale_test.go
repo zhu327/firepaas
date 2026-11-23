@@ -193,6 +193,17 @@ func TestPutAutoscaleCustomRequiresAdmin(t *testing.T) {
 	if code := anon(targetOnly); code != 403 {
 		t.Fatalf("custom target without admin = %d, want 403", code)
 	}
+	// 项目级 owner key（scopes=["admin"] 但绑定具体 ProjectID）不得设置跨租户 PromQL。
+	req := httptest.NewRequest("PUT", "/v1/apps/x/autoscale", strings.NewReader(custom))
+	req.SetPathValue("id", "x")
+	req = req.WithContext(withIdentity(req.Context(), identity{
+		Kind: "key", KeyID: "k-owner", ProjectID: "proj-a", Scopes: []string{"admin"},
+	}))
+	rec := httptest.NewRecorder()
+	a.putAutoscale(rec, req)
+	if rec.Code != 403 {
+		t.Fatalf("project-scoped admin custom PromQL = %d, want 403 (%s)", rec.Code, rec.Body.String())
+	}
 }
 
 // admin 身份的 custom 全链路（PG）：PUT 200 + GET 回显。

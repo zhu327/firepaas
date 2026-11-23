@@ -29,19 +29,24 @@ type FenceEntry struct {
 	UpdatedAt       time.Time `json:"updated_at"`
 }
 
+type machineLockEntry struct {
+	mu   sync.Mutex
+	refs int
+}
+
 // Fences 是 machine_id → FenceEntry 的持久化映射，带原子落盘。
 type Fences struct {
 	mu      sync.Mutex
 	path    string
 	entries map[string]FenceEntry
 	// machineLocks 只在进程内保护同一 machine 的复合操作；fence 本身仍由
-	// mu 保护并持久化。锁不落盘，进程重启后没有遗留持锁状态。
-	machineLocks map[string]*sync.Mutex
+	// mu 保护并持久化。按引用计数回收，避免长期运行后随历史 machineID 无限增长。
+	machineLocks map[string]*machineLockEntry
 }
 
 // OpenFences 加载 fences；文件不存在时从空状态开始。
 func OpenFences(path string) (*Fences, error) {
-	f := &Fences{path: path, entries: map[string]FenceEntry{}, machineLocks: map[string]*sync.Mutex{}}
+	f := &Fences{path: path, entries: map[string]FenceEntry{}, machineLocks: map[string]*machineLockEntry{}}
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return f, nil
@@ -65,14 +70,23 @@ func OpenFences(path string) (*Fences, error) {
 // exactly once; callers must not recursively lock the same key.
 func (f *Fences) LockMachine(machineID string) func() {
 	f.mu.Lock()
-	lock := f.machineLocks[machineID]
-	if lock == nil {
-		lock = &sync.Mutex{}
-		f.machineLocks[machineID] = lock
+	entry := f.machineLocks[machineID]
+	if entry == nil {
+		entry = &machineLockEntry{}
+		f.machineLocks[machineID] = entry
 	}
+	entry.refs++
 	f.mu.Unlock()
-	lock.Lock()
-	return lock.Unlock
+	entry.mu.Lock()
+	return func() {
+		entry.mu.Unlock()
+		f.mu.Lock()
+		entry.refs--
+		if entry.refs == 0 && f.machineLocks[machineID] == entry {
+			delete(f.machineLocks, machineID)
+		}
+		f.mu.Unlock()
+	}
 }
 
 // WithMachine is retained for existing callers.

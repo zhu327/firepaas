@@ -53,3 +53,15 @@ func TestDatasetSourceDigestStableAndShort(t *testing.T) {
 		t.Fatalf("digest length = %d, want 16", len(a))
 	}
 }
+
+func TestShortPrefixHandlesShortIDs(t *testing.T) {
+	if got := shortPrefix("exec-1", 8); got != "exec-1" {
+		t.Fatalf("shortPrefix(%q, 8) = %q, want exec-1", "exec-1", got)
+	}
+	if got := shortPrefix("exec-12345678", 8); got != "exec-123" {
+		t.Fatalf("shortPrefix(%q, 8) = %q, want exec-123", "exec-12345678", got)
+	}
+	if got := shortPrefix("", 8); got != "" {
+		t.Fatalf("shortPrefix(%q, 8) = %q, want empty", "", got)
+	}
+}

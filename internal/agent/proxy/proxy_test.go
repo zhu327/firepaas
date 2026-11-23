@@ -79,6 +79,9 @@ func TestProxyMarksEndpointResolution502Retryable(t *testing.T) {
 	if got := rr.Header().Get(HeaderRetryable); got != retryableValue {
 		t.Fatalf("retry marker = %q, want %q", got, retryableValue)
 	}
+	if strings.Contains(rr.Body.String(), "instance gone") {
+		t.Fatalf("endpoint lookup 502 leaked internal error: %q", rr.Body.String())
+	}
 }
 
 func TestProxyMarksGuestTransport502Retryable(t *testing.T) {
@@ -176,6 +179,35 @@ func TestProxyStripsRequestIDBeforeWorkload(t *testing.T) {
 	}
 	if got := <-guestSaw; got != "" {
 		t.Fatalf("internal request id forwarded to workload: %q", got)
+	}
+}
+
+func TestProxyPreservesOriginalHostHeader(t *testing.T) {
+	guestHost := make(chan string, 1)
+	guest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		guestHost <- r.Host
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer guest.Close()
+	_, port, err := net.SplitHostPort(guest.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	inst := &instances.Instance{StoredMetadata: instances.StoredMetadata{
+		IP: "127.0.0.1", Tags: map[string]string{
+			"firepaas/execution_id": "e1", "firepaas/port": port,
+		},
+	}}
+	p := New(machine.New(&testInstances{instance: inst}, &testImages{}, nil, nil))
+	r := proxyRequest()
+	r.Host = "myapp.example.com"
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, r)
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", rr.Code)
+	}
+	if got := <-guestHost; got != "myapp.example.com" {
+		t.Fatalf("workload saw Host=%q, want myapp.example.com", got)
 	}
 }
 

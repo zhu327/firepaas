@@ -233,3 +233,23 @@ func TestLookupCacheNegativeNotCached(t *testing.T) {
 		t.Fatalf("negative lookup must not populate cache, got %d entries", n)
 	}
 }
+
+// 纯内存缓存行为（无需 DB）：ExpiresAt 早于 cacheTTL 时不得越界缓存；过期访问即清理。
+func TestLookupCacheHonorsKeyExpiry(t *testing.T) {
+	m := NewCached(nil, time.Minute)
+	exp := time.Now().Add(40 * time.Millisecond)
+	m.remember("h1", &Key{ID: "k1", Scopes: []string{"read"}, ExpiresAt: &exp})
+	if k, ok := m.cached("h1"); !ok || k.ID != "k1" {
+		t.Fatalf("expected hit before expiry, got %+v %v", k, ok)
+	}
+	time.Sleep(60 * time.Millisecond)
+	if k, ok := m.cached("h1"); ok || k != nil {
+		t.Fatalf("expired key must not be served from cache, got %+v %v", k, ok)
+	}
+	m.mu.Lock()
+	_, stillPresent := m.cache["h1"]
+	m.mu.Unlock()
+	if stillPresent {
+		t.Fatal("expired entry should be deleted on read")
+	}
+}

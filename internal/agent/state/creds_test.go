@@ -101,6 +101,36 @@ func TestCredsEnsureAndDurablePersistence(t *testing.T) {
 	}
 }
 
+func TestCredsRollsBackOnPersistFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "creds.json")
+	c, err := OpenCreds(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Set("m1", "exec-1", Digest("tok-1")); err != nil {
+		t.Fatal(err)
+	}
+	// 用普通文件占据父路径，使 MkdirAll/writeFileDurable 确定性失败（root 下同样生效）。
+	blocker := filepath.Join(dir, "blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c.path = filepath.Join(blocker, "creds.json")
+	if err := c.Set("m1", "exec-2", Digest("tok-2")); err == nil {
+		t.Fatal("expected persist error on Set")
+	}
+	if !c.Verify("m1", "exec-1", "tok-1") || c.Verify("m1", "exec-2", "tok-2") {
+		t.Fatal("Set failure must roll back in-memory entry")
+	}
+	if err := c.Drop("m1"); err == nil {
+		t.Fatal("expected persist error on Drop")
+	}
+	if !c.Verify("m1", "exec-1", "tok-1") {
+		t.Fatal("Drop failure must roll back in-memory entry")
+	}
+}
+
 func readFile(t *testing.T, p string) string {
 	t.Helper()
 	b, err := os.ReadFile(p)

@@ -42,27 +42,29 @@ func computeAutoscaleWantMulti(policy store.AutoscalePolicy,
 	wantConcurrency := ceilDiv(int(math.Ceil(load)), policy.TargetConcurrency)
 	byDim["concurrency"] = wantConcurrency
 	want = wantConcurrency
-	if policy.TargetRPS > 0 && extra.rpsOK {
-		w := ceilDiv(int(math.Ceil(extra.rpsRate)), policy.TargetRPS)
+	if policy.TargetRPS > 0 && extra.rpsOK && !math.IsNaN(extra.rpsRate) && !math.IsInf(extra.rpsRate, 0) {
+		w := ceilDiv(int(math.Ceil(math.Max(0, extra.rpsRate))), policy.TargetRPS)
 		byDim["rps"] = w
 		if w > want {
 			want = w
 		}
 	}
-	if policy.TargetCPURatio > 0 && extra.cpuOK {
-		w := int(math.Ceil(float64(eff) * extra.cpuUtil / policy.TargetCPURatio))
+	if policy.TargetCPURatio > 0 && extra.cpuOK && !math.IsNaN(extra.cpuUtil) && !math.IsInf(extra.cpuUtil, 0) {
+		w := int(math.Ceil(math.Max(0, float64(eff)*extra.cpuUtil/policy.TargetCPURatio)))
 		byDim["cpu"] = w
 		if w > want {
 			want = w
 		}
 	}
-	if policy.CustomTarget > 0 && policy.CustomPromQuery != "" && extra.customOK {
-		var w int
+	if policy.CustomTarget > 0 && policy.CustomPromQuery != "" && extra.customOK &&
+		!math.IsNaN(extra.customValue) && !math.IsInf(extra.customValue, 0) {
+		var raw float64
 		if policy.CustomMode == "absolute" {
-			w = int(math.Ceil(extra.customValue / policy.CustomTarget))
+			raw = extra.customValue / policy.CustomTarget
 		} else {
-			w = int(math.Ceil(float64(eff) * extra.customValue / policy.CustomTarget))
+			raw = float64(eff) * extra.customValue / policy.CustomTarget
 		}
+		w := int(math.Ceil(math.Max(0, raw)))
 		byDim["custom"] = w
 		if w > want {
 			want = w

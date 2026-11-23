@@ -28,7 +28,7 @@ func TestSingleLeaderAndHandover(t *testing.T) {
 
 	ctx1, cancel1 := context.WithCancel(context.Background())
 	defer cancel1()
-	got1, err := tryAcquire(ctx1, cancel1, cfg, key)
+	got1, done1, err := tryAcquire(ctx1, cancel1, cfg, key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +38,7 @@ func TestSingleLeaderAndHandover(t *testing.T) {
 
 	// 实例 2 抢不到。
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	got2, err := tryAcquire(ctx2, cancel2, cfg, key)
+	got2, _, err := tryAcquire(ctx2, cancel2, cfg, key)
 	cancel2()
 	if err != nil {
 		t.Fatal(err)
@@ -47,13 +47,13 @@ func TestSingleLeaderAndHandover(t *testing.T) {
 		t.Fatal("instance2 must not acquire while instance1 holds the lock")
 	}
 
-	// 实例 1 释放后，实例 2 可以拿到。释放是异步的（后台 goroutine）。
+	// 实例 1 释放后，等解锁 goroutine 收敛，实例 2 立即可拿到。
 	cancel1()
-	time.Sleep(300 * time.Millisecond)
+	<-done1
 
 	ctx3, cancel3 := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel3()
-	got3, err := tryAcquire(ctx3, cancel3, cfg, key)
+	got3, done3, err := tryAcquire(ctx3, cancel3, cfg, key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,5 +61,5 @@ func TestSingleLeaderAndHandover(t *testing.T) {
 		t.Fatal("instance2 should acquire after instance1 releases")
 	}
 	cancel3()
-	time.Sleep(300 * time.Millisecond)
+	<-done3
 }

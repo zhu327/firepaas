@@ -244,7 +244,13 @@ func TestEbpfDatapathNetns(t *testing.T) {
 	}
 
 	// 2) 代理 redirect + 反向 NAT（回流 src 还原为原始 dst:80）。
-	proxy, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", testProxyPort(t, "FIREPAAS_TEST_PROXY_PORT80", 18080)))
+	proxyPort80 := testProxyPort(t, "FIREPAAS_TEST_PROXY_PORT80", 18080)
+	if err := b.ApplyEgress(ctx, ref, &api.PolicySnapshot{
+		Mode: "unrestricted", ProxyPort80: proxyPort80, Generation: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	proxy, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", proxyPort80))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -287,7 +293,7 @@ func TestEbpfDatapathNetns(t *testing.T) {
 	// 3) conn limit：per-execution 上限 2（含 SYN 重传去重）。
 	if err := b.ApplyEgress(ctx, ref, &api.PolicySnapshot{
 		Mode: "allowlist", AllowedCIDRs: []string{"203.0.113.0/24"},
-		MaxTCPConns: 2, Generation: 1,
+		ProxyPort80: proxyPort80, MaxTCPConns: 2, Generation: 2,
 	}); err != nil {
 		t.Fatal(err)
 	}

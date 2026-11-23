@@ -124,6 +124,12 @@ func (m *Manager) Create(
 	h := sha256.Sum256([]byte(plain))
 	keyHash := hex.EncodeToString(h[:])
 
+	ttlSecs := int64(ttl / time.Second)
+	if ttl > 0 && ttlSecs == 0 {
+		// 正 TTL 不足 1 秒时向上取整为 1 秒，避免截断为 0 后意外变成“永不过期”。
+		ttlSecs = 1
+	}
+
 	var k Key
 	var expiresAt, lastUsedAt, revokedAt *time.Time
 	err := m.pool.QueryRow(ctx, `
@@ -131,7 +137,7 @@ func (m *Manager) Create(
 		VALUES($1,$2,$3,$4::text[],NULLIF($5,''),
 		       CASE WHEN $6::bigint > 0 THEN now() + ($6::bigint || ' seconds')::interval END)
 		RETURNING id, name, key_hash, scopes, coalesce(project_id,''), created_at, expires_at, last_used_at, revoked_at`,
-		NewID(), name, keyHash, scopes, projectID, int64(ttl/time.Second),
+		NewID(), name, keyHash, scopes, projectID, ttlSecs,
 	).Scan(&k.ID, &k.Name, &k.KeyHash, &k.Scopes, &k.ProjectID,
 		&k.CreatedAt, &expiresAt, &lastUsedAt, &revokedAt)
 	if err != nil {
@@ -156,6 +162,9 @@ func (m *Manager) GetByHash(ctx context.Context, keyHash string) (*Key, error) {
 	return k, nil
 }
 
+// maxCacheEntries 限制认证正缓存上限，避免长期运行下只增不删。
+const maxCacheEntries = 10000
+
 // cached 读取未过期缓存条目（返回副本，调用方不可跨请求共享可变切片）。
 func (m *Manager) cached(keyHash string) (*Key, bool) {
 	m.mu.Lock()
@@ -164,24 +173,58 @@ func (m *Manager) cached(keyHash string) (*Key, bool) {
 		return nil, false
 	}
 	e, ok := m.cache[keyHash]
-	if !ok || time.Now().After(e.expiresAt) {
+	if !ok {
+		return nil, false
+	}
+	now := time.Now()
+	if now.After(e.expiresAt) || (e.key.ExpiresAt != nil && !now.Before(*e.key.ExpiresAt)) {
+		delete(m.cache, keyHash)
 		return nil, false
 	}
 	k := e.key
 	k.Scopes = slices.Clone(k.Scopes)
+	if k.LastUsedAt != nil {
+		t := *k.LastUsedAt
+		k.LastUsedAt = &t
+	}
 	return &k, true
 }
 
-// remember 写入正结果缓存。
+// remember 写入正结果缓存。缓存有效期不超过 key 自身的 ExpiresAt。
 func (m *Manager) remember(keyHash string, k *Key) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.cache == nil {
 		return
 	}
+	now := time.Now()
+	cacheExp := now.Add(m.cacheTTL)
+	if k.ExpiresAt != nil {
+		if !now.Before(*k.ExpiresAt) {
+			delete(m.cache, keyHash)
+			return
+		}
+		if k.ExpiresAt.Before(cacheExp) {
+			cacheExp = *k.ExpiresAt
+		}
+	}
+	if len(m.cache) >= maxCacheEntries {
+		for h, ce := range m.cache {
+			if now.After(ce.expiresAt) {
+				delete(m.cache, h)
+			}
+		}
+		if len(m.cache) >= maxCacheEntries {
+			clear(m.cache)
+		}
+	}
 	entry := *k
 	entry.Scopes = slices.Clone(k.Scopes)
-	m.cache[keyHash] = cacheEntry{key: entry, expiresAt: time.Now().Add(m.cacheTTL)}
+	if k.LastUsedAt != nil {
+		t := *k.LastUsedAt
+		entry.LastUsedAt = &t
+	}
+	m.cache[keyHash] = cacheEntry{key: entry, expiresAt: cacheExp}
 }
 
 // invalidate 清空缓存（Revoke 后调用：按 id 撤销无法反查 hash，全清最安全）。
@@ -219,11 +262,22 @@ var ErrNotFound = fmt.Errorf("api key not found or revoked")
 // ErrInvalidInput：创建入参非法（API 层映射 400；DB 错误不应落入 400）。
 var ErrInvalidInput = fmt.Errorf("invalid api key input")
 
-// Touch 更新 last_used_at（错误仅告警，不阻断请求路径）。
+// Touch 更新 last_used_at（错误仅告警，不阻断请求路径），并同步刷新本地缓存的
+// LastUsedAt，避免高 QPS 命中缓存时每次请求都穿透写库。
 func (m *Manager) Touch(ctx context.Context, keyHash string) error {
 	_, err := m.pool.Exec(ctx,
 		`UPDATE api_keys SET last_used_at=now() WHERE key_hash=$1`, keyHash)
-	return err
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	if e, ok := m.cache[keyHash]; ok {
+		now := time.Now()
+		e.key.LastUsedAt = &now
+		m.cache[keyHash] = e
+	}
+	m.mu.Unlock()
+	return nil
 }
 
 // GetByID 按 id 取 key（含已撤销/过期，用于自助 revoke 的归属校验）。
@@ -298,14 +352,15 @@ func (m *Manager) List(ctx context.Context) ([]Key, error) {
 }
 
 // Revoke 撤销（软删）。不存在也幂等成功。
-// 先清缓存再写库：写库失败时宁可穿透查询（fail-closed 方向），
-// 不放过已撤销的 hash。
+// 写库前清一次缓存，写库提交后再清一次缓存：彻底消除并发 GetByHash 在
+// UPDATE 提交前把旧记录重新写回缓存的 TOCTOU 竞态窗口。
 func (m *Manager) Revoke(ctx context.Context, id string) error {
 	m.invalidate()
 	if _, err := m.pool.Exec(ctx,
 		`UPDATE api_keys SET revoked_at=now() WHERE id=$1 AND revoked_at IS NULL`, id); err != nil {
 		return fmt.Errorf("revoke api key: %w", err)
 	}
+	m.invalidate()
 	return nil
 }
 

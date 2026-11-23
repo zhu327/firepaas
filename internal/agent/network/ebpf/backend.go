@@ -521,12 +521,12 @@ func (b *Backend) DetachSlot(ctx context.Context, ref slot.SlotRef) error {
 	return nil
 }
 
-// EnsureSlotNAT：slot 内一级 NAT（masquerade）+ 代理 prerouting DNAT 由
-// nft fp-slot 表提供（与 nft 后端共享实现）。proxy redirect 不重写 L3/L4
-// （TC 位置无法可靠维护校验和），由 conntrack 自动反向 NAT——"代理回流不
-// masquerade" 断言在该路径上成立。
+// EnsureSlotNAT：slot 内一级 NAT（masquerade）由 nft fp-slot 表提供（与 nft
+// 后端共享实现）。此处不无条件安装 80/443 代理 DNAT（避免无 egress 策略的
+// unrestricted VM 被导入代理后因未注册而丢包）；代理 DNAT 随 ApplyEgress 按
+// PolicySnapshot 动态安装/清除。
 func (b *Backend) EnsureSlotNAT(ctx context.Context, ref slot.SlotRef) error {
-	return slot.EnsureNetnsNAT(ctx, ref, b.port80, b.port443)
+	return slot.EnsureNetnsNAT(ctx, ref, 0, 0)
 }
 
 // egressModeVal 与 BPF 侧 struct egress_mode_val 同布局。
@@ -550,9 +550,12 @@ func (b *Backend) ApplyEgress(ctx context.Context, ref slot.SlotRef, snap *api.P
 		return err
 	}
 	if snap == nil {
-		// 先落限额（标量、幂等、不碰 egress map）：失败即中止，数据面保持旧
-		// CIDR 策略，不产生“策略已切但限额还是旧值”的半应用状态。
+		// 先落限额与代理 DNAT（标量、幂等、不碰 egress map）：失败即中止，
+		// 数据面保持旧 CIDR 策略，不产生半应用状态。
 		if err := slot.EnsureNetnsTCPLimit(ctx, ref, 0); err != nil {
+			return err
+		}
+		if err := slot.EnsureNetnsProxyDNAT(ctx, ref, 0, 0); err != nil {
 			return err
 		}
 		b.clearEgressSlot(slotKey)
@@ -591,10 +594,13 @@ func (b *Backend) ApplyEgress(ctx context.Context, ref slot.SlotRef, snap *api.P
 	if snap.ProxyPort443 > 0 {
 		mode.Proxy443 = 1
 	}
-	// 先落限额（标量、幂等、不碰 egress map）：失败即中止，数据面保持旧
-	// CIDR 策略，不产生“策略已切但限额还是旧值”的半应用状态。
+	// 先落限额与代理 DNAT（标量、幂等、不碰 egress map）：失败即中止，
+	// 数据面保持旧 CIDR 策略，不产生“策略已切但限额/DNAT 还是旧值”的半应用状态。
 	if err := slot.EnsureNetnsTCPLimit(ctx, ref, snap.MaxTCPConns); err != nil {
 		return fmt.Errorf("ebpf: tcp limit: %w", err)
+	}
+	if err := slot.EnsureNetnsProxyDNAT(ctx, ref, snap.ProxyPort80, snap.ProxyPort443); err != nil {
+		return fmt.Errorf("ebpf: proxy dnat: %w", err)
 	}
 	// 落表：内层先清后写，再挂外层，最后写 mode（读端任一中间态仍是旧
 	// 快照或空条目；空外层条目 = unrestricted，崩溃窗口 fail-open 等价

@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -60,25 +61,28 @@ func NewPrometheusAnalysis(cfg PrometheusAnalysisConfig) *PrometheusAnalysis {
 	return &PrometheusAnalysis{cfg: cfg}
 }
 
+// promLabelEscape 转义插入已有双引号内部的 PromQL 字符串片段（反斜杠先于双引号）。
+var promLabelReplacer = strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`)
+
 func promLabelEscape(s string) string {
-	return strings.ReplaceAll(s, `"`, `\"`)
+	return promLabelReplacer.Replace(s)
 }
 
 // errorRateQuery 生成 to 代错误率 PromQL（5xx/全部；分母为零时 Prom
 // 零流量时无 series（ErrNoData→窗内 Wait/到期 Rollback）；零可服务判定仍由 serving-ratio 门承担）。
 func errorRateQuery(host string, generation int64, window time.Duration) string {
-	h, g := promLabelEscape(host), strconv.FormatInt(generation, 10)
+	g := strconv.FormatInt(generation, 10)
 	return fmt.Sprintf(
 		`sum(rate(firepaas_edge_gen_responses_total{host=%q,generation=%q,code_class="5xx"}[%s]))`+
 			` / sum(rate(firepaas_edge_gen_responses_total{host=%q,generation=%q}[%s]))`,
-		h, g, window, h, g, window)
+		host, g, window, host, g, window)
 }
 
 // p99Query 生成 to 代 p99 PromQL。
 func p99Query(host string, generation int64, window time.Duration) string {
 	return fmt.Sprintf(
 		`histogram_quantile(0.99, sum by (le) (rate(firepaas_edge_gen_latency_seconds_bucket{host=%q,generation=%q}[%s])))`,
-		promLabelEscape(host),
+		host,
 		strconv.FormatInt(generation, 10),
 		window,
 	)
@@ -113,6 +117,9 @@ func (a *PrometheusAnalysis) AssessCutover(
 		if err != nil {
 			return a.queryFailure(atWindowEnd, "error-rate", err)
 		}
+		if math.IsNaN(rate) || math.IsInf(rate, 0) {
+			return a.queryFailure(atWindowEnd, "error-rate", fmt.Errorf("non-finite sample %v", rate))
+		}
 		if rate > a.cfg.MaxErrorRate {
 			return VerdictRollback, fmt.Sprintf(
 				"to-generation error rate %.3f exceeds %.3f; auto-rollback", rate, a.cfg.MaxErrorRate)
@@ -122,6 +129,9 @@ func (a *PrometheusAnalysis) AssessCutover(
 		p99, err := a.cfg.Querier.Query(ctx, p99Query(host, gen, a.cfg.window()))
 		if err != nil {
 			return a.queryFailure(atWindowEnd, "p99", err)
+		}
+		if math.IsNaN(p99) || math.IsInf(p99, 0) {
+			return a.queryFailure(atWindowEnd, "p99", fmt.Errorf("non-finite sample %v", p99))
 		}
 		if p99 > a.cfg.P99LatencySec {
 			return VerdictRollback, fmt.Sprintf(

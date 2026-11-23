@@ -114,6 +114,10 @@ func (a *API) createSnapshot(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	if m.CurrentExecutionID == "" || m.NodeID == "" {
+		writeErr(w, 409, "machine has no current execution/node yet")
+		return
+	}
 	// ADR-0024/0030: memory checkpoints cannot capture secret memory or a
 	// writable volume/overlay whose independent lifecycle cannot be replayed.
 	if kind == "MEMORY" {
@@ -126,15 +130,15 @@ func (a *API) createSnapshot(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 409, "memory checkpoint forbidden with writable volume attachments")
 			return
 		}
-		if dep, err := a.store.ActiveDeploymentForApp(r.Context(), m.AppID); err == nil && dep != nil &&
-			len(dep.SecretRefs) > 0 {
-			writeErr(w, 409, "memory checkpoint forbidden: execution may have received secrets (ADR-0024)")
+		hasSecrets, err := a.store.MachineHasActiveSecretDelivery(r.Context(), m.ID, m.CurrentExecutionID)
+		if err != nil {
+			writeInternalErr(w, r, err)
 			return
 		}
-	}
-	if m.CurrentExecutionID == "" || m.NodeID == "" {
-		writeErr(w, 409, "machine has no current execution/node yet")
-		return
+		if hasSecrets {
+			writeErr(w, 409, "memory checkpoint forbidden: execution received secrets (ADR-0024)")
+			return
+		}
 	}
 	compatibilityKey := ""
 	nodes, err := a.store.ListNodes(r.Context())
@@ -1143,21 +1147,22 @@ func (a *API) attachVolume(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "overlay_size_bytes is only valid for DATASET_RO")
 		return
 	}
-	opID := "op-vol-att-" + volID + "-" + m.CurrentExecutionID[:8]
-	raw := []byte(
-		fmt.Sprintf(
-			`{"volume_id":%q,"machine_id":%q,"execution_id":%q,"generation":%d,"operation_id":%q,"mount_path":%q,"readonly":%v,"overlay":%v,"overlay_size_bytes":%d}`,
-			volID,
-			machineID,
-			m.CurrentExecutionID,
-			m.Generation,
-			opID,
-			body.MountPath,
-			body.Readonly,
-			body.OverlaySizeBytes > 0,
-			body.OverlaySizeBytes,
-		),
-	)
+	opID := "op-vol-att-" + volID + "-" + shortPrefix(m.CurrentExecutionID, 8)
+	raw, err := json.Marshal(map[string]any{
+		"volume_id":          volID,
+		"machine_id":         machineID,
+		"execution_id":       m.CurrentExecutionID,
+		"generation":         m.Generation,
+		"operation_id":       opID,
+		"mount_path":         body.MountPath,
+		"readonly":           body.Readonly,
+		"overlay":            body.OverlaySizeBytes > 0,
+		"overlay_size_bytes": body.OverlaySizeBytes,
+	})
+	if err != nil {
+		writeInternalErr(w, r, err)
+		return
+	}
 	p := store.EnqueueOperationParams{
 		OperationID:    opID,
 		ProjectID:      v.ProjectID,
@@ -1210,9 +1215,18 @@ func (a *API) detachVolume(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 409, "machine has no current execution")
 		return
 	}
-	opID := "op-vol-det-" + volID + "-" + m.CurrentExecutionID[:8]
-	raw := []byte(fmt.Sprintf(`{"volume_id":%q,"machine_id":%q,"execution_id":%q,"generation":%d,"operation_id":%q}`,
-		volID, machineID, m.CurrentExecutionID, m.Generation, opID))
+	opID := "op-vol-det-" + volID + "-" + shortPrefix(m.CurrentExecutionID, 8)
+	raw, err := json.Marshal(map[string]any{
+		"volume_id":    volID,
+		"machine_id":   machineID,
+		"execution_id": m.CurrentExecutionID,
+		"generation":   m.Generation,
+		"operation_id": opID,
+	})
+	if err != nil {
+		writeInternalErr(w, r, err)
+		return
+	}
 	v, err := a.store.GetVolume(r.Context(), volID)
 	if err != nil {
 		writeInternalErr(w, r, err)
@@ -1259,4 +1273,11 @@ func writeVolumeEnqueueErr(w http.ResponseWriter, r *http.Request, err error) {
 	default:
 		writeInternalErr(w, r, err)
 	}
+}
+
+func shortPrefix(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
 }

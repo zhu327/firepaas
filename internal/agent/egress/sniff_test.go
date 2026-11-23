@@ -154,3 +154,17 @@ func TestPeekHTTPHostBoundedReads(t *testing.T) {
 		t.Fatalf("prefix must replay exactly")
 	}
 }
+
+func TestPeekHTTPHostRejectsConflictingDuplicateHostHeaders(t *testing.T) {
+	raw := "GET / HTTP/1.1\r\nHost: allowed.example.com\r\nHost: evil.example.com\r\n\r\n"
+	peek, err := PeekHTTPHost(bufio.NewReader(strings.NewReader(raw)))
+	if !errors.Is(err, ErrNoHostInfo) || peek.Host != "" {
+		t.Fatalf("conflicting duplicate Host headers must fail closed: host=%q err=%v", peek.Host, err)
+	}
+	// 两个完全一致的 Host 头允许通过。
+	same := "GET / HTTP/1.1\r\nHost: allowed.example.com\r\nHost: ALLOWED.EXAMPLE.COM\r\n\r\n"
+	peek, err = PeekHTTPHost(bufio.NewReader(strings.NewReader(same)))
+	if err != nil || peek.Host != "allowed.example.com" {
+		t.Fatalf("identical Host headers: host=%q err=%v", peek.Host, err)
+	}
+}

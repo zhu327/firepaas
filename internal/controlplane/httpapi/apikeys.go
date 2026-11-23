@@ -258,10 +258,6 @@ func (a *API) rotateAPIKey(w http.ResponseWriter, r *http.Request) {
 		writeInternalErr(w, r, err)
 		return
 	}
-	if target.RevokedAt != nil {
-		writeErr(w, 409, "api key already revoked; create a new key instead")
-		return
-	}
 	if !identityIsGlobal(id) {
 		if target.ProjectID != id.ProjectID {
 			writeErr(w, 403, "cross-project access denied")
@@ -272,6 +268,10 @@ func (a *API) rotateAPIKey(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if target.RevokedAt != nil {
+		writeErr(w, 409, "api key already revoked; create a new key instead")
+		return
+	}
 	var ttl time.Duration
 	if body.TTLHours != nil {
 		if *body.TTLHours < 0 {
@@ -280,9 +280,12 @@ func (a *API) rotateAPIKey(w http.ResponseWriter, r *http.Request) {
 		}
 		ttl = time.Duration(*body.TTLHours) * time.Hour
 	} else if target.ExpiresAt != nil {
-		if d := time.Until(*target.ExpiresAt); d > 0 {
-			ttl = d
+		d := time.Until(*target.ExpiresAt)
+		if d <= 0 {
+			writeErr(w, 409, "api key already expired; specify ttl_hours or create a new key instead")
+			return
 		}
+		ttl = d
 	}
 	nk, plain, err := a.apiKeys.Create(r.Context(), target.Name, target.Scopes, target.ProjectID, ttl)
 	if errors.Is(err, apikeys.ErrInvalidInput) {

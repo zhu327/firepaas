@@ -153,3 +153,39 @@ func TestRedactJSONBytesEmpty(t *testing.T) {
 		t.Fatalf("nil input should map to {}, got %q", got)
 	}
 }
+
+func TestAPIKeyAndSecretValueRedacted(t *testing.T) {
+	for _, key := range []string{"api_key", "apiKey", "X-Api-Key", "secret_value", "secretValue"} {
+		if !IsSensitive(key) {
+			t.Fatalf("key %q must be sensitive", key)
+		}
+	}
+	raw := []byte(`{"api_key":"fp_123","secret_value":"top-secret","ok":"keep"}`)
+	out := string(RedactJSONBytes(raw))
+	if strings.Contains(out, "fp_123") || strings.Contains(out, "top-secret") {
+		t.Fatalf("api_key/secret_value leaked: %s", out)
+	}
+	if !strings.Contains(out, `"ok":"keep"`) {
+		t.Fatalf("safe field dropped: %s", out)
+	}
+}
+
+func TestRedactHeadersCaseInsensitiveCookies(t *testing.T) {
+	h := map[string][]string{
+		"authorization": {"Bearer secret"},
+		"cookie":        {"session=abc"},
+		"Set-Cookie":    {"session=xyz; HttpOnly"},
+		"set-cookie":    {"sid=123"},
+		"X-Api-Key":     {"fp_abc"},
+		"Content-Type":  {"application/json"},
+	}
+	out := RedactHeaders(h)
+	for _, k := range []string{"authorization", "cookie", "Set-Cookie", "set-cookie", "X-Api-Key"} {
+		if out[k] != "[REDACTED]" {
+			t.Fatalf("header %q not redacted: %v", k, out[k])
+		}
+	}
+	if got, ok := out["Content-Type"].([]string); !ok || len(got) != 1 || got[0] != "application/json" {
+		t.Fatalf("safe header altered: %v", out["Content-Type"])
+	}
+}

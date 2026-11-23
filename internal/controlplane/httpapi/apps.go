@@ -189,7 +189,8 @@ func (a *API) createApp(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// P3-13：过滤移除绑定（null）条目并校验存在性。
-		refs, err := a.validateSecretRefs(r.Context(), effectiveProjectID(r, "dev"), body.SecretRefs)
+		// 按最终归属的 body.ProjectID 校验，避免全局 root 显式指定 project_id 时误查默认项目。
+		refs, err := a.validateSecretRefs(r.Context(), body.ProjectID, body.SecretRefs)
 		if err != nil {
 			writeErr(w, 400, err.Error())
 			return

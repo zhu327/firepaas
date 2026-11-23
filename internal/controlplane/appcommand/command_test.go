@@ -14,12 +14,13 @@ import (
 )
 
 type fakeStore struct {
-	app       *store.App
-	active    *store.Deployment
-	secretErr error
-	deployErr error
-	deployed  *store.Deployment
-	rollout   *store.Rollout
+	app           *store.App
+	active        *store.Deployment
+	secretErr     error
+	secretProject string
+	deployErr     error
+	deployed      *store.Deployment
+	rollout       *store.Rollout
 }
 
 func (f *fakeStore) GetApp(context.Context, string) (*store.App, error) { return f.app, nil }
@@ -27,7 +28,8 @@ func (f *fakeStore) ActiveDeploymentForApp(context.Context, string) (*store.Depl
 	return f.active, nil
 }
 
-func (f *fakeStore) GetSecretMeta(context.Context, string, string, *int64) (*store.SecretMeta, error) {
+func (f *fakeStore) GetSecretMeta(_ context.Context, projectID, _ string, _ *int64) (*store.SecretMeta, error) {
+	f.secretProject = projectID
 	if f.secretErr != nil {
 		return nil, f.secretErr
 	}
@@ -228,5 +230,23 @@ func TestExecuteApprovalRequired(t *testing.T) {
 	}
 	if st.rollout == nil || st.rollout.ApprovalRequired {
 		t.Fatalf("rollout = %+v, want approval off by default", st.rollout)
+	}
+}
+
+func TestExecuteValidatesSecretsAgainstAppProject(t *testing.T) {
+	active := &store.Deployment{Generation: 1, ImageRef: "old", VCPU: 1, MemMIB: 512, Port: 8080}
+	st := &fakeStore{app: &store.App{ID: "app-1", ProjectID: "proj-prod", Generation: 1}, active: active}
+	cmd := New(st, fakeImages{})
+	cmd.newID = func() string { return "fixed" }
+	refs := map[string]store.SecretRef{"API_KEY": {Secret: "k1"}}
+	if _, err := cmd.Execute(context.Background(), Intent{
+		AppID:      "app-1",
+		ProjectID:  "dev", // 全局 root 调用方未指定项目时常见默认值
+		SecretRefs: refs,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if st.secretProject != "proj-prod" {
+		t.Fatalf("GetSecretMeta project = %q, want app project %q", st.secretProject, "proj-prod")
 	}
 }

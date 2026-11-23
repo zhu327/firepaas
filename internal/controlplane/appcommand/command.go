@@ -163,7 +163,11 @@ func (c *Command) Execute(ctx context.Context, in Intent) (Result, error) {
 	if in.SecretRefs == nil {
 		in.SecretRefs = active.SecretRefs
 	}
-	in.SecretRefs, err = c.validateSecretRefs(ctx, in.ProjectID, in.SecretRefs)
+	secretProjectID := app.ProjectID
+	if secretProjectID == "" {
+		secretProjectID = in.ProjectID
+	}
+	in.SecretRefs, err = c.validateSecretRefs(ctx, secretProjectID, in.SecretRefs)
 	if err != nil {
 		return Result{}, invalid(err)
 	}
